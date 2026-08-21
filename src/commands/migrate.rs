@@ -1,3 +1,4 @@
+use crate::naming::PackageKind;
 use crate::{error::CliError, ui, Result};
 use colored::Colorize;
 use forgedb_migrations::{HopBodyClass, MigrationGenerator, MigrationTracker, SchemaChange};
@@ -8,45 +9,221 @@ fn map_err(e: String) -> CliError {
     CliError::Migration(e)
 }
 
-pub struct MigrateCreateOptions {
-    pub description: String,
-    pub auto: bool,
-    pub schema: Option<PathBuf>,
+/// The app one `migrate` invocation acts on (#335 §9).
+///
+/// **No `migrate` command is CWD-relative, and none of them discovers
+/// anything.** The operator names the app, and every path derives from that:
+/// `migrations/` is read beside the schema rather than beside wherever the
+/// operator happened to be standing.
+///
+/// The schema path is already the app's identity everywhere else in epic #332
+/// — `cache::member_hash` is FNV-1a over the project-relative schema path — so
+/// requiring it here states the existing key explicitly instead of inferring it
+/// from a working directory.
+pub struct AppRef {
+    /// `--schema`, **required on every arm**, and exactly one per invocation:
+    /// no `migrate` command takes a list and none sweeps. The per-tenant sweep
+    /// left with `migrate up` and is the substance of #373.
+    pub schema: PathBuf,
+    /// The global `--config` override, threaded so `migrate` governs exactly
+    /// the way `generate` does. It overrides the knobs, never the identity —
+    /// which project a schema belongs to is a fact about the tree.
+    pub config: Option<String>,
 }
 
-pub struct MigrateStatusOptions;
+pub struct MigrateCreateOptions {
+    pub app: AppRef,
+    pub description: String,
+    pub auto: bool,
+}
+
+pub struct MigrateStatusOptions {
+    pub app: AppRef,
+}
 
 pub struct MigrateBuildOptions {
+    pub app: AppRef,
     pub from: u32,
     pub to: u32,
-    /// Where to emit + build the transformer crate (default `migrations/transform`).
-    pub output: Option<PathBuf>,
+    /// TOMBSTONE for the deleted `-o/--output` (#335 §9).
+    ///
+    /// It still parses so that passing it is an **error naming the
+    /// replacement** rather than clap's "unexpected argument", which names
+    /// none. Its old default value was `migrations/transform` — precisely the
+    /// path that reproduces #328 — so keeping the flag was never an option.
+    pub removed_output: Option<PathBuf>,
 }
 
 pub struct MigrateRunOptions {
+    pub app: AppRef,
+    /// Origin format version — **required**, because the transformer member is
+    /// range-stamped (`transform-<from>-<to>`) and cannot be named without it.
+    pub from: u32,
+    /// Destination format version.
+    pub to: u32,
     pub src: PathBuf,
     pub dest: PathBuf,
-    /// The transformer crate dir (default `migrations/transform`).
-    pub bin_dir: Option<PathBuf>,
+    /// TOMBSTONE for the deleted `--bin-dir` (#335 §9). See
+    /// [`MigrateBuildOptions::removed_output`].
+    pub removed_bin_dir: Option<PathBuf>,
 }
 
 /// Options for `forgedb migrate engine` (#254): the ForgeDB **byte-format**
 /// migration, orthogonal to the schema-version transformer above.
 pub struct MigrateEngineOptions {
+    /// The app. Unlike the transformer's, this schema is not location-only —
+    /// an engine bump changes no `.forge`, so the SAME schema is baked on both
+    /// sides of the hop.
+    pub app: AppRef,
     /// Source data directory (stamped at the old engine generation).
     pub src: PathBuf,
     /// Destination directory to materialize (must not exist / be empty).
     pub dest: PathBuf,
-    /// Schema file (default: auto-discovered `schema.forge`). An engine bump
-    /// changes no `.forge`, so the SAME schema is baked on both sides of the hop.
-    pub schema: Option<PathBuf>,
-    /// Where to emit + build the hop crate (default `migrations/engine`).
-    pub output: Option<PathBuf>,
+    /// TOMBSTONE for the deleted `-o/--output` (#335 §9). See
+    /// [`MigrateBuildOptions::removed_output`].
+    pub removed_output: Option<PathBuf>,
+}
+
+/// The directory a schema's governing config is walked up from, and the
+/// directory its `migrations/` sits beside.
+///
+/// A bare `schema.forge` has no parent component, and walking from `""` would
+/// resolve against the filesystem **root** rather than the CWD — the difference
+/// between "the config beside my schema" and "any config on the machine".
+///
+/// `main.rs` carries the same five lines for the same reason. They are not
+/// shared because that one lives in the **binary** crate and this in the
+/// library, so there is no path from here to it.
+fn schema_dir(schema: &Path) -> &Path {
+    match schema.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    }
+}
+
+/// One `migrate` invocation's app, resolved: which project governs it, which
+/// container in the build cache is its, and every name it builds under.
+struct ResolvedApp {
+    /// The `.forge` the operator named.
+    schema: PathBuf,
+    /// `<the schema's directory>/migrations` — derived from the given app,
+    /// never from the CWD and never walked for.
+    migrations_dir: PathBuf,
+    /// The app's legible derived identity, e.g. `foo_services_blog`.
+    app_name: String,
+    reserved: crate::cache::Reserved,
+}
+
+impl ResolvedApp {
+    /// The cargo `[package] name` for one of this app's cache members.
+    fn package(&self, kind: &PackageKind) -> String {
+        crate::naming::package_name(&self.app_name, kind)
+    }
+
+    /// The `[[bin]]` name for a class-C member.
+    ///
+    /// `naming::bin_name` **is** `naming::package_name` today; both are called
+    /// rather than one derived from the other here, so that if they ever
+    /// diverge it is one edit in `naming.rs` and not a search of this file.
+    fn bin(&self, kind: &PackageKind) -> String {
+        crate::naming::bin_name(&self.app_name, kind)
+    }
+
+    /// The member directory: `<container>/transform-1-2`, `<container>/engine-1-2`.
+    fn member(&self, kind: &PackageKind) -> PathBuf {
+        self.reserved.container.join(kind.dir())
+    }
+}
+
+/// Run the governance chain every `migrate` arm now runs — the same one the
+/// Generate arm runs: `govern -> identify_reported -> reserve` (#335 §9).
+///
+/// One new failure mode, stated deliberately rather than discovered: `migrate`
+/// gaining `identify_reported` means it can hard-fail on a #333 project-id
+/// collision — including on `migrate engine`, which carries the *mandatory*
+/// 0.4.0 engine upgrade. That is consistent with `generate`, and the
+/// diagnostic names `[project].name` as the remedy.
+fn resolve_app(app: &AppRef) -> Result<ResolvedApp> {
+    let schema = &app.schema;
+    // The schema is not discovered, so a missing one is the operator naming the
+    // wrong app — never a cue to go looking for another.
+    if !schema.is_file() {
+        return Err(CliError::SchemaNotFound(format!(
+            "{} does not exist. `--schema` names the app this migration belongs to; \
+             it is not discovered and there is no default.",
+            schema.display()
+        )));
+    }
+
+    let governing = crate::project::govern(app.config.as_deref(), schema_dir(schema))?;
+    let project = governing.identify_reported()?;
+    let reserved =
+        crate::cache::reserve(&project.name, &project.root, schema, governing.symbol_naming())?;
+    // C7: every command that writes into the cache prints where it wrote.
+    // Once the build happens in a hashed directory the user has never seen, a
+    // silent path is the difference between a build they can inspect and one
+    // they cannot.
+    ui::info(&format!("Build cache: {}", reserved.container.display()));
+
+    Ok(ResolvedApp {
+        schema: schema.clone(),
+        migrations_dir: schema_dir(schema).join("migrations"),
+        app_name: reserved.app_name.clone(),
+        reserved,
+    })
+}
+
+/// A deleted flag that still **parses**, so that passing it is an error naming
+/// the replacement (#335 §9).
+///
+/// Removing the flag outright hands the user clap's "unexpected argument",
+/// which names no replacement. Keeping it and ignoring it is worse still: a
+/// flag that reads as applied and is not is the exact failure mode this design
+/// deletes everywhere else. So the flag survives as a tombstone whose entire
+/// behavior is this refusal.
+fn refuse_removed_flag(flag: &str, value: Option<&PathBuf>, replacement: &str) -> Result<()> {
+    match value {
+        None => Ok(()),
+        Some(v) => Err(CliError::Migration(format!(
+            "`{flag} {}` was removed (#335): ForgeDB owns where this is built, and it is \
+             built as a member of the project's own cache workspace rather than into a \
+             directory of your choosing. {replacement}",
+            v.display()
+        ))),
+    }
+}
+
+/// `forgedb migrate up`, removed (#335 §9, maintainer decision 3).
+///
+/// It was a convenience wrapper over `migrate build` + `migrate run`, not a
+/// capability — one fewer command needing a cache-placement answer, and one
+/// fewer that builds a transformer. What is actually lost is the per-tenant
+/// sweep and the source-version auto-detection, and that is the substance of
+/// **#373**; git history is their record.
+///
+/// This exists as a **tombstone rather than a deleted subcommand** so the
+/// removal errors and names its replacement: an operator following a runbook
+/// gets told what to run, not clap's "unrecognized subcommand".
+pub fn up() -> Result<()> {
+    Err(CliError::Migration(
+        "`forgedb migrate up` was removed (#335). It was a wrapper over two commands, \
+         so run them:\n  \
+         forgedb migrate build --schema <app.forge> --from <F> --to <T>\n  \
+         forgedb migrate run   --schema <app.forge> --from <F> --to <T> \
+         --src <data> --dest <migrated>\n\
+         The per-tenant sweep (--tenant-root) and --from auto-detection are tracked \
+         for restoration as #373."
+            .to_string(),
+    ))
 }
 
 /// Create a new migration
 pub fn create(opts: MigrateCreateOptions) -> Result<()> {
-    let migrations_dir = PathBuf::from("migrations");
+    let app = resolve_app(&opts.app)?;
+    // Derived from the app the operator named, never from the working directory
+    // (#335 §9): one root config can govern many apps, and a CWD-relative
+    // `migrations/` gave whichever of them the operator happened to `cd` into.
+    let migrations_dir = app.migrations_dir.clone();
 
     if opts.auto {
         // Auto-detect changes by diffing the current schema against the recorded
@@ -57,8 +234,14 @@ pub fn create(opts: MigrateCreateOptions) -> Result<()> {
         // classified `Authored` and gets a `migrations/{id}/transform.rs` scaffold
         // the operator fills in.  Purely-additive changes still get the cheap
         // reopen-backfill fast path; anything that rewrites data-at-rest routes
-        // through the offline transformer (`forgedb migrate up`).
-        let schema_path = opts.schema.clone().unwrap_or_else(|| PathBuf::from("schema.forge"));
+        // through the offline transformer (`forgedb migrate build` + `run`).
+        //
+        // The schema is the one the operator named. The CWD-relative
+        // `schema.forge` default that used to sit here died with the rest of
+        // the discovery (#335 §9): a defaulted schema path is the same defect
+        // wearing a different name — it picks an app out of the working
+        // directory and diffs *that* app's snapshot.
+        let schema_path = app.schema.clone();
         ui::info(&format!(
             "Auto-detecting schema changes ({})...",
             schema_path.display()
@@ -173,7 +356,7 @@ pub fn create(opts: MigrateCreateOptions) -> Result<()> {
                     ));
                 }
             }
-            print_migration_next_steps(from_version, to_version, authored_count > 0);
+            print_migration_next_steps(&app.schema, from_version, to_version, authored_count > 0);
         }
     } else {
         // Manual migration - create empty template
@@ -197,8 +380,9 @@ pub fn create(opts: MigrateCreateOptions) -> Result<()> {
 }
 
 /// Show migration status
-pub fn status(_opts: MigrateStatusOptions) -> Result<()> {
-    let migrations_dir = PathBuf::from("migrations");
+pub fn status(opts: MigrateStatusOptions) -> Result<()> {
+    let app = resolve_app(&opts.app)?;
+    let migrations_dir = app.migrations_dir.clone();
 
     // Load all migrations
     let all_migrations =
@@ -263,17 +447,44 @@ pub fn status(_opts: MigrateStatusOptions) -> Result<()> {
 
 /// Generate + compile the offline transformer bin for a version range (#74 Phase
 /// 3).  One operator artifact that migrates a data dir from `--from` to `--to`.
+///
+/// The transformer is emitted into this app's build-cache container as
+/// `transform-<from>-<to>/` and compiled as a **member of the project's cargo
+/// workspace** (#335 §1/§9) — not into a directory the operator chooses, which
+/// is how a generated `[package]` came to land under a foreign cargo root with
+/// no `[workspace]` table (#328).
 pub fn build(opts: MigrateBuildOptions) -> Result<()> {
-    let migrations_dir = PathBuf::from("migrations");
-    let output = opts
-        .output
-        .unwrap_or_else(|| migrations_dir.join("transform"));
+    refuse_removed_flag(
+        "--output",
+        opts.removed_output.as_ref(),
+        "Pass `--schema <app.forge>` instead: the transformer is emitted into that app's \
+         build-cache container as `transform-<from>-<to>/`, and the command prints the path.",
+    )?;
+    let app = resolve_app(&opts.app)?;
+    let kind = PackageKind::Transform {
+        from: opts.from,
+        to: opts.to,
+    };
 
-    let bin = compile_transformer(opts.from, opts.to, &output)?;
+    // Said out loud, because the alternative reading is the natural one and it
+    // is wrong: `--schema` names the APP, and nothing else. The transformer is
+    // generated from the versioned snapshots the lineage committed, so a
+    // drifted HEAD schema cannot change a historical hop.
+    ui::detail(&format!(
+        "--schema selects the app; the transformer itself is generated from the committed \
+         per-version schemas under {}",
+        app.migrations_dir.display()
+    ));
+
+    emit_transform_crate(&app, &kind)?;
+    sync_cache_root(&app)?;
+    let bin = build_member_bin(&app, &kind, "transformer")?;
+
     ui::success(&format!("Built transformer: {}", bin.display()));
     ui::info(&format!(
-        "Run it with the app STOPPED: `forgedb migrate up --from {} --to {} --src <data> --dest <migrated>` \
-         (or directly: `{} <src> <dest>`)",
+        "Run it with the app STOPPED: `forgedb migrate run --schema {} --from {} --to {} \
+         --src <data> --dest <migrated>` (or directly: `{} <src> <dest>`)",
+        app.schema.display(),
         opts.from,
         opts.to,
         bin.display()
@@ -281,123 +492,167 @@ pub fn build(opts: MigrateBuildOptions) -> Result<()> {
     Ok(())
 }
 
-/// Emit + `cargo build --release` the transformer crate for a version range,
-/// returning the built binary's path (#74 Phase 3/4).  Shared by `migrate build`
-/// and `migrate up`.
-fn compile_transformer(from: u32, to: u32, output: &Path) -> Result<PathBuf> {
-    ui::info(&format!(
-        "Generating transformer for format v{from} → v{to} into {}",
-        output.display()
-    ));
-    emit_transform(from, to, output, true)?;
-
-    ui::info("Compiling the transformer (cargo build --release)...");
-    cargo_build_transform_bin(output, "transformer")
+/// Rewrite the project's workspace root around what is now on disk (#335 §3).
+///
+/// Runs **after** emission: a root rendered before it lists the *previous*
+/// run's packages, so an app's first `migrate build` would write a root naming
+/// no `transform-<a>-<b>` at all and `cargo build -p <it>` would fail with
+/// `did not match any packages`.
+///
+/// **It prunes nothing.** `PruneOwner::MigrateBuild` / `MigrateEngine` exist so
+/// that `generate` does not reap a transformer it did not emit (§3 rule 4);
+/// they do not oblige `migrate` to reap one either. A sibling range is not
+/// garbage — `transform-1-2` is still valid work after `transform-2-3` is
+/// built, and the epic's asymmetry says to fail toward keeping: a package on
+/// disk that `members` does not name is inert, while a wrongly-deleted one
+/// costs a rebuild.
+fn sync_cache_root(app: &ResolvedApp) -> Result<()> {
+    let synced = crate::cache::sync_root(&app.reserved.project, &app.reserved.container)?;
+    // C9: reported rather than silent, because it happened in a directory the
+    // user never opens.
+    if synced.lock_dropped {
+        ui::info(&format!(
+            "CLI version changed — dropped {}/Cargo.lock so dependencies re-resolve",
+            app.reserved.project.display()
+        ));
+    }
+    for orphan in &synced.orphans {
+        ui::detail(&format!(
+            "Orphaned member (its schema is gone): {}",
+            orphan.display()
+        ));
+    }
+    Ok(())
 }
 
-/// The transformer bin's name, fixed by the `[[bin]]` section of the manifest
-/// `TransformGenerator::cargo_toml` emits (the engine-hop crate reuses it).
-const TRANSFORM_BIN: &str = "forgedb-transform";
-
-/// `cargo build --release` in `crate_dir`, returning the bin's path **as cargo
-/// reports it** rather than as we guess it (#292).
+/// Compile one class-C cache member's `[[bin]]` and return the path **cargo
+/// reported**, never one we joined by hand.
 ///
-/// The path is not ours to compute.  Cargo resolves its target directory from
-/// `CARGO_TARGET_DIR` and from `[build] target-dir` in every `config.toml` on its
-/// discovery chain — including `$CARGO_HOME/config.toml`, which is machine-wide —
-/// so any path we join by hand is wrong for those users, and wrong *silently*:
-/// this function used to return a constructed path it never checked, so `migrate
-/// build` exited 0 while naming a file that was not there.
+/// # One driver, not two
 ///
-/// `--message-format=json-render-diagnostics` puts one JSON message per line on
-/// stdout while leaving human-readable diagnostics and progress on stderr, so
-/// capturing stdout costs the user no output.  The `compiler-artifact` message for
-/// the bin carries its real `executable`, and it is emitted on a fully-cached
-/// rebuild too — a no-op build still has to report where the binary is.
-fn cargo_build_transform_bin(crate_dir: &Path, what: &str) -> Result<PathBuf> {
-    let child = std::process::Command::new("cargo")
-        .args([
-            "build",
-            "--release",
-            "--message-format=json-render-diagnostics",
-        ])
-        .current_dir(crate_dir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .map_err(|e| CliError::Migration(format!("failed to run cargo: {e}")))?;
-    let out = child
-        .wait_with_output()
-        .map_err(|e| CliError::Migration(format!("failed to run cargo: {e}")))?;
-    if !out.status.success() {
-        return Err(CliError::Migration(format!(
-            "{what} build failed (see cargo output above)"
-        )));
-    }
+/// `cargo_build_transform_bin` used to live here. It was already the correct
+/// driver — `.current_dir`, streamed diagnostics,
+/// `--message-format=json-render-diagnostics` on stdout, the real `executable`
+/// read out of the `compiler-artifact` message, and a refusal to return a path
+/// it had not `is_file()`-checked, with #292 named as the reason. Its one
+/// limitation was that it knew exactly one package, in exactly one directory.
+///
+/// So it was **absorbed by the general driver rather than duplicated here**
+/// (#335 step 6/8). Everything `migrate` needs from cargo now goes through
+/// [`crate::commands::build::driver`], and this function is a thin adapter:
+/// name the member, ask the driver to build it, and pick the `bin` back out of
+/// what cargo reported.
+///
+/// Three things come for free by routing rather than re-implementing, and each
+/// one is a defect this file used to own:
+///
+/// * **the duplicate-artifact guard runs first.** One app can hold both
+///   `transform-1-2` and `engine-1-2`; if two members ever declared the same
+///   `[[bin]]` name, cargo would `warning: output filename collision`, **exit
+///   0**, and leave one of them behind — after which resolving a bin by name
+///   runs the *wrong hop* over a user's data dir at exit 0. That is scenario
+///   25, and it needs no compile to catch.
+/// * **the release profile floor is the same one `forgedb build` uses.**
+///   `[profile.release]` in a workspace *member* is silently ignored by cargo,
+///   which is why `transform.rs` no longer writes one; the floor is applied by
+///   `driver::plan` as `--config`, at the root, where cargo honours it.
+/// * **the build runs at the cache workspace root**, so one `Cargo.lock` and
+///   one `target/` are shared with every other package of the project instead
+///   of the member resolving its own.
+///
+/// `release` is always `true` here: a transformer and an engine hop each make
+/// one full pass over a user's data directory, and a debug build of that is not
+/// a build anyone wants to wait through.
+fn build_member_bin(app: &ResolvedApp, kind: &PackageKind, what: &str) -> Result<PathBuf> {
+    use crate::commands::build::driver::{self, Selected, TargetKind};
 
-    let mut executable: Option<PathBuf> = None;
-    for line in out.stdout.split(|b| *b == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(msg) = serde_json::from_slice::<serde_json::Value>(line) else {
-            continue;
-        };
-        if msg.get("reason").and_then(|r| r.as_str()) != Some("compiler-artifact") {
-            continue;
-        }
-        if msg.pointer("/target/name").and_then(|n| n.as_str()) != Some(TRANSFORM_BIN) {
-            continue;
-        }
-        if let Some(exe) = msg.get("executable").and_then(|e| e.as_str()) {
-            executable = Some(PathBuf::from(exe));
-        }
-    }
+    let package = app.package(kind);
+    let member = app.member(kind);
 
-    let bin = executable.ok_or_else(|| {
-        CliError::Migration(format!(
-            "the {what} build emitted no `{TRANSFORM_BIN}` executable — check that {} still \
-             declares `[[bin]] name = \"{TRANSFORM_BIN}\"`",
-            crate_dir.join("Cargo.toml").display()
-        ))
-    })?;
-    // Never hand back a path without checking it: reporting success for a file that
-    // is not there is the whole of #292.
-    if !bin.is_file() {
-        return Err(CliError::Migration(format!(
-            "cargo reported the {what} bin at {} but nothing is there",
-            bin.display()
-        )));
-    }
-    Ok(bin)
+    // Refuse before compiling, not after: this is the guard that catches the
+    // `transform`/`engine` pair, and cargo's own report of the condition is a
+    // warning that exits 0.
+    driver::assert_no_duplicate_artifact_names(&app.reserved.project)?;
+
+    let artifacts = driver::execute(&driver::plan(
+        &app.reserved.project,
+        &[Selected {
+            package: package.clone(),
+            kind: kind.clone(),
+        }],
+        true,
+    ))?;
+
+    artifacts
+        .into_iter()
+        .find(|a| a.package == package && a.kind == TargetKind::Bin)
+        .map(|a| a.path)
+        .ok_or_else(|| {
+            CliError::Migration(format!(
+                "the {what} package `{package}` built, but cargo reported no `bin` \
+                 artifact for it. Its manifest is at {}.",
+                member.join("Cargo.toml").display()
+            ))
+        })
 }
 
-/// Locate an already-built transformer bin **without building** (#292).
+/// Locate an already-built class-C bin **without building** (#292).
 ///
 /// `migrate run` is the one site that cannot ask cargo what it just produced,
 /// because it deliberately produces nothing — it runs a bin an earlier `migrate
-/// build` left behind.  `cargo metadata` reports the same resolved
-/// `target_directory` a build would use, so this honours the redirect without
-/// compiling anything.  The crate-local `target/` is searched as well, so a tree
-/// built under different configuration is still found, and every location looked in
-/// is named if none of them hit — the old error named only the one guess, which is
-/// what made this a loop with no exit.
-fn locate_transform_bin(crate_dir: &Path) -> Result<PathBuf> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
+/// build` left behind. `cargo metadata` reports the same resolved
+/// `target_directory` a build would use, so this honours `CARGO_TARGET_DIR` and
+/// every `[build] target-dir` on cargo's discovery chain without compiling
+/// anything.
+///
+/// Two things changed with the cache (#335 §9):
+///
+/// * the bin is resolved by the **derived, range-stamped** name, never by the
+///   old `const TRANSFORM_BIN = "forgedb-transform"` — a literal that one app's
+///   `transform/` and `engine/` both answered to, so the CLI could run the
+///   wrong hop over a user's data dir at exit 0;
+/// * a miss is a **hard error naming the cache path**, and there is *no*
+///   fallback to `migrations/transform`. The fallback is the tempting move and
+///   it is wrong twice: it re-emits a `[package]` with no `[workspace]` under
+///   whatever foreign cargo root the CWD sits in (#328 verbatim), and it does
+///   so on `migrate engine`, the mandatory upgrade path.
+fn locate_member_bin(app: &ResolvedApp, kind: &PackageKind, what: &str) -> Result<PathBuf> {
+    let member = app.member(kind);
+    let bin_name = app.bin(kind);
 
-    let out = std::process::Command::new("cargo")
-        .args(["metadata", "--format-version", "1", "--no-deps"])
-        .current_dir(crate_dir)
-        .output();
-    if let Ok(out) = &out
-        && out.status.success()
-        && let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&out.stdout)
-        && let Some(dir) = meta.get("target_directory").and_then(|t| t.as_str())
-    {
-        candidates.push(PathBuf::from(dir).join("release").join(TRANSFORM_BIN));
+    // The member itself missing is a different situation with a different
+    // remedy than a member that is present and unbuilt, so it gets its own
+    // message rather than being folded into the candidate list below.
+    if !member.join("Cargo.toml").is_file() {
+        return Err(CliError::Migration(format!(
+            "no {what} for this range at {} — nothing has emitted it. Run \
+             `forgedb migrate build --schema {} --from <F> --to <T>` first.",
+            member.display(),
+            app.schema.display()
+        )));
     }
 
-    let local = crate_dir.join("target").join("release").join(TRANSFORM_BIN);
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // Asked through the SAME driver that ran the build, at the workspace ROOT —
+    // because that is where the build runs and therefore where cargo resolves
+    // the target directory from. `migrate` spawns no cargo of its own; if this
+    // disagreed with `driver::execute` about the target directory, `run` would
+    // look for the bin somewhere `build` never wrote it.
+    if let Ok(dir) = crate::commands::build::driver::target_directory(&app.reserved.project) {
+        candidates.push(dir.join("release").join(&bin_name));
+    }
+
+    // The cache root's own `target/`, in case `cargo metadata` could not run at
+    // all (a root that has never been synced). Every location looked in is
+    // named if none of them hit — the error that named only one guess is what
+    // made this a loop with no exit (#292).
+    let local = app
+        .reserved
+        .project
+        .join("target")
+        .join("release")
+        .join(&bin_name);
     if !candidates.contains(&local) {
         candidates.push(local);
     }
@@ -406,12 +661,16 @@ fn locate_transform_bin(crate_dir: &Path) -> Result<PathBuf> {
         return Ok(hit.clone());
     }
     Err(CliError::Migration(format!(
-        "transformer bin not found — looked in:\n{}\nRun `forgedb migrate build --from <F> --to <T>` first.",
+        "{what} bin `{bin_name}` not found — its package is at {}, and the binary was \
+         looked for in:\n{}\nRun `forgedb migrate build --schema {} --from <F> --to <T>` \
+         first.",
+        member.display(),
         candidates
             .iter()
             .map(|p| format!("  {}", p.display()))
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n"),
+        app.schema.display()
     )))
 }
 
@@ -432,13 +691,29 @@ fn run_transformer(bin: &Path, src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Run a previously-built transformer bin over a src→dest data dir (#74 Phase 3).
+/// Run a previously-built transformer over a src→dest data dir (#74 Phase 3).
 /// The app must be stopped (offline, exclusive-writer migration — C12).
+///
+/// `--from`/`--to` are required and are not a convenience: the transformer is a
+/// **range-stamped** cache member (`transform-<from>-<to>`), and naming a
+/// member without its range is impossible. One `transform/` per app collided
+/// across ranges and `run` got whichever built last — a collision that
+/// pre-existed at the old shared `migrations/transform` default, but one that
+/// moving into a directory the user never opens would have turned from visible
+/// into invisible.
 pub fn run(opts: MigrateRunOptions) -> Result<()> {
-    let bin_dir = opts
-        .bin_dir
-        .unwrap_or_else(|| PathBuf::from("migrations/transform"));
-    let bin = locate_transform_bin(&bin_dir)?;
+    refuse_removed_flag(
+        "--bin-dir",
+        opts.removed_bin_dir.as_ref(),
+        "Pass `--schema <app.forge> --from <F> --to <T>` instead: those name the exact \
+         cache member `migrate build` produced, which a directory alone cannot.",
+    )?;
+    let app = resolve_app(&opts.app)?;
+    let kind = PackageKind::Transform {
+        from: opts.from,
+        to: opts.to,
+    };
+    let bin = locate_member_bin(&app, &kind, "transformer")?;
 
     ui::info(&format!(
         "Migrating {} → {} via {}",
@@ -455,19 +730,29 @@ pub fn run(opts: MigrateRunOptions) -> Result<()> {
 /// **byte-format generation** boundary.
 ///
 /// This is NOT the schema-version transformer. The two counters are orthogonal:
-/// `migrate up` replays the app's own `migrations/` lineage, and this replays
-/// ForgeDB's engine generations. An engine bump changes no `.forge`, produces no
-/// lineage hop, and would therefore run nothing at all through the transformer —
-/// which is exactly why it needs its own command rather than a fold-in.
+/// `migrate build`/`run` replay the app's own `migrations/` lineage, and this
+/// replays ForgeDB's engine generations. An engine bump changes no `.forge`,
+/// produces no lineage hop, and would therefore run nothing at all through the
+/// transformer — which is exactly why it needs its own command rather than a
+/// fold-in.
 ///
 /// The hop crate is generated (never schema-blind): a nullable, arrayed, or
 /// struct-nested timestamp is written as an opaque `FixedBytes` transmute that no
 /// schema-agnostic reader may decode, and 81 of the 247 timestamp fields in the
 /// example corpus are nullable. See `forgedb_codegen::engine`.
+///
+/// **This is the mandatory 0.4.0 upgrade path**, which is why it gets no
+/// fallback of any kind: every failure here is a hard error naming the cache
+/// path, and the old `-o/--output` default (`migrations/engine`) — a generated
+/// `[package]` with no `[workspace]` under whatever cargo root the operator
+/// stood in — is #328 verbatim.
 pub fn engine(opts: MigrateEngineOptions) -> Result<()> {
-    let output = opts
-        .output
-        .unwrap_or_else(|| PathBuf::from("migrations").join("engine"));
+    refuse_removed_flag(
+        "--output",
+        opts.removed_output.as_ref(),
+        "Pass `--schema <app.forge>` instead: the hop crate is emitted into that app's \
+         build-cache container as `engine-<from>-<to>/`, and the command prints the path.",
+    )?;
 
     let Some((schema_version, from_engine)) = detect_src_versions(&opts.src)? else {
         return Err(CliError::Migration(format!(
@@ -477,6 +762,8 @@ pub fn engine(opts: MigrateEngineOptions) -> Result<()> {
     };
     let to_engine = forgedb_codegen::rust::CURRENT_ENGINE_VERSION;
 
+    // Both no-op arms answer before the app is resolved, so a dir that needs no
+    // migration is not also a project-id claim and a cache reservation.
     if from_engine == to_engine {
         ui::success(&format!(
             "{} is already at engine generation {to_engine} — nothing to migrate.",
@@ -492,15 +779,20 @@ pub fn engine(opts: MigrateEngineOptions) -> Result<()> {
         )));
     }
 
+    let app = resolve_app(&opts.app)?;
+    let kind = PackageKind::Engine {
+        from: from_engine,
+        to: to_engine,
+    };
+
     ui::info(&format!(
         "Engine migration: {} (schema v{schema_version}, engine generation {from_engine} → {to_engine})",
         opts.src.display()
     ));
 
-    emit_engine(opts.schema.as_deref(), schema_version, from_engine, to_engine, &output)?;
-
-    ui::info("Compiling the engine-hop bin (cargo build --release)...");
-    let bin = cargo_build_transform_bin(&output, "engine-hop")?;
+    emit_engine_crate(&app, &kind, schema_version)?;
+    sync_cache_root(&app)?;
+    let bin = build_member_bin(&app, &kind, "engine-hop")?;
 
     ui::info(&format!(
         "Migrating {} → {} (the source dir is left untouched — it is your rollback)",
@@ -512,23 +804,30 @@ pub fn engine(opts: MigrateEngineOptions) -> Result<()> {
     Ok(())
 }
 
-/// Emit the engine-hop crate into `output`. The same schema is baked on both
-/// sides; only `EXPECTED_ENGINE_VERSION` differs between the two modules.
-fn emit_engine(
-    schema: Option<&Path>,
-    schema_version: u32,
-    from_engine: u32,
-    to_engine: u32,
-    output: &Path,
-) -> Result<()> {
+/// Emit the engine-hop crate as a cache member. The same schema is baked on
+/// both sides; only `EXPECTED_ENGINE_VERSION` differs between the two modules.
+///
+/// Unlike the transformer's, this schema is **not** location-only: an engine
+/// bump changes no `.forge`, so the app's current schema is the correct one to
+/// bake on both sides of the hop.
+fn emit_engine_crate(app: &ResolvedApp, kind: &PackageKind, schema_version: u32) -> Result<()> {
     use forgedb_codegen::{EngineHopPlan, EngineMigrationGenerator};
 
-    let schema_path = crate::project::find_schema(schema.map(|p| p.to_string_lossy()).as_deref())?;
-    let src = std::fs::read_to_string(&schema_path)
-        .map_err(|e| CliError::SchemaNotFound(format!("{}: {}", schema_path.display(), e)))?;
+    let (from_engine, to_engine) = match kind {
+        PackageKind::Engine { from, to } => (*from, *to),
+        other => {
+            return Err(CliError::Migration(format!(
+                "internal error: the engine hop was asked to emit a `{}` package",
+                other.dir()
+            )));
+        }
+    };
+
+    let src = std::fs::read_to_string(&app.schema)
+        .map_err(|e| CliError::SchemaNotFound(format!("{}: {}", app.schema.display(), e)))?;
     let parsed = forgedb_parser::Parser::new(&src)
         .and_then(|mut p| p.parse())
-        .map_err(|e| CliError::SchemaValidation(format!("{}: {e}", schema_path.display())))?;
+        .map_err(|e| CliError::SchemaValidation(format!("{}: {e}", app.schema.display())))?;
 
     let plan = EngineHopPlan {
         schema: &parsed,
@@ -536,206 +835,49 @@ fn emit_engine(
         from_engine,
         to_engine,
     };
-    let crate_out = EngineMigrationGenerator::generate(&plan, "forgedb-engine-migrate")
+    let package = app.package(kind);
+    let crate_out = EngineMigrationGenerator::generate(&plan, &package)
         .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
 
-    std::fs::create_dir_all(output)?;
-    let cargo_path = output.join("Cargo.toml");
-    if !cargo_path.exists() {
-        std::fs::write(&cargo_path, &crate_out.cargo_toml)?;
-    }
+    write_class_c_member(app, kind, &crate_out)?;
+    Ok(())
+}
+
+/// Write one class-C package into the cache, in full.
+///
+/// **Every file is rewritten on every emission, the manifest included**, and
+/// there is deliberately no only-if-absent branch. Every scaffolder in the
+/// *output* directory has one, and is right to: those files are the user's.
+/// Nothing in the cache is. Carried forward unchanged, a CLI upgrade that bumps
+/// a substrate pin would never reach an existing member, and the stale pin
+/// would sit in a directory the user never opens — where the publish-gap check
+/// cannot see it.
+///
+/// This is also what retires the `--force` question for these crates: there is
+/// no "File exists, use --force" branch, because there is no file here that
+/// could be the operator's to protect.
+fn write_class_c_member(
+    app: &ResolvedApp,
+    kind: &PackageKind,
+    crate_out: &forgedb_codegen::TransformCrate,
+) -> Result<()> {
+    let member = app.member(kind);
+    std::fs::create_dir_all(&member)?;
+    std::fs::write(member.join("Cargo.toml"), &crate_out.cargo_toml)?;
     for (rel, content) in &crate_out.sources {
-        let path = output.join(rel);
+        let path = member.join(rel);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&path, content)?;
     }
     ui::success(&format!(
-        "Generated engine-hop crate ({} source files) at {}",
+        "Generated {} ({} source files) at {}",
+        crate_out.crate_name,
         crate_out.sources.len(),
-        output.display()
+        member.display()
     ));
     Ok(())
-}
-
-/// Options for the one-CLI `migrate up` orchestration (#74 Phase 4).
-pub struct MigrateUpOptions {
-    /// Origin format version.  Defaults to the version detected from the source
-    /// data dir's manifests.
-    pub from: Option<u32>,
-    /// Destination format version.  Defaults to the lineage's current version.
-    pub to: Option<u32>,
-    /// Source data directory (single-dir mode).
-    pub src: Option<PathBuf>,
-    /// Destination directory to materialize (single-dir mode).
-    pub dest: Option<PathBuf>,
-    /// Transformer crate dir (default `migrations/transform`).
-    pub output: Option<PathBuf>,
-    /// Per-tenant sweep: migrate every data dir directly under this root.
-    pub tenant_root: Option<PathBuf>,
-    /// Destination-name suffix for the per-tenant sweep (default
-    /// `-migrated-v<to>`): tenant `t`'s output is `<root>/t<suffix>`.
-    pub dest_suffix: Option<String>,
-}
-
-/// One-CLI migration lifecycle (#74 Phase 4): generate + `cargo build` the
-/// transformer for the resolved version range, then run it over one data dir
-/// (`--src`/`--dest`) or every tenant dir under `--tenant-root` (a rolling,
-/// independent sweep — a failed tenant is reported and skipped, its source
-/// unchanged).  The app must be STOPPED (offline, exclusive-writer — C12).
-pub fn up(opts: MigrateUpOptions) -> Result<()> {
-    let migrations_dir = PathBuf::from("migrations");
-    let lineage = forgedb_migrations::MigrationLineage::load(&migrations_dir).map_err(map_err)?;
-    let to = opts.to.unwrap_or_else(|| lineage.current_schema_version());
-    let output = opts
-        .output
-        .clone()
-        .unwrap_or_else(|| migrations_dir.join("transform"));
-
-    // Enumerate the (src, dest) jobs: a per-tenant sweep, or a single dir.
-    let jobs: Vec<(PathBuf, PathBuf)> = if let Some(root) = &opts.tenant_root {
-        collect_tenant_jobs(root, to, opts.dest_suffix.as_deref())?
-    } else {
-        let src = opts.src.clone().ok_or_else(|| {
-            CliError::Migration(
-                "`migrate up` needs --src and --dest (or --tenant-root for a per-tenant sweep)"
-                    .to_string(),
-            )
-        })?;
-        let dest = opts
-            .dest
-            .clone()
-            .ok_or_else(|| CliError::Migration("`migrate up` needs --dest".to_string()))?;
-        vec![(src, dest)]
-    };
-
-    // Resolve the origin version once: explicit --from, else detect it from the
-    // first job's source manifests.  A tenant at a different version is refused by
-    // the built bin's open-guard (counted as a per-tenant failure, sweep continues).
-    let from = match opts.from {
-        Some(f) => f,
-        None => {
-            let first = &jobs[0].0;
-            detect_src_schema_version(first)?.ok_or_else(|| {
-                CliError::Migration(format!(
-                    "could not detect the source format version of {} — pass --from explicitly",
-                    first.display()
-                ))
-            })?
-        }
-    };
-
-    if from == to {
-        ui::success(&format!(
-            "Data is already at format v{to} — nothing to migrate."
-        ));
-        return Ok(());
-    }
-    if to < from {
-        return Err(CliError::Migration(format!(
-            "refusing to migrate backwards: source is at v{from}, target is v{to} \
-             (the transformer only replays forward)"
-        )));
-    }
-
-    ui::info(&format!(
-        "Migrating {} data dir(s): format v{from} → v{to}",
-        jobs.len()
-    ));
-
-    // Build the transformer once for the whole range, then run it per job.
-    let bin = compile_transformer(from, to, &output)?;
-
-    let mut failures = Vec::new();
-    for (src, dest) in &jobs {
-        ui::info(&format!("→ {} ⇒ {}", src.display(), dest.display()));
-        match run_transformer(&bin, src, dest) {
-            Ok(()) => ui::success(&format!("  migrated {}", dest.display())),
-            Err(e) => {
-                ui::error(&format!("  FAILED {}: {}", src.display(), e));
-                failures.push(src.clone());
-            }
-        }
-    }
-
-    if !failures.is_empty() {
-        return Err(CliError::Migration(format!(
-            "{} of {} data dir(s) failed to migrate (their originals are unchanged): {}",
-            failures.len(),
-            jobs.len(),
-            failures
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
-    }
-    ui::success(&format!(
-        "Migration complete ({} dir(s)) — regenerate your app and point it at the destination(s).",
-        jobs.len()
-    ));
-    Ok(())
-}
-
-/// Enumerate the per-tenant sweep jobs under `root` (#74 Phase 4): one
-/// `(src, dest)` per immediate subdirectory that looks like a data dir (has a
-/// `<model>/manifest.json`), skipping any dir already named like a migration
-/// output.  `dest` is `<root>/<tenant><suffix>`.
-fn collect_tenant_jobs(
-    root: &Path,
-    to: u32,
-    dest_suffix: Option<&str>,
-) -> Result<Vec<(PathBuf, PathBuf)>> {
-    let suffix = dest_suffix
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("-migrated-v{to}"));
-
-    let mut jobs = Vec::new();
-    let entries = std::fs::read_dir(root).map_err(|e| {
-        CliError::Migration(format!(
-            "failed to read tenant root {}: {}",
-            root.display(),
-            e
-        ))
-    })?;
-    for entry in entries {
-        let path = entry.map_err(|e| CliError::Migration(e.to_string()))?.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default()
-            .to_string();
-        // Skip outputs of a prior sweep.
-        if name.ends_with(&suffix) {
-            continue;
-        }
-        // Only sweep dirs that actually hold data (a model manifest).
-        if detect_src_schema_version(&path)?.is_none() {
-            continue;
-        }
-        jobs.push((path, root.join(format!("{name}{suffix}"))));
-    }
-    jobs.sort();
-    if jobs.is_empty() {
-        return Err(CliError::Migration(format!(
-            "no tenant data dirs found under {} (a data dir has a <model>/manifest.json)",
-            root.display()
-        )));
-    }
-    Ok(jobs)
-}
-
-/// Detect the on-disk schema serial of a data directory by reading the first
-/// `<model>/manifest.json` under it (#74 Phase 4).  Every model/junction manifest
-/// in a consistent dir carries the same version (the app open-guard enforces it),
-/// so the first one found is authoritative.  `None` when the dir holds no manifest
-/// (not a data dir, or empty).
-fn detect_src_schema_version(data_dir: &Path) -> Result<Option<u32>> {
-    Ok(detect_src_versions(data_dir)?.map(|(schema, _engine)| schema))
 }
 
 /// Both on-disk counters, read from the first model manifest under `data_dir`.
@@ -775,15 +917,52 @@ fn detect_src_versions(data_dir: &Path) -> Result<Option<(u32, u32)>> {
     Ok(None)
 }
 
-/// Generate the transformer crate for a version range into `output` (#74 Phase 3).
-/// Shared by `migrate build` and `generate transform`.  Loads the committed
-/// lineage, expands the contiguous range (C1), parses each version's committed
-/// full schema, builds the frozen per-hop plan, and emits the crate.
-pub fn emit_transform(from: u32, to: u32, output: &Path, force: bool) -> Result<()> {
+/// `forgedb generate transform` — **removed** (#335 §9).
+///
+/// This is the last caller-facing shape that emitted a `[package]` into a
+/// directory of the operator's choosing, and it is the shape of #328: a
+/// generated manifest with no `[workspace]` table, landing under whatever
+/// foreign cargo root the working directory happened to sit in, which refuses
+/// to build. The resolution is the cache root, so there is nowhere left for an
+/// arbitrary `--output` to point.
+///
+/// It survives as a tombstone rather than a deleted target for the same reason
+/// every other removal in this design does: an error naming the replacement is
+/// the whole value of the removal. Its one caller is
+/// `commands::generate::run`'s `"transform"` arm.
+pub fn emit_transform(from: u32, to: u32, _output: &Path, _force: bool) -> Result<()> {
+    Err(CliError::Migration(format!(
+        "`forgedb generate transform` was removed (#335): the transformer is a member of \
+         ForgeDB's build cache now, not a crate emitted into a directory you choose. \
+         Run `forgedb migrate build --schema <app.forge> --from {from} --to {to}` instead \
+         — it prints the cache path it wrote to."
+    )))
+}
+
+/// Generate the transformer crate for a version range and write it into the
+/// app's cache container as `transform-<from>-<to>/` (#74 Phase 3, #335 §9).
+///
+/// Loads the committed lineage **from the app's own `migrations/`**, expands the
+/// contiguous range (C1), parses each version's committed full schema, builds
+/// the frozen per-hop plan, and emits the crate.
+///
+/// Nothing here reads the app's current schema: the versioned snapshots are the
+/// input, so a drifted HEAD schema cannot change a historical hop.
+fn emit_transform_crate(app: &ResolvedApp, kind: &PackageKind) -> Result<()> {
     use forgedb_codegen::{HopPlan, TransformGenerator, TransformPlan, VersionSchema};
     use forgedb_migrations::MigrationLineage;
 
-    let migrations_dir = PathBuf::from("migrations");
+    let (from, to) = match kind {
+        PackageKind::Transform { from, to } => (*from, *to),
+        other => {
+            return Err(CliError::Migration(format!(
+                "internal error: the transformer was asked to emit a `{}` package",
+                other.dir()
+            )));
+        }
+    };
+
+    let migrations_dir = app.migrations_dir.clone();
     let lineage = MigrationLineage::load(&migrations_dir).map_err(map_err)?;
     let hop_migrations = lineage.expand_range(from, to).map_err(map_err)?;
     if hop_migrations.is_empty() {
@@ -844,36 +1023,11 @@ pub fn emit_transform(from: u32, to: u32, output: &Path, force: bool) -> Result<
         .collect();
     let plan = TransformPlan { versions, hops };
 
-    let crate_out = TransformGenerator::generate(&plan, "forgedb-transform")
+    let package = app.package(kind);
+    let crate_out = TransformGenerator::generate(&plan, &package)
         .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
 
-    // Write the crate.  `Cargo.toml` is a user-editable scaffold (only-if-absent);
-    // the `src/*.rs` are always (re)written.
-    std::fs::create_dir_all(output)?;
-    let cargo_path = output.join("Cargo.toml");
-    if !cargo_path.exists() {
-        std::fs::write(&cargo_path, &crate_out.cargo_toml)?;
-    }
-    for (rel, content) in &crate_out.sources {
-        let path = output.join(rel);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        if path.exists() && !force {
-            return Err(CliError::Other(format!(
-                "File exists: {}. Use --force to overwrite",
-                path.display()
-            )));
-        }
-        std::fs::write(&path, content)?;
-    }
-
-    ui::success(&format!(
-        "Generated transformer crate ({} source files) at {}",
-        crate_out.sources.len(),
-        output.display()
-    ));
-    Ok(())
+    write_class_c_member(app, kind, &crate_out)
 }
 
 /// Build the frozen per-model structural ops for one hop from its recorded schema
@@ -1121,7 +1275,13 @@ fn to_simple_schema(schema: &forgedb_parser::Schema) -> forgedb_migrations::Simp
 
 /// Print the offline data-migration next steps for a recorded hop that rewrites
 /// data-at-rest (#74 Phase 4).  `has_authored` toggles the "author the body" step.
-fn print_migration_next_steps(from: u32, to: u32, has_authored: bool) {
+///
+/// It stops teaching `forgedb migrate up`, which no longer exists (#335 §9,
+/// #373). This text is how an operator learns the lifecycle, so a removed
+/// command left in it is a runbook that dead-ends — every step names `--schema`
+/// for the same reason.
+fn print_migration_next_steps(schema: &Path, from: u32, to: u32, has_authored: bool) {
+    let schema = schema.display();
     println!("\n{}", "Next steps (offline data migration):".bold());
     let mut step = 1;
     if has_authored {
@@ -1131,11 +1291,17 @@ fn print_migration_next_steps(from: u32, to: u32, has_authored: bool) {
         );
         step += 1;
     }
-    println!("  {step}. Regenerate your app:  forgedb generate");
+    println!("  {step}. Regenerate your app:  forgedb generate --schema {schema}");
+    step += 1;
+    println!(
+        "  {step}. Build the transformer:\n         \
+         forgedb migrate build --schema {schema} --from {from} --to {to}"
+    );
     step += 1;
     println!(
         "  {step}. Migrate the data with the app STOPPED:\n         \
-         forgedb migrate up --from {from} --to {to} --src <data-dir> --dest <migrated-dir>"
+         forgedb migrate run --schema {schema} --from {from} --to {to} \
+         --src <data-dir> --dest <migrated-dir>"
     );
     step += 1;
     println!("  {step}. Point the regenerated app at <migrated-dir>.");
@@ -1168,5 +1334,3 @@ fn detect_schema_changes(
 
     Ok(forgedb_migrations::SchemaDiffer::diff(&old_simple, &new_simple))
 }
-
-
