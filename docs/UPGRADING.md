@@ -14,9 +14,10 @@ Version policy is [`SEMVER.md`](SEMVER.md); pre-1.0, a **minor** bump is where b
 
 ## 0.5.0
 
-Three config breaks, all loud and all in `forgedb.toml`. None of them touch a data
-directory: nothing on disk needs migrating, and the generated code is unchanged. What
-changes is which config file applies to a schema, and what a config is allowed to contain.
+Four config breaks, all loud and all in `forgedb.toml`. **None of them touch a data
+directory** — nothing on disk needs migrating. The first three change only which config
+file applies to a schema and what a config is allowed to contain; the fourth also changes
+**which targets get emitted**, because `["all"]` now genuinely means all.
 
 ### 1. `[generate].schema` was removed
 
@@ -80,6 +81,55 @@ Two consequences for existing trees:
 
 **Remedy, if you want the old behavior:** put a `forgedb.toml` beside the schema, or pass
 `-c/--config`, which is an outright override and does no walk.
+
+### 4. `[generate].targets` is now required, and its values are respelled
+
+Two breaks in one key, deliberately paired so an existing project edits it once.
+
+**It is required.** It used to be optional, where *absent meant every target*. That reading
+is the inverse of what the field default gives a caller, and #335 defines the package prune
+against the **declared** set — so an absent value would collapse that set to whatever a
+single invocation happened to select, and `forgedb generate rust` on a default project would
+prune away the server, the bindings and the replica.
+
+```
+error: forgedb.toml:4:1: `[generate].targets` is required.
+
+An absent value used to mean "every target", which is the opposite of what an
+absent list normally means — and it leaves the set of packages to build undefined.
+
+To keep exactly today's behavior, write:
+
+    [generate]
+    targets = ["all"]
+```
+
+**Its values now speak the same vocabulary the CLI does.** `forgedb generate node --sdk` has
+always been the command; `typescript` was its config spelling, and the CLI *rejects* that word
+outright. One name meaning two different things in two places is the kind of split that only
+shows up when someone copies a value from a doc into the wrong file.
+
+| Old config value | Now write | CLI equivalent |
+|---|---|---|
+| `typescript` | `node-sdk` (or `bun-sdk`) | `generate node --sdk` |
+| `wasm` | `browser-replica` | `generate browser --replica` |
+| `rust`, `api`, `openapi`, `stubs`, `ffi` | unchanged | `generate <name>` |
+| `rust-sdk`, `python-sdk`, `go-sdk` | unchanged | `generate <runtime> --sdk` |
+| *(no spelling existed)* | `node-runtime`, `bun-runtime`, `python-runtime`, `go-runtime` | `generate <runtime> --runtime` |
+
+The old spellings still work and **warn**, naming the replacement. They are not silently
+accepted — a deprecated value that behaves identically and says nothing is how the two
+vocabularies drifted apart in the first place.
+
+**Unknown values are now an error rather than a silent no-op.** `targets = ["napi"]` used to
+emit **nothing at all**: the filter was present, so every real target was disabled, and
+nothing was reported. It now names the legal set.
+
+**`["all"]` genuinely means all.** Previously the opt-in targets (`ffi`, `wasm`, the three
+REST SDKs) were reachable only by listing them explicitly, so a project with no `targets` key
+never emitted them from `generate all` despite "absent means everything". Stated here so it is
+not discovered as a regression: if you were relying on `all` skipping the browser replica, list
+what you want instead.
 
 ### What is new rather than broken
 

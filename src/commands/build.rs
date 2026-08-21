@@ -17,6 +17,14 @@ pub struct BuildOptions {
     /// as an argument is what makes that unrepresentable; two loaders that merely
     /// agree today is the same bug waiting.
     pub gen_config: forgedb_codegen::GenConfig,
+    /// The project's declared target set, as canonical internal names (#335 §12).
+    ///
+    /// This used to be hardcoded `None` at both call sites below, which made
+    /// every opt-in arm of `generate_all` — `ffi`, the browser replica, the
+    /// three REST SDKs, and (once they existed) the three native bindings —
+    /// unreachable from `forgedb build`. `build` could not reach a target the
+    /// project had explicitly declared.
+    pub config_targets: Vec<String>,
 }
 
 pub fn run(options: BuildOptions) -> Result<()> {
@@ -50,7 +58,7 @@ pub fn run(options: BuildOptions) -> Result<()> {
                 check: false,
                 output: options.output.clone(),
                 schema: options.schema.clone(),
-                config_targets: None,
+                config_targets: Some(options.config_targets.clone()),
                 gen_config: options.gen_config,
                 force: true,
                 from: None,
@@ -66,7 +74,7 @@ pub fn run(options: BuildOptions) -> Result<()> {
             check: false,
             output: options.output.clone(),
             schema: options.schema.clone(),
-            config_targets: None,
+            config_targets: Some(options.config_targets.clone()),
             gen_config: options.gen_config,
             force: true,
             from: None,

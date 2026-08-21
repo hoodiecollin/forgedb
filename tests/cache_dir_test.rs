@@ -964,7 +964,9 @@ fn an_unrecognised_directory_is_not_admitted_as_a_member() {
 /// this is the assertion that makes the split load-bearing rather than stylistic.
 #[test]
 fn reserve_does_not_write_the_workspace_root() {
-    let env = scoped_home();
+    // `_env`, not `_`: the binding keeps the FORGEDB_HOME guard alive for the
+    // body. A bare `_` drops it immediately and the test writes to the real home.
+    let _env = scoped_home();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     let schema = root.join("schema.forge");

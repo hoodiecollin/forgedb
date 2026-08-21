@@ -5,6 +5,7 @@ pub mod diagnostics;
 pub mod error;
 pub mod naming;
 pub mod project;
+pub mod targets;
 pub mod templates;
 pub mod ui;
 

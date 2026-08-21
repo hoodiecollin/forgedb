@@ -606,13 +606,21 @@ fn run(cli: Cli) -> Result<()> {
             // schema-blind [runtime]/[storage] knobs into the codegen GenConfig
             // baked into database.rs. An invalid knob value is a config error.
             let gen_config = forge_config.gen_config()?;
+            // Canonical internal names, never the raw user spellings (#335 §12,
+            // decision 10). The warnings are the deprecated pre-#122 values; a
+            // deprecated value that behaves identically and says nothing is how
+            // the config and CLI vocabularies drifted apart to begin with.
+            let (config_targets, target_warnings) = forge_config.resolved_targets()?;
+            for warning in &target_warnings {
+                ui::warning(warning);
+            }
             commands::generate::run(commands::generate::GenerateOptions {
                 target,
                 mode,
                 check,
                 output: resolved_output,
                 schema: resolved_schema,
-                config_targets: forge_config.generate.targets.clone(),
+                config_targets: Some(config_targets),
                 gen_config,
                 force,
                 from,
@@ -654,12 +662,20 @@ fn run(cli: Cli) -> Result<()> {
             let forge_config = governing.config();
             let resolved_output = Some(governing.output(output.as_deref()));
             let resolved_schema = Some(schema_path.display().to_string());
+            // `build` reaches every declared target (#335 §12). It used to pass
+            // `config_targets: None`, which made every opt-in arm of
+            // `generate_all` unreachable from `forgedb build` entirely.
+            let (config_targets, target_warnings) = forge_config.resolved_targets()?;
+            for warning in &target_warnings {
+                ui::warning(warning);
+            }
             commands::build::run(commands::build::BuildOptions {
                 release,
                 target,
                 output: resolved_output,
                 schema: resolved_schema,
                 no_api,
+                config_targets,
                 // Same resolution as `Commands::Generate` above, from the same
                 // loaded config — `build` must bake what `generate` would (#361).
                 gen_config: forge_config.gen_config()?,

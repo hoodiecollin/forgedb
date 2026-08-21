@@ -77,7 +77,7 @@ impl ProjectConfig {
 }
 
 /// Generator-specific configuration (`[generate]` table in `forgedb.toml`).
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GenerateConfig {
     /// **Removed in #333.**  Declared only so the key stays *recognized and
@@ -98,6 +98,33 @@ pub struct GenerateConfig {
     /// Which targets to enable.  When absent all targets are enabled.
     /// Valid values: `rust`, `typescript`, `api`, `stubs`.
     pub targets: Option<Vec<String>>,
+}
+
+/// The built-in default is a **stated value**, not an absence (#335 §12).
+///
+/// This is what makes "required" mean the right thing.  With `targets` written
+/// here rather than left `None`:
+///
+/// * **no `forgedb.toml` at all** — the fallback config — declares `["all"]`,
+///   so a project that never wrote a config keeps working exactly as before;
+/// * **a config file with no `[generate]` table** takes this same default,
+///   because it has declared nothing about generation;
+/// * **a config file WITH a `[generate]` table but no `targets` key** leaves the
+///   field `None` (serde's default for an `Option` field) and is **refused**.
+///
+/// That last case is the one worth refusing: a half-declared table where the
+/// most consequential key is left to be guessed.  The distinction costs one
+/// hand-written `Default` and removes the "absent means everything" reading that
+/// #335 §12 identifies as the same class of defect as #333's
+/// `ProjectConfig::default()`.
+impl Default for GenerateConfig {
+    fn default() -> Self {
+        Self {
+            schema: None,
+            output: None,
+            targets: Some(vec![crate::targets::DEFAULT_TARGETS.to_string()]),
+        }
+    }
 }
 
 /// Multi-tenancy configuration (`[tenant]` table).  Physical, dir-per-tenant
@@ -411,7 +438,65 @@ pub fn parse_config(content: &str, path: &std::path::Path) -> Result<ForgeConfig
         return Err(removal_error(content, path, removed.span().start));
     }
 
+    // `[generate].targets` is REQUIRED in a config file (#335 §12, decision 2).
+    //
+    // It used to be optional, where ABSENT MEANT EVERY TARGET — the inverse of
+    // what an empty list normally reads as, and the same class of defect as
+    // #333's `ProjectConfig::default()`.  #335 defines the package prune against
+    // the *declared* set, so an absent value would collapse that set to whatever
+    // a single invocation happened to select: `forgedb generate rust` on a
+    // default project would prune away the server, the bindings and the replica.
+    //
+    // A project with NO config file at all is a different case and is not an
+    // error — it takes the built-in `["all"]`, which is a value like any other
+    // (see `crate::targets::DEFAULT_TARGETS`).  What is refused is a config file
+    // that declares some of `[generate]` and leaves this key to be guessed.
+    if config.generate.targets.is_none() {
+        return Err(missing_targets_error(content, path));
+    }
+
     Ok(config)
+}
+
+impl ForgeConfig {
+    /// The declared target set, as canonical internal names, plus any
+    /// deprecation warnings the caller should print.
+    ///
+    /// The one door onto `[generate].targets` — both `generate` and `build` come
+    /// through here, so neither can see the raw user spellings and neither can
+    /// invent its own reading of an absent value. `build` used to pass
+    /// `config_targets: None` outright (#335 §12), which made every opt-in arm
+    /// of `generate_all` unreachable from `forgedb build`.
+    pub fn resolved_targets(&self) -> Result<(Vec<String>, Vec<String>)> {
+        let declared = self.generate.targets.as_deref().unwrap_or(&[]);
+        crate::targets::resolve_all(declared)
+    }
+}
+
+/// The diagnostic for an absent `[generate].targets` (#335 §12).
+///
+/// Anchored on the `[generate]` table header when there is one, so the caret
+/// lands where the key belongs rather than at the top of the file.
+fn missing_targets_error(content: &str, path: &std::path::Path) -> CliError {
+    let (line, column) = content
+        .find("[generate]")
+        .map(|offset| key_position(content, offset))
+        .unwrap_or((1, 1));
+
+    CliError::ConfigDiagnostic(format!(
+        "{}:{}:{}: `[generate].targets` is required.\n\n\
+         An absent value used to mean \"every target\", which is the opposite of \
+         what an absent list normally means — and it leaves the set of packages \
+         to build undefined.\n\n\
+         To keep exactly today's behavior, write:\n\n\
+         \x20   [generate]\n\
+         \x20   targets = [\"all\"]\n\n\
+         Legal values:\n{}",
+        path.display(),
+        line,
+        column,
+        crate::targets::legal_list()
+    ))
 }
 
 /// The bespoke diagnostic for the removed `[generate].schema` key (#333 §10).

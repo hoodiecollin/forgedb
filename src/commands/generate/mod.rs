@@ -249,11 +249,14 @@ pub fn run(options: GenerateOptions) -> Result<()> {
         // Golang binding (RFC #203). Resolved from `go --runtime`;
         // rides the FFI cdylib over cgo — adds no new C symbol / substrate dep.
         "go" => {
+            // A single-target `generate go --runtime` is the only emitter in
+            // this invocation, so it owns the engine crate.
             generated_files.extend(generate_go_binding(
                 &schema,
                 &output_path,
                 force,
                 schema_version,
+                false,
             )?);
         }
         // REST client SDKs (#118/#205/#206). Resolved from `python|go|rust --sdk`.
@@ -440,6 +443,31 @@ fn generate_all(
         files.extend(generate_go_sdk(schema, output_path, force)?);
     }
 
+    // The three native runtime bindings.  These had NO arm here at all until
+    // #335 §12: they were reachable only through a single-target CLI invocation
+    // (`generate node --runtime`, `generate python --runtime`, `generate go
+    // --runtime`), so `[generate].targets` could name them and `generate all`
+    // would still emit nothing.  Decision 10 gives them config spellings, which
+    // is only meaningful if `all` can actually reach them.
+    if target_filter.is_some_and(|ts| ts.iter().any(|t| t.as_str() == "napi")) {
+        files.extend(generate_napi_binding(schema, output_path, force, schema_version)?);
+    }
+    if target_filter.is_some_and(|ts| ts.iter().any(|t| t.as_str() == "pyo3")) {
+        files.extend(generate_pyo3_binding(schema, output_path, force, schema_version)?);
+    }
+    if target_filter.is_some_and(|ts| ts.iter().any(|t| t.as_str() == "go")) {
+        // The `ffi` arm above may already have emitted the engine crate.
+        let ffi_already_emitted =
+            target_filter.is_some_and(|ts| ts.iter().any(|t| t.as_str() == "ffi"));
+        files.extend(generate_go_binding(
+            schema,
+            output_path,
+            force,
+            schema_version,
+            ffi_already_emitted,
+        )?);
+    }
+
     Ok(files)
 }
 
@@ -611,10 +639,22 @@ fn generate_go_binding(
     output_path: &Path,
     force: bool,
     schema_version: u32,
+    ffi_already_emitted: bool,
 ) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
-    // The FFI engine crate (cdylib) the Go package links against — reused
-    // verbatim, so Go requires no new C symbol.
-    let mut files = generate_ffi_engine(schema, output_path, force, schema_version)?;
+    // The FFI engine crate the Go package links against — reused verbatim, so Go
+    // requires no new C symbol.
+    //
+    // `ffi_already_emitted` exists because `all` now genuinely reaches every
+    // target (#335 §12): with both `ffi` and `go` declared, emitting the engine
+    // from here as well wrote `ffi/src/lib.rs` twice and the second write failed
+    // with `File exists`. Two paths emitting one artifact is the defect class
+    // this whole issue is about, so the engine is emitted exactly once by
+    // whichever arm comes first and Go links what is already there.
+    let mut files = if ffi_already_emitted {
+        Vec::new()
+    } else {
+        generate_ffi_engine(schema, output_path, force, schema_version)?
+    };
 
     let go_dir = output_path.join("go");
     fs::create_dir_all(&go_dir)?;
@@ -915,6 +955,16 @@ fn write_file(path: &PathBuf, content: &str, force: bool) -> Result<()> {
 ///   and map `(runtime, mode)` to the matching generator.
 /// - The pre-#122 flat verbs `typescript`/`wasm` are a **clean break**: they
 ///   error with a pointer to the new form (this CLI is pre-1.0; see docs/SEMVER).
+/// Test-only door onto [`resolve_target`], so `crate::targets`'s anti-drift
+/// guard can assert that every config spelling means what its documented
+/// command line means.  Exposing the resolver rather than duplicating its table
+/// is the point: a copy is a second definition, which is the defect decision 10
+/// removes.
+#[cfg(test)]
+pub fn resolve_target_for_test(raw: &str, mode: Option<GenerateMode>) -> Result<String> {
+    resolve_target(raw, mode)
+}
+
 fn resolve_target(raw: &str, mode: Option<GenerateMode>) -> Result<String> {
     let target = raw.to_lowercase();
 

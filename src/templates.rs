@@ -145,8 +145,12 @@ isolated = {}
 # Relative paths below resolve against the SCHEMA's directory, so under a shared
 # root config `output` is a per-app pattern rather than one shared directory.
 output = "generated"
-# Uncomment to restrict which targets are generated:
-# targets = ["rust", "typescript", "api", "stubs"]
+# Which targets to generate. REQUIRED (#335) — an absent value used to mean
+# "everything", which is the opposite of what an absent list normally reads as.
+# `all` means every target; name them individually to narrow it. The spellings
+# are the same ones the CLI takes: node-sdk, node-runtime, python-runtime,
+# go-runtime, browser-replica, rust, api, openapi, stubs, ffi, *-sdk.
+targets = ["all"]
 
 # Generate-time RUNTIME BEHAVIOR (epic #126). These schema-blind knobs are baked
 # into the generated database.rs when you run `forgedb generate` / `forgedb build`
