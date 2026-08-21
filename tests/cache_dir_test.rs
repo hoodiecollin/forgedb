@@ -1267,7 +1267,8 @@ fn s335_10_a_server_app_carries_utoipa() {
     assert!(lib.contains("use utoipa::ToSchema;"));
 
     // The server links `core` by a RENAMED dependency, so no generated source
-    // byte carries the per-app hash.
+    // byte carries this app's package name — nor, a fortiori, the member hash,
+    // which the assertion below pins.
     let server_manifest = std::fs::read_to_string(app.join("server/Cargo.toml")).unwrap();
     assert!(server_manifest.contains(&core_package_of("web", "schema.forge", &["schema.forge"])));
     let main_rs = std::fs::read_to_string(app.join("server/src/main.rs")).unwrap();

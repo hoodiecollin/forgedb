@@ -716,14 +716,14 @@ fn scenario_27_print_artifact_with_an_ambiguous_match_errors() {
 
 /// `--print-artifact` takes a **kind**, never a package name.
 ///
-/// Package names carry the per-app hash, so a Dockerfile that baked one would
-/// break the moment the schema file is renamed — silently, in a file the user
-/// does not re-read.
+/// A package name is derived from the app's path (`naming::app_name`), so a
+/// Dockerfile that baked one would break the moment the schema file is moved or
+/// renamed — silently, in a file the user does not re-read.
 #[test]
 fn scenario_27_print_artifact_refuses_a_package_name() {
-    let report = report_of(&[("server", TargetKind::Bin, "/t/blog-3f2a-server")]);
+    let report = report_of(&[("server", TargetKind::Bin, "/t/acme_blog-server")]);
     let err = report
-        .print_artifact("blog-3f2a-server")
+        .print_artifact("acme_blog-server")
         .unwrap_err()
         .to_string();
     assert!(err.contains("not a ForgeDB package kind"), "{err}");

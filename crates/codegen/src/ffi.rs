@@ -131,7 +131,7 @@ impl FfiGenerator {
 
             // The one generated database for this app, reached as a cargo
             // dependency. The MANIFEST renames it to `forgedb_core`, so no
-            // generated `.rs` byte carries the per-app hash.
+            // generated `.rs` byte carries this app's package name.
             use forgedb_core as database;
 
             use std::ffi::{CStr, CString, c_char, c_void};
