@@ -351,8 +351,20 @@ impl ForgeConfig {
                 )));
             }
         };
+        // #335 §10. Decided from the app's DECLARED target set, never from what a
+        // single invocation emitted — otherwise `generate rust` and `generate all`
+        // would bake different `database.rs` for the same project. Resolution
+        // failures fall back to ON, which is today's behavior: a spurious utoipa
+        // dependency is inert, while a missing derive is a compile error in
+        // `server` that the orphan rule makes unfixable downstream.
+        let web = self
+            .resolved_targets()
+            .map(|(targets, _)| targets.iter().any(|t| t == "api"))
+            .unwrap_or(true);
+
         Ok(forgedb_codegen::GenConfig {
             replication: self.runtime.replication,
+            web,
             fsync,
             wal_checkpoint_interval: self
                 .storage
@@ -593,6 +605,9 @@ commit_max_frames = 40
                 wasm_commit_debounce_ms: 500,
                 wasm_commit_max_frames: 40,
                 replication_log_retention: 4096,
+                // No `[generate]` table in this fixture, so the built-in
+                // `["all"]` applies and `all` expands to include `api` (#335 §12).
+                web: true,
             }
         );
     }

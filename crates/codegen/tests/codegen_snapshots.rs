@@ -3925,6 +3925,9 @@ Author {
         wasm_commit_debounce_ms: 250,
         wasm_commit_max_frames: 100,
         replication_log_retention: 0,
+        // #335 §10: `web` is exercised by its own test below, because turning it
+        // off here would change every assertion in this one.
+        web: true,
     };
     let custom = RustGenerator::generate_with_config(&schema, 1, cfg).unwrap().code;
     let c = flatten(&custom);
@@ -10805,5 +10808,80 @@ Link {
     assert!(
         f.contains("fn __doc_is_unfiltered(params: &HashMap<String, String>) -> bool"),
         "#288: a model with filterable fields keeps the live parameter: {f}"
+    );
+}
+
+/// **#335 §10 (absorbing #336).** With no web surface declared, the emitted
+/// database carries no utoipa import, no `ToSchema` derive and no `#[schema(..)]`
+/// attribute.
+///
+/// All three must go together. A `#[schema(..)]` left behind without the derive
+/// is `cannot find attribute 'schema' in this scope` — a hard error, not an inert
+/// leftover — and the import alone is `unresolved import 'utoipa'`, which is how
+/// this was found: a Rust-only app's `core` failed to compile because the
+/// manifest gate had landed and the source gate had not.
+#[test]
+fn test_rust_generation_web_off_emits_no_utoipa() {
+    let mut parser = forgedb_parser::Parser::new(
+        r#"
+enum Status { Active, Archived }
+
+struct Point {
+  x: f64
+  y: f64
+}
+
+Note {
+  id: +uuid
+  body: string
+  status: Status
+  at: timestamp
+  origin: Point
+  tags: [string; 3]
+}
+"#,
+    )
+    .unwrap();
+    let schema = parser.parse().unwrap();
+
+    let cfg = GenConfig {
+        web: false,
+        ..GenConfig::DEFAULT
+    };
+    let off = RustGenerator::generate_with_config(&schema, 1, cfg)
+        .unwrap()
+        .code;
+
+    // Assert on the TOKENS, never on the bare name. `ToSchema` also appears in a
+    // generated doc comment ("never `Deserialize`/`ToSchema`, never returned"),
+    // so `!contains("ToSchema")` fails against prose while the real derives are
+    // correctly gated — and, worse, the mirror-image assertion on the ON path
+    // would PASS on prose alone. Same trap as the unconditional
+    // `FsyncPolicy::Always` doc comment recorded on #364.
+    let derives_to_schema = |code: &str| {
+        code.lines()
+            .any(|l| l.contains("#[derive(") && l.contains("ToSchema"))
+    };
+
+    assert!(
+        !off.contains("use utoipa::"),
+        "the utoipa import survived:\n{off}"
+    );
+    assert!(!derives_to_schema(&off), "a ToSchema derive survived");
+    assert!(
+        !off.contains("#[schema("),
+        "a #[schema(..)] attribute survived without its derive"
+    );
+
+    // ...and the default still emits all three, so this test cannot pass by the
+    // generator simply having stopped emitting them.
+    let on = RustGenerator::generate_with_config(&schema, 1, GenConfig::DEFAULT)
+        .unwrap()
+        .code;
+    assert!(on.contains("use utoipa::ToSchema"), "the ON path lost its import");
+    assert!(derives_to_schema(&on), "the ON path lost its derive");
+    assert!(
+        on.contains("#[schema("),
+        "this schema no longer exercises #[schema(..)], so the OFF assertion above is vacuous"
     );
 }

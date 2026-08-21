@@ -218,6 +218,38 @@ impl RustGenerator {
 
     /// The generate-time runtime-behavior config (#126) active for the current
     /// `generate*` call. Read at each config-dependent emission site.
+    /// A `#[schema(..)]` attribute, or nothing when there is no web surface.
+    ///
+    /// `schema` is utoipa's attribute and only exists where `ToSchema` is
+    /// derived — leaving one behind when the derive is gated out is
+    /// `cannot find attribute 'schema' in this scope`, not a harmless no-op.
+    /// Every production of one routes through here so the two cannot disagree.
+    fn schema_attr(attr: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+        if Self::active_cfg().web {
+            attr
+        } else {
+            quote! {}
+        }
+    }
+
+    /// The `, ToSchema` fragment of a derive list, or nothing (#335 §10).
+    ///
+    /// Gated on the app declaring a web surface, because once `database.rs` and
+    /// `api.rs` are separate crates the derive lands in `core` while its
+    /// `#[openapi(components(schemas(...)))]` consumer lands in `server` — and
+    /// the ORPHAN RULE means `server` cannot supply the impl, both trait and type
+    /// being foreign to it. So it must be decided at generate time or not at all.
+    ///
+    /// Emitted as a leading-comma fragment so the derive lists it joins stay
+    /// readable at their call sites.
+    fn to_schema_derive() -> proc_macro2::TokenStream {
+        if Self::active_cfg().web {
+            quote! { , ToSchema }
+        } else {
+            quote! {}
+        }
+    }
+
     fn active_cfg() -> GenConfig {
         ACTIVE_CONFIG.with(|c| c.get())
     }
@@ -369,6 +401,16 @@ impl RustGenerator {
 
         // Attributes and imports
         let inline_str_import = Self::inline_str_import(schema);
+        // #335 §10: the utoipa import and every `ToSchema` derive are gated on
+        // the app declaring a web surface. Once `database.rs` and `api.rs` are
+        // separate crates the derive and its consumer are in different crates and
+        // the ORPHAN RULE blocks supplying the impl from `server`, so this cannot
+        // be decided later. Default is ON, so existing output is byte-identical.
+        let utoipa_import = if Self::active_cfg().web {
+            quote! { use utoipa::ToSchema; }
+        } else {
+            quote! {}
+        };
         let imports = quote! {
             // `irrefutable_let_patterns`: the WAL recovery path matches
             // `WalOperation::Raw` via `if let` — currently the only variant, so
@@ -385,7 +427,7 @@ impl RustGenerator {
             #inline_str_import
             use forgedb_types::{Uuid, Timestamp, Value};
             use serde::{Deserialize, Serialize};
-            use utoipa::ToSchema;
+            #utoipa_import
         };
         tokens.extend(imports);
 
@@ -1380,10 +1422,11 @@ impl RustGenerator {
         );
 
         // Generate the model struct, storage struct, and implementation
+        let to_schema_derive = Self::to_schema_derive();
         let tokens = quote! {
             #[doc = #model_doc]
             #[repr(C)]
-            #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+            #[derive(Debug, Clone, Serialize, Deserialize #to_schema_derive)]
             pub struct #model_name {
                 #(#fields),*
             }
@@ -1619,9 +1662,10 @@ impl RustGenerator {
 
         let structs = variants.iter().map(|(suffix, doc)| {
             let event_name = format_ident!("{}{}", model.name, suffix);
+            let to_schema_derive = Self::to_schema_derive();
             quote! {
                 #[doc = #doc]
-                #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+                #[derive(Debug, Clone, Serialize, Deserialize #to_schema_derive)]
                 pub struct #event_name {
                     pub #field_name: #model_name,
                 }
@@ -1650,16 +1694,17 @@ impl RustGenerator {
         // than assuming the id is uuid- or integer-shaped.
         let id_schema_attr = model.identity_field()
             .and_then(|f| Self::schema_value_type(schema, &f.field_type, true))
-            .map(|vt| quote! { #[schema(value_type = #vt)] })
+            .map(|vt| Self::schema_attr(quote! { #[schema(value_type = #vt)] }))
             .unwrap_or_default();
         let doc = format!(
             "Live-query result-set delta for `{}` (#62 Direction B): removal-aware \
              membership changes over a generated closed-set query.",
             model.name
         );
+        let to_schema_derive = Self::to_schema_derive();
         quote! {
             #[doc = #doc]
-            #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+            #[derive(Debug, Clone, Serialize, Deserialize #to_schema_derive)]
             #[serde(tag = "kind", rename_all = "lowercase")]
             pub enum #delta_name {
                 /// The full matching set at subscription time.
@@ -2310,7 +2355,7 @@ impl RustGenerator {
                 let (schema_attr, serde_attr) = if let Some(vt) =
                     Self::timestamp_schema_value_type(schema, &field.field_type)
                 {
-                    (quote! { #[schema(value_type = #vt)] }, quote! {})
+                    (Self::schema_attr(quote! { #[schema(value_type = #vt)] }), quote! {})
                 } else if let Some(attrs) = Self::big_array_attrs(&field.field_type) {
                     attrs
                 } else {
@@ -2325,12 +2370,13 @@ impl RustGenerator {
             })
             .collect();
 
+        let to_schema_derive = Self::to_schema_derive();
         quote! {
             #[doc = #struct_doc]
             #[repr(C)]
             // `PartialEq` (not `Eq` — a struct may hold `f64`) so a struct-typed
             // field participates in the live-query typed change detector (#84).
-            #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+            #[derive(Debug, Clone, PartialEq, Serialize, Deserialize #to_schema_derive)]
             pub struct #struct_name {
                 #(#fields),*
             }
@@ -2401,9 +2447,10 @@ impl RustGenerator {
 
         let name_str = &enum_def.name;
 
+        let to_schema_derive = Self::to_schema_derive();
         Ok(quote! {
             #[doc = #enum_doc]
-            #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, ToSchema)]
+            #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize #to_schema_derive)]
             pub enum #enum_name {
                 #(#variant_idents),*
             }
@@ -7572,16 +7619,16 @@ impl RustGenerator {
         is_key: bool,
     ) -> (TokenStream, TokenStream) {
         if let Some(vt) = Self::schema_value_type(schema, &field.field_type, is_key) {
-            (quote! { #[schema(value_type = #vt)] }, quote! {})
+            (Self::schema_attr(quote! { #[schema(value_type = #vt)] }), quote! {})
         } else if Self::is_decimal_type(&field.field_type) {
             if field.is_nullable() {
                 (
-                    quote! { #[schema(value_type = Option<String>)] },
+                    Self::schema_attr(quote! { #[schema(value_type = Option<String>)] }),
                     quote! { #[serde(with = "rust_decimal::serde::str_option")] },
                 )
             } else {
                 (
-                    quote! { #[schema(value_type = String)] },
+                    Self::schema_attr(quote! { #[schema(value_type = String)] }),
                     quote! { #[serde(with = "rust_decimal::serde::str")] },
                 )
             }
@@ -9264,9 +9311,10 @@ impl RustGenerator {
                     Self::identity_field_name(model),
                 );
 
+            let to_schema_derive = Self::to_schema_derive();
             structs.push(quote! {
                 #[doc = #doc]
-                #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+                #[derive(Debug, Clone, Serialize, Deserialize #to_schema_derive)]
                 pub struct #proj_ident {
                     #(#struct_field_defs),*
                 }
@@ -9538,9 +9586,9 @@ impl RustGenerator {
             quote! { Vec<serde_json::Value> }
         };
         let schema_attr = if nullable {
-            quote! { #[schema(value_type = Option<#inner_schema>)] }
+            Self::schema_attr(quote! { #[schema(value_type = Option<#inner_schema>)] })
         } else {
-            quote! { #[schema(value_type = #inner_schema)] }
+            Self::schema_attr(quote! { #[schema(value_type = #inner_schema)] })
         };
         Some((schema_attr, quote! { #[serde(with = #path)] }))
     }
@@ -13563,9 +13611,10 @@ impl RustGenerator {
                 resolved_idents.push(resolved_ident);
             }
 
+            let to_schema_derive = Self::to_schema_derive();
             items.push(quote! {
                 #[doc = #struct_doc]
-                #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+                #[derive(Debug, Clone, Serialize, Deserialize #to_schema_derive)]
                 pub struct #struct_ident {
                     pub #base_ident: #model_ident,
                     #(#struct_fields,)*
