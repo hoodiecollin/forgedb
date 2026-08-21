@@ -240,14 +240,15 @@ forgedb/
 
 **All Tests:**
 ```bash
-# Run all tests in workspace
-cargo test --all
+# Run the whole workspace. --no-fail-fast surfaces ALL results; cargo
+# otherwise halts at the first failing test binary.
+cargo test --workspace --no-fail-fast
+
+# Examples are excluded by --lib/--bins/--tests AND by --doc, so build them too.
+cargo build --workspace --examples
 
 # Run with output
-cargo test --all -- --nocapture
-
-# Run with specific test threads
-cargo test -- --test-threads=1
+cargo test --workspace -- --nocapture
 ```
 
 **Unit Tests Only:**
@@ -265,7 +266,7 @@ cargo test --lib --package forgedb-storage
 cargo test --test '*'
 
 # Specific integration test
-cargo test --test storage_integration
+cargo test --test integration_test
 ```
 
 **Documentation Tests:**

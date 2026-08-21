@@ -194,9 +194,6 @@ cargo test test_parse_model --package forgedb-parser
 
 # Run with output
 cargo test -- --nocapture
-
-# Run with specific features
-cargo test --features "full-text-search"
 ```
 
 ### Run Examples
