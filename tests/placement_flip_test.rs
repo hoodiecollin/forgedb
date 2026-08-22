@@ -492,11 +492,7 @@ fn scenario_31_a_go_binary_survives_deletion_of_the_cargo_target_directory() {
     );
 
     // …and it references nothing outside the system.
-    for line in load_commands(&bin).lines().skip(1) {
-        let lib = line.split_whitespace().next().unwrap_or("");
-        if lib.is_empty() {
-            continue;
-        }
+    for lib in linked_libraries(&bin) {
         assert!(
             lib.starts_with("/usr/lib/")
                 || lib.starts_with("/System/")
@@ -518,6 +514,130 @@ fn load_commands(bin: &Path) -> String {
     }
     let out = cmd.arg(bin).output().expect("inspect load commands");
     String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The libraries `bin` loads, normalised to one shape across the two tools.
+///
+/// `load_commands` already picks the right tool per platform, and the caller used to parse
+/// the result as though both spoke the same language. They do not, and BOTH differences
+/// are silent — the check kept running and kept looking thorough (#409):
+///
+/// ```text
+/// otool -L                          ldd
+/// ────────────────────────────      ────────────────────────────────────────────────
+/// /path/to/bin:              <- header    (no header line at all)
+///     /usr/lib/libSystem.B.dylib (…)      linux-vdso.so.1 (0x…)
+///                                         libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x…)
+///                                         /lib64/ld-linux-x86-64.so.2 (0x…)
+/// ```
+///
+/// 1. **The header.** The old code did `.skip(1)`, which drops `otool`'s `path:` line — and
+///    on Linux drops the first *real* library instead, unchecked. The set it examined was
+///    quietly one short.
+/// 2. **The first token.** With `otool` it is the library path. With `ldd` it is the SONAME,
+///    and the path is on the far side of `=>`. So every `ldd` line of that form was tested
+///    as `libc.so.6` rather than `/lib/x86_64-linux-gnu/libc.so.6`, matched no prefix in the
+///    allow-list, and failed — correctly rejecting a library that is as system as they come.
+///
+/// Both are the same mistake as the assertion they serve: a rule written against the output
+/// of one host, on a test that only ever ran on that host. Normalising here means the
+/// allow-list has exactly one format to reason about.
+fn linked_libraries(bin: &Path) -> Vec<String> {
+    parse_linked_libraries(&load_commands(bin))
+}
+
+/// The parsing half, split out so it can be tested WITHOUT the host it parses.
+///
+/// This matters more than it looks. The bug being fixed is Linux-only, `scenario_31` runs
+/// only in the nightly, and the person fixing it was on macOS — so the fix would otherwise
+/// have been verified on the one platform where the bug does not occur. That is the same
+/// shape as the defect itself. A pure function over captured tool output is checkable
+/// anywhere, on every PR, by `parses_both_tools_output` below.
+fn parse_linked_libraries(output: &str) -> Vec<String> {
+    output
+        .lines()
+        // `otool` prints `<binary>:` first; `ldd` prints no header. Drop the header by what
+        // it IS, not by position — position is what got this wrong.
+        .filter(|l| !l.trim_end().ends_with(':'))
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            // `ldd`'s resolved form: `soname => /abs/path (0xaddr)`. The path is what the
+            // allow-list is about; the SONAME carries no location at all.
+            let token = match line.split(" => ").nth(1) {
+                Some(rhs) => rhs.split_whitespace().next()?,
+                // Either an `otool` entry, an absolute-path `ldd` entry (the loader), or a
+                // pseudo-library with no path (`linux-vdso.so.1`).
+                None => line.split_whitespace().next()?,
+            };
+            // `ldd` renders an unresolvable dependency as `name => not found`; `nth(1)` then
+            // yields "not". Keep the SONAME so the failure names the missing library.
+            if token == "not" {
+                return line.split_whitespace().next().map(str::to_string);
+            }
+            Some(token.to_string())
+        })
+        .collect()
+}
+
+/// Fixtures captured from the real tools, including the exact `ldd` output that failed in
+/// CI (run 32549821061).
+///
+/// NOT `#[ignore]`d: it compiles nothing and shells out to nothing, so it runs in tier 1 on
+/// every PR — unlike `scenario_31`, which is nightly-only and, before #409, had only ever
+/// been run on macOS. The bug it guards was invisible for exactly that reason.
+#[test]
+fn parses_both_tools_output() {
+    // `otool -L` — a `path:` header, then tab-indented absolute paths.
+    let otool = "\
+/tmp/smoke/smoke:
+\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1345.120.2)
+\t/usr/lib/libresolv.9.dylib (compatibility version 1.0.0, current version 1.0.0)
+";
+    assert_eq!(
+        parse_linked_libraries(otool),
+        vec!["/usr/lib/libSystem.B.dylib", "/usr/lib/libresolv.9.dylib"],
+        "otool: the header line must be dropped and each path taken whole"
+    );
+
+    // `ldd` — NO header, a pseudo-library with no path, two `soname => path` lines, and the
+    // loader as a bare absolute path. Verbatim from the failing CI run.
+    let ldd = "\
+\tlinux-vdso.so.1 (0x00007fffe2379000)
+\tlibgcc_s.so.1 => /lib/x86_64-linux-gnu/libgcc_s.so.1 (0x00007f4cff831000)
+\tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f4cff600000)
+\t/lib64/ld-linux-x86-64.so.2 (0x00007f4cff861000)
+";
+    assert_eq!(
+        parse_linked_libraries(ldd),
+        vec![
+            "linux-vdso.so.1",
+            "/lib/x86_64-linux-gnu/libgcc_s.so.1",
+            "/lib/x86_64-linux-gnu/libc.so.6",
+            "/lib64/ld-linux-x86-64.so.2",
+        ],
+        "ldd: nothing may be skipped by position, and `soname => path` must yield the PATH"
+    );
+
+    // The regression, stated as its own assertion because it is the whole bug: every
+    // resolved `ldd` path must satisfy the allow-list scenario_31 applies. Under the old
+    // parser these were `libgcc_s.so.1` / `libc.so.6`, which match no prefix.
+    for lib in parse_linked_libraries(ldd) {
+        assert!(
+            lib.starts_with("/lib/")
+                || lib.starts_with("/usr/lib/")
+                || lib.starts_with("linux-vdso")
+                || lib.contains("ld-linux"),
+            "a stock Linux binary's `{lib}` must read as a system library"
+        );
+    }
+
+    // An unresolvable dependency must name the LIBRARY, not the word "not" — otherwise the
+    // failure message points at nothing.
+    let missing = "\tlibfoo.so.1 => not found\n";
+    assert_eq!(parse_linked_libraries(missing), vec!["libfoo.so.1"]);
 }
 
 const SMOKE_MAIN: &str = r#"package main
