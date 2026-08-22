@@ -1,0 +1,132 @@
+# Tier 2 — the ignored suite, nightly (#390).
+#
+# Twenty tests are `#[ignore]`d out of the default suite because each one generates a
+# crate and compiles it. They are too slow to ride every PR — and they are exactly where
+# rot hides, because they are the ones a human has to CHOOSE to run. Both defects that
+# motivated #390 lived here: #381 for two weeks, #386 for an unknown period.
+#
+# THIS FILE LIVES ON `main`, AND THAT IS NOT A MISTAKE. DO NOT "DE-DUPLICATE" IT.
+#
+# GitHub only evaluates `schedule:` triggers in workflow files on the DEFAULT branch,
+# which for this repo is `main`. A copy that existed only on `develop` would never fire —
+# and would fail in the worst possible way: no red job, no missing-run warning, nothing at
+# all. Silence is indistinguishable from success, which is the precise failure #390
+# exists to remove.
+#
+# So it runs FROM `main` and reaches over to test `develop`. The explicit `ref:` below is
+# load-bearing for the same reason: without it this would test `main` — a branch that
+# moves once a cycle — and report green all cycle while `develop` rotted, finding the
+# breakage at the release instead of the night it appeared.
+#
+# WHY IT EXECUTES RATHER THAN JUST COMPILING
+#
+# `cargo test --no-run -- --ignored` was the obvious cheap version, and it is verified
+# (#384) to report GREEN ON A BROKEN TREE. `#[ignore]` is a runtime attribute — rustc
+# compiles those tests either way — and the rot lives inside `const DRIVER: &str` literals
+# that a subprocess compiles at RUN time. rustc never type-checks that string. The class is
+# "Rust source held as data" and the only thing that covers it is execution.
+#
+# WHAT IS NOT RUN HERE: migrate_tests
+#
+# `make test-ignored` skips it. It compiles a real transformer against the PUBLISHED
+# substrate, so on `develop` — which is allowed to carry a publish gap by design — it fails
+# for reasons that have nothing to do with the commit under test. A job legitimately red
+# for most of every cycle stops being read, which is the same non-control in a new costume.
+# It runs on the `main` surface instead, in substrate-reclose.yml, which already measures
+# this repo's relationship to crates.io. tests/ci_gate_test.rs asserts that home still
+# exists, so the skip cannot quietly become a deletion.
+#
+# A RED SQUARE IN A TAB NOBODY OPENS IS NOT A REPORT
+#
+# Hence the reporting step. It files ONE issue and updates it on subsequent failures — a
+# week of breakage should be one issue with a history, not seven issues. The `bugfix`
+# label is not cosmetic: pm-playbook PM010 requires exactly one type label per work item,
+# so an unlabelled auto-filed issue turns `pm-playbook check` red, making this control's
+# side effect the breaking of a different one.
+name: Nightly (ignored suite)
+
+on:
+  schedule:
+    # 09:00 UTC daily. Not on the hour boundary GitHub's scheduler is most contended on.
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write # the reporting step files/updates the failure issue
+
+concurrency:
+  group: nightly-ignored
+  cancel-in-progress: false
+
+jobs:
+  ignored:
+    name: ignored suite (develop)
+    runs-on: ubuntu-22.04
+    # ~7 minutes of tests, but every one of them compiles a crate from cold on a fresh
+    # runner. Generous, and still far below the 6-hour default a hang would otherwise burn.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # LOAD-BEARING. See the header: this workflow runs from `main` because that is
+          # where `schedule:` fires, but `develop` is what it is meant to watch.
+          ref: develop
+
+      # `make test-ignored` is workspace-level too, so it builds the inspector's Tauri
+      # shell and needs the same system libraries. See the action for why.
+      - uses: ./.github/actions/linux-workspace-deps
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Tier 2 — the ignored suite
+        id: suite
+        # `make test-ignored` is the single definition of this command; tests/ci_gate_test.rs
+        # asserts it stays workspace-level rather than degrading into a list of test
+        # binaries, which would cover 13 of 20 while looking complete.
+        run: make test-ignored
+
+      - name: Report the failure where it will be read
+        if: ${{ failure() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          TITLE="Nightly ignored suite is failing on develop"
+
+          # One issue, updated — not one per night. `--search` is scoped to open issues
+          # carrying the marker label so a closed one starts a fresh report rather than
+          # being resurrected.
+          EXISTING="$(gh issue list \
+            --state open --label nightly-failure --label bugfix \
+            --search "\"$TITLE\" in:title" \
+            --json number --jq '.[0].number // empty')"
+
+          BODY="The nightly tier-2 run failed.
+
+          Run: $RUN_URL
+          Commit: \`${{ github.sha }}\` on \`develop\`
+
+          These are the tests that are \`#[ignore]\`d out of the default suite because each
+          one generates and compiles a crate. They run only here, so a failure means the
+          scenario has been broken for at most one day — and would previously have gone
+          unnoticed indefinitely (#390).
+
+          Reproduce locally:
+
+          \`\`\`bash
+          make test-ignored
+          \`\`\`"
+
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+            echo "commented on #$EXISTING"
+          else
+            gh issue create \
+              --title "$TITLE" \
+              --label bugfix \
+              --label nightly-failure \
+              --body "$BODY"
+          fi
