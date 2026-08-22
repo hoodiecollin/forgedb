@@ -503,3 +503,36 @@ jobs:
           else
             echo "No open release gates."
           fi
+
+  # ---------------------------------------------------------------------------
+  # migrate_tests — relocated here from the nightly ignored suite (#390).
+  # ---------------------------------------------------------------------------
+  #
+  # This test compiles a real transformer against the PUBLISHED substrate. That makes it
+  # a measurement of the same thing the job above measures — this repo's relationship to
+  # crates.io — and NOT a measurement of the commit under test.
+  #
+  # Which is exactly why it cannot live in the nightly. The nightly watches `develop`, and
+  # `develop` is *allowed* to carry a publish gap; that is the whole point of holding the
+  # gap off the default branch. Run there, this test would be red for most of every cycle
+  # for a completely correct reason — and a job that is permanently red stops being read,
+  # which is the non-control #390 was filed to remove.
+  #
+  # It runs on `main`, where a failure means something is genuinely wrong, and it runs on
+  # ONE host: it is a network- and minutes-heavy compile, and the matrix above exists to
+  # catch host-specific scaffold problems, which this test does not probe.
+  #
+  # tests/ci_gate_test.rs asserts this step still exists. `make test-ignored` skips this
+  # test by name, so without a home here that skip would silently be a deletion.
+  migrate:
+    name: migrate_tests against the published substrate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run migrate_tests
+        # --ignored is load-bearing: without it libtest FILTERS THE TEST OUT and the step
+        # passes having run nothing at all.
+        run: cargo test --test migrate_tests -- --ignored --nocapture
