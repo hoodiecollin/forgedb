@@ -66,6 +66,27 @@ Example: `cargo run -- generate all --output ./generated`.
 
 ### Test baseline
 
+**Two tiers, and CI runs both (#390) — it previously ran neither.**
+
+| Tier | Command | Where |
+|---|---|---|
+| 1 — default suite | `make test` | `.github/workflows/test.yml`; required check on PRs into `develop`/`main` |
+| 2 — ignored suite | `make test-ignored` | `.github/workflows/nightly-ignored.yml`, nightly against `develop`; files an issue on failure |
+
+`make test` is exactly `cargo test --workspace --no-fail-fast` + `cargo build --workspace
+--examples`; the workflow invokes the target rather than repeating it, so there is one
+definition. `tests/ci_gate_test.rs` guards the properties that would otherwise break
+*silently* — the tier-2 command staying workspace-level rather than degrading into a list of
+test binaries (that form covers 13 of the 20 ignored tests and looks complete), the `--skip`
+still matching exactly the one test that belongs on the `main` surface, and the examples build
+still being there.
+
+**A build-only check does NOT substitute for running tier 2.** `cargo test --no-run --
+--ignored` reports **green on a broken tree** (verified, #384): `#[ignore]` is a runtime
+attribute, so rustc compiles those tests either way, and the rot lives inside `const DRIVER:
+&str` literals a subprocess compiles at run time. The class is *Rust source held as data* and
+only execution covers it.
+
 Plain `cargo test --workspace --no-fail-fast` is **green**:
 
 ```bash
@@ -507,9 +528,14 @@ of truth.
 
    - **Core work branches off `develop` and merges back to `develop`** (keep branch-per-scope +
      auto-merge; only the base changes). Nothing core lands on `main` except a release merge.
+   - **Core work goes through a PULL REQUEST (#390).** It used to merge locally, and that is
+     why nothing gated it: a merge gate can only stop a merge it sees, so a PR-only check
+     would have watched an empty road. The branch-per-scope + auto-merge rhythm is unchanged —
+     only the mechanism is. Note the enforcement is a repo *ruleset*, not a file, and admins
+     retain `bypass_mode: always`: the gate is refusable deliberately, never by accident.
    - **Branches land as merge commits — `git merge --no-ff`, never squash, never rebase.**
      Squash and rebase are disabled in the repo settings, so the GitHub button refuses anything
-     else; most work merges locally anyway. Subject form:
+     else. Subject form:
      `Merge <branch>: <what it did> (#<issue>)`. `--no-ff` is load-bearing — a branch that is
      merely ahead fast-forwards otherwise, erasing the boundary exactly as a rebase would.
      **Close the issue by hand**: GitHub honours `Closes #N` only for PRs into the *default*
@@ -551,8 +577,9 @@ of truth.
 
    A **deny-list on future milestones**, not an allow-list on the current one — so chores, CI fixes
    and typo PRs close no issue and pass silently, correctly: work with no issue cannot be
-   next-cycle work. `.github/workflows/cycle-scope.yml` gates PRs into `develop`; since most work
-   here merges locally, run it yourself before merging a branch back:
+   next-cycle work. `.github/workflows/cycle-scope.yml` gates PRs into `develop` — which now
+   reaches core work, since it goes through PRs (#390). For anything that still lands directly,
+   run the same check yourself before merging a branch back:
 
    ```bash
    make cycle-scope ISSUE=245        # what the branch closes

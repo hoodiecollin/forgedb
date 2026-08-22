@@ -240,14 +240,20 @@ forgedb/
 
 **All Tests:**
 ```bash
-# Run the whole workspace. --no-fail-fast surfaces ALL results; cargo
-# otherwise halts at the first failing test binary.
+# TIER 1 — the default suite. Exactly what CI runs (.github/workflows/test.yml).
+# --no-fail-fast surfaces ALL results; cargo otherwise halts at the first failing
+# binary. The examples build is separate because --lib/--bins/--tests AND --doc all
+# EXCLUDE examples, so no test flag covers them.
+make test
+
+# TIER 2 — the ~20 tests that each generate and compile a crate. #[ignore]d out of
+# tier 1; run nightly by CI. Minutes, not seconds. Run it when you touch codegen, the
+# build cache, or the generated API.
+make test-ignored
+
+# The individual commands, if you need to vary them
 cargo test --workspace --no-fail-fast
-
-# Examples are excluded by --lib/--bins/--tests AND by --doc, so build them too.
 cargo build --workspace --examples
-
-# Run with output
 cargo test --workspace -- --nocapture
 ```
 
