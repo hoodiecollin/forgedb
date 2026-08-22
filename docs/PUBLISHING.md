@@ -35,7 +35,8 @@ CLI from the registry**. NOT a stable API ([SEMVER.md §4](./SEMVER.md)):
 
 **Not published:**
 
-- `apps/inspector/src-tauri` (`publish = false`).
+- `apps/inspector/src-tauri` (`publish = false`) — and since #411 it is not a member of
+  this workspace at all, but its own; `cargo publish` from the root never sees it.
 
 > There is **no single coordinated version**. Do not run a script that rewrites every crate to
 > one version — that contradicts the substrate design. Bump only the crate(s) whose public API,

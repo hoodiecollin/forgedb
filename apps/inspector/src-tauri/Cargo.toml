@@ -1,8 +1,23 @@
+# A STANDALONE WORKSPACE (#411), deliberately not a member of the repo root's.
+#
+# The inspector is a separately shippable surface with its own build and release line, and
+# its Tauri shell needs GTK/WebKit system libraries on Linux. As a root member it imposed
+# that dependency on every core `--workspace` command, including the tier-1 CI gate — for
+# a desktop app that gate does not otherwise touch.
+#
+# Consequence to know about: this crate now resolves its own `Cargo.lock` and builds into
+# its own `target/` (already gitignored). It is NOT covered by `cargo test --workspace`
+# from the repo root; `make inspector-*` targets are how it is built.
+[workspace]
+
 [package]
 name = "forgedb-inspector"
 version = "0.1.0"
 description = "ForgeDB Inspector — desktop app to browse, edit, and inspect ForgeDB-generated databases"
-edition.workspace = true
+# A literal, not `edition.workspace = true`: workspace inheritance does not cross a
+# workspace boundary, and this is now its own root. Keep in step with the repo root's
+# `[workspace.package] edition`.
+edition = "2024"
 publish = false
 
 # Tauri v2 desktop layout: the shell lives in a lib (`run()`), `main.rs` is a

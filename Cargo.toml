@@ -19,8 +19,20 @@ members = [
     "crates/txn",
     "crates/coordinator",
     "crates/lsp-server",
-    "apps/inspector/src-tauri",
 ]
+
+# The Tauri inspector is its OWN workspace (#411), not a member of this one.
+#
+# As a member it was built by every `--workspace` command — `cargo test`, `cargo build`,
+# the tier-1 CI gate, the nightly. On Linux its shell needs GTK/WebKit system libraries,
+# which is why `cargo test --workspace` had never actually been runnable on a bare Linux
+# host: it passes on macOS because the equivalent frameworks ship with the OS, so every
+# past run of "the baseline" was a macOS run (found by #390's first CI run).
+#
+# `exclude` is required even though the child declares its own `[workspace]` — without it
+# cargo still treats a path inside this directory as a candidate member.
+exclude = ["apps/inspector/src-tauri"]
+
 resolver = "2"
 
 # Shared package metadata. `edition` is uniform across the workspace and inherited

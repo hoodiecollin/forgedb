@@ -70,24 +70,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # WHY THE CORE TEST GATE INSTALLS A DESKTOP TOOLCHAIN
+      # NO SYSTEM DEPENDENCIES, and that is now a property worth keeping.
       #
-      # `apps/inspector/src-tauri` is a workspace MEMBER, so `--workspace` builds the
-      # inspector's Tauri shell, and on Linux that pulls gdk-sys/webkit2gtk — which are
-      # system libraries, absent from a bare runner. The first run of this workflow failed
-      # on exactly that.
+      # This job briefly installed a GTK/WebKit toolchain, because the inspector's Tauri
+      # shell was a root workspace member and `--workspace` therefore built it. #411 made
+      # the inspector its own workspace, so the core suite builds on any host with nothing
+      # but the pinned Rust toolchain. If a step here ever needs `apt-get`, something has
+      # been added to the core workspace that probably should not be in it.
       #
-      # Which surfaced something nobody knew: `cargo test --workspace` has NEVER been
-      # runnable on a bare Linux host. It passes on macOS, where the frameworks are part
-      # of the OS, and every past run of "the baseline" was therefore a macOS run.
-      #
-      # The alternative was `--exclude forgedb-inspector`. Rejected: that crate has real
-      # tests which have been running locally all along, so excluding it would open a
-      # silent coverage hole inside the one change whose entire purpose is closing silent
-      # coverage holes. Paying for the toolchain keeps `make test` meaning the same thing
-      # on a runner as it does on a laptop — which is what lets the step below be the
-      # single definition.
-      - uses: ./.github/actions/linux-workspace-deps
+      # The cost of that split is real and is tracked, not absorbed: the inspector's own
+      # tests no longer run here. See #411.
 
       # Toolchain comes from rust-toolchain.toml (channel 1.96); rustup on the runner
       # honours it, so no setup-rust action is needed. Matches substrate-reclose.yml and
