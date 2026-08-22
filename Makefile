@@ -272,16 +272,18 @@ extension-package:
 crash-test:
 	cargo test --test crash_recovery_test -- --ignored --nocapture
 
-.PHONY: index-key-parity
+.PHONY: index-test
 
-## Index-key parity proof (#230): generate a model carrying every indexable type,
-## compile it, and assert the monomorphic key emission is byte-identical to the
-## `serde_json::Value` form it replaced — plus a round-trip through the real
-## generated `find_by_*`. `f64` is the one exception: its legacy key was broken and
-## was replaced (#242), so it is asserted against its own contract, not against
-## legacy. Also #[ignore]d out of the fast suite (compiles a crate).
-index-key-parity:
-	cargo test --test index_key_parity_test -- --ignored --nocapture
+## Index contract, end to end: generate a model carrying every indexable type in both
+## its plain and nullable form (plus both FK forms), compile it, store a row per field
+## and resolve each one back through the REAL generated `find_by_*`. Proves the record
+## and probe sides of the emitted key agree, that distinct values do not collide, and
+## that the null bucket stays distinct from the literal string "null" (#102).
+## Byte-comparison against the pre-#230 key form used to live here and was removed
+## (#381) — see the file header for why it should not come back.
+## #[ignore]d out of the fast suite (compiles a crate).
+index-test:
+	cargo test --test index_test -- --ignored --nocapture
 
 .PHONY: oversized-array-test
 

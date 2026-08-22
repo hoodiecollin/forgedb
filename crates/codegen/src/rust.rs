@@ -3468,7 +3468,10 @@ impl RustGenerator {
     /// produce a key whose tag was decided at generate time — a runtime match over
     /// `Value` variants inside *generated* code, which is the shape this project
     /// exists to avoid.  The emission is now chosen per field type; the key bytes
-    /// are unchanged (guarded by `tests/index_key_parity_test.rs`).
+    /// were unchanged by that switch, which `tests/index_key_parity_test.rs` proved
+    /// at the time.  That comparison has since been retired (#381) — the keys are
+    /// in-memory and rebuilt at open, so nothing depends on their bytes matching a
+    /// superseded form.
     ///
     /// Two arms of the old match were not what they looked like:
     ///
@@ -3529,11 +3532,13 @@ impl RustGenerator {
     /// bound to a reference to the value.  Split out of [`index_key_expr`] so the
     /// nullable path reuses it verbatim for its `Some` arm.
     ///
-    /// Each arm reproduces byte-for-byte what `serde_json` produced for that type
-    /// through the pre-#230 expression; `tests/index_key_parity_test.rs` holds the
-    /// frozen legacy implementation and asserts the equality, and the shape
-    /// assertions in `codegen_snapshots.rs` pin what is emitted here.  Change one
-    /// and both must move.
+    /// Each arm originally reproduced byte-for-byte what `serde_json` produced for
+    /// that type through the pre-#230 expression.  That is history, not a live
+    /// constraint (#381): these keys are in-memory and rebuilt at open, so an arm may
+    /// change shape freely as long as the record side and the probe side keep
+    /// agreeing.  What holds it in place now is the shape assertions in
+    /// `codegen_snapshots.rs` (what is emitted) plus `tests/index_test.rs` (that a
+    /// stored row is still found through the generated `find_by_*`).
     fn index_key_body(schema: &Schema, field_type: &forgedb_parser::FieldType) -> TokenStream {
         use forgedb_parser::FieldType;
         let field_type = &Self::resolved_type(schema, field_type);
