@@ -7288,10 +7288,55 @@ fn test_go_generation_binding() {
     assert!(GoGenerator::go_mod_scaffold("forgedb", true).contains("arrow-go/v18"), "go.mod pins arrow-go when needed");
     assert!(!GoGenerator::go_mod_scaffold("forgedb", false).contains("arrow-go"), "no arrow dep when unneeded");
 
-    // Identity red line: no generic runtime query surface, ever.
-    for forbidden in ["forgedb_query", "switch model", "predicate", "QueryBuilder", "reflect."] {
-        assert!(!code.contains(forbidden), "must not emit generic query surface: {forbidden}");
-    }
+    // IDENTITY RED LINE: no generic runtime query surface, ever. CLAUDE.md's opening
+    // section. Asserted through `go/parser` (#388) because the five bare substrings this
+    // replaces —
+    //
+    //     for forbidden in ["forgedb_query", "switch model", "predicate", "QueryBuilder", "reflect."]
+    //
+    // failed in BOTH directions, which is the worst possible property for the guard
+    // protecting the strongest invariant in the project:
+    //
+    //   * FALSE ALARM. An innocent doc comment reading "builds no predicate and is not a
+    //     QueryBuilder; it does not use reflect." trips three of the five. Prose is not
+    //     code, and a substring cannot tell them apart.
+    //   * FALSE GREEN — the dangerous one. A genuine generic dispatcher spelled to dodge
+    //     every needle walks straight through:
+    //
+    //         import rt "reflect"
+    //         func (c *Client) Find(kind string, ms []Matcher) ([]any, error) {
+    //             switch kind {
+    //             case "Account": return c.scan(rt.TypeOf(Account{}), ms)
+    //             }
+    //         }
+    //
+    //     Aliasing the import and renaming one variable is the entire evasion. An earlier
+    //     variant using `switch model` / `reflect.TypeOf` did trip the old guard, but
+    //     only by luck: those spellings happen to contain two of the literals.
+    //
+    // So the assertions below are on the PATH an import resolves to, never its local name,
+    // and on the presence of dispatch, never on what the dispatched variable is called.
+    let go = forgedb_source_guard::go_facts(&code);
+    assert!(
+        !go.imports("reflect"),
+        "identity red line: generated Go must not import `reflect` — runtime type          inspection is a generic query surface. Aliases do not hide it; imports seen: {:?}",
+        go.import_paths
+    );
+    assert!(
+        !go.dispatches_generically(),
+        "identity red line: generated Go must not route on a model NAME at runtime — the \
+         whole point is that per-model code is GENERATED, so there is nothing to look up. \
+         Integer status switches from the cgo wrappers are legitimate and deliberately not \
+         counted here. string-literal switch tags: {:?}, type switches: {}",
+        go.string_switch_tags, go.type_switches
+    );
+    // Prove the parse actually saw the file. An empty verdict and a clean one are
+    // indistinguishable otherwise — a guard that never evaluated reads as passing.
+    assert!(
+        go.decl_count > 0 && !go.func_names.is_empty(),
+        "the Go parse must have seen real declarations, got {} decls / {:?}",
+        go.decl_count, go.func_names
+    );
 }
 
 /// Every `C.<sym>` the Go binding calls, as a sorted, deduped set.
