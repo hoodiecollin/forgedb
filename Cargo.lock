@@ -590,6 +590,8 @@ name = "forgedb-source-guard"
 version = "0.0.0"
 dependencies = [
  "quote",
+ "serde",
+ "serde_json",
  "syn",
 ]
 
