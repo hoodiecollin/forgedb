@@ -3436,13 +3436,71 @@ impl RustGenerator {
     /// scale, so normalizing both the stored value and the probe argument keys them
     /// identically.  Nullable decimal normalizes through `.map(...)`; every other
     /// field type is returned unchanged.
+    /// The quantum a `timestamp` field's values are floored to, when flooring is not
+    /// the identity (#389).
+    ///
+    /// ONE definition, because the quantum is needed by three sites that must agree:
+    /// `index_value_expr` (hash-index key), `ordered_key_expr` (ordered-index key and
+    /// range bounds), and — mirrored, not shared, since it is a different crate —
+    /// `ApiGenerator::generate_filter_check`. Three copies of "what does this field
+    /// floor to" is exactly how the record side and the probe side came to disagree
+    /// in the first place.
+    ///
+    /// `None` for a non-timestamp, and for `timestamp(us)`, whose quantum is 1:
+    /// `floor_to_micros(1)` is a no-op, and the write gate emits no statement for it
+    /// either, so emitting one here would be noise that reads as meaningful.
+    ///
+    /// Unwraps `Nullable` so an optional timestamp gets the same treatment; the
+    /// caller decides whether to apply it through `.map`.
+    fn timestamp_floor_quantum(field_type: &forgedb_parser::FieldType) -> Option<i64> {
+        let precision = match field_type {
+            forgedb_parser::FieldType::Timestamp(p) => p,
+            forgedb_parser::FieldType::Nullable(inner) => match &**inner {
+                forgedb_parser::FieldType::Timestamp(p) => p,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let quantum = precision.quantum_micros();
+        (quantum > 1).then_some(quantum)
+    }
+
+    /// Apply [`Self::timestamp_floor_quantum`] to a value expression, threading
+    /// through `Option` when the field is nullable.
+    fn timestamp_floored(
+        field_type: &forgedb_parser::FieldType,
+        value_expr: TokenStream,
+    ) -> Option<TokenStream> {
+        let quantum = Self::timestamp_floor_quantum(field_type)?;
+        Some(
+            if matches!(field_type, forgedb_parser::FieldType::Nullable(_)) {
+                quote! { (#value_expr).map(|__ts| __ts.floor_to_micros(#quantum)) }
+            } else {
+                quote! { (#value_expr).floor_to_micros(#quantum) }
+            },
+        )
+    }
+
     fn index_value_expr(field_type: &forgedb_parser::FieldType, value_expr: TokenStream) -> TokenStream {
         match field_type {
             forgedb_parser::FieldType::Decimal => quote! { (#value_expr).normalize() },
             forgedb_parser::FieldType::Nullable(inner) if Self::is_decimal_type(inner) => {
                 quote! { (#value_expr).map(|__d| __d.normalize()) }
             }
-            _ => value_expr,
+            // #389: a `timestamp` field's stored value is floored to its declared
+            // quantum by the write gate, but the PROBE argument was not — so a row
+            // written at 1_234_567_890us was filed under 1_234_567_000 and looked up
+            // as 1_234_567_890, and `find_by_*` returned `[]` for the very value that
+            // had just been written. Silently, which is what made it a data bug rather
+            // than an error.
+            //
+            // Flooring here rather than beside the write gate is what fixes it once:
+            // this hook is applied to the record side AND the probe side of every hash
+            // index, so the two are self-consistent by construction. On the record side
+            // it is a no-op — the value is already aligned and `floor_to_micros` is
+            // idempotent — which is the same reason the `Decimal::normalize` arm above
+            // is safe on both sides.
+            _ => Self::timestamp_floored(field_type, value_expr.clone()).unwrap_or(value_expr),
         }
     }
 
@@ -3852,7 +3910,14 @@ impl RustGenerator {
         match field_type {
             forgedb_parser::FieldType::Decimal => quote! { (#value_expr).normalize() },
             forgedb_parser::FieldType::F64 => quote! { __forgedb_f64_key(#value_expr) },
-            _ => value_expr,
+            // #389, the ordered peer. Only the `min` bound actually moves: stored keys
+            // are all multiples of the quantum, so `Included(t)` and `Included(floor(t))`
+            // admit exactly the same multiples at the `max` end. At the `min` end they do
+            // not — `Included(t)` excludes the bucket `floor(t)` sits in — which is why
+            // `find_by_t_at_range(Some(t), Some(t), ..)` returned `[]` for the same value
+            // `find_by_t_at(t)` missed. Applied to the stored value and to each bound, so
+            // a bound stays comparable to what it is bounding.
+            _ => Self::timestamp_floored(field_type, value_expr.clone()).unwrap_or(value_expr),
         }
     }
 

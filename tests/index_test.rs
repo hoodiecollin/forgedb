@@ -210,17 +210,26 @@ static mut FAILURES: u32 = 0;
 
 /// The `t_at` fixture value, in microseconds.
 ///
-/// A WHOLE NUMBER OF MILLISECONDS, deliberately: `t_at` is declared `^timestamp`,
-/// whose quantum is a millisecond, and the write path floors a value to the field
-/// quantum while the index probe does NOT floor its argument (#389). A value with
-/// a sub-millisecond remainder is therefore stored under a different key than the
-/// one `find_by_t_at` computes for the same value, and the round-trip below would
-/// fail for a reason that is not about indexes at all.
+/// **DELIBERATELY NOT a whole number of milliseconds** (`…_890_123`), and that is the
+/// point of it (#389).
 ///
-/// Do not "simplify" this to an arbitrary integer. When #389 lands, the flooring
-/// happens on both sides and any value will do — until then this alignment is what
-/// keeps the guard measuring what it claims to.
-const T_AT: i64 = 1_234_567_890_000;
+/// This constant used to be millisecond-aligned, with a comment explaining that the
+/// alignment was a workaround: `t_at` is `^timestamp`, quantum one millisecond, and the
+/// write path floored the stored value while the index probe did not floor its argument,
+/// so any value carrying a sub-millisecond remainder was filed under one key and looked
+/// up under another. The workaround kept this guard green on exactly the broken path.
+///
+/// #389 floors both sides, so the remainder below is now carried through the write, the
+/// hash-index key, the ordered-index bounds and the REST predicate identically. Removing
+/// the workaround is the end-to-end guard: revert the fix and this test fails, which is
+/// more than any assertion added alongside it would prove.
+///
+/// Do not "simplify" this back to a round number. A round number cannot fail.
+const T_AT: i64 = 1_234_567_890_123;
+
+/// What `T_AT` becomes once floored to `t_at`'s millisecond quantum — what is actually
+/// stored, and what a reader gets back.
+const T_AT_FLOORED: i64 = 1_234_567_890_000;
 
 /// The observable contract, through the real generated index paths.
 fn roundtrip(dir: std::path::PathBuf) {
@@ -293,7 +302,36 @@ fn roundtrip(dir: std::path::PathBuf) {
     hit("n_f64", db.kitchen.find_by_n_f64(1.0), id_unset);
     hit("b_flag", db.kitchen.find_by_b_flag(true), id_unset);
     hit("u_ref", db.kitchen.find_by_u_ref(uref), id_unset);
+    // #389: probing with the UNFLOORED value must find the row. This is the assertion
+    // the old millisecond-aligned fixture could not make, because with an aligned value
+    // the floored and unfloored keys are the same string.
     hit("t_at", db.kitchen.find_by_t_at(Timestamp::from_micros(T_AT)), id_unset);
+    // …and probing with the floored value must find it too: flooring is idempotent, so
+    // both spellings of "the same instant" have to land in one bucket. If only one of
+    // these two passes, the sides have been made consistent in the wrong direction.
+    hit(
+        "t_at (floored probe)",
+        db.kitchen.find_by_t_at(Timestamp::from_micros(T_AT_FLOORED)),
+        id_unset,
+    );
+    // #389, third site: the ORDERED index (`find_by_*_range`, #169) keys its bounds
+    // through `ordered_key_expr`, the peer of the hash index's `index_value_expr`, and
+    // it was not floored either. Only the `min` bound actually moves — stored keys are
+    // all multiples of the quantum, so `Included(t)` and `Included(floor(t))` admit the
+    // same multiples at the `max` end — but `Included(t)` EXCLUDES the bucket
+    // `floor(t)` sits in, so the degenerate range over one instant returned nothing.
+    //
+    // Nothing in the tree exercised `_range` at all before this.
+    hit(
+        "t_at range [T_AT, T_AT]",
+        db.kitchen.find_by_t_at_range(
+            Some(Timestamp::from_micros(T_AT)),
+            Some(Timestamp::from_micros(T_AT)),
+            false,
+            None,
+        ),
+        id_unset,
+    );
     hit("e_status", db.kitchen.find_by_e_status(Status::Published), id_unset);
     hit("owner", db.kitchen.find_by_owner(owner), id_unset);
 

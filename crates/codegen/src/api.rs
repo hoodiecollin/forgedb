@@ -1121,8 +1121,28 @@ impl ApiGenerator {
             // way the body is.  Parsing a bare integer here would have silently
             // meant *seconds* while storage moved to micros — a filter that
             // matched nothing rather than failing.
-            FieldType::Timestamp(_) => {
-                quote! { want.parse::<forgedb_types::Timestamp>().ok() }
+            // #389: floor the parsed param to the field's quantum, because
+            // `Timestamp`'s `PartialEq` is over the raw `i64` micros and so does not
+            // self-correct — unlike `Decimal`, whose `PartialEq` compares by numeric
+            // value and therefore needed only its *key* normalized.
+            //
+            // This is a separate fix from the index key, and both are required. On the
+            // REST list path the index pushdown selects candidate rows and this
+            // predicate re-checks them; fixing only the key would have made the
+            // pushdown find the row and the predicate discard it — still `[]`, for a
+            // new reason.
+            FieldType::Timestamp(p) => {
+                let quantum = p.quantum_micros();
+                if quantum > 1 {
+                    quote! {
+                        want.parse::<forgedb_types::Timestamp>()
+                            .ok()
+                            .map(|__ts| __ts.floor_to_micros(#quantum))
+                    }
+                } else {
+                    // `timestamp(us)` — flooring is the identity; emit nothing extra.
+                    quote! { want.parse::<forgedb_types::Timestamp>().ok() }
+                }
             }
             FieldType::Enum(name) => {
                 let en = format_ident!("{}", name);
