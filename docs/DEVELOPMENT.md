@@ -31,6 +31,17 @@ rustc --version  # Edition 2024 needs >= 1.85; rust-toolchain.toml pins 1.96
 cargo --version
 ```
 
+**Go toolchain (required for the test suite):**
+```bash
+# https://go.dev/dl/  — or `brew install go`
+go version
+```
+
+`tools/goguard` is a stdlib-only helper that parses generated Go through `go/parser`, so the
+generator-identity red line is asserted structurally instead of by substring match. `make test`
+builds it. If Go is absent the Go guards **fail loudly** rather than skipping — a skipped guard
+reports green because it never ran, which is the failure class those guards exist to remove.
+
 **Git:**
 ```bash
 # Verify git installation

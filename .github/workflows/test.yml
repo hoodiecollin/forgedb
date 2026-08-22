@@ -86,5 +86,22 @@ jobs:
       # go-reclose.yml.
       - uses: Swatinem/rust-cache@v2
 
+      # WHY THE RUST TEST GATE INSTALLS GO (#388)
+      #
+      # `crates/source-guard` asserts properties of generated Go through `go/parser`, run as
+      # a subprocess — Go's own stdlib is the reference parser, and every Rust-callable
+      # alternative is a reimplementation (tree-sitter-go is a CST and needs a C compiler;
+      # the one credible pure-Rust port is unmaintained and pre-generics).
+      #
+      # This step is NOT optional and the guards do NOT skip when Go is absent. A guard that
+      # skips reports green because it never evaluated, which is the entire failure class
+      # #388 exists to delete — so removing this step turns the identity red line red, loudly,
+      # rather than quietly disabling it. That is deliberate.
+      #
+      # Same pattern as go-reclose.yml.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
       - name: Tier 1 — workspace suite + examples
         run: make test

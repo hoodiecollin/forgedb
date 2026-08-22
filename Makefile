@@ -275,8 +275,28 @@ extension-package:
 ## all EXCLUDE examples, so nothing in the test command compiles them — which has
 ## silently broken the tree twice. It is cheap; it stays.
 test:
+	$(MAKE) goguard
 	cargo test --workspace --no-fail-fast
 	cargo build --workspace --examples
+
+## The Go half of the AST guards (#388). `crates/source-guard` builds this on demand at
+## first use, so `make test` would work without invoking it — it runs first so the Go
+## toolchain is proven present BEFORE a hundred Rust tests do, and so a missing toolchain
+## is named directly instead of surfacing inside an unrelated codegen test.
+##
+## Invoked as a RECIPE LINE rather than declared as a prerequisite of `test:`, because
+## tests/ci_gate_test.rs parses the Makefile for a literal `test:` target and a
+## `test: goguard` header makes it report "Makefile has no `test:` target". Keeping the
+## guard's parser working matters more than the tidier spelling.
+##
+## Stdlib-only, so there is no module download and no go.sum to keep in step.
+goguard:
+	cd tools/goguard && go build -o ../../target/goguard/goguard .
+
+## Vet + test the Go helper itself. Not part of `test`: it is the guard's own guard, and
+## it runs `go test`, which the Rust suite has no reason to invoke.
+goguard-check:
+	cd tools/goguard && gofmt -l . && go vet ./... && go test ./...
 
 ## TIER 2 — the ignored suite (#390). Every test that is `#[ignore]`d out of tier 1
 ## because it generates and compiles a crate. Minutes, not seconds. Run nightly by
