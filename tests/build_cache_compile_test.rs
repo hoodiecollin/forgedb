@@ -32,6 +32,9 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use forgedb::commands::build::driver;
+use forgedb::naming;
+
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
@@ -254,6 +257,72 @@ fn exported_c_symbols(code: &str) -> BTreeSet<String> {
         "two no_mangle definitions share one symbol name inside ONE crate"
     );
     out
+}
+
+/// The staticlib cargo built for one app's `ffi` package, given that app's
+/// container directory.
+///
+/// **The container's directory name cannot be used to find it.** That name is
+/// [`forgedb::cache::member_hash`], an internal storage key, and #335 §2
+/// guarantees it appears in **no** public name — `tests/cache_dir_test.rs`
+/// asserts exactly that. Archive names come from the cargo package name, which
+/// is [`forgedb::naming::package_name`] over the app's *derived* name. Matching
+/// a hash against an archive path therefore never matched anything, which is the
+/// bug this scenario carried while `#[ignore]`d (#386).
+///
+/// Two properties this lookup has and a substring search did not:
+///
+/// * **cargo says which archive belongs to which package**, via its own
+///   `--message-format=json` stream. Nothing here re-derives cargo's
+///   package-name-to-lib-name mangling, so the mapping cannot quietly rot the
+///   way the hash one did.
+/// * **Exactly one hit, or a panic naming what was found.** `find()` returning
+///   the first match is how a lookup silently answers with the *sibling's*
+///   archive — the one failure that would make this scenario compare a set with
+///   itself and report disjointness that proves nothing.
+fn staticlib_of(artifacts: &[driver::Artifact], app_dir: &Path) -> PathBuf {
+    let app = forgedb::cache::member_app_name(app_dir).unwrap_or_else(|| {
+        panic!(
+            "no app-name marker in {} — `cache::reserve` writes one",
+            app_dir.display()
+        )
+    });
+    let want = naming::package_name(&app, &naming::PackageKind::Ffi);
+
+    let hits: Vec<&driver::Artifact> = artifacts
+        .iter()
+        .filter(|a| a.package == want && a.kind == driver::TargetKind::Staticlib)
+        .collect();
+    match hits.as_slice() {
+        [one] => one.path.clone(),
+        [] => panic!(
+            "cargo reported no staticlib for package `{want}` (app {}).\nIt reported:\n{}",
+            app_dir.display(),
+            inventory(artifacts)
+        ),
+        many => panic!(
+            "{} staticlibs for package `{want}` — the lookup is ambiguous:\n{}",
+            many.len(),
+            inventory(artifacts)
+        ),
+    }
+}
+
+/// Every artifact cargo reported, for a panic message that says what was there
+/// instead of only what was missing.
+fn inventory(artifacts: &[driver::Artifact]) -> String {
+    artifacts
+        .iter()
+        .map(|a| {
+            format!(
+                "  {:<10} {:<28} {}",
+                a.kind.as_str(),
+                a.package,
+                a.path.display()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Whitespace-insensitive containment. `prettyplease` renders paths as
@@ -667,12 +736,16 @@ fn scenario_3_the_two_staticlibs_export_disjoint_symbols() {
     let apps = fx.containers();
     assert_eq!(apps.len(), 2, "two schemas must reserve two containers");
 
-    let out = fx.cargo(&["build"]);
+    // `json-render-diagnostics` keeps errors human-readable on stderr while
+    // putting the artifact inventory on stdout, so a build failure here still
+    // reads the way the other scenarios' does.
+    let out = fx.cargo(&["build", "--message-format=json-render-diagnostics"]);
     assert!(
         out.status.success(),
         "the two-app cache workspace does not build:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let artifacts = driver::parse_artifacts(&String::from_utf8_lossy(&out.stdout));
 
     let libdir = fx.target_dir().join("debug");
     let archives: Vec<PathBuf> = std::fs::read_dir(&libdir)
@@ -727,30 +800,19 @@ fn scenario_3_the_two_staticlibs_export_disjoint_symbols() {
     // the assertion until it proved nothing.
     let mut checked = 0usize;
     for (mine, theirs) in [(0usize, 1usize), (1, 0)] {
-        let hash = apps[mine]
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
         let exports = exported_c_symbols(&read(&apps[mine].join("ffi/src/lib.rs")));
         assert!(exports.len() > 10, "a near-empty export set proves nothing");
 
-        let own = archives
-            .iter()
-            .find(|p| p.to_string_lossy().contains(&hash))
-            .unwrap_or_else(|| panic!("no staticlib for app {hash}: {archives:?}"));
-        let other_hash = apps[theirs]
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        let other = archives
-            .iter()
-            .find(|p| p.to_string_lossy().contains(&other_hash))
-            .unwrap_or_else(|| panic!("no staticlib for app {other_hash}: {archives:?}"));
+        let own = staticlib_of(&artifacts, &apps[mine]);
+        let other = staticlib_of(&artifacts, &apps[theirs]);
+        assert_ne!(
+            own, other,
+            "the two apps resolved to the SAME archive — a comparison of a set with itself \
+             would report a collision that is not there, or hide one that is"
+        );
 
-        let own_syms = defined(own);
-        let other_syms = defined(other);
+        let own_syms = defined(&own);
+        let other_syms = defined(&other);
         for sym in &exports {
             assert!(
                 own_syms.contains(sym),

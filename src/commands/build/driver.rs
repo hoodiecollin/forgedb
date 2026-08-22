@@ -80,10 +80,11 @@ const COLLISION_MARKER: &str = "output filename collision";
 ///
 /// The `kind` is carried alongside the name because the target split ([`plan`])
 /// and the artifact selector (`--print-artifact`) are both defined on the kind,
-/// never on the package name: package names carry the per-app hash, kinds do not.
+/// never on the package name: a package name is derived from the app's path and
+/// changes when a schema moves, kinds do not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Selected {
-    /// The cargo `[package] name` — `naming::package_name`, hash and all.
+    /// The cargo `[package] name` — `naming::package_name`, app name and all.
     pub package: String,
     /// Which ForgeDB package this is.
     pub kind: PackageKind,
@@ -776,11 +777,12 @@ pub enum Profile {
 /// One artifact, as `--report` writes it.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ReportedArtifact {
-    /// The cargo `[package] name` — `naming::package_name`, hash included.
+    /// The cargo `[package] name` — `naming::package_name`, app name included.
     pub package: String,
-    /// `naming::PackageKind::dir()`.  **The stable selector**: package names
-    /// carry the per-app hash, kinds do not, so this is what a Dockerfile may
-    /// name.  It round-trips through `PackageKind::from_dir`.
+    /// `naming::PackageKind::dir()`.  **The stable selector**: a package name is
+    /// derived from the app's path and changes when a schema moves, kinds do
+    /// not, so this is what a Dockerfile may name.  It round-trips through
+    /// `PackageKind::from_dir`.
     pub kind: String,
     pub target_kind: TargetKind,
     /// Absolute, and existence-checked before it got here.
@@ -851,8 +853,8 @@ impl BuildReport {
                 "`--print-artifact {kind}`: `{kind}` is not a ForgeDB package kind.\n\
                  Legal kinds: core, server, napi, pyo3, ffi, wasm, transform-<from>-<to>, \
                  engine-<from>-<to>.\n\
-                 (It is a KIND, never a package name: package names carry the per-app hash, \
-                 so a baked one breaks when the schema file is renamed.)"
+                 (It is a KIND, never a package name: package names are derived from the app's \
+                 path, so a baked one breaks when the schema file is moved or renamed.)"
             )));
         };
         let want = primary_target_kind(&package_kind);

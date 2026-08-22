@@ -7966,10 +7966,12 @@ User {
 /// #230: index keys are emitted **monomorphically per field type**, not by matching
 /// on a `serde_json::Value` at runtime.
 ///
-/// This is link 1 of the parity guard chain — it pins *what the generator emits*.
-/// Link 2 (`tests/index_key_parity_test.rs`) compiles a generated crate and asserts
-/// those forms are byte-identical to the `Value` match they replaced. Changing
-/// `RustGenerator::index_key_body` means moving both.
+/// This pins *what the generator emits*, at the string level, in the fast suite.
+/// It is now the only guard on the emitted form: the byte-comparison against the
+/// pre-#230 `Value` match was removed with the parity half of the index test (#381),
+/// because that baseline was re-derived from live serde and had silently drifted.
+/// `tests/index_test.rs` covers the other end — that a stored row is found again
+/// through the real generated `find_by_*` — but asserts nothing about key bytes.
 #[test]
 fn test_rust_generation_monomorphic_index_keys() {
     let src = r#"

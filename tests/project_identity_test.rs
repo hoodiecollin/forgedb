@@ -551,7 +551,19 @@ fn scenario_15_generate_and_build_agree() {
     // CWD-based resolution and a schema-based one disagree.
     let args = ["-v", "--schema", "apps/api/schema.forge"];
     let generate = run(&root, home.path(), &["-v", "generate", "rust", "--schema", "apps/api/schema.forge", "--output", root.join("out").to_str().unwrap()]);
-    let build = run(&root, home.path(), &["build", &args[0], "--schema", "apps/api/schema.forge"]);
+    // `--plan` for cost, and it costs no coverage: the line this scenario reads
+    // is printed by `identify_reported()` in `main.rs`, BEFORE `build::run` is
+    // entered at all — so the release compile underneath was asserted on by
+    // nothing and took 97s (#380). Since #335 put the compile in the ForgeDB
+    // cache workspace, a `build` in a fixture SUCCEEDS at compiling the whole
+    // generated app, which is why an unchanged test got expensive on its own.
+    let build = run(&root, home.path(), &["build", "--plan", &args[0], "--schema", "apps/api/schema.forge"]);
+
+    // Asserted because `project_line` alone cannot see a LATE failure: the
+    // `Project:` line is printed early, so a `build` that dies after it still
+    // yields a readable — and matching — line. Under `--plan` there is nothing
+    // left that may legitimately fail, so this is now assertable (#380).
+    assert!(build.status.success(), "build --plan failed:\n{}", combined(&build));
 
     assert_eq!(project_line(&generate), "mono (from [project].name)");
     assert_eq!(

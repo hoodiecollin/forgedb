@@ -172,8 +172,9 @@ fn the_dockerfile_drives_the_cli_and_copies_the_reported_artifact() {
     );
 
     // Property 3: `--print-artifact` is handed the stable KIND, never a package
-    // name — package names carry the per-app hash and change when the schema file
-    // is renamed. Asserted by reading the token that follows the flag.
+    // name — package names are derived from the app's path and change when the
+    // schema file is moved or renamed. Asserted by reading the token that
+    // follows the flag.
     let invocation = dockerfile
         .lines()
         .find(|l| !l.trim_start().starts_with('#') && l.contains("$(forgedb build"))
