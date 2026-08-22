@@ -5685,11 +5685,24 @@ Widget {
         code.contains("want.parse::<i32>()"),
         "i32 filter parses the param to i32"
     );
+    // Matched WITHOUT the `want.` prefix: #389 appended `.ok().map(...)`, and
+    // prettyplease then broke the receiver onto its own line, so the contiguous
+    // `want.parse::<…>` span stopped existing. The needle was testing the formatter's
+    // line-breaking as much as the emission — exactly the hazard the note below this
+    // block already warns about for the generic path.
     assert!(
-        code.contains("want.parse::<forgedb_types::Timestamp>()"),
+        code.contains(".parse::<forgedb_types::Timestamp>()"),
         "#254: a timestamp filter parses the RFC 3339 wire form, the same form the \
          body uses — parsing a bare integer here would have silently meant SECONDS \
          against microsecond storage, matching nothing instead of failing"
+    );
+    assert!(
+        code.contains("floor_to_micros(1000i64)"),
+        "#389: `made_at` is bare `timestamp` (quantum 1ms), and the write path floors \
+         the stored value to it. `Timestamp`'s PartialEq is over raw i64 micros and so \
+         does NOT self-correct — unlike Decimal, whose PartialEq compares by numeric \
+         value and needed only its key normalized. Without flooring the parsed param, \
+         filtering by the instant you just wrote returns an empty page"
     );
     // (The generic path may wrap across lines in the formatted output, so match
     // the pieces rather than one contiguous span.)
