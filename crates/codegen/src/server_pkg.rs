@@ -95,7 +95,7 @@ path = "src/main.rs"
 
 [dependencies]
 # The one generated database for this app. Renamed so no generated source
-# carries the per-app hash.
+# carries this app's package name.
 forgedb_core = {{ package = "{core_package}", path = "../core" }}
 
 # Substrate the API layer links directly. NOT the storage/wal/txn set — those

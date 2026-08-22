@@ -86,8 +86,8 @@ impl WasmGenerator {
             // the shipped defect was two `RustGenerator` invocations with
             // different `GenConfig`s producing two databases from one `generate`.
             //
-            // The per-app package hash never appears here: the *manifest* says
-            // `forgedb_core = { package = "<slug>-<hash>-core", path = "../core" }`
+            // This app's package name never appears here: the *manifest* says
+            // `forgedb_core = { package = "<app-name>-core", path = "../core" }`
             // and the source says a fixed `forgedb_core`.
             use forgedb_core as database;
 
