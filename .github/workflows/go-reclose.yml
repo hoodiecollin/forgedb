@@ -44,12 +44,36 @@
 # drift when those change.
 name: Go reclose
 
+# WHY THIS IS `main`-ONLY, AND WHY IT WAS RED FOR TWO WEEKS BEFORE ANYONE NOTICED (#402)
+#
+# This job builds a generated project OUTSIDE the checkout, so every `forgedb-*` dep
+# resolves from crates.io. That makes it the same class of check as substrate-reclose —
+# and it needs the same branch restriction, which it never had.
+#
+# It used to run on `pull_request` with no branch filter, so it ran on PRs into `develop`.
+# `develop` is *allowed* to carry a publish gap; that is the entire point of holding the gap
+# off the default branch. A job resolving from the registry therefore fails there BY DESIGN,
+# and it did: the 2026-08-07/08 runs failed with `no field `auto_sequences` on type
+# `Manifest`` — #187 had added that field to `forgedb-storage` and generated code used it
+# before the crate was published. Correct behaviour from the job, on the one branch where it
+# means nothing.
+#
+# Nine runs, nine failures, six branches, and nobody read it — because everyone who saw it
+# red saw it red on a branch that had not caused it. A job that is always red is not a
+# control; its signal is indistinguishable from noise, so a REAL Go/FFI reclose break would
+# have landed unnoticed, which is exactly what this job exists to prevent.
+#
+# The paths filter went with it. On `main` the meaningful event is a release merge, and
+# whether that merge happens to touch `go.rs` is unrelated to whether the Go reclose still
+# closes. substrate-reclose has no paths filter for the same reason.
+#
+# Changing the Go generator on `develop` and want this run against it? `workflow_dispatch`
+# against the branch — the same escape hatch substrate-reclose documents.
 on:
+  push:
+    branches: [main]
   pull_request:
-    paths:
-      - crates/codegen/src/go.rs
-      - crates/codegen/src/ffi.rs
-      - .github/workflows/go-reclose.yml
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -143,6 +167,24 @@ jobs:
           # depend on a directory ForgeDB is free to delete.
           grep -q -- '-L\${SRCDIR} -lforgedb' generated/go/forgedb.go
           ! grep -q 'ffi/target/release' generated/go/forgedb.go
+
+          # 4a. wasm32 std, installed where CARGO will run (#402).
+          #
+          # `forgedb build` compiles the cache WORKSPACE, and #335 emits six packages per
+          # app — core, server, ffi, napi, pyo3 and **wasm**. The workspace root lists all
+          # of them as members, so building it reaches the wasm member even though this
+          # reclose only cares about the Go/FFI path. Without the target that surfaces as
+          # `error[E0463]: can't find crate for \`core\``, which reads as a broken
+          # generator rather than a missing rustup component.
+          #
+          # `cd` into the cache first, and that is not tidiness. substrate-reclose learned
+          # it the hard way: `rustup target add` inside the CHECKOUT installs wasm32 std for
+          # the `rust-toolchain.toml` pin only, the scaffold build runs under the runner's
+          # default toolchain, and the build then fails with the same "can't find crate for
+          # core" WHILE THE ADD STEP REPORTS SUCCESS. The toolchain split is deliberate — an
+          # installed user has their own toolchain, not our pin — so rustup has to be run
+          # from where cargo will be.
+          (cd "$FORGEDB_HOME" && rustup target add wasm32-unknown-unknown)
 
           # 4. `forgedb build` compiles the cache workspace and DELIVERS the ffi
           #    staticlib to generated/go/libforgedb.a. Every substrate dep
