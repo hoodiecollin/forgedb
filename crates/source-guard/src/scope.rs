@@ -126,6 +126,67 @@ macro_rules! body_queries {
                 self.block.stmts.iter().position(pred)
             }
 
+            /// The declared type of the parameter named `name`, rendered as compact source
+            /// text (`Option<f64>`, not `Option < f64 >`).
+            ///
+            /// Replaces the two-spelling dance that byte matching forces —
+            /// `contains("min : Option < f64 >") || contains("min: Option<f64>")` — which
+            /// exists only because prettyplease's spacing is not stable across contexts.
+            /// The type is one thing; it should be asked for once.
+            ///
+            /// `None` when there is no such parameter, so a caller can distinguish "absent"
+            /// from "present with a different type" instead of collapsing both to false.
+            pub fn param_type(&self, name: &str) -> Option<String> {
+                self.sig.inputs.iter().find_map(|arg| match arg {
+                    syn::FnArg::Typed(pt) => match &*pt.pat {
+                        syn::Pat::Ident(id) if id.ident == name => {
+                            Some(crate::scope::render_type(&pt.ty))
+                        }
+                        _ => None,
+                    },
+                    syn::FnArg::Receiver(_) => None,
+                })
+            }
+
+            /// Every parameter name, in declaration order — for a failure message that can
+            /// say what IS there.
+            pub fn param_names(&self) -> Vec<String> {
+                self.sig
+                    .inputs
+                    .iter()
+                    .filter_map(|arg| match arg {
+                        syn::FnArg::Typed(pt) => match &*pt.pat {
+                            syn::Pat::Ident(id) => Some(id.ident.to_string()),
+                            _ => None,
+                        },
+                        syn::FnArg::Receiver(_) => Some("self".to_string()),
+                    })
+                    .collect()
+            }
+
+            /// The body rendered as a token string, whitespace-normalized by the tokenizer.
+            ///
+            /// **The escape hatch, scoped.** It exists because some assertions are about
+            /// emitted *shape* (a match arm, a local struct declaration) that the query
+            /// surface does not yet express, and forcing those through the AST now would
+            /// mean either a worse assertion or a much larger change.
+            ///
+            /// The important difference from the byte window it replaces: this text is
+            /// bounded by the AST to **this body**. It cannot widen. A rotted anchor fails
+            /// at the lookup rather than silently handing back the rest of the file.
+            ///
+            /// Still a substring match, so it still cannot tell a call from a comment.
+            /// Grep `body_text_because` to find every assertion still on that footing —
+            /// the list should shrink, and must never grow silently.
+            pub fn body_text_because(&self, why: &str) -> String {
+                debug_assert!(
+                    !why.trim().is_empty(),
+                    "body_text_because needs a real reason, not an empty string"
+                );
+                use quote::ToTokens;
+                self.block.to_token_stream().to_string()
+            }
+
             /// Where this scope came from, for messages.
             pub fn origin(&self) -> &str {
                 &self.origin
@@ -282,6 +343,34 @@ impl RustSource {
         }
     }
 
+    /// **Every** method named `name`, across all `impl` blocks, with its owner.
+    ///
+    /// This is usually what a guard over generated code actually means. Generated
+    /// `database.rs` emits one `insert` / `__stage_append` / `__with_scan` *per model*, so
+    /// `code.find("fn __stage_append")` silently asserted about whichever storage was
+    /// emitted first and never looked at the rest — a two-model schema got a one-model
+    /// guard, and nothing said so.
+    ///
+    /// Prefer this to picking one owner when the property is supposed to hold for all of
+    /// them. Returns an error when there are none, so a rotted name still fails loudly.
+    pub fn methods_named(&self, name: &str) -> Result<Vec<(String, MethodScope<'_>)>, ScopeError> {
+        let hits = self.methods_matching(|_, m| m.sig.ident == name);
+        if hits.is_empty() {
+            return Err(self.scope_error(format!("method `{name}`"), self.method_names()));
+        }
+        Ok(hits
+            .into_iter()
+            .map(|(owner, m)| {
+                let scope = MethodScope {
+                    sig: &m.sig,
+                    block: &m.block,
+                    origin: format!("{}::{owner}::{name}", self.origin()),
+                };
+                (owner, scope)
+            })
+            .collect())
+    }
+
     /// A method named `name` on the impl whose self type renders as `ty`.
     pub fn method_in(&self, ty: &str, name: &str) -> Result<MethodScope<'_>, ScopeError> {
         let hits = self.methods_matching(|imp, m| imp == ty && m.sig.ident == name);
@@ -333,6 +422,59 @@ impl RustSource {
         }
     }
 
+    /// The initializer expression of the struct-literal field named `name`, anywhere in
+    /// this file, rendered as compact source text.
+    ///
+    /// Replaces "find `<name>: ` in a flattened blob and take the next N characters",
+    /// where N was a guess. An expression has exact bounds; a character budget does not,
+    /// and when the terminator needle rots the budget silently becomes the answer.
+    ///
+    /// Returns **every distinct** initializer, deduped. Generated code initializes the
+    /// same field in several places — an open path, a create path, a scan-buffer holder —
+    /// so there is rarely exactly one, and taking the first (as the byte form did) silently
+    /// answers about whichever the emitter happened to put first. The caller decides which
+    /// shape it means, and can assert how many there are.
+    ///
+    /// Absent is still an error: a rotted field name must fail, not return an empty list
+    /// that every `all()` check passes vacuously.
+    pub fn struct_literal_field_inits(&self, name: &str) -> Result<Vec<String>, ScopeError> {
+        use quote::ToTokens;
+
+        struct Collect<'n> {
+            name: &'n str,
+            hits: Vec<String>,
+            seen: Vec<String>,
+        }
+        impl<'ast, 'n> syn::visit::Visit<'ast> for Collect<'n> {
+            fn visit_field_value(&mut self, node: &'ast syn::FieldValue) {
+                if let syn::Member::Named(id) = &node.member {
+                    self.seen.push(id.to_string());
+                    if id == self.name {
+                        self.hits
+                            .push(node.expr.to_token_stream().to_string().replace(" :: ", "::"));
+                    }
+                }
+                syn::visit::visit_field_value(self, node);
+            }
+        }
+
+        let mut c = Collect {
+            name,
+            hits: Vec::new(),
+            seen: Vec::new(),
+        };
+        syn::visit::visit_file(&mut c, self.ast());
+
+        if c.hits.is_empty() {
+            c.seen.sort();
+            c.seen.dedup();
+            return Err(self.scope_error(format!("struct-literal field `{name}`"), c.seen));
+        }
+        c.hits.sort();
+        c.hits.dedup();
+        Ok(c.hits)
+    }
+
     /// The declared type of `field` on `struct_name`, rendered as source text.
     ///
     /// Replaces `flat.contains("pubid:String")`, which matches `pub id: String` in *any*
@@ -380,7 +522,7 @@ impl RustSource {
 }
 
 /// Render a type as compact source text (`Option < Vec < usize > >` → `Option<Vec<usize>>`).
-fn render_type(ty: &syn::Type) -> String {
+pub(crate) fn render_type(ty: &syn::Type) -> String {
     use quote::ToTokens;
     ty.to_token_stream()
         .to_string()
