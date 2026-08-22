@@ -73,7 +73,9 @@ These keep the two axes clean and the derived views trivial. **Enforce them on e
   (§5.2).
 - **`hotfix` ⇒ `bugfix` + a milestone, and `hotfix` ⊕ {`experiment`, `epic`}** (PM014). A hotfix is
   a *form* of bugfix, not a fourth type (§5.6).
-- **A patch milestone holds one hotfix and its gates, nothing else** (PM015).
+- **A patch milestone holds one hotfix, its gates, and any `release-gate` — no other work** (PM015).
+  A `release-gate` is a release obligation rather than work, so it was never what "nothing else"
+  excluded; §5.6 says where a patch's asset ledger lives.
 
 The structural rules live with the structures they govern: gate parentage and completeness in §9,
 epic decomposition in §7.1.
