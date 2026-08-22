@@ -26,6 +26,9 @@
 //!
 //! **When you migrate a site to `forgedb_source_guard`, lower `BUDGET`.** The test tells you
 //! the number. It is not a target to sit at; it is a debt that only moves one way.
+//!
+//! As of #388 every in-scope Rust site is migrated and the count is at its floor — see the
+//! per-site notes on `BUDGET` for why the remainder cannot widen a Rust assertion.
 
 use std::path::{Path, PathBuf};
 
@@ -34,10 +37,19 @@ use std::path::{Path, PathBuf};
 /// Lower these as sites migrate to `forgedb-source-guard`. Never raise one: a new guard has
 /// the testkit available and has no reason to reach for a widening window.
 const BUDGET: &[(&str, usize)] = &[
-    // 10 remaining after #388 migrated the #238 scan-borrow guard. `:6184` (the #170
-    // insert-fsync window) is fixed separately as a live v0.5.0 defect (#424) and is
-    // counted here until it is back-migrated to AST scoping.
-    ("crates/codegen/tests/codegen_snapshots.rs", 10),
+    // 3 remaining, and every one is deliberately out of scope for #388 rather than
+    // pending. Each was inspected; none can widen a Rust assertion:
+    //
+    //   * the strict-mirror walk over the generated **TypeScript** client — TS is an
+    //     explicit non-goal of #388, which covers Rust and Go;
+    //   * an `unwrap_or(0)` inside a **failure-message argument**, not an assertion. The
+    //     worst case is a confusing message on a test that is already failing;
+    //   * a scope into generated **Go** whose start is `unwrap_or_else(|| panic!(…))` —
+    //     already fatal on a miss, which is the property that matters.
+    //
+    // So this is a floor, not a debt. If it drops to 2 one of the above was addressed;
+    // if it rises, a genuinely new widening window was added and the test says where.
+    ("crates/codegen/tests/codegen_snapshots.rs", 3),
 ];
 
 fn repo_root() -> PathBuf {

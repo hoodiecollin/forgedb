@@ -717,32 +717,44 @@ User {
     // (physical row order + `gather_buffered`) instead of a per-row read syscall
     // storm.  A churn-free selection is the dense prefix, so `export` aliases the
     // column via mmap; deleted rows are excluded by one bulk tombstone read.
-    let scan = &db_code[db_code.find("pub fn __with_scan<R>").unwrap()..];
-    let scan = &scan[..scan.find("fn __rows_by_").unwrap_or(scan.len())];
-    let scan_flat: String = scan.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(scan.contains("struct __UserScanBufs"),
+    // Scoped on the AST (#388). The window this replaces ended at a `fn __rows_by_`
+    // terminator with `unwrap_or(scan.len())`, so a terminator that stopped matching
+    // widened the scope to the rest of the file rather than failing.
+    let scan_src = RustSource::generated("database.rs", db_code.clone());
+    let scan_scope = scan_src
+        .method_named("__with_scan")
+        .expect("#168: the buffered scan scope is emitted");
+    // Shape assertions that the query surface does not yet express — a locally declared
+    // struct, a type path, a match arm. Still substring matches, but over text the AST
+    // BOUNDS to this body: it cannot widen, and a rotted name fails at the lookup above.
+    let scan_flat = scan_scope.body_text_because(
+        "#168 asserts emitted SHAPE (a local struct decl, two storage type paths, a match \
+         arm); expressing those structurally is the next slice of #388, and the scope is \
+         already structural so it can no longer widen",
+    );
+    assert!(scan_flat.contains("struct __UserScanBufs"),
         "#168: local buffered-column holder emitted");
-    assert!(scan.contains(".gather_buffered(&__rows)"),
+    assert!(scan_scope.calls("gather_buffered"),
         "#168: each scan column is bulk-loaded once");
-    assert!(scan.contains("forgedb_storage::BufferedFixedColumn"),
+    assert!(scan_flat.contains("forgedb_storage :: BufferedFixedColumn"),
         "#168: fixed scan columns use the buffered fixed reader");
-    assert!(scan.contains("forgedb_storage::BufferedVariableColumn"),
+    assert!(scan_flat.contains("forgedb_storage :: BufferedVariableColumn"),
         "#168: string scan columns use the buffered variable reader");
-    assert!(scan_flat.contains("self.tombstones .live_indices(&__all)"),
-        "#168: deleted rows excluded by one bulk tombstone read.\nGot: {scan_flat}");
-    assert!(scan.contains("__all.sort_unstable()"),
+    assert!(scan_scope.calls("live_indices"),
+        "#168: deleted rows excluded by one bulk tombstone read");
+    assert!(scan_scope.calls("sort_unstable"),
         "#168: live rows iterated in physical (ascending) order");
     // #228: an index-pushdown selection is sorted too — `gather_buffered` bounds its
     // reads to [min, max], so ascending order keeps the spanned read tight.  It is
     // NOT tombstone-filtered: delete removes the id from every secondary index, so a
     // candidate resolved through one is live by construction.
-    assert!(scan_flat.contains("Some(mut __c) => { __c.sort_unstable(); __c }"),
+    assert!(scan_flat.contains("Some (mut __c) => { __c . sort_unstable () ; __c }"),
         "#228: a pushdown selection is sorted for span locality.\nGot: {scan_flat}");
     // The buffered loop decodes by SLOT via the reused field_read_stmt bodies —
     // never a per-row positional read against `self.<col>` inside the scan loop.
-    assert!(scan.contains("for __slot in 0..__n"),
+    assert!(scan_flat.contains("for __slot in 0 .. __n"),
         "#168: buffered decode iterates slots");
-    assert!(scan.contains("f(&mut __refs)"),
+    assert!(scan_flat.contains("f (& mut __refs)"),
         "#228: the scope hands the borrowed views to the caller's callback");
 }
 
@@ -777,10 +789,17 @@ Metric {
     assert!(db_code.contains("pub fn find_by_at_range"), "#169: timestamp range method");
     assert!(db_code.contains("price_ordered"), "#169: decimal ordered index");
     // Decimal bound is normalized (scale-invariant), like its hash key.
-    let price_range = &db_code[db_code.find("fn find_by_price_range").unwrap()..];
-    let price_range = &price_range[..price_range.find("__out\n").unwrap_or(price_range.len().min(1200))];
-    assert!(price_range.contains("normalize"),
-        "#169: decimal range bounds normalized to match the stored key");
+    // Scoped on the AST (#388). The window this replaces ended at a `__out\n` needle with
+    // `unwrap_or(len().min(1200))`, so a terminator that stopped matching widened the scope
+    // to 1200 bytes of whatever followed instead of failing.
+    let db_src = RustSource::generated("database.rs", db_code.clone());
+    assert!(
+        db_src
+            .method_named("find_by_price_range")
+            .expect("#169: decimal range method")
+            .calls("normalize"),
+        "#169: decimal range bounds normalized to match the stored key"
+    );
 
     // The parallel hash index is untouched (exact-match path preserved).
     assert!(db_code.contains("views_index"), "#169: hash index kept alongside (parallel, not replace)");
@@ -791,14 +810,20 @@ Metric {
     // getting only the first right would compile and be unusable.
     assert!(db_code.contains("ratio_ordered"), "#242: f64 gets an ordered index");
     assert!(db_code.contains("pub fn find_by_ratio_range"), "#242: f64 range method");
-    let ratio_range = &db_code[db_code.find("fn find_by_ratio_range").unwrap()..];
-    let ratio_range = &ratio_range[..ratio_range.find("__out\n").unwrap_or(ratio_range.len().min(1200))];
-    assert!(
-        ratio_range.contains("min : Option < f64 >") || ratio_range.contains("min: Option<f64>"),
-        "#242: the caller passes an f64 bound, never the encoded u64: {ratio_range}"
+    let ratio_range = db_src
+        .method_named("find_by_ratio_range")
+        .expect("#242: f64 range method");
+    // The parameter's declared type, asked once. The byte form needed BOTH spellings —
+    // `contains("min : Option < f64 >") || contains("min: Option<f64>")` — because
+    // prettyplease's spacing is not stable across contexts. A type is one thing.
+    assert_eq!(
+        ratio_range.param_type("min").as_deref(),
+        Some("Option<f64>"),
+        "#242: the caller passes an f64 bound, never the encoded u64; params: {:?}",
+        ratio_range.param_names()
     );
     assert!(
-        ratio_range.contains("__forgedb_f64_key"),
+        ratio_range.calls("__forgedb_f64_key"),
         "#242: the bound is encoded on the way in, so it is comparable to the stored key"
     );
 
@@ -6170,22 +6195,56 @@ Post {
     // #170 group commit: staged rows use the BUFFERED (no-fsync) WAL append, so a
     // transaction pays ONE barrier (the commit's `wal.flush()`) instead of one per
     // staged row. The committed insert/update/delete path keeps the per-op `write`.
-    let stage_body = &code[code.find("fn __stage_append").unwrap()..];
-    let stage_body = &stage_body[..stage_body.find("row_index\n").unwrap_or(stage_body.len().min(1500))];
-    assert!(
-        stage_body.contains(".write_buffered("),
-        "#170: __stage_append uses the buffered (no-fsync) WAL append"
-    );
-    assert!(
-        !stage_body.contains(".write(&forgedb_wal::WalEntry"),
-        "#170: __stage_append does NOT per-record fsync (no plain wal.write)"
-    );
-    // The committed single-write path keeps the durable per-op fsync.
-    let insert_body = &code[code.find("pub fn insert(").unwrap_or(0)..];
-    assert!(
-        insert_body.contains(".write(&forgedb_wal::WalEntry"),
-        "#170: committed insert still fsyncs per op (durable single write unchanged)"
-    );
+    // Both #170 scopes are structural now (#388). What they replace:
+    //
+    //   * `__stage_append` ended at a `row_index\n` needle with
+    //     `unwrap_or(len().min(1500))` — a rotted terminator widened to 1500 bytes of
+    //     whatever followed rather than failing;
+    //   * `insert` began at `code.find("pub fn insert(").unwrap_or(0)` and ran to EOF.
+    //     BOTH ends were wrong. Measured on this schema, that window covered 237 KB of a
+    //     261 KB file and contained EIGHT `.write(&forgedb_wal::WalEntry` calls, only ONE
+    //     of them insert's — the rest belonging to `update`, `delete`, the second model's
+    //     three, `commit` and a shared helper. The assertion below passed with insert's
+    //     own WAL write deleted outright. It was not guarding #170. (#424 shipped the
+    //     bounded-and-fatal interim; this supersedes it with the real fix.)
+    //
+    // Counting rather than testing presence keeps the claim pinned to one write: if a
+    // scope ever widens to swallow a sibling method again, the count moves and this
+    // goes red.
+    let wal_src = RustSource::generated("database.rs", code.clone());
+
+    // EVERY storage, not just the first one emitted. This schema has two models, so the
+    // byte-window form asserted about `UserStorage` and never looked at `PostStorage` — a
+    // two-model schema silently got a one-model guard. `methods_named` returns all of them,
+    // and the AMBIGUITY error is what surfaced it: `code.find` could not have.
+    let stages = wal_src
+        .methods_named("__stage_append")
+        .expect("#170: the staged-append path is emitted");
+    assert_eq!(stages.len(), 2, "one staged-append per model");
+    for (owner, stage) in &stages {
+        assert!(
+            stage.calls("write_buffered"),
+            "#170: {owner}::__stage_append uses the buffered (no-fsync) WAL append"
+        );
+        assert_eq!(
+            stage.call_count("write"),
+            0,
+            "#170: {owner}::__stage_append does NOT per-record fsync (no plain wal.write)"
+        );
+    }
+
+    // The committed single-write path keeps the durable per-op fsync — again, per model.
+    let inserts = wal_src
+        .methods_named("insert")
+        .expect("#170: the committed insert path is emitted");
+    assert_eq!(inserts.len(), 2, "one insert per model");
+    for (owner, insert) in &inserts {
+        assert_eq!(
+            insert.call_count("write"),
+            1,
+            "#170: {owner}::insert still fsyncs per op: exactly one plain WAL write, in its own body"
+        );
+    }
 }
 
 #[test]
@@ -9031,16 +9090,35 @@ fn db_for(src: &str) -> String {
     RustGenerator::generate(&schema).unwrap().code
 }
 
-/// The `FixedColumn::new(...)` initializer for one field's column, whitespace
-/// collapsed so assertions track the shape rather than prettyplease's wrapping.
+/// The `FixedColumn::new(...)` initializer for one field's column, taken from the AST
+/// (#388) so its bounds are the expression's own.
+///
+/// What this replaces found `"{field}_col: FixedColumn::new("` in a whitespace-flattened
+/// blob and then took everything up to a `") .expect"` terminator — falling back to
+/// `min(200)` CHARACTERS when that terminator did not match. A character budget is a guess
+/// about where an expression ends, and when the terminator rots the guess silently becomes
+/// the answer. An expression has exact bounds.
 fn column_init(code: &str, field: &str) -> String {
-    let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
-    let needle = format!("{field}_col: FixedColumn::new(");
-    let at = flat.find(&needle).unwrap_or_else(|| {
-        panic!("no FixedColumn init for `{field}` — it did not get a fixed column at all")
-    });
-    let tail = &flat[at..];
-    tail[..tail.find(") .expect").unwrap_or(tail.len().min(200))].to_string()
+    let inits = RustSource::generated("database.rs", code.to_string())
+        .struct_literal_field_inits(&format!("{field}_col"))
+        .unwrap_or_else(|e| panic!("no column initializer for `{field}`: {e}"));
+
+    // A field is initialized in several places (open, create, the scan-buffer holder), so
+    // narrow to the `FixedColumn::new(...)` construction this helper is about. Requiring
+    // exactly one is the point: two DIFFERENT strides for one field would mean the write
+    // path and the read path disagree, which is a real bug the byte form could not see
+    // because it stopped at the first match.
+    let fixed: Vec<&String> = inits
+        .iter()
+        .filter(|i| i.starts_with("FixedColumn::new"))
+        .collect();
+    assert_eq!(
+        fixed.len(),
+        1,
+        "`{field}` must have exactly one FixedColumn::new stride; got {fixed:?} \
+         (all initializers: {inits:?})"
+    );
+    fixed[0].clone()
 }
 
 /// Res 6: the exact form is exactly N bytes, with no length prefix — the
