@@ -73,6 +73,10 @@ jobs:
           # where `schedule:` fires, but `develop` is what it is meant to watch.
           ref: develop
 
+      # `make test-ignored` is workspace-level too, so it builds the inspector's Tauri
+      # shell and needs the same system libraries. See the action for why.
+      - uses: ./.github/actions/linux-workspace-deps
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Tier 2 — the ignored suite
