@@ -84,23 +84,6 @@ pub struct MigrateEngineOptions {
     pub removed_output: Option<PathBuf>,
 }
 
-/// The directory a schema's governing config is walked up from, and the
-/// directory its `migrations/` sits beside.
-///
-/// A bare `schema.forge` has no parent component, and walking from `""` would
-/// resolve against the filesystem **root** rather than the CWD — the difference
-/// between "the config beside my schema" and "any config on the machine".
-///
-/// `main.rs` carries the same five lines for the same reason. They are not
-/// shared because that one lives in the **binary** crate and this in the
-/// library, so there is no path from here to it.
-fn schema_dir(schema: &Path) -> &Path {
-    match schema.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    }
-}
-
 /// One `migrate` invocation's app, resolved: which project governs it, which
 /// container in the build cache is its, and every name it builds under.
 struct ResolvedApp {
@@ -155,7 +138,7 @@ fn resolve_app(app: &AppRef) -> Result<ResolvedApp> {
         )));
     }
 
-    let governing = crate::project::govern(app.config.as_deref(), schema_dir(schema))?;
+    let governing = crate::project::govern(app.config.as_deref(), crate::project::schema_dir(schema))?;
     let project = governing.identify_reported()?;
     let reserved =
         crate::cache::reserve(&project.name, &project.root, schema, governing.symbol_naming())?;
@@ -167,7 +150,7 @@ fn resolve_app(app: &AppRef) -> Result<ResolvedApp> {
 
     Ok(ResolvedApp {
         schema: schema.clone(),
-        migrations_dir: schema_dir(schema).join("migrations"),
+        migrations_dir: crate::project::migrations_dir(schema),
         app_name: reserved.app_name.clone(),
         reserved,
     })

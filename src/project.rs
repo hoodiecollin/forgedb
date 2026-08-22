@@ -451,6 +451,39 @@ pub fn identify_and_claim(chain: &Chain) -> Result<ProjectId> {
     }
     Ok(id)
 }
+/// The directory a schema's governing config is walked up from, and the directory its
+/// `migrations/` sits beside.
+///
+/// A bare `schema.forge` has no parent component, and walking from `""` would resolve
+/// against the filesystem **root** rather than the CWD — the difference between "the
+/// config beside my schema" and "any config on the machine".
+///
+/// This lived in three private copies (`main.rs`, `commands/migrate.rs`, and open-coded
+/// in `commands/validate.rs` in a form that missed the empty-parent case). #333/#361 made
+/// this module the one place a path question is answered; the copies predate that, and
+/// their existence is what let #437 happen — `generate` had no `project::` spelling to
+/// reach for, so it reached for a bare relative string instead.
+pub fn schema_dir(schema: &Path) -> &Path {
+    match schema.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    }
+}
+
+/// Where a schema's migration lineage lives: `<the schema's directory>/migrations`.
+///
+/// `migrate` appends to this and `generate` bakes its serial into the generated app's
+/// `EXPECTED_SCHEMA_VERSION`. If the two disagree about where it is, the interlock guards
+/// nothing — **silently**, because both halves still compile and both still produce a
+/// number (#437).
+///
+/// The failure is not merely "reads nothing and falls back to baseline". It reads whatever
+/// `migrations/` the *current directory* happens to have, so generating app B from app A's
+/// directory bakes A's lineage into B.
+pub fn migrations_dir(schema: &Path) -> PathBuf {
+    schema_dir(schema).join("migrations")
+}
+
 
 /// Which schema an invocation is about: `--schema` if given, else the first
 /// candidate name found beside the caller.

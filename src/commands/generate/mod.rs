@@ -233,7 +233,13 @@ pub fn run(options: GenerateOptions) -> Result<()> {
     // migrations yet).  The open guard compares this opaque integer and refuses a
     // stale data dir; it is threaded into every `database.rs` emission (the server
     // and the wasm replica share one lineage).
-    let schema_version = forgedb_migrations::current_schema_version("migrations");
+    // #437: resolved from the SCHEMA's directory, never the CWD. The bare relative
+    // string this used to pass read whatever `migrations/` the current directory had —
+    // so generating from a repo root baked baseline 1, and generating app B from app A's
+    // directory baked A's lineage into B. Both compile, both emit a number, and the
+    // interlock silently stops guarding.
+    let lineage_dir = crate::project::migrations_dir(Path::new(&schema_path));
+    let schema_version = forgedb_migrations::current_schema_version(&lineage_dir);
 
     // Determine the committed output directory.
     let output_dir = options.output.as_deref().unwrap_or("./generated");
