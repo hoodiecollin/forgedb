@@ -27,7 +27,7 @@ Complete guide for setting up your development environment and working with Forg
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Verify installation
-rustc --version  # Should be 1.70+
+rustc --version  # Edition 2024 needs >= 1.85; rust-toolchain.toml pins 1.96
 cargo --version
 ```
 
