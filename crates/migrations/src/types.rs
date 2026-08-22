@@ -373,6 +373,21 @@ pub struct Migration {
     pub to_version: u32,
 }
 
+/// What a build can say about a migration file's stored checksum (#366).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChecksumStatus {
+    /// Recomputed and matched.
+    Verified,
+    /// Recomputed and did NOT match — the file changed after it was written. The only
+    /// one of these four that means what the old error message said.
+    Mismatch,
+    /// Written before #366, by a `DefaultHasher` value that is meaningless outside the
+    /// compiler that produced it. Nothing can check it, and nothing is wrong with it.
+    Unverifiable,
+    /// Tagged with a digest this build does not know — written by a NEWER forgedb.
+    UnknownAlgorithm(String),
+}
+
 impl Migration {
     /// Create a new migration (version fields defaulted to `0` — used by callers
     /// that do not track the lineage, and by the crate's own unit tests).
@@ -424,13 +439,43 @@ impl Migration {
         let mut temp = self.clone();
         temp.checksum = String::new();
         let json = serde_json::to_string(&temp).unwrap_or_default();
-        md5::compute(json.as_bytes())
+        checksum::compute(json.as_bytes())
     }
 
-    /// Verify migration integrity
+    /// Verify migration integrity.
+    ///
+    /// Returns `true` for a file this build cannot verify as well as for one it verifies
+    /// successfully — see [`Migration::checksum_status`] for the distinction, which the
+    /// loader reports and this bool deliberately flattens for existing callers.
     pub fn verify_checksum(&self) -> bool {
-        let expected = self.calculate_checksum();
-        self.checksum == expected
+        // Verified and Unverifiable both load; Mismatch and UnknownAlgorithm do not.
+        // Written as a POSITIVE list on purpose: the negative form (`!= Mismatch`) let
+        // UnknownAlgorithm through here while the loader rejected it, so the bool and
+        // the loader disagreed about the same file. A new variant must now be classified
+        // deliberately rather than defaulting to "fine".
+        matches!(
+            self.checksum_status(),
+            ChecksumStatus::Verified | ChecksumStatus::Unverifiable
+        )
+    }
+
+    /// What this build can actually say about the stored checksum (#366).
+    ///
+    /// Three answers, not two. Collapsing them is what made the old failure mode so
+    /// misleading: an unverifiable file and a modified file are not the same event, and
+    /// only one of them is the user's problem.
+    pub fn checksum_status(&self) -> ChecksumStatus {
+        match checksum::classify(&self.checksum) {
+            checksum::Kind::Current => {
+                if self.checksum == self.calculate_checksum() {
+                    ChecksumStatus::Verified
+                } else {
+                    ChecksumStatus::Mismatch
+                }
+            }
+            checksum::Kind::Legacy => ChecksumStatus::Unverifiable,
+            checksum::Kind::Unknown(algo) => ChecksumStatus::UnknownAlgorithm(algo.to_string()),
+        }
     }
 
     /// Get the filename for this migration
@@ -511,15 +556,84 @@ impl MigrationState {
     }
 }
 
-// Simple MD5 implementation for checksums
-mod md5 {
-    pub fn compute(data: &[u8]) -> String {
-        // Simple hash for now - in production, use proper MD5
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+/// The migration-file checksum: a **specified** digest, tagged with its own name.
+///
+/// ## What was here before
+///
+/// A module called `md5` that was not MD5. It wrapped `DefaultHasher`, whose algorithm
+/// std explicitly does not guarantee across releases — and the value it produced is
+/// written into the migration JSON and verified on load. So the checksum was only
+/// meaningful to the exact compiler that computed it.
+///
+/// `cargo install forgedb` builds with whatever toolchain the user has;
+/// `rust-toolchain.toml` pins this repo's builds and does not reach an installed user. A
+/// rustup upgrade, or two developers on one repo, was enough to make every committed
+/// migration file fail to load — reported as
+/// `"file may be corrupted"`, which sends you to look for disk damage, the one thing that
+/// did not happen (#366).
+///
+/// The name is part of the defect, not incidental to it: a thing called `md5` that is not
+/// MD5 is how this survived review.
+///
+/// ## Why FNV-1a and not SHA-2
+///
+/// This detects accidental edits to a file the user committed. It is not an adversarial
+/// integrity boundary — anyone who can rewrite the migration can rewrite the checksum
+/// beside it, whatever the algorithm. Priced against the shipped graph, `sha2` is +7
+/// crates and `twox-hash` +1, against +0 for a specified constant-driven loop.
+///
+/// ## Why this is NOT shared with `cache::member_hash`
+///
+/// `src/cache.rs` also implements FNV-1a, and deliberately keeps its own copy. Two
+/// reasons, and the first is structural: `crates/migrations` cannot depend on the root
+/// crate, which depends on it. The second is that they are the same *algorithm* serving
+/// unrelated *contracts* — one keys build-cache directories, this one detects edits to a
+/// user's committed file. Sharing them would couple two stability guarantees that have no
+/// reason to move together, and each is pinned by its own golden vectors.
+pub mod checksum {
+    /// The tag written into every checksum this module produces.
+    ///
+    /// Load-bearing: it is what lets a reader tell "hashed by a version that predates
+    /// #366" from "this file was edited". Without it, fixing the algorithm would make
+    /// every existing migration file fail with the same misleading corruption error the
+    /// fix exists to remove — the fix would detonate exactly the artifact it protects.
+    pub const TAG: &str = "fnv1a64";
 
-        let mut hasher = DefaultHasher::new();
-        data.hash(&mut hasher);
-        format!("{:x}", hasher.finish())
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x100_0000_01b3;
+
+    /// FNV-1a (64-bit), rendered as 16 lowercase hex digits behind the tag.
+    ///
+    /// Specified here in full rather than delegated, because the whole point is that the
+    /// bytes do not move when something else does.
+    pub fn compute(data: &[u8]) -> String {
+        let mut hash = FNV_OFFSET_BASIS;
+        for byte in data {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        format!("{TAG}:{hash:016x}")
+    }
+
+    /// How a stored checksum relates to what this version can compute.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum Kind<'a> {
+        /// Written by this algorithm — comparable.
+        Current,
+        /// No tag at all: written before #366, by a `DefaultHasher` value that is
+        /// meaningless outside the compiler that produced it. Unverifiable, not wrong.
+        Legacy,
+        /// Tagged with something this build does not know — written by a NEWER forgedb.
+        /// Distinct from `Legacy` on purpose: downgrading is a real situation and
+        /// silently accepting an unknown digest would be the wrong answer.
+        Unknown(&'a str),
+    }
+
+    pub fn classify(stored: &str) -> Kind<'_> {
+        match stored.split_once(':') {
+            Some((TAG, _)) => Kind::Current,
+            Some((other, _)) => Kind::Unknown(other),
+            None => Kind::Legacy,
+        }
     }
 }
