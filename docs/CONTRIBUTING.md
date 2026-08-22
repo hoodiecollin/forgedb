@@ -194,9 +194,6 @@ cargo test test_parse_model --package forgedb-parser
 
 # Run with output
 cargo test -- --nocapture
-
-# Run with specific features
-cargo test --features "full-text-search"
 ```
 
 ### Run Examples
@@ -606,10 +603,38 @@ Closes #123
 ### Review Process
 
 **1. Automated checks** run (CI):
-- Build succeeds
-- Tests pass
-- Linter passes
-- Documentation builds
+
+| Check | Runs on | Blocks? |
+|---|---|---|
+| **`test suite`** — tier 1 (`make test`) | PRs into `develop`/`main`, and pushes to both | **Yes**, on PRs |
+| Cycle-scope gate | PRs into `develop` | Yes |
+| Substrate outside-repo reclose | `main` | Yes |
+| `migrate_tests` vs the published substrate | `main` | Yes |
+| Go reclose | PRs touching the Go/FFI generators | Yes |
+| Nightly ignored suite — tier 2 | schedule, against `develop` | Files an issue |
+
+Run tier 1 yourself before opening a PR — it is the same command CI runs:
+
+```bash
+make test          # cargo test --workspace --no-fail-fast + cargo build --workspace --examples
+```
+
+The examples build is not optional: `--lib`, `--bins`, `--tests` **and** `--doc` all
+exclude examples, so no test flag covers them, and their omission has silently broken
+the tree twice.
+
+The slow tier is the ~20 tests that each generate and compile a crate. They are
+`#[ignore]`d out of tier 1 and run nightly, but run them yourself when you touch codegen,
+the build cache, or the generated API:
+
+```bash
+make test-ignored  # minutes, not seconds
+```
+
+Before #390 nothing in CI ran `cargo test` at all, and this section claimed otherwise —
+which is a plausible reason it went unnoticed long enough to cost
+[#381](https://github.com/hoodiecollin/forgedb/issues/381) and
+[#386](https://github.com/hoodiecollin/forgedb/issues/386).
 
 **2. Code review** by maintainers:
 - Code quality
@@ -638,7 +663,11 @@ The subject line names the branch and what it did, with the issue in parentheses
 Merge feat/238-string-n: string(N) fixed-width inline string columns (#238)
 ```
 
-Most work here merges **locally** rather than through the GitHub button:
+**Core work goes through a pull request** (#390). It used to merge locally, and a
+merge gate can only stop a merge it sees — a PR-only check would have been watching an
+empty road. The branch-per-scope rhythm is unchanged; only the mechanism is. Merge with
+the GitHub button (merge commit — squash and rebase are disabled), or locally once the
+PR's checks are green:
 
 ```bash
 make cycle-scope PR=<n>          # or ISSUE=<n> — the gate CI runs on PRs into develop
