@@ -153,7 +153,8 @@ See [Pull Request Process](#pull-request-process) below for detailed guidelines.
 ### Prerequisites
 
 **Required:**
-- Rust 1.70+ ([rustup.rs](https://rustup.rs/))
+- Rust 1.96 — pinned in `rust-toolchain.toml`; rustup honours it automatically ([rustup.rs](https://rustup.rs/)).
+  The workspace is edition 2024, which requires ≥ 1.85; 1.70 cannot build it.
 - Git
 
 **Optional but recommended:**
