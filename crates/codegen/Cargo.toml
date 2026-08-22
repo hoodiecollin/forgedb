@@ -27,3 +27,8 @@ insta = "1.40"
 # malformed manifest is the exact failure class #335 is about, and a string
 # snapshot cannot see it.
 toml = "0.8"
+# AST-based guards over generated Rust (#388). PATH-ONLY — no `version` key. See the
+# longer note in the root Cargo.toml: a version here breaks `cargo publish` for this
+# crate, because cargo only strips a versionless dev-dependency from the published
+# manifest and `forgedb-source-guard` is `publish = false`.
+forgedb-source-guard = { path = "../source-guard" }

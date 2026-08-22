@@ -19,6 +19,7 @@ members = [
     "crates/txn",
     "crates/coordinator",
     "crates/lsp-server",
+    "crates/source-guard",
 ]
 
 # The Tauri inspector is its OWN workspace (#411), not a member of this one.
@@ -126,6 +127,14 @@ home = "0.5"
 # vacuously. Already in the lockfile transitively, so this adds no package to the resolve;
 # dev-only, so `cargo install forgedb` never builds it.
 regex = "1.12"
+
+# AST-based guards over Rust source (#388). PATH-ONLY, and it MUST STAY THAT WAY:
+# `forgedb-source-guard` is `publish = false`, so adding a `version` key here makes
+# `cargo publish -p forgedb` fail with "no matching package found" — cargo only strips a
+# dev-dependency from the published manifest when it has no version. Every other path dep
+# above carries a version because every other one is published; this is the deliberate
+# exception, not an oversight. Verified in both directions with `cargo package`.
+forgedb-source-guard = { path = "crates/source-guard" }
 
 # The profile that 'dist' will build with
 [profile.dist]

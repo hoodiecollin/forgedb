@@ -452,6 +452,7 @@ dependencies = [
  "forgedb-migrations",
  "forgedb-parser",
  "forgedb-query-params",
+ "forgedb-source-guard",
  "forgedb-validation",
  "forgedb-wal",
  "forgedb-watcher",
@@ -506,6 +507,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "forgedb-parser",
+ "forgedb-source-guard",
  "insta",
  "prettyplease",
  "proc-macro2",
@@ -581,6 +583,13 @@ version = "0.1.1"
 dependencies = [
  "serde",
  "serde_urlencoded",
+]
+
+[[package]]
+name = "forgedb-source-guard"
+version = "0.0.0"
+dependencies = [
+ "syn",
 ]
 
 [[package]]
