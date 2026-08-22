@@ -2,6 +2,7 @@
 //!
 //! Uses insta for snapshot testing to ensure generated code remains stable.
 
+use forgedb_source_guard::RustSource;
 use forgedb_codegen::{
     ApiGenerator, FfiGenerator, GenConfig, GoGenerator, GoSdkGenerator, HopPlan, ModelOp,
     NapiGenerator, OpenApiGenerator, PyO3Generator, PythonSdkGenerator, RustGenerator,
@@ -9118,12 +9119,36 @@ fn test_rust_generation_string_n_scan_borrows_the_slot() {
     // not available there, because the live column reads through the file on
     // every access and has nothing to lend. So scope the absence to the scan
     // scope's body rather than to the whole file.
-    let scan = &code[code.find("pub fn __with_scan").expect("the scan scope is emitted")..];
-    let scan: String = scan.split_whitespace().collect::<Vec<_>>().join(" ");
-    let scan = &scan[..scan.find("pub fn ").map(|i| i + 7).unwrap_or(scan.len())];
-    assert!(
-        !scan.contains("read_bytes"),
-        "a per-row `Vec` on the scan path is the one outcome #238 exists to avoid: {scan}"
+    //
+    // FIRST AST-SCOPED GUARD (#388). What this replaces, and why:
+    //
+    //     let scan = &code[code.find("pub fn __with_scan").expect(…)..];
+    //     let scan: String = scan.split_whitespace()…join(" ");
+    //     let scan = &scan[..scan.find("pub fn ").map(|i| i + 7).unwrap_or(scan.len())];
+    //     assert!(!scan.contains("read_bytes"), …);
+    //
+    //   * the terminator was `unwrap_or(scan.len())` — if `pub fn ` ever stopped
+    //     matching, the scope silently WIDENED to the rest of the file rather than
+    //     failing;
+    //   * the whitespace flatten existed only because `prettyplease` breaks lines by
+    //     length, so the same call renders differently between schemas;
+    //   * and `contains("read_bytes")` cannot tell a call from a comment, from a string
+    //     literal, or from a longer identifier such as `read_bytes_at`.
+    //
+    // `method_named` fails loudly if the method is absent, and — the part a substring
+    // cannot express at all — if it is AMBIGUOUS. Generated code declares one
+    // `__with_scan` per model, so on a multi-model schema `code.find` silently took the
+    // first and asserted about whichever model happened to be emitted first. This schema
+    // has a single model, so the lookup is unique by construction; the error would say so
+    // otherwise instead of quietly picking one.
+    let scan_src = RustSource::generated("database.rs", code.clone());
+    let scan = scan_src
+        .method_named("__with_scan")
+        .expect("the scan scope is emitted");
+    assert_eq!(
+        scan.call_count("read_bytes"),
+        0,
+        "a per-row `Vec` on the scan path is the one outcome #238 exists to avoid"
     );
 }
 
