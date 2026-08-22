@@ -1,4 +1,4 @@
-use crate::types::{Migration, SchemaChange};
+use crate::types::{ChecksumStatus, Migration, SchemaChange};
 use std::fs;
 use std::path::Path;
 
@@ -58,11 +58,29 @@ impl MigrationGenerator {
         let migration: Migration = serde_json::from_str(&contents)
             .map_err(|e| format!("Failed to parse migration file: {}", e))?;
 
-        // Verify checksum
-        if !migration.verify_checksum() {
-            return Err(
-                "Migration file checksum verification failed - file may be corrupted".to_string(),
-            );
+        // #366: three distinguishable outcomes, not one. The old message said
+        // "may be corrupted" for every failure, including the one caused by upgrading
+        // rustup — which sent the reader to look for disk damage, the one thing that had
+        // not happened.
+        match migration.checksum_status() {
+            ChecksumStatus::Verified | ChecksumStatus::Unverifiable => {}
+            ChecksumStatus::Mismatch => {
+                return Err(format!(
+                    "Migration file checksum does not match its contents: {}\n\
+                     The file was modified after it was created. Restore it from version \
+                     control, or delete the checksum field to accept the current contents.",
+                    path.as_ref().display()
+                ));
+            }
+            ChecksumStatus::UnknownAlgorithm(algo) => {
+                return Err(format!(
+                    "Migration file {} carries a `{algo}` checksum, which this build of \
+                     forgedb does not know how to compute.\n\
+                     It was almost certainly written by a NEWER forgedb; upgrade rather \
+                     than editing the file.",
+                    path.as_ref().display()
+                ));
+            }
         }
 
         Ok(migration)
