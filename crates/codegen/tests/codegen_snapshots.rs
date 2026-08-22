@@ -6180,10 +6180,40 @@ Post {
         "#170: __stage_append does NOT per-record fsync (no plain wal.write)"
     );
     // The committed single-write path keeps the durable per-op fsync.
-    let insert_body = &code[code.find("pub fn insert(").unwrap_or(0)..];
-    assert!(
-        insert_body.contains(".write(&forgedb_wal::WalEntry"),
-        "#170: committed insert still fsyncs per op (durable single write unchanged)"
+    //
+    // The window is BOUNDED to `insert`'s own body, and both ends are FATAL on a miss.
+    // It used to read `&code[code.find("pub fn insert(").unwrap_or(0)..]`, which was
+    // wrong twice over:
+    //
+    //   * `unwrap_or(0)` meant a stale needle did not fail — it silently widened the
+    //     window to the WHOLE FILE from byte 0, leaving the assertion live but aimed at
+    //     the wrong subject.
+    //   * even when the needle matched, the window ran to EOF. Measured on this schema:
+    //     the window covered 237 KB of a 261 KB file and contained EIGHT
+    //     `.write(&forgedb_wal::WalEntry` calls, only ONE of them `insert`'s. The other
+    //     seven belong to `update`, `delete`, the second model's `insert`/`update`/
+    //     `delete`, `commit`, and a shared helper — so this assertion passed even with
+    //     `insert`'s own WAL write deleted outright. It was not guarding #170.
+    //
+    // Hence `assert_eq!(…, 1)` rather than `contains`: a count pins the claim to
+    // insert's single write, and goes RED if the window ever widens to swallow a
+    // sibling method again. Superseded by AST scoping under #388; until then this is
+    // the bounded-and-fatal form.
+    let insert_at = code
+        .find("pub fn insert(")
+        .expect("#170: `pub fn insert(` must be present to scope the fsync guard");
+    let insert_body = {
+        let tail = &code[insert_at..];
+        let end = tail[1..]
+            .find("\n    pub fn ")
+            .map(|i| i + 1)
+            .expect("#170: a following `pub fn` must bound insert's body");
+        &tail[..end]
+    };
+    assert_eq!(
+        insert_body.matches(".write(&forgedb_wal::WalEntry").count(),
+        1,
+        "#170: committed insert still fsyncs per op — exactly one WAL write, inside          insert's own body (got:\n{insert_body})"
     );
 }
 
