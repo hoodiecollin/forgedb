@@ -380,6 +380,33 @@ jobs:
           grep -q 'staticlib' "$CACHE_APP/ffi/Cargo.toml"
           "$FORGEDB" build
 
+          # #337: the delivered half. A C consumer of ForgeDB now gets a header
+          # and an archive in its own tree, and this is the only step that proves
+          # a registry-resolved build produces two halves that AGREE — the
+          # fingerprint macro in the header against the accessor in the archive.
+          # A compile cannot see that; only linking and running can.
+          test -f generated/ffi/forgedb.h
+          test -f generated/ffi/libforgedb.a
+          cat > csmoke.c <<'CSMOKE'
+          #include <stdio.h>
+          #include "forgedb.h"
+          int main(void) {
+            printf("header:  %s\n", FORGEDB_FINGERPRINT);
+            if (!forgedb_fingerprint_ok()) {
+              fprintf(stderr, "FAIL: the archive was built from different source than the header\n");
+              return 1;
+            }
+            printf("fingerprint agrees\n");
+            return 0;
+          }
+          CSMOKE
+          case "$(uname -s)" in
+            Darwin) LINK_FLAGS="-framework CoreFoundation -framework Security -lc++";;
+            *)      LINK_FLAGS="-lm -ldl -lpthread -lstdc++";;
+          esac
+          cc -I generated/ffi csmoke.c generated/ffi/libforgedb.a $LINK_FLAGS -o csmoke
+          ./csmoke
+
       - name: 3/6 napi — generate node --runtime, then forgedb build
         shell: bash
         env:
@@ -391,6 +418,25 @@ jobs:
           cat "$CACHE_APP/napi/Cargo.toml"
           ! grep -q '^forgedb-' "$CACHE_APP/napi/Cargo.toml"
           "$FORGEDB" build
+
+          # #337: require the delivered addon. `cargo build` cannot see whether
+          # the two halves agree, and it cannot see a load failure at all — the
+          # addon is `dlopen`ed by Node, not by the linker.
+          test -f generated/napi/forgedb.node
+          grep -q '"main": "index.js"' generated/napi/package.json
+          cat > nodesmoke.js <<'NODESMOKE'
+          const os = require('os'), fs = require('fs'), path = require('path');
+          const db = require(path.join(process.cwd(), 'generated', 'napi'));
+          const h = db.ForgeDb.open(fs.mkdtempSync(path.join(os.tmpdir(), 'reclose-')));
+          h.createAuthor({ email: 'a@b.c', name: 'Ada', posts: null });
+          h.commit();
+          const rows = h.allAuthor();
+          if (rows.length !== 1 || rows[0].name !== 'Ada') {
+            throw new Error('read back the wrong row: ' + JSON.stringify(rows));
+          }
+          console.log('node OK');
+          NODESMOKE
+          node nodesmoke.js
 
       - name: 4/6 pyo3 — generate python --runtime, then forgedb build
         shell: bash
@@ -409,6 +455,25 @@ jobs:
           # its absence would surface as a link error naming neither cause.
           test -f "$CACHE_APP/pyo3/build.rs"
           "$FORGEDB" build
+
+          # #337: import the delivered extension. This is the ONLY check that can
+          # see a `PyInit_<stem>` mismatch — the extension is delivered under a
+          # private name and CPython resolves the init symbol from that FILENAME,
+          # so a disagreement between the name and the `#[pymodule]` function is
+          # invisible to `cargo build`, to `cargo check` and to every snapshot.
+          test -f generated/pyo3/_forgedb_native.abi3.so
+          cat > pysmoke.py <<'PYSMOKE'
+          import os, sys, tempfile
+          sys.path.insert(0, os.path.join(os.getcwd(), "generated", "pyo3"))
+          import forgedb
+          h = forgedb.ForgeDb.open(tempfile.mkdtemp())
+          h.create_author({"email": "a@b.c", "name": "Ada", "posts": None})
+          h.commit()
+          rows = [r.to_dict() for r in h.all_author()]
+          assert len(rows) == 1 and rows[0]["name"] == "Ada", rows
+          print("python OK", forgedb.__fingerprint__)
+          PYSMOKE
+          python3 pysmoke.py
 
       - name: 5/6 browser read-replica — generate browser --replica (wasm32)
         shell: bash

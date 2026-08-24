@@ -147,6 +147,135 @@ fn run_command(workflow_file: &str, step_name: &str) -> String {
     unwrap_continuations(&tail[..end])
 }
 
+/// The shell of a step whose `run:` is a BLOCK SCALAR (`run: |`).
+///
+/// [`run_command`] reads to the end of the `run:` line, which for a block scalar
+/// is the literal `|` — so a `!contains` guard built on it passes having examined
+/// one character, and a `contains` guard fails for a reason that looks like the
+/// step being wrong. That is latent rather than live today (both existing callers
+/// key single-line steps), and it stays latent because the block-scalar form is
+/// here rather than because nobody has reached for it.
+///
+/// Comments are stripped, like [`workflow`] does: these steps explain themselves
+/// in prose, and a needle that its own rationale can satisfy is not a guard.
+fn run_block(workflow_file: &str, step_name: &str) -> String {
+    let src = read(&format!(".github/workflows/{workflow_file}"));
+    let needle = format!("- name: {step_name}");
+    let start = src.find(&needle).unwrap_or_else(|| {
+        panic!("{workflow_file} has no step named {step_name:?} — the guard keyed to it is now vacuous")
+    });
+    let rest = &src[start..];
+    let run = rest.find("\n").map(|_| ()).and(rest.find("run: |")).unwrap_or_else(|| {
+        panic!(
+            "step {step_name:?} in {workflow_file} has no block-scalar `run: |`. \
+             If it became a single-line `run:`, use `run_command` — this helper \
+             would otherwise return the whole rest of the file."
+        )
+    });
+    let body = &rest[run + "run: |".len()..];
+
+    // A block scalar runs to the first line that is neither blank nor indented
+    // deeper than the step's own `- name:` key.
+    let indent = src[..start]
+        .rfind('\n')
+        .map(|nl| start - nl - 1)
+        .unwrap_or(0);
+    let mut out = String::new();
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            out.push('\n');
+            continue;
+        }
+        let this = line.len() - line.trim_start().len();
+        if this <= indent {
+            break;
+        }
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        out.push_str(line.trim_start());
+        out.push('\n');
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// S337 — the reclose LOADS what it built.
+// ---------------------------------------------------------------------------
+
+/// #337's delivered artifacts are only proven by loading them, and the reclose
+/// is the only place that happens against registry-resolved substrate.
+///
+/// Each assertion anchors on the COMMAND that does the work — the interpreter
+/// invocation, the compile — never on a step name or on a comment. Dropping one
+/// must fail loudly here rather than leaving an arm that still passes while
+/// covering less than it claims.
+#[test]
+fn s337_each_reclose_arm_loads_the_artifact_it_delivered() {
+    for (step, needles) in [
+        (
+            "2/6 ffi — generate ffi, then forgedb build",
+            vec!["cc -I generated/ffi", "generated/ffi/libforgedb.a", "./csmoke"],
+        ),
+        (
+            "3/6 napi — generate node --runtime, then forgedb build",
+            vec!["node nodesmoke.js", "generated/napi/forgedb.node"],
+        ),
+        (
+            "4/6 pyo3 — generate python --runtime, then forgedb build",
+            vec!["python3 pysmoke.py", "generated/pyo3/_forgedb_native.abi3.so"],
+        ),
+    ] {
+        let body = run_block("substrate-reclose.yml", step);
+        for needle in needles {
+            assert!(
+                body.contains(needle),
+                "reclose step {step:?} no longer runs `{needle}` — the arm still \
+                 builds, still goes green, and no longer proves the delivered \
+                 artifact can be loaded:\n{body}"
+            );
+        }
+    }
+}
+
+/// The Go reclose must exercise the `init()` check's CALL SITE, not merely a
+/// matching pair.
+///
+/// A run where both halves agree proves the check does not false-positive. Only
+/// a deliberately mismatched pair proves it runs at all (#345's lesson). The
+/// mismatch is induced with a `[storage]` knob because that changes durability
+/// semantics and not one exported symbol — the case the linker cannot see.
+#[test]
+fn s337_the_go_reclose_proves_the_init_check_executes() {
+    let body = run_block("go-reclose.yml", "Reclose — generate, build, link, run");
+    for needle in [
+        // The induced mismatch: regenerate without rebuilding the archive.
+        "fsync = \"always\"",
+        "generate go --runtime --force",
+        // …and the assertion that the binary REFUSES to run.
+        "different schema",
+        "forgedb build",
+    ] {
+        assert!(
+            body.contains(needle),
+            "the Go reclose no longer induces a fingerprint mismatch (`{needle}` is \
+             gone), so the init() check is only ever exercised on a matching pair \
+             — which proves it does not false-positive, and nothing else:\n{body}"
+        );
+    }
+    // `forgedb build` must NOT be re-run between the regenerate and the go
+    // build, or the pair matches again and the guard is vacuous.
+    let after = body
+        .split_once("generate go --runtime --force")
+        .expect("the induced mismatch is present")
+        .1;
+    assert!(
+        !after.contains("\"$FORGEDB\" build"),
+        "the reclose rebuilds the archive after inducing the mismatch, so the two \
+         halves agree again and the init() check is never triggered:\n{after}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // S5 — the tier-2 command stays workspace-level.
 // ---------------------------------------------------------------------------
