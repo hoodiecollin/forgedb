@@ -233,6 +233,27 @@ jobs:
           # own, so a failure here names generation rather than the build.
           "$FORGEDB" generate all
 
+          # EXACTLY WHICH MANIFESTS REACH THE USER'S TREE (#339).
+          #
+          # An EQUALITY, not a superset. A superset would pass through the exact
+          # change it exists to catch: `[placement].rust_package` defaulting on
+          # would add a second manifest and read as fine. So would any new
+          # emitter nobody told CI about.
+          #
+          # This is the checkable form of the property `forgedb init` states
+          # positively at scaffold time — ForgeDB owns the build, and the one
+          # cargo package it writes into the consumer's tree is the class-A REST
+          # client the user compiles themselves.
+          find "$APP" -name Cargo.toml | sed "s#^$APP/##" | LC_ALL=C sort \
+            > "$RUNNER_TEMP/manifests.actual"
+          printf '%s\n' 'generated/rust-sdk/Cargo.toml' > "$RUNNER_TEMP/manifests.expected"
+          if ! diff -u "$RUNNER_TEMP/manifests.expected" "$RUNNER_TEMP/manifests.actual"; then
+            echo "FAIL: the set of cargo manifests ForgeDB writes into the app has changed." >&2
+            echo "A new one means an emitter started writing into a tree ForgeDB does not" >&2
+            echo "own; a missing one means an arm above is no longer emitting what it claims." >&2
+            exit 1
+          fi
+
       - name: Locate the cache workspace
         shell: bash
         run: |

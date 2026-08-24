@@ -847,3 +847,45 @@ fn no_cache_action_names_the_forgedb_home() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// S339-6 — exactly one manifest reaches the consumer's tree.
+// ---------------------------------------------------------------------------
+
+/// An EQUALITY, not a superset — and that distinction is the whole guard.
+///
+/// A superset assertion passes through the exact change it exists to catch: an
+/// `[placement].rust_package` default flipping on adds a second manifest and
+/// reads as fine, and so does any new emitter that starts writing a cargo
+/// package into a tree ForgeDB does not own.
+///
+/// The plan for #339 originally pinned the placement MODE in the app's config
+/// instead. That is unimplementable — #338's surface is one optional key whose
+/// absence is the opt-out, and there is no affirmative "cache-only" spelling to
+/// write. Asserting the OUTCOME needs no spelling, catches strictly more, and
+/// fails with the diff.
+#[test]
+fn the_bare_job_asserts_an_exact_manifest_set() {
+    let body = run_block("substrate-reclose.yml", "0/6 generate all — emit every cache package");
+
+    assert!(
+        body.contains("find \"$APP\" -name Cargo.toml"),
+        "the reclose no longer enumerates the manifests under the app, so a \
+         second cargo package appearing in a user's tree would be \
+         invisible:\n{body}"
+    );
+    assert!(
+        body.contains("diff -u"),
+        "the manifest check no longer COMPARES the two sets. A `grep`/`test -f` \
+         form is a superset assertion, and a superset passes through the exact \
+         change this exists to catch — a placement default flipping on, or a new \
+         emitter nobody told CI about:\n{body}"
+    );
+    assert!(
+        body.contains("generated/rust-sdk/Cargo.toml"),
+        "the expected set no longer names the one manifest ForgeDB legitimately \
+         writes into the app (the class-A REST client crate). An empty expected \
+         set would fail always; a missing one would compare against \
+         nothing:\n{body}"
+    );
+}
