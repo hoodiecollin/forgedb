@@ -64,11 +64,14 @@
 //!                     indexed: false,
 //!                     index_type: "hash".to_string(),
 //!                     constraints: vec![],
+//!                     depends_on: vec![],
 //!                 },
 //!             ],
 //!             composite_indexes: vec![],
 //!         },
 //!     ],
+//!     enums: vec![],
+//!     structs: vec![],
 //! };
 //!
 //! let new_schema = SimpleSchema {
@@ -84,6 +87,7 @@
 //!                     indexed: false,
 //!                     index_type: "hash".to_string(),
 //!                     constraints: vec![],
+//!                     depends_on: vec![],
 //!                 },
 //!                 SimpleField {
 //!                     name: "email".to_string(),
@@ -93,11 +97,14 @@
 //!                     indexed: false,
 //!                     index_type: "hash".to_string(),
 //!                     constraints: vec![],
+//!                     depends_on: vec![],
 //!                 },
 //!             ],
 //!             composite_indexes: vec![],
 //!         },
 //!     ],
+//!     enums: vec![],
+//!     structs: vec![],
 //! };
 //!
 //! // SchemaDiffer is a unit struct; call diff() as a static method
@@ -224,12 +231,15 @@ pub mod lineage;
 mod tracker;
 mod types;
 
-pub use diff::{SchemaDiffer, SimpleSchema, SimpleModel, SimpleField, SimpleConstraint};
+pub use diff::{
+    SchemaDiffer, SimpleConstraint, SimpleEnum, SimpleField, SimpleModel, SimpleSchema,
+    SimpleStruct,
+};
 pub use generator::MigrationGenerator;
 pub use lineage::{
-    authored_body_path, current_schema_version, load_versioned_schema, migration_body_dir,
-    save_versioned_schema, scaffold_authored_body, versioned_schema_dir, versioned_schema_path,
-    MigrationLineage, BASELINE_SCHEMA_VERSION,
+    BASELINE_SCHEMA_VERSION, MigrationLineage, authored_body_path, current_schema_version,
+    load_versioned_schema, migration_body_dir, save_versioned_schema, scaffold_authored_body,
+    versioned_schema_dir, versioned_schema_path,
 };
 pub use tracker::MigrationTracker;
 pub use types::*;

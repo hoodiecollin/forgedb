@@ -1,9 +1,19 @@
+use crate::project::{Answer, Asker, Question};
 use crate::{error::CliError, project, templates, ui, Result};
 use std::fs;
 use std::path::Path;
 
 pub struct InitOptions {
+    /// The directory to scaffold. Frequently a path (`apps/api`), which is why
+    /// the project id is its **last component** rather than the whole argument.
     pub project_name: String,
+    /// `--project-name`: the project id, decoupled from the directory.
+    ///
+    /// The non-interactive twin of C12's prompt (#367). The two decisions a
+    /// prompt fills fire on adopted repositories, so this does nothing for them
+    /// on its own — but a scaffold whose directory name is already taken has
+    /// exactly one thing it needs, and needing it in CI is why it is a flag.
+    pub project_name_override: Option<String>,
     pub template: Option<String>,
     /// REMOVED (#335 §15). Carried only so `refuse_removed_flags` can name the
     /// replacement; setting it is always an error.
@@ -16,7 +26,12 @@ pub struct InitOptions {
     pub isolated: Option<bool>,
 }
 
+/// `forgedb init`, with whatever asker this invocation is entitled to.
 pub fn run(options: InitOptions) -> Result<()> {
+    run_with(options, &*crate::ask::asker())
+}
+
+pub fn run_with(options: InitOptions, asker: &dyn Asker) -> Result<()> {
     // Before anything touches the filesystem: a removed flag is refused by name,
     // never absorbed. Placed first so the refusal cannot leave a half-scaffolded
     // directory behind.
@@ -35,8 +50,7 @@ pub fn run(options: InitOptions) -> Result<()> {
     // adding an app looks like. So `init` asks nothing and simply reports what
     // it found, then records the answer explicitly.
     let isolated = resolve_isolated(&options)?;
-    let project_id = derive_project_id(&options.project_name);
-    refuse_a_taken_name(&project_id, isolated)?;
+    let project_id = resolve_a_taken_name(project_id(&options)?, isolated, asker)?;
 
     // Create project directory structure
     create_project_structure(&options)?;
@@ -188,20 +202,49 @@ fn resolve_isolated(options: &InitOptions) -> Result<bool> {
 ///
 /// Only meaningful for a project root: a config that joins an enclosing project
 /// declares no name of its own, so it cannot collide.
-fn refuse_a_taken_name(project_name: &str, isolated: bool) -> Result<()> {
+fn resolve_a_taken_name(
+    project_name: String,
+    isolated: bool,
+    asker: &dyn Asker,
+) -> Result<String> {
     if !isolated {
-        return Ok(());
+        return Ok(project_name);
     }
-    if let Some(held_by) = project::held_by(project_name)? {
-        return Err(CliError::Config(format!(
-            "Project name {project_name:?} is already claimed by {}.\n\n\
-             Two projects sharing an id would share one build cache, one lockfile \
-             and one target directory. Pick a different name, or pass \
-             --no-isolated to join an enclosing project instead.",
-            held_by.display()
-        )));
+    let Some(holder) = project::held_by(&project_name)? else {
+        return Ok(project_name);
+    };
+
+    // C12's other half: at a terminal, offer a new name here — where the name is
+    // being chosen — rather than refusing and leaving the user to pick one.
+    //
+    // `TakeOverClaim` is deliberately NOT offered and not honoured: `init`
+    // claims nothing (a scaffold that reserved an id it may never generate would
+    // leave a stale claim behind for every abandoned `init`), so there is
+    // nothing here for a take-over to write into. The first `generate` in the
+    // new tree reaches the take-over path with a real project behind it.
+    let question = Question::Collision {
+        id: project_name.clone(),
+        root: Path::new(".").join(&project_name),
+        held_by: holder.path.clone(),
+        holder_exists: holder.exists,
+        schema_hint: None,
+    };
+    if let Some(Answer::Name(chosen)) = asker.ask(&question)? {
+        // The DIRECTORY keeps the name the user typed. A project id and a
+        // directory are different things.
+        ui::info(&format!("Naming this project {chosen:?}"));
+        return Ok(chosen);
     }
-    Ok(())
+
+    Err(CliError::Config(format!(
+        "Project name {project_name:?} is already claimed by {}.\n\n\
+         Two projects sharing an id would share one build cache, one lockfile \
+         and one target directory.\n\n\
+         Give this project a different id with `--project-name <NAME>` — the \
+         directory keeps the name you typed — or pass --no-isolated to join \
+         an enclosing project instead.",
+        holder.path.display()
+    )))
 }
 
 /// The project id for a scaffold: the **last component** of the path, not the
@@ -211,6 +254,38 @@ fn refuse_a_taken_name(project_name: &str, isolated: bool) -> Result<()> {
 /// argument was harmless while `[project].name` was ignored; since #333 the name
 /// is used verbatim as a directory under `~/.forgedb`, so a path there is either
 /// rejected or escapes the cache.
+/// This scaffold's project id: `--project-name` when given, else the directory's
+/// last path component.
+///
+/// The **directory keeps the name the user typed** either way. A project id and
+/// a directory are different things, and conflating them is what made a taken id
+/// an unfixable `init` — the user had to rename the directory to rename the
+/// project.
+fn project_id(options: &InitOptions) -> Result<String> {
+    match options.project_name_override.as_deref() {
+        Some(explicit) => {
+            // Refused here rather than at the first `generate`: a project id is
+            // used verbatim as a directory under ~/.forgedb, so a path there
+            // escapes the cache rather than keys it.
+            if explicit.is_empty()
+                || explicit.contains('/')
+                || explicit.contains('\\')
+                || explicit == "."
+                || explicit == ".."
+            {
+                return Err(CliError::Config(format!(
+                    "Invalid --project-name {explicit:?}: a project id is used \
+                     verbatim as a directory name under ~/.forgedb/projects/, so \
+                     it cannot be empty, contain a path separator, or be `.` or \
+                     `..`."
+                )));
+            }
+            Ok(explicit.to_string())
+        }
+        None => Ok(derive_project_id(&options.project_name)),
+    }
+}
+
 fn derive_project_id(project_name: &str) -> String {
     Path::new(project_name)
         .file_name()
