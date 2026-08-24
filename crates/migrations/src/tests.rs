@@ -17,7 +17,7 @@ fn test_migration_generate_and_load_roundtrip() {
             field_name: "age".to_string(),
             field_type: "u32".parse().unwrap(),
             nullable: true,
-            default_value: Some("0".to_string()),
+            default_json: Some("0".to_string()),
         },
     ];
 
@@ -48,7 +48,7 @@ fn test_breaking_change_detection() {
             field_name: "name".to_string(),
             field_type: "string".parse().unwrap(),
             nullable: false,
-            default_value: None,
+            default_json: None,
         },
         SchemaChange::RemoveField {
             model_name: "User".to_string(),
@@ -65,7 +65,7 @@ fn test_breaking_change_detection() {
     let migration = Migration::new("Update User model".to_string(), changes);
 
     assert!(migration.has_breaking_changes());
-    // M4: AddField { nullable: false, default_value: None } is also breaking now
+    // M4: AddField { nullable: false, default_json: None } is also breaking now
     assert_eq!(migration.breaking_changes().len(), 3);
     assert_eq!(migration.safe_changes().len(), 0);
 }
@@ -187,7 +187,7 @@ fn test_diff_classifies_authored_body_residue() {
         field_name: "role".to_string(),
         field_type: "string".parse().unwrap(),
         nullable: false,
-        default_value: None,
+        default_json: None,
     };
     for c in [&type_change, &narrow_nullable, &required_no_default] {
         assert_eq!(
@@ -227,7 +227,7 @@ fn test_diff_classifies_authored_body_residue() {
         field_name: "bio".to_string(),
         field_type: "string".parse().unwrap(),
         nullable: true,
-        default_value: None,
+        default_json: None,
     };
     let rename = SchemaChange::RenameField {
         model_name: "User".to_string(),
@@ -277,7 +277,7 @@ fn test_migration_lineage_expands_range() {
                 field_name: format!("f{i}"),
                 field_type: "string".parse().unwrap(),
                 nullable: true,
-                default_value: None,
+                default_json: None,
             }],
             *from,
             *to,
@@ -327,7 +327,7 @@ fn test_scaffold_authored_body_only_for_residue() {
             field_name: "bio".to_string(),
             field_type: "string".parse().unwrap(),
             nullable: true,
-            default_value: None,
+            default_json: None,
         }],
         1,
         2,

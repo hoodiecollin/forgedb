@@ -15,7 +15,7 @@ fn test_generate_and_load_migration() {
             field_name: "email".to_string(),
             field_type: "string".parse().unwrap(),
             nullable: false,
-            default_value: None,
+            default_json: None,
         },
     ];
 
@@ -45,7 +45,7 @@ fn test_migration_report() {
             field_name: "name".to_string(),
             field_type: "string".parse().unwrap(),
             nullable: false,
-            default_value: None,
+            default_json: None,
         },
         SchemaChange::RemoveField {
             model_name: "User".to_string(),

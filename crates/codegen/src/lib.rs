@@ -48,6 +48,7 @@
 //! ```
 
 pub mod config;
+pub mod default_fill;
 pub mod core_pkg;
 pub mod server_pkg;
 pub mod go_sdk;
@@ -69,6 +70,7 @@ pub mod go;
 // Re-export generators for convenience
 pub use api::ApiGenerator;
 pub use config::{FsyncMode, GenConfig};
+pub use default_fill::{FillValue, default_fill};
 pub use core_pkg::CorePackage;
 pub use server_pkg::{ServerLayout, ServerPackage};
 pub use ffi::FfiGenerator;

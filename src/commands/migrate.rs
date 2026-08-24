@@ -1062,15 +1062,15 @@ fn build_model_ops(
                 model_name,
                 field_name,
                 nullable,
-                default_value,
+                default_json,
                 ..
             } => {
-                let json = add_field_default_json(
+                let json = add_field_json(
                     dest_schema,
                     model_name,
                     field_name,
                     *nullable,
-                    default_value.as_deref(),
+                    default_json.as_deref(),
                 );
                 acc.entry(model_name.clone())
                     .or_default()
@@ -1111,97 +1111,37 @@ fn build_model_ops(
         .collect()
 }
 
-/// Compute the JSON default literal for an additive field, resolving the field's
-/// real type from the destination schema (#74 Phase 3).  A nullable add with no
-/// default is `null`; a defaulted add is encoded to match the field's serde
-/// representation (numbers for numeric types, quoted strings for string-repr
-/// types like `string`/`uuid`/`decimal`/enum).
-fn add_field_default_json(
+/// The JSON literal the transformer's hop inserts for an additive field
+/// (#74 Phase 3).
+///
+/// Three cases, and the third is the interesting one:
+///
+/// 1. the change records a resolved `@default` — used **verbatim**, because it
+///    is already the one lowering `forgedb_codegen::default_fill` produced and
+///    the reopen backfill writes the matching bytes from the same value;
+/// 2. a nullable add — `null`;
+/// 3. a required add with no default. There is nothing here to emit. It is
+///    `Authored` residue whose value comes from the recorded answer, and
+///    `emit_transform_crate` refuses to generate a hop that has none.
+fn add_field_json(
     dest_schema: &forgedb_parser::Schema,
     model_name: &str,
     field_name: &str,
     nullable: bool,
-    default_value: Option<&str>,
+    default_json: Option<&str>,
 ) -> String {
-    use forgedb_parser::FieldType;
-
-    // Resolve the (non-nullable) base type of the field from the dest schema.
-    fn base(ft: &FieldType) -> &FieldType {
-        match ft {
-            FieldType::Nullable(inner) => base(inner),
-            other => other,
-        }
+    if let Some(j) = default_json {
+        return j.to_string();
     }
-    let ftype = dest_schema
-        .models
-        .iter()
-        .find(|m| m.name == model_name)
-        .and_then(|m| m.fields.iter().find(|f| f.name == field_name))
-        .map(|f| base(&f.field_type));
-
-    let quote_str = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string());
-
-    match default_value {
-        None => {
-            if nullable {
-                return "null".to_string();
-            }
-            // Non-null add with no default is Authored residue, not Auto — but be
-            // defensive: emit a type-zero so a mis-tagged hop still compiles.
-            match ftype {
-                Some(FieldType::Bool) => "false".to_string(),
-                Some(FieldType::F64) => "0.0".to_string(),
-                Some(
-                    FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64
-                    | FieldType::Timestamp(_),
-                ) => "0".to_string(),
-                // #238: an inline `string(N)` is a `String` in the generated
-                // struct, so its type-zero is the empty string like any other.
-                // (`string(N!)` would reject `""` at write, but this arm is
-                // defensive residue for a mis-tagged hop, not a real default.)
-                Some(FieldType::String | FieldType::StringN { .. } | FieldType::Bytes(_)) => {
-                    "\"\"".to_string()
-                }
-                _ => "null".to_string(),
-            }
-        }
-        Some(d) => match ftype {
-            Some(FieldType::Bool) => {
-                if d == "true" || d == "false" {
-                    d.to_string()
-                } else {
-                    "false".to_string()
-                }
-            }
-            Some(FieldType::F64) => {
-                if d.parse::<f64>().is_ok() {
-                    d.to_string()
-                } else {
-                    "0.0".to_string()
-                }
-            }
-            Some(
-                FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64
-                | FieldType::Timestamp(_),
-            ) => {
-                if d.parse::<i64>().is_ok() {
-                    d.to_string()
-                } else {
-                    "0".to_string()
-                }
-            }
-            Some(FieldType::Json) => {
-                // A raw JSON default is used verbatim; otherwise quote it.
-                if serde_json::from_str::<serde_json::Value>(d).is_ok() {
-                    d.to_string()
-                } else {
-                    quote_str(d)
-                }
-            }
-            // string / uuid / decimal / enum: string serde repr → quote.
-            _ => quote_str(d),
-        },
+    if nullable {
+        return "null".to_string();
     }
+    // Case 3. Reached only if the answer resolution above it let an unanswered
+    // required add through; the emitted `null` then fails the destination
+    // decode by NAME, which is the whole point (#374 decision 5) — an empty
+    // string would have been accepted and exit 0.
+    let _ = (dest_schema, model_name, field_name);
+    "null".to_string()
 }
 
 /// Path of the recorded schema snapshot (the last schema a migration was created
@@ -1491,5 +1431,41 @@ fn detect_schema_changes(
         })?;
     let old_simple = to_simple_schema(&old_schema);
 
-    Ok(forgedb_migrations::SchemaDiffer::diff(&old_simple, &new_simple))
+    let mut changes = forgedb_migrations::SchemaDiffer::diff(&old_simple, &new_simple);
+    resolve_schema_defaults(&new_schema, &mut changes);
+    Ok(changes)
+}
+
+/// Fill each `AddField`'s `default_json` from the destination field's
+/// `@default` directive (#374 step 4).
+///
+/// It runs **here, in the CLI**, and not in the differ, for the same reason
+/// `depends_on` is populated here (#438): `crates/migrations` is a pure
+/// comparison over its own value types and has no parser dependency, so it
+/// cannot see a directive's typed parameters — `SimpleConstraint` carries them
+/// stringified. The one definition of what a `@default` lowers to is
+/// `forgedb_codegen::default_fill`, and this is one of its two call sites; the
+/// other is the generated reopen backfill.
+fn resolve_schema_defaults(
+    dest_schema: &forgedb_parser::Schema,
+    changes: &mut [forgedb_migrations::SchemaChange],
+) {
+    for change in changes.iter_mut() {
+        let SchemaChange::AddField {
+            model_name,
+            field_name,
+            default_json,
+            ..
+        } = change
+        else {
+            continue;
+        };
+        *default_json = dest_schema
+            .models
+            .iter()
+            .find(|m| &m.name == model_name)
+            .and_then(|m| m.fields.iter().find(|f| &f.name == field_name))
+            .and_then(|f| forgedb_codegen::default_fill(dest_schema, f))
+            .map(|fill| fill.json_literal());
+    }
 }

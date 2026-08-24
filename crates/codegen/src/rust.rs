@@ -5362,18 +5362,90 @@ impl RustGenerator {
         }
     }
 
+    /// The column append for a resolved `@default` (#374 step 4) — the second
+    /// of [`crate::default_fill`]'s two lowerings.
+    ///
+    /// Every arm mirrors the encoding `generate_append_statements` uses for a
+    /// real record value of the same type, because a backfilled row and an
+    /// inserted row are read by the same decoder. `FillValue` only exists for
+    /// non-nullable fields whose encoding is settled, which is why there is no
+    /// presence-tag branch here.
+    fn backfill_append_of(
+        schema: &Schema,
+        field: &forgedb_parser::Field,
+        fill: &crate::default_fill::FillValue,
+    ) -> TokenStream {
+        use crate::default_fill::FillValue;
+        let col = format_ident!("{}_col", field.name);
+        let append_method = Self::get_append_method(schema, &field.field_type);
+        match fill {
+            FillValue::Bool(b) => quote! {
+                self.#col.#append_method(#b).expect("Failed to backfill column default");
+            },
+            FillValue::Int(n) => {
+                // Unsuffixed so it infers to the column's own integer type,
+                // exactly as the `0` literal in the type-zero arm does.
+                let lit = proc_macro2::Literal::i64_unsuffixed(*n);
+                quote! {
+                    self.#col.#append_method(#lit).expect("Failed to backfill column default");
+                }
+            }
+            FillValue::Float(f) => quote! {
+                self.#col.#append_method(#f).expect("Failed to backfill column default");
+            },
+            FillValue::Str(s) => quote! {
+                self.#col.append_string(#s).expect("Failed to backfill column default");
+            },
+            FillValue::Json(raw) => quote! {
+                self.#col.append_string(#raw).expect("Failed to backfill column default");
+            },
+            FillValue::Enum { discriminant, .. } => quote! {
+                self.#col.append_bytes(&[#discriminant]).expect("Failed to backfill column default");
+            },
+            FillValue::Decimal(lexeme) => quote! {
+                self.#col
+                    .append_uuid(
+                        <rust_decimal::Decimal as std::str::FromStr>::from_str(#lexeme)
+                            .expect("schema @default is not a decimal")
+                            .serialize(),
+                    )
+                    .expect("Failed to backfill column default");
+            },
+        }
+    }
+
     /// Emit one "append a default entry" statement per storage-backed field —
     /// the same column encoding as `generate_append_statements`, but with the
     /// field's type default instead of a record value.  Used to backfill a newly
     /// added column so existing rows keep a well-formed value (#92 Phase 4 additive
-    /// migration).  Defaults are type-zero / null (nullable → None, string → "",
-    /// numeric → 0, uuid/FK → nil); the schema `@default` is not yet honored here
-    /// (a follow-up), which is why additive fields should be nullable or carry a
-    /// meaningful zero.
+    /// migration).
+    ///
+    /// A field carrying a `@default` the differ can resolve
+    /// ([`crate::default_fill`]) backfills **that value**; every other field
+    /// backfills its type zero (nullable → None, string → "", numeric → 0,
+    /// uuid/FK → nil).
+    ///
+    /// # Why the `@default` arm is here and not only in the transformer (#374)
+    ///
+    /// A newly-added required field reaches existing rows two ways — this
+    /// backfill on reopen, and the offline transformer's hop — and they used to
+    /// disagree, because this one wrote the type zero unconditionally while the
+    /// hop wrote the recorded default. `status: string @default("pending")`
+    /// therefore produced `""` in one dir and `"pending"` in the other for the
+    /// same schema edit, decided by which command the operator ran.
+    /// `default_fill` is the ONE definition both lowerings derive from; this is
+    /// the second lowering and `FillValue::json_literal` is the first.
     fn generate_backfill_appends(schema: &Schema, model: &forgedb_parser::Model) -> Vec<(proc_macro2::Ident, TokenStream)> {
         let mut out = Vec::new();
         for field in &model.fields {
             let col = format_ident!("{}_col", field.name);
+            // #374: a resolvable `@default` wins over the type zero, and does so
+            // BEFORE the per-type branches below so there is exactly one place
+            // the decision is made.
+            if let Some(fill) = crate::default_fill::default_fill(schema, field) {
+                out.push((col, Self::backfill_append_of(schema, field, &fill)));
+                continue;
+            }
             if Self::is_json_type(&field.field_type) {
                 let one = if field.is_nullable() {
                     // Nullable json: the 1-byte presence tag `0x00` = None (#231 —

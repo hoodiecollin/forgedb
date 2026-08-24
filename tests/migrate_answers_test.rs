@@ -150,3 +150,153 @@ fn test_scenario_1_one_edit_records_one_change() {
          double-report (#374 decision 6). Record: {rec:#}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Scenario 4 — one default, two routes, identical rows (TIER 2)
+// ---------------------------------------------------------------------------
+
+/// v1: three `Post` rows, no `status`.
+const S4_V1: &str = "Post {\n  id: +uuid\n  title: string\n}\n";
+
+/// v2: `status` added, required, with a `@default`.
+const S4_V2: &str =
+    "Post {\n  id: +uuid\n  title: string\n  status: string @default(\"pending\")\n}\n";
+
+/// Writes three rows under v1 into `argv[1]`, and emits each row's JSON — the
+/// transformer hop's first step, verbatim — into `<data>/../rows.json`.
+const S4_WRITE_V1: &str = r##"mod database;
+use database::*;
+mod api;
+
+fn main() {
+    let dir = std::path::PathBuf::from(std::env::args().nth(1).expect("data dir arg"));
+    let out = dir.parent().expect("data dir has a parent").join("rows.json");
+    let mut db = Database::open_at(dir);
+    for (i, title) in ["alpha", "beta", "gamma"].iter().enumerate() {
+        db.create_post(Post {
+            id: format!("00000000-0000-0000-0000-00000000000{}", i + 1)
+                .parse()
+                .expect("parse uuid"),
+            title: title.to_string(),
+        })
+        .expect("create post");
+    }
+    let rows: Vec<serde_json::Value> = db
+        .post
+        .all()
+        .iter()
+        .map(|r| serde_json::to_value(r).expect("serialize v1 row"))
+        .collect();
+    assert_eq!(rows.len(), 3);
+    std::fs::write(&out, serde_json::to_string(&rows).unwrap()).expect("write rows.json");
+    println!("wrote 3 v1 rows with no `status` column");
+}
+"##;
+
+/// ROUTE A — the reopen backfill. Opens the **v1 data dir** with the v2 schema.
+/// `recover_from_wal` finds `status_col` short of the tombstone anchor and
+/// backfills it.
+const S4_REOPEN: &str = r##"mod database;
+use database::*;
+mod api;
+
+fn main() {
+    let dir = std::path::PathBuf::from(std::env::args().nth(1).expect("data dir arg"));
+    let db = Database::open_at(dir);
+    let mut rows = db.post.all();
+    rows.sort_by(|a, b| a.title.cmp(&b.title));
+    assert_eq!(rows.len(), 3, "expected the three v1 rows, got {:?}", rows);
+    for r in &rows {
+        println!("reopen route: {} -> status={:?}", r.title, r.status);
+        assert_eq!(
+            r.status, "pending",
+            "the reopen backfill wrote {:?} instead of the schema's @default. \
+             That is finding 4: the same edit, different data by route.",
+            r.status
+        );
+    }
+    println!("ROUTE A OK: alpha,beta,gamma all read status=pending");
+}
+"##;
+
+/// ROUTE B — the transformer hop, over a FRESH dir. Reads the v1 row JSON,
+/// applies the one structural op a `@default` add emits (`field_adds`, whose
+/// literal `default_fill` produced), decodes into the v2 struct and inserts.
+///
+/// The `"pending"` literal below is the one
+/// `crates/codegen/tests/default_fill_test.rs::the_scenario_4_fixtures_literal_is_what_default_fill_produces`
+/// pins — this driver is a `const &str` a subprocess compiles, so it cannot
+/// compute it.
+const S4_TRANSFORM: &str = r##"mod database;
+use database::*;
+mod api;
+
+fn main() {
+    let dir = std::path::PathBuf::from(std::env::args().nth(1).expect("data dir arg"));
+    let src = dir.parent().expect("data dir has a parent").join("rows.json");
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(&std::fs::read_to_string(&src).expect("read rows.json"))
+            .expect("parse rows.json");
+    assert_eq!(rows.len(), 3);
+
+    let mut db = Database::open_at(dir);
+    for mut j in rows {
+        // `build_model_ops` emits exactly this for a defaulted add: insert the
+        // recorded JSON literal under the field's name, then decode.
+        if let Some(o) = j.as_object_mut() {
+            o.insert("status".to_string(), serde_json::from_str("\"pending\"").unwrap());
+        }
+        let rec: Post = serde_json::from_value(j).expect("decode v1 row at v2");
+        db.create_post(rec).expect("insert migrated row");
+    }
+
+    let mut got = db.post.all();
+    got.sort_by(|a, b| a.title.cmp(&b.title));
+    assert_eq!(got.len(), 3);
+    for r in &got {
+        println!("transform route: {} -> status={:?}", r.title, r.status);
+        assert_eq!(r.status, "pending");
+    }
+    println!("ROUTE B OK: alpha,beta,gamma all read status=pending");
+}
+"##;
+
+/// Both routes over the same schema edit produce the same rows.
+///
+/// **Compiles and RUNS the generated code, and asserts the row values.** Nothing
+/// that compares generated code as strings can see this defect: each route was
+/// individually well-formed and only their *disagreement* corrupted — `""` in
+/// one dir and `"pending"` in the other, decided by which command the operator
+/// happened to run.
+#[test]
+#[ignore = "generates and compiles three crates; run with --ignored"]
+fn scenario_4_one_default_two_routes_identical_rows() {
+    // Only `generate_compile_run_in` + `assert_driver_ok` are used here; the
+    // rest of the shared harness is dead in this file and live in its others.
+    #[allow(dead_code)]
+    #[path = "common/mod.rs"]
+    mod common;
+
+    let shared = std::env::temp_dir().join(format!("forgedb-s4-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&shared);
+    fs::create_dir_all(&shared).unwrap();
+    let v1_data = shared.join("v1-data");
+
+    let (out, proj) = common::generate_compile_run_in("s4writer", S4_V1, S4_WRITE_V1, Some(&v1_data));
+    common::assert_driver_ok(&out, &proj, "the v1 writer failed");
+
+    // Route A reopens the SAME directory the v1 writer left behind.
+    let (out, proj) = common::generate_compile_run_in("s4reopen", S4_V2, S4_REOPEN, Some(&v1_data));
+    common::assert_driver_ok(&out, &proj, "the reopen backfill did not honour @default");
+
+    // Route B builds a fresh destination, as the transformer does.
+    let (out, proj) = common::generate_compile_run_in(
+        "s4transform",
+        S4_V2,
+        S4_TRANSFORM,
+        Some(&shared.join("v2-data")),
+    );
+    common::assert_driver_ok(&out, &proj, "the transformer route did not honour @default");
+
+    let _ = fs::remove_dir_all(&shared);
+}

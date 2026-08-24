@@ -18,7 +18,22 @@ pub enum SchemaChange {
         /// is still a plain string — see [`SimpleType`].
         field_type: SimpleType,
         nullable: bool,
-        default_value: Option<String>,
+        /// The **JSON literal** existing rows get, resolved from the
+        /// destination field's `@default` directive (#374 step 4). `None` when
+        /// the field declares no default, or declares one this build cannot
+        /// resolve — see `forgedb_codegen::default_fill`.
+        ///
+        /// This is the *schema's* answer and is distinct from
+        /// [`SchemaChange`]'s operator-supplied one: generated code knows a
+        /// `@default` and applies it in the reopen backfill, so an add carrying
+        /// one is not breaking. An operator's answer is known only to the
+        /// transformer, so an add carrying one IS.
+        ///
+        /// It replaces the never-populated `default_value`, which the differ set
+        /// to `None` at its one construction site and no other producer ever
+        /// touched (gate 1 finding 3) — a carrier that read as "the default, if
+        /// any" while always meaning "no".
+        default_json: Option<String>,
     },
     /// A field was removed from a model
     RemoveField {
@@ -343,7 +358,7 @@ impl SchemaChange {
             // same value the generated reopen-backfill writes.
             SchemaChange::AddField {
                 nullable: false,
-                default_value: None,
+                default_json: None,
                 ..
             } => HopBodyClass::Authored,
             SchemaChange::AddField { .. } => HopBodyClass::Auto,
@@ -426,7 +441,7 @@ impl SchemaChange {
             // breaking — existing rows have no value to fill in.
             SchemaChange::AddField {
                 nullable: false,
-                default_value: None,
+                default_json: None,
                 ..
             } => true,
             SchemaChange::AddField { .. } => false,

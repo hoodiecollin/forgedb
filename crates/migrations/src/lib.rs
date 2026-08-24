@@ -193,7 +193,7 @@
 //!   "changes": [
 //!     { "AddField": { "model_name": "User", "field_name": "email",
 //!                     "field_type": "string", "nullable": true,
-//!                     "default_value": null } }
+//!                     "default_json": null } }
 //!   ],
 //!   "from_version": 1,
 //!   "to_version": 2

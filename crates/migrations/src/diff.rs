@@ -763,7 +763,7 @@ impl SchemaDiffer {
                     field_name: field_name.clone(),
                     field_type: new_field.ty.clone(),
                     nullable: new_field.nullable,
-                    default_value: None,
+                    default_json: None,
                 });
             }
         }
