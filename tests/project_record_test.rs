@@ -354,3 +354,226 @@ fn s9_an_existing_name_is_never_overwritten_silently() {
         "a rename reports the cache directory it orphaned: {report}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// S10 — a stale claim is detected and taken over
+// ---------------------------------------------------------------------------
+
+/// **The case gate 1 identified as probably the common one**, and the one
+/// today's code gets exactly backwards.
+///
+/// The ledger is append-only — `cache::ledger_root()` has two callers and
+/// nothing anywhere removes a `.claim` — so a project that is moved or renamed
+/// collides with its own ghost. The message it gets tells it to rename itself,
+/// which is the wrong remedy: there is no other project, only a dead record.
+///
+/// This is also the strongest available argument that a flag cannot serve here.
+/// The *set of available answers* depends on filesystem state the user cannot
+/// know when they type the command — whether the holding root still exists is
+/// discoverable only by ForgeDB, at run time, after the walk.
+#[test]
+fn s10_a_stale_claim_is_detected_and_taken_over() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let a = base.join("a");
+    std::fs::create_dir_all(a.join(".git")).unwrap();
+    write(&a.join("forgedb.toml"), "[project]\nname = \"shared\"\n");
+    write(&a.join("schema.forge"), SCHEMA);
+
+    let first = run(
+        &a,
+        home.path(),
+        &[
+            "generate",
+            "rust",
+            "--output",
+            a.join("generated").to_str().unwrap(),
+        ],
+    );
+    assert!(first.status.success(), "{}", combined(&first));
+
+    // Move the project. Nothing tells the ledger.
+    let b = base.join("b");
+    std::fs::rename(&a, &b).unwrap();
+
+    let stale = run(
+        &b,
+        home.path(),
+        &[
+            "generate",
+            "rust",
+            "--force",
+            "--output",
+            b.join("generated").to_str().unwrap(),
+        ],
+    );
+    assert!(!stale.status.success(), "{}", combined(&stale));
+    let msg = combined(&stale);
+    assert!(
+        msg.contains("no longer exists"),
+        "the diagnostic must say the holding path is gone: {msg}"
+    );
+    assert!(
+        msg.contains("unmounted") || msg.contains("unplugged"),
+        "…and carry the caveat that made automatic reaping wrong: {msg}"
+    );
+    assert!(
+        msg.contains("forgedb project claim --take-over"),
+        "…and name the take-over, which is the remedy: {msg}"
+    );
+    assert!(
+        !msg.contains("[project].name"),
+        "…and NOT tell the user to rename a project that has no conflict. \
+         Padding this message to satisfy a grep would reintroduce the bug: {msg}"
+    );
+
+    let taken = run(&b, home.path(), &["project", "claim", "--take-over"]);
+    assert!(taken.status.success(), "{}", combined(&taken));
+
+    let after = run(
+        &b,
+        home.path(),
+        &[
+            "generate",
+            "rust",
+            "--force",
+            "--output",
+            b.join("generated").to_str().unwrap(),
+        ],
+    );
+    assert!(after.status.success(), "{}", combined(&after));
+
+    // The project kept its name — a take-over writes the LEDGER, and the config
+    // is untouched.
+    assert_eq!(
+        std::fs::read_to_string(b.join("forgedb.toml")).unwrap(),
+        "[project]\nname = \"shared\"\n"
+    );
+    let show = run(&b, home.path(), &["project", "show"]);
+    assert!(
+        combined(&show).contains("held by this project"),
+        "{}",
+        combined(&show)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S11 — a live holder is never reaped
+// ---------------------------------------------------------------------------
+
+/// Detect and offer; never reap. A holding root can be absent because a network
+/// mount is not mounted — but a holding root that is *present* is a real
+/// collision, and the answer is a different name, not a displacement.
+#[test]
+fn s11_a_live_holder_is_never_reaped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    for side in ["one", "two"] {
+        let root = base.join(side);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        write(&root.join("forgedb.toml"), "[project]\nname = \"clash\"\n");
+        write(&root.join("schema.forge"), SCHEMA);
+    }
+
+    let first = run(
+        &base.join("one"),
+        home.path(),
+        &[
+            "generate",
+            "rust",
+            "--output",
+            base.join("one/generated").to_str().unwrap(),
+        ],
+    );
+    assert!(first.status.success(), "{}", combined(&first));
+
+    let ledger = home.path().join("ledger/clash.claim");
+    let before = std::fs::read(&ledger).unwrap();
+
+    let refused = run(
+        &base.join("two"),
+        home.path(),
+        &["project", "claim", "--take-over"],
+    );
+    assert!(!refused.status.success(), "a live holder is not displaced");
+    let msg = combined(&refused);
+    assert!(msg.contains("still exists"), "{msg}");
+    assert!(msg.contains("--force"), "names the escape hatch: {msg}");
+    assert_eq!(
+        std::fs::read(&ledger).unwrap(),
+        before,
+        "a refusal writes nothing"
+    );
+
+    let forced = run(
+        &base.join("two"),
+        home.path(),
+        &["project", "claim", "--take-over", "--force"],
+    );
+    assert!(forced.status.success(), "{}", combined(&forced));
+    let report = combined(&forced);
+    assert!(
+        report.contains(base.join("one").to_str().unwrap()),
+        "…and names exactly which root it displaced, which is not recoverable \
+         afterwards — the ledger holds one path: {report}"
+    );
+    assert_ne!(std::fs::read(&ledger).unwrap(), before);
+}
+
+// ---------------------------------------------------------------------------
+// S12 — release drops only our own claim
+// ---------------------------------------------------------------------------
+
+#[test]
+fn s12_release_drops_only_our_own_claim() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    for side in ["one", "two"] {
+        let root = base.join(side);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        write(&root.join("forgedb.toml"), "[project]\nname = \"clash\"\n");
+        write(&root.join("schema.forge"), SCHEMA);
+    }
+
+    let first = run(
+        &base.join("one"),
+        home.path(),
+        &[
+            "generate",
+            "rust",
+            "--output",
+            base.join("one/generated").to_str().unwrap(),
+        ],
+    );
+    assert!(first.status.success(), "{}", combined(&first));
+    let ledger = home.path().join("ledger/clash.claim");
+    assert!(ledger.exists());
+
+    // Another root cannot release it: that would not resolve anything, it would
+    // hand the id to whichever project ran next.
+    let foreign = run(&base.join("two"), home.path(), &["project", "release"]);
+    assert!(!foreign.status.success(), "{}", combined(&foreign));
+    assert!(ledger.exists(), "the holder's claim survives");
+
+    let ours = run(&base.join("one"), home.path(), &["project", "release"]);
+    assert!(ours.status.success(), "{}", combined(&ours));
+    assert!(!ledger.exists(), "the claim is gone");
+
+    // …and a fresh generate re-claims it.
+    let again = run(
+        &base.join("one"),
+        home.path(),
+        &[
+            "generate",
+            "rust",
+            "--force",
+            "--output",
+            base.join("one/generated").to_str().unwrap(),
+        ],
+    );
+    assert!(again.status.success(), "{}", combined(&again));
+    assert!(ledger.exists());
+}

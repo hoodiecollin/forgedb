@@ -301,6 +301,30 @@ enum ProjectCommands {
         #[arg(long)]
         force: bool,
     },
+
+    /// Take this project's id over from the root the ledger names
+    ///
+    /// Nothing removes a claim, so a project that was moved or renamed collides
+    /// with its own record. This releases that record and keeps the name.
+    Claim {
+        /// Required. Claiming happens on its own during `generate`/`build`;
+        /// this command exists only to displace a stale holder.
+        #[arg(long)]
+        take_over: bool,
+
+        /// Take over even though the holding root still exists
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Drop this project's own claim on its id
+    Release,
+
+    /// Report every fact identity is derived from, deciding nothing
+    ///
+    /// Works in exactly the cases `generate` refuses to: an ambiguous root is
+    /// listed rather than resolved.
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -1017,6 +1041,11 @@ fn run(cli: Cli) -> Result<()> {
                     ProjectCommands::Name { name, force } => {
                         commands::project::ProjectCommand::Name { name, force }
                     }
+                    ProjectCommands::Claim { take_over, force } => {
+                        commands::project::ProjectCommand::Claim { take_over, force }
+                    }
+                    ProjectCommands::Release => commands::project::ProjectCommand::Release,
+                    ProjectCommands::Show => commands::project::ProjectCommand::Show,
                 },
                 schema,
             })

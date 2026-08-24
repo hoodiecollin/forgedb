@@ -624,6 +624,102 @@ pub fn held_by(name: &str) -> Result<Option<Holder>> {
     }
 }
 
+/// Take an id over from whoever the ledger says holds it.
+///
+/// **Ledger only — no config is touched.** The ledger records *who currently
+/// holds an id*, which is detection state and legitimately lives in a directory
+/// GC may empty at any time. A chosen *name* is a resolution and goes in the
+/// project's own `forgedb.toml`; recording one here would resurrect a resolved
+/// collision as a silent merge of two projects the moment the cache is wiped
+/// (the C1 line, and `scenario_14`'s standing guard).
+///
+/// `force` is required when the holding root still exists. Gate 1 forbids
+/// *automatic* reaping — a path can be absent because a network mount is not
+/// mounted, which is exactly when taking the id over is wrong — but an explicit
+/// human act over a live holder is a different thing, and it prints what it
+/// displaced.
+///
+/// **Not atomic, unlike [`claim`].** Claiming is `O_EXCL` on a file that must
+/// not exist; a take-over is read-then-write and cannot have that guarantee.
+/// The holder is re-read immediately before the write and the write is a
+/// temp-file rename, which is as close as this gets. Saying so here rather than
+/// implying an atomicity the code does not have: the ledger is documented as
+/// GC-able derived state, so a lock around it would be pretending.
+pub fn take_over_claim(id: &ProjectId, force: bool) -> Result<Option<Holder>> {
+    if id.source == IdSource::PathHash {
+        return Err(CliError::Config(format!(
+            "Project id {:?} is derived from a path hash, so it is never claimed \
+             and there is nothing to take over. Two different absolute paths hash \
+             differently, so this id cannot collide with itself.",
+            id.name
+        )));
+    }
+
+    let dir = cache::ledger_root()?;
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.claim", id.name));
+    let ours = id.root.to_string_lossy().to_string();
+
+    // Re-read immediately before the write: the gap between the read that
+    // produced the diagnostic and this one is where another process could have
+    // claimed it.
+    let previous = held_by(&id.name)?;
+    match &previous {
+        Some(h) if h.path == id.root => return Ok(None),
+        Some(h) if h.exists && !force => {
+            return Err(CliError::ConfigDiagnostic(format!(
+                "Project name {:?} is held by {}, and that path still \
+                 exists.\n\n\
+                 This is a real collision, not a stale claim: two projects sharing \
+                 an id would share one build cache, one lockfile and one target \
+                 directory. The usual answer is a different `[project].name` \
+                 here.\n\n\
+                 If you are certain that root is no longer a ForgeDB project, \
+                 pass --force to displace it.",
+                id.name,
+                h.path.display(),
+            )));
+        }
+        _ => {}
+    }
+
+    let temp = dir.join(format!(".{}.claim.forgedb-tmp", id.name));
+    std::fs::write(&temp, ours.as_bytes())?;
+    if let Err(e) = std::fs::rename(&temp, &path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(e.into());
+    }
+    Ok(previous)
+}
+
+/// Drop our own claim on an id.
+///
+/// Refuses to release a claim held by another root: the ledger entry is that
+/// root's, and deleting it from here would hand the id to whoever ran next
+/// rather than resolve anything. Returns whether a claim was actually removed.
+pub fn release_claim(id: &ProjectId) -> Result<bool> {
+    if id.source == IdSource::PathHash {
+        return Ok(false);
+    }
+    let path = cache::ledger_root()?.join(format!("{}.claim", id.name));
+    match held_by(&id.name)? {
+        None => Ok(false),
+        Some(h) if h.path == id.root => {
+            std::fs::remove_file(&path)?;
+            Ok(true)
+        }
+        Some(h) => Err(CliError::ConfigDiagnostic(format!(
+            "Project name {:?} is claimed by {}, not by {}.\n\n\
+             `release` drops this project's own claim. Releasing another root's \
+             would not resolve anything — it would hand the id to whichever \
+             project ran next.",
+            id.name,
+            h.path.display(),
+            id.root.display(),
+        ))),
+    }
+}
+
 /// Resolve an identity and refuse a collision, asking nothing.
 ///
 /// The non-interactive contract, unchanged: a taken id is an error naming the

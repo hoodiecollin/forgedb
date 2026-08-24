@@ -16,12 +16,19 @@
 //! run at the moment it is most wanted.
 
 use crate::ask::CommandConsent;
-use crate::project::{self, Chain};
+use crate::error::CliError;
+use crate::project::{self, Chain, Identified};
 use crate::{ui, Result};
 
 pub enum ProjectCommand {
     /// Persist `[project].name` at the project root.
     Name { name: String, force: bool },
+    /// Take this project's id over from the root the ledger names.
+    Claim { take_over: bool, force: bool },
+    /// Drop this project's own claim.
+    Release,
+    /// Report every fact identity is derived from, deciding nothing.
+    Show,
 }
 
 pub struct ProjectOptions {
@@ -41,6 +48,9 @@ pub fn run(options: ProjectOptions) -> Result<()> {
 
     match options.command {
         ProjectCommand::Name { name, force } => name_cmd(&chain, &name, force),
+        ProjectCommand::Claim { take_over, force } => claim_cmd(&chain, take_over, force),
+        ProjectCommand::Release => release_cmd(&chain),
+        ProjectCommand::Show => show(&chain),
     }
 }
 
@@ -71,6 +81,110 @@ fn name_cmd(chain: &Chain, name: &str, force: bool) -> Result<()> {
             old.name,
             dir.display()
         ));
+    }
+    Ok(())
+}
+
+/// `forgedb project claim --take-over` — the answer to the *common* instance of
+/// the collision decision.
+///
+/// Nothing anywhere removes a `.claim`, so a project that was moved, renamed or
+/// deleted collides with its own record and today's diagnostic tells it to
+/// rename itself. That is the wrong remedy: the right one is to release a dead
+/// claim, and the project keeps its name.
+fn claim_cmd(chain: &Chain, take_over: bool, force: bool) -> Result<()> {
+    let id = project::identify(chain)?;
+    if !take_over {
+        return Err(CliError::Config(
+            "`forgedb project claim` needs --take-over to say what it should do.\n\n\
+             Claiming happens on its own as part of `generate`/`build`; this \
+             command exists to take an id over from a root that no longer holds \
+             it. `forgedb project show` reports who does."
+                .to_string(),
+        ));
+    }
+    match project::take_over_claim(&id, force)? {
+        None => ui::info(&format!("Project {:?} was already ours.", id.name)),
+        Some(previous) => {
+            ui::success(&format!("Project {:?} now points at {}", id.name, id.root.display()));
+            // Named rather than summarised: displacing a LIVE holder is a real
+            // consequence, and "which root did I just displace" is not
+            // recoverable afterwards — the ledger holds one path.
+            ui::info(&format!(
+                "Displaced {}{}",
+                previous.path.display(),
+                if previous.exists {
+                    " (which still exists)"
+                } else {
+                    " (which no longer exists)"
+                }
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn release_cmd(chain: &Chain) -> Result<()> {
+    let id = project::identify(chain)?;
+    if project::release_claim(&id)? {
+        ui::success(&format!("Released the claim on {:?}", id.name));
+    } else {
+        ui::info(&format!("Nothing to release: {:?} is unclaimed.", id.name));
+    }
+    Ok(())
+}
+
+/// Report the facts, **without collapsing them to one answer**.
+///
+/// `show` must work in precisely the cases identity does not, so it reports an
+/// ambiguity as a list rather than resolving it — otherwise it errors in the one
+/// situation it is most wanted. It is also the only non-mutating way to see the
+/// claim holder and its liveness, which is what keeps the scenarios from reading
+/// the ledger's file layout directly (a second derivation of something
+/// `cache.rs` owns).
+fn show(chain: &Chain) -> Result<()> {
+    let root = chain.root_dir();
+    ui::info(&format!("Project root: {}", root.display()));
+    match chain.project_root() {
+        Some(link) => ui::info(&format!("Config:       {}", link.path.display())),
+        None => ui::info(&format!(
+            "Config:       none (would be created at {})",
+            root.join(crate::config::CONFIG_FILE).display()
+        )),
+    }
+
+    let id = match project::identify_or_ask(chain)? {
+        Identified::Resolved(id) => {
+            ui::info(&format!("Id:           {} ({:?})", id.name, id.source));
+            Some(id.name)
+        }
+        Identified::Ambiguous { candidates, .. } => {
+            ui::warning(&format!(
+                "Id:           AMBIGUOUS — {} ecosystem manifests name this directory:",
+                candidates.len()
+            ));
+            for (manifest, name) in &candidates {
+                ui::info(&format!("                {manifest} -> {name}"));
+            }
+            ui::info("Record one with: forgedb project name <NAME>");
+            None
+        }
+    };
+
+    let Some(name) = id else { return Ok(()) };
+    match project::held_by(&name)? {
+        None => ui::info("Claim:        unclaimed"),
+        Some(holder) if holder.path == root => ui::info("Claim:        held by this project"),
+        Some(holder) if holder.exists => ui::warning(&format!(
+            "Claim:        held by {} — which still exists, so this is a real \
+             collision. Set a different `[project].name` here.",
+            holder.path.display()
+        )),
+        Some(holder) => ui::warning(&format!(
+            "Claim:        held by {} — that path no longer exists. \
+             `forgedb project claim --take-over` takes the id back.",
+            holder.path.display()
+        )),
     }
     Ok(())
 }
