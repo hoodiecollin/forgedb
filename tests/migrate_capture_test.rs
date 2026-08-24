@@ -520,3 +520,67 @@ fn a_model_rename_is_proposed_and_replaces_both_halves() {
         }]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Decision 5 — a required add with no answer emits NOTHING
+// ---------------------------------------------------------------------------
+
+use forgedb::commands::migrate::{Fill, lower_fill};
+
+/// `lower_fill` is the one place a field's value is decided, and its precedence
+/// is stated rather than emergent.
+///
+/// The last row is decision 5. A required add with no default and no answer
+/// contributes **no op**, so the key is ABSENT from the row and the destination
+/// decode fails with `missing field`, naming it. Returning a type-zero here is
+/// what made an unanswered hop write `""` and exit 0 — a successful exit is the
+/// defect's whole signature, which is why the end-to-end half of this
+/// (`tests/migrate_escape_test.rs` scenario 15) has to RUN the generated hop.
+///
+/// Mutation-verified: making the final arm `Some(Fill::Json("\"\"".into()))`
+/// turns this test red, and scenario 15 red with it.
+#[test]
+fn decision_5_a_required_add_with_no_answer_lowers_to_nothing() {
+    let constant = Answer::Constant {
+        json: "\"x\"".into(),
+    };
+    let copy = Answer::CopyField {
+        field: "title".into(),
+    };
+    let escape = Answer::Escape {
+        language: EscapeLanguage::TypeScript,
+        file: "transform.ts".into(),
+        scaffold_checksum: "fnv1a64:0".into(),
+    };
+
+    // 1. The schema's `@default` wins, whatever else is present.
+    assert_eq!(
+        lower_fill(false, Some("\"pending\""), Some(&constant)),
+        Some(Fill::Json("\"pending\"".into())),
+        "a schema default is applied by BOTH routes; an answer is applied by the \
+         transformer only, so the two are not interchangeable"
+    );
+    // 2. Then the operator's answer.
+    assert_eq!(
+        lower_fill(false, None, Some(&constant)),
+        Some(Fill::Json("\"x\"".into()))
+    );
+    assert_eq!(
+        lower_fill(false, None, Some(&copy)),
+        Some(Fill::Copy("title".into()))
+    );
+    // 3. An escape's value comes from the author's transform, which runs AFTER
+    //    these structural ops — so there is nothing to emit here.
+    assert_eq!(lower_fill(false, None, Some(&escape)), None);
+    // 4. `null` for a nullable add: the only value a nullable field can be given
+    //    without asking.
+    assert_eq!(lower_fill(true, None, None), Some(Fill::Json("null".into())));
+    // 5. DECISION 5. Nothing.
+    assert_eq!(
+        lower_fill(false, None, None),
+        None,
+        "a required add with no default and no answer must emit NO op, so the key \
+         is absent and the decode fails naming it. A type-zero here is what made \
+         an unanswered hop write \"\" and exit 0."
+    );
+}

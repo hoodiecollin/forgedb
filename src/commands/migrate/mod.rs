@@ -1404,7 +1404,8 @@ fn build_model_ops(
 }
 
 /// What a hop emits for one field's value.
-enum Fill {
+#[derive(Debug, Clone, PartialEq)]
+pub enum Fill {
     /// A JSON literal inserted verbatim.
     Json(String),
     /// A per-row copy of another field of the same model.
@@ -1427,7 +1428,7 @@ enum Fill {
 ///
 /// `Answer::Escape` returns `None` here too: an escape's value comes from the
 /// author's own transform, which runs after these structural ops.
-fn lower_fill(
+pub fn lower_fill(
     nullable: bool,
     default_json: Option<&str>,
     answer: Option<&forgedb_migrations::Answer>,

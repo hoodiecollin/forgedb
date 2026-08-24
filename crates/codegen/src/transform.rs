@@ -687,7 +687,10 @@ fn escape_support() -> TokenStream {
     quote! {
         struct __Escape {
             child: std::process::Child,
-            stdin: std::process::ChildStdin,
+            // `Option` so `finish` can TAKE it: dropping stdin is the EOF that
+            // ends the child's read loop, and a partial move out of `self`
+            // would leave the rest of `self` unusable for the error path.
+            stdin: Option<std::process::ChildStdin>,
             stdout: std::io::BufReader<std::process::ChildStdout>,
             stderr: Option<std::thread::JoinHandle<String>>,
             rows: u64,
@@ -706,7 +709,7 @@ fn escape_support() -> TokenStream {
                     .map_err(|e| format!(
                         "could not start the transform runtime `{}`: {}", program, e
                     ))?;
-                let stdin = child.stdin.take().expect("stdin was piped");
+                let stdin = Some(child.stdin.take().expect("stdin was piped"));
                 let stdout = std::io::BufReader::new(
                     child.stdout.take().expect("stdout was piped")
                 );
@@ -735,11 +738,16 @@ fn escape_support() -> TokenStream {
                 let req = serde_json::json!({ "model": model, "row": row });
                 let line = serde_json::to_string(&req)
                     .map_err(|e| format!("serialize {} for the transform runtime: {}", model, e))?;
-                self.stdin
-                    .write_all(line.as_bytes())
-                    .and_then(|_| self.stdin.write_all(b"\n"))
-                    .and_then(|_| self.stdin.flush())
-                    .map_err(|e| self.died(&format!("writing a {} row: {}", model, e)))?;
+                let __wrote = match self.stdin.as_mut() {
+                    None => Err(std::io::Error::other("the transform runtime is closed")),
+                    Some(__in) => __in
+                        .write_all(line.as_bytes())
+                        .and_then(|_| __in.write_all(b"\n"))
+                        .and_then(|_| __in.flush()),
+                };
+                if let Err(e) = __wrote {
+                    return Err(self.died(&format!("writing a {} row: {}", model, e)));
+                }
 
                 let mut reply = String::new();
                 match self.stdout.read_line(&mut reply) {
@@ -762,11 +770,13 @@ fn escape_support() -> TokenStream {
             }
 
             fn died(&mut self, what: &str) -> String {
+                // Drained FIRST and bound: inlining it into the `format!` below
+                // borrows `self` immutably for the whole call while
+                // `drain_stderr` needs it mutably.
+                let tail = self.drain_stderr();
                 format!(
                     "the transform runtime `{}` failed while {}.{}",
-                    self.program,
-                    what,
-                    self.drain_stderr()
+                    self.program, what, tail
                 )
             }
 
@@ -779,7 +789,7 @@ fn escape_support() -> TokenStream {
 
             fn finish(mut self) -> ::std::result::Result<(), String> {
                 // Dropping stdin is the EOF that ends the child's read loop.
-                drop(self.stdin);
+                drop(self.stdin.take());
                 let status = self
                     .child
                     .wait()
