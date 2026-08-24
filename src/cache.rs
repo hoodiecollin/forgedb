@@ -467,7 +467,7 @@ pub fn assert_not_in_cache(data_root: &Path) -> Result<()> {
 /// The half of [`assert_not_in_cache`] that is a question rather than a refusal,
 /// extracted so #338's in-tree placement guard can ask it and write its own
 /// diagnostic. Two callers, two messages, one resolution — and the resolution is
-/// the part with the subtlety in it.
+/// the part with the subtleties in it.
 ///
 /// Two of them. The path is made **absolute** first, because a relative
 /// configured value is exactly the dangerous case (nobody writes "put it in the
