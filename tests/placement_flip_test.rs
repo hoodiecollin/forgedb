@@ -182,8 +182,15 @@ fn scenario_29_exactly_one_rust_generator_invocation_exists() {
     );
 }
 
-/// The four packages `output` has stopped receiving are actually gone from it,
+/// The four **crates** `output` has stopped receiving are actually gone from it,
 /// and the two things that stayed are still there.
+///
+/// #337 narrowed this from "the directory is absent" to "the CRATE is absent".
+/// Those directories now receive the consumer-facing half of each binding — a
+/// header, an entry module, a Python module — which is generated text the user
+/// commits, not a cargo package. Asserting the whole directory away would refuse
+/// the delivery destination the epic exists to create, so the assertion is on the
+/// two files that make a directory a crate.
 #[test]
 fn the_output_directory_no_longer_receives_the_four_moved_packages() {
     let dir = project(
@@ -194,12 +201,22 @@ fn the_output_directory_no_longer_receives_the_four_moved_packages() {
 
     let outdir = dir.join("generated");
     for moved in ["ffi", "napi", "pyo3"] {
-        assert!(
-            !outdir.join(moved).exists(),
-            "{} still receives `{moved}/`",
-            outdir.display()
-        );
+        for crate_file in ["Cargo.toml", "src/lib.rs", "src/database.rs"] {
+            assert!(
+                !outdir.join(moved).join(crate_file).exists(),
+                "{} still receives `{moved}/{crate_file}`",
+                outdir.display()
+            );
+        }
     }
+
+    // …and each of them DOES receive its consumer-facing half (#337), which is
+    // the other half of the same property: the crate moved, the shim arrived.
+    assert!(outdir.join("ffi/forgedb.h").is_file(), "no C header in generated/ffi/");
+    assert!(outdir.join("napi/index.js").is_file(), "no entry module in generated/napi/");
+    assert!(outdir.join("napi/index.d.ts").is_file(), "no declarations in generated/napi/");
+    assert!(outdir.join("pyo3/forgedb.py").is_file(), "no Python module in generated/pyo3/");
+    assert!(outdir.join("pyo3/forgedb.pyi").is_file(), "no Python stub in generated/pyo3/");
     // `replica/`'s CRATE moved; its browser assets did not — they are files the
     // user's page serves, and a content-hashed cache directory is unservable.
     assert!(!outdir.join("replica/src").exists(), "replica/src/ was not moved");
@@ -437,13 +454,17 @@ fn scenario_31_a_go_binary_survives_deletion_of_the_cargo_target_directory() {
         staticlib.display()
     );
 
-    // Deliver it beside the Go package. This is the copy `forgedb build` owes
-    // the Go binding — see `forgedb::commands::generate::deliver_go_staticlib`.
+    // The delivery `forgedb build` already performed (#337 folded the Go
+    // carve-out into the general table). Asserted rather than re-run: a test
+    // that delivers for itself proves the copy works and says nothing about
+    // whether `build` runs it.
     let go_dir = dir.join("generated/go");
-    let delivered =
-        forgedb::commands::generate::deliver_go_staticlib(&dir.join("generated"), &staticlib)
-            .expect("deliver the staticlib");
-    assert_eq!(delivered, go_dir.join("libforgedb.a"));
+    let delivered = go_dir.join("libforgedb.a");
+    assert!(
+        delivered.is_file(),
+        "`forgedb build` did not deliver the archive to {}",
+        delivered.display()
+    );
 
     // The Arrow file pulls an external Go module; drop it so this case needs no
     // network. It is orthogonal to what is being asserted (how the engine links).
