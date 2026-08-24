@@ -577,3 +577,99 @@ fn test_a_schema_default_answers_the_question_before_it_is_asked() {
     );
     assert_eq!(rec["record_version"], 1);
 }
+
+// ---------------------------------------------------------------------------
+// A hop answered IN THE RECORD needs no file on disk
+// ---------------------------------------------------------------------------
+
+/// `migrate build` must not demand a `transform.rs` for a hop whose answer is a
+/// constant.
+///
+/// This is the common case #374 creates, and it was broken: the build read the
+/// authored body whenever no *escape language* was recorded, on the stated
+/// premise that "no language" means "written before #374". It does not. A
+/// current record whose only authored change was answered with a constant or a
+/// field copy names no escape language either — and `migrate build` demanded a
+/// `transform.rs` that was never scaffolded, for a hop that is fully answered.
+/// The fact that actually separates the two is `record_version`.
+///
+/// The assertion is on the **absence** of that message rather than on a
+/// successful build, deliberately: `migrate build` compiles a crate whose
+/// substrate deps resolve from crates.io, so a tier-1 test cannot take it to
+/// completion. What it CAN prove is that emission got past the point that was
+/// wrong, and a message naming `transform.rs` is that point.
+#[test]
+fn test_a_hop_answered_in_the_record_needs_no_transform_file() {
+    let temp = TempDir::new().unwrap();
+    let dir = temp.path();
+    fixture(dir, "Post {\n  id: +uuid\n  title: string\n}\n");
+
+    // A required add with no default, answered with a CONSTANT — the shape a
+    // terminal `migrate create` produces and the one the bug was reachable
+    // through. It is written by hand because the answer comes from a prompt,
+    // and the subprocess harness can only ever walk the non-interactive branch.
+    fs::write(
+        dir.join("schema.forge"),
+        "Post {\n  id: +uuid\n  title: string\n  slug: string\n}\n",
+    )
+    .unwrap();
+    write_answered_record(dir);
+
+    let rec = only_record(dir);
+    assert_eq!(rec["record_version"], 1, "a current record: {rec:#}");
+    assert!(
+        rec["changes"][0]["AddField"]["answer"].is_object(),
+        "the change is answered IN THE RECORD: {rec:#}"
+    );
+    assert!(
+        !dir.join("migrations")
+            .join(rec["id"].as_str().unwrap())
+            .join("transform.rs")
+            .exists(),
+        "no transform was scaffolded, because a constant needs none"
+    );
+
+    let out = forgedb(dir)
+        .args([
+            "migrate", "build", "--schema", "schema.forge", "--from", "1", "--to", "2",
+        ])
+        .output()
+        .expect("run migrate build");
+    let log = combined(&out);
+    assert!(
+        !log.contains("transform.rs"),
+        "the build demanded an authored body for a hop that is answered in the \
+         record. `record_version`, not the absence of an escape language, is what \
+         says a record predates #374:\n{log}"
+    );
+}
+
+/// Record a v1 -> v2 hop whose one change is an `Authored` required add
+/// answered with `Answer::Constant`, plus the v2 schema snapshot the
+/// transformer needs.
+fn write_answered_record(dir: &Path) {
+    use forgedb_migrations::{Answer, Migration, MigrationGenerator, SchemaChange};
+    let m = Migration::with_id(
+        Migration::next_id(),
+        "add slug".to_string(),
+        vec![SchemaChange::AddField {
+            model_name: "Post".into(),
+            field_name: "slug".into(),
+            field_type: "string".parse().unwrap(),
+            nullable: false,
+            default_json: None,
+            answer: Some(Answer::Constant {
+                json: "\"untitled\"".into(),
+            }),
+        }],
+        1,
+        2,
+    );
+    MigrationGenerator::write_migration(migrations_dir(dir), m).unwrap();
+    forgedb_migrations::save_versioned_schema(
+        &migrations_dir(dir),
+        2,
+        &fs::read_to_string(dir.join("schema.forge")).unwrap(),
+    )
+    .unwrap();
+}

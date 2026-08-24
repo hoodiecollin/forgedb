@@ -1152,11 +1152,21 @@ fn emit_transform_crate(app: &ResolvedApp, kind: &PackageKind) -> Result<()> {
             .1;
         let model_ops = build_model_ops(&m.changes, dest_schema);
         let language = escape_language_of(m);
+        // A `transform.rs` is read for exactly two records, and the second is
+        // decided by the RECORD VERSION rather than by the absence of a
+        // language.
+        //
+        // "No language recorded" is NOT the same fact as "written before #374":
+        // a current record whose only authored change was answered with a
+        // constant or a field copy also names no escape language, and that is
+        // the common case this issue creates. Keying on it demanded a
+        // `transform.rs` that was never scaffolded, for a hop that is fully
+        // answered.
+        let is_legacy = m.record_version == 0;
         let authored_src = if language == Some(forgedb_migrations::EscapeLanguage::Rust)
-            || (language.is_none() && !m.authored_changes().is_empty())
+            || (is_legacy && !m.authored_changes().is_empty())
         {
-            // Rust — embedded verbatim (C13). `language.is_none()` with authored
-            // residue is a pre-#374 record, whose body is always `transform.rs`.
+            // Rust — embedded verbatim (C13).
             let p = forgedb_migrations::authored_body_path(&migrations_dir, &m.id);
             Some(std::fs::read_to_string(&p).map_err(|e| {
                 CliError::Migration(format!(
