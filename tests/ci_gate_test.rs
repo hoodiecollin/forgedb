@@ -961,3 +961,58 @@ fn the_parent_workspace_job_still_does_its_work() {
          say which line moved:\n{p2}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// S339-3 — the SDK arm BUILDS the crate; it does not grep it.
+// ---------------------------------------------------------------------------
+
+/// The generated Rust SDK is covered by string snapshots and by a
+/// `syn::parse_file` at generation time. Parsing is not compiling — the emitted
+/// crate names `reqwest`/`serde` types it has never been type-checked against —
+/// and this step is the only place anything compiles it.
+///
+/// The plausible regression is not deletion but softening: a `test -f` on the
+/// manifest, or a `grep` for a symbol, which look like coverage and are not. So
+/// the assertions anchor on the compile and on the membership query, and
+/// explicitly on `cargo build` running from the workspace ROOT rather than
+/// inside the SDK directory — building in place is the shape #430 withdrew and
+/// it has no green state under a foreign root.
+#[test]
+fn the_sdk_arm_builds_rather_than_greps() {
+    let body = run_block(
+        "substrate-reclose.yml",
+        "P3 class-A output — the generated Rust SDK, adopted and built",
+    );
+
+    for needle in [
+        // Adoption: one path dep from a crate the consumer owns.
+        "forgedb-client = { path = \"../app/generated/rust-sdk\" }",
+        // The compile, from the ROOT.
+        "cargo build -p consumer",
+        // Membership, asked of cargo rather than asserted about the filesystem.
+        "cargo metadata --no-deps",
+        // The client is CONSTRUCTED — a path dep alone exercises no public surface.
+        "ForgeDbClient::new(",
+        // The foreign root is still untouched after adoption.
+        "$ROOT_SHA",
+    ] {
+        assert!(
+            body.contains(needle),
+            "the SDK arm no longer runs `{needle}`. Without it the step reads as \
+             coverage of a crate nothing compiles — `RustSdkGenerator` has only \
+             string snapshots and a parse check behind it:\n{body}"
+        );
+    }
+
+    // Building INSIDE the SDK directory is the withdrawn shape (#430): it has no
+    // green state under a foreign root, and a step that reintroduced it would be
+    // red forever for a reason that is not ForgeDB's.
+    assert!(
+        !body.contains("cd \"$APP/generated/rust-sdk\""),
+        "the SDK arm builds in place rather than by adoption. A package under a \
+         foreign workspace root that is not a member cannot build, and the fix \
+         that would make it — a `[workspace]` table in the generated package — is \
+         withdrawn (#430), because a nested one that any member path-depends on \
+         fails the entire workspace:\n{body}"
+    );
+}

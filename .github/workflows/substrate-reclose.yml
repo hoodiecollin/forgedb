@@ -869,3 +869,78 @@ jobs:
           # that would be tempting (and that #338 explicitly refuses), and a
           # checksum failure alone would not say which line moved.
           grep -q 'members = \["consumer"\]' Cargo.toml
+
+      - name: P3 class-A output — the generated Rust SDK, adopted and built
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # THE FIRST TIME ANYTHING ANYWHERE COMPILES THIS CRATE.
+          #
+          # `RustSdkGenerator` is covered by string snapshots and by a
+          # `syn::parse_file` at generation time. Parsing is not compiling: the
+          # emitted crate names `reqwest`, `serde` and `serde_json` types it has
+          # never been type-checked against, and a snapshot passes on code that
+          # does not build.
+          #
+          # ADOPTED, not built in place. Under a foreign root a `cargo build`
+          # inside the SDK directory fails — cargo's documented behaviour for a
+          # package under a workspace root that is not a member — and the fix that
+          # would make it pass, a `[workspace]` table in the generated package, is
+          # withdrawn (#430): a nested one that any member path-depends on fails
+          # the whole workspace. So the consumer adopts it with one path dep, the
+          # way #338's model already prescribes for the in-tree package, and cargo
+          # makes it an implicit member.
+          #
+          # The pre-adoption failure is deliberately NOT asserted. Encoding
+          # cargo's error text as a required property would make a future cargo
+          # relaxation read as a ForgeDB regression, and the property worth
+          # holding is "a consumer in a workspace can build what we wrote".
+          test -f "$APP/generated/rust-sdk/Cargo.toml"
+
+          cat >> "$WORK/consumer/Cargo.toml" <<'DEP'
+          forgedb-client = { path = "../app/generated/rust-sdk" }
+          DEP
+          # A `main` that CONSTRUCTS the client: a path dep alone would compile
+          # the crate but exercise none of its public surface, so a client whose
+          # constructor did not typecheck against the consumer's own edition and
+          # feature set would still pass.
+          cat > "$WORK/consumer/src/main.rs" <<'MAIN'
+          fn main() {
+              let _c = forgedb_client::ForgeDbClient::new("http://127.0.0.1:3000");
+          }
+          MAIN
+
+          cd "$WORK"
+          # From the workspace ROOT, not from the SDK directory — that is the
+          # whole point of the step.
+          cargo build -p consumer
+
+          # …and cargo agrees it is a member, rather than merely a directory that
+          # happened to compile. `--no-deps` lists exactly the workspace members.
+          cargo metadata --no-deps --format-version 1 > "$RUNNER_TEMP/meta.json"
+          python3 - "$RUNNER_TEMP/meta.json" "$FORGEDB_HOME" <<'PY'
+          import json, sys
+
+          meta = json.load(open(sys.argv[1]))
+          home = sys.argv[2]
+          members = {p["name"]: p["manifest_path"] for p in meta["packages"]}
+
+          if "forgedb-client" not in members:
+              print("FAIL: the SDK is not a workspace member. Members: %s" % sorted(members))
+              print("It compiled, but as something cargo does not consider part of this")
+              print("workspace — which is not the shape a consumer adopting it would get.")
+              sys.exit(1)
+          print("ok: forgedb-client is a member at %s" % members["forgedb-client"])
+
+          leaks = sorted(n for n, m in members.items() if m.startswith(home))
+          if leaks:
+              print("FAIL: the consumer's build graph reaches into ForgeDB's cache: %s" % leaks)
+              print("The cache is derived state and may be deleted at any time (C8); a")
+              print("consumer build that depends on it breaks the moment it is pruned.")
+              sys.exit(1)
+          print("ok: no member resolves under %s" % home)
+          PY
+
+          # `members` was never edited — adoption is a path dep from a crate the
+          # consumer owns, and cargo joins the package on its own.
+          test "$(sha256sum Cargo.toml | cut -d' ' -f1)" = "$ROOT_SHA"
