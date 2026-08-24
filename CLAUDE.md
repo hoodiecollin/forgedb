@@ -173,6 +173,20 @@ built-in `generated` default included** (`Governing::output` owns all three case
 `output` is a per-app pattern; the CWD-relative reading had every app in a project
 overwriting its siblings.
 
+**A THIRD destination is opt-in: `[placement].rust_package` (#338).** A Rust consumer who builds
+with cargo can have the generated database emitted into their own tree as a ForgeDB-owned cargo
+package — `Cargo.toml` + `src/lib.rs`, **never** an `api.rs`/`main.rs`/`[[bin]]`, whatever
+`[generate].targets` says. The cache emitter, the in-tree emitter and `--check` all render through
+`CorePackage::files`, so the three copies of `database.rs` (mirror, cache, in-tree) are
+byte-identical by construction. `Governing::rust_package()` is the knob's ONE reader (schema-relative,
+from `Chain::nearest()` — it is a knob, not a project-wide fact). The key's **absence is the
+opt-out**; there is no affirmative "cache-only" spelling. `forgedb build` never compiles it (class D
+has no delivery step), and **ForgeDB prints the dep line rather than writing it** — it edits no
+manifest it did not author, emits no `[workspace]` table (a nested one that a member path-depends on
+fails the whole workspace), and writes no `members` entry (a path dep inside the workspace directory
+joins on its own). The table name is a **one-way door**: `deny_unknown_fields` means every released
+CLI rejects a config carrying it.
+
 **`src/main.rs` links the library** (`use forgedb::{…}`) rather than re-declaring its
 modules. Re-declaring compiles each twice and makes every `pub` item only the tests use read
 as dead code in the binary — do not reintroduce `mod` declarations there.
