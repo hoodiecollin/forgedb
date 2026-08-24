@@ -65,6 +65,7 @@ fn scenario_5_a_constant_is_recorded_as_data() {
         "20260808000000",
         Some(&mut ask),
         "unused",
+        (1, 2),
     )
     .expect("the scripted operator answers");
 
@@ -107,6 +108,7 @@ fn a_copy_answer_names_a_field_of_the_same_type() {
         "20260808000000",
         Some(&mut ask),
         "unused",
+        (1, 2),
     )
     .unwrap();
 
@@ -136,6 +138,7 @@ fn the_copy_option_is_absent_when_nothing_could_be_copied() {
         "20260808000000",
         Some(&mut ask),
         "unused",
+        (1, 2),
     )
     .unwrap();
     assert_eq!(
@@ -155,6 +158,7 @@ fn the_copy_option_is_absent_when_nothing_could_be_copied() {
         "20260808000001",
         Some(&mut ask),
         "unused",
+        (1, 2),
     )
     .unwrap();
     assert!(
@@ -184,6 +188,7 @@ fn the_escape_hatch_records_the_scaffolds_own_hash() {
         "20260808000000",
         Some(&mut ask),
         "unused",
+        (1, 2),
     )
     .unwrap()
     .expect("an escape answer writes a scaffold");
@@ -250,6 +255,7 @@ fn the_scaffold_does_not_teach_the_todo_convention() {
             &format!("2026080800{:04}", lang as u8),
             Some(&mut ask),
             "unused",
+            (1, 2),
         )
         .unwrap()
         .expect("an escape answer writes a scaffold");
@@ -287,6 +293,7 @@ fn an_existing_authored_file_is_never_clobbered() {
         "20260808000000",
         Some(&mut ask),
         "unused",
+        (1, 2),
     )
     .unwrap();
 

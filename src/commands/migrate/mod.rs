@@ -112,6 +112,13 @@ struct ResolvedApp {
     /// The app's legible derived identity, e.g. `foo_services_blog`.
     app_name: String,
     reserved: crate::cache::Reserved,
+    /// The project root a relative `[toolchain].path` resolves against — never
+    /// the CWD (#333/#361).
+    project_root: PathBuf,
+    /// The governing config, kept so a later step can read a knob without
+    /// walking the chain a second time (and possibly getting a different
+    /// answer).
+    governing: crate::config::ForgeConfig,
 }
 
 impl ResolvedApp {
@@ -155,10 +162,15 @@ fn resolve_app(app: &AppRef) -> Result<ResolvedApp> {
         )));
     }
 
-    let governing = crate::project::govern(app.config.as_deref(), crate::project::schema_dir(schema))?;
-    let project = governing.identify_reported()?;
-    let reserved =
-        crate::cache::reserve(&project.name, &project.root, schema, governing.symbol_naming())?;
+    let governing_chain =
+        crate::project::govern(app.config.as_deref(), crate::project::schema_dir(schema))?;
+    let project = governing_chain.identify_reported()?;
+    let symbol_naming = governing_chain.symbol_naming();
+    // Taken by value: `migrate build` reads `[toolchain]` much later, and
+    // re-walking the chain there could answer a different question than the one
+    // this app's identity was resolved against.
+    let governing = governing_chain.into_config();
+    let reserved = crate::cache::reserve(&project.name, &project.root, schema, symbol_naming)?;
     // C7: every command that writes into the cache prints where it wrote.
     // Once the build happens in a hashed directory the user has never seen, a
     // silent path is the difference between a build they can inspect and one
@@ -170,6 +182,8 @@ fn resolve_app(app: &AppRef) -> Result<ResolvedApp> {
         migrations_dir: crate::project::migrations_dir(schema),
         app_name: reserved.app_name.clone(),
         reserved,
+        project_root: project.root.clone(),
+        governing,
     })
 }
 
@@ -367,6 +381,7 @@ pub fn create(opts: MigrateCreateOptions) -> Result<()> {
         &migration_id,
         ask,
         reason,
+        (from_version, to_version),
     )?;
 
     let has_breaking = changes.iter().any(|c| c.is_breaking());
@@ -399,6 +414,27 @@ pub fn create(opts: MigrateCreateOptions) -> Result<()> {
         to_version
     ));
     println!("\n{}", MigrationGenerator::generate_report(&migration));
+
+    // ForgeDB's own files beside the author's transform: the host loop and one
+    // typed module per version in this hop. Always rewritten — a CLI upgrade
+    // must reach them, and the drift belongs in the author's `git diff`.
+    if scaffold.is_some() {
+        let from_schema = forgedb_migrations::load_versioned_schema(&migrations_dir, from_version)
+            .map_err(map_err)
+            .and_then(|src| {
+                forgedb_parser::Parser::new(&src)
+                    .and_then(|mut p| p.parse())
+                    .map_err(|e| {
+                        CliError::Migration(format!("committed schema v{from_version}: {e}"))
+                    })
+            })?;
+        escape::write_support_files(
+            &migrations_dir,
+            &migration.id,
+            escape_language,
+            &[(from_version, &from_schema), (to_version, &dest_schema)],
+        )?;
+    }
 
     if let Some(path) = &scaffold {
         ui::warning(&format!(
@@ -1095,6 +1131,13 @@ fn emit_transform_crate(app: &ResolvedApp, kind: &PackageKind) -> Result<()> {
         parsed.push((v, schema));
     }
 
+    // The escape language a hop records, if any. Resolved for the WHOLE range
+    // before anything is generated (#374): an interpreter that is missing is
+    // missing whether or not the crate compiles, and learning it after a cargo
+    // build costs a compile to discover what a `--version` could have said.
+    let member = app.member(kind);
+    let mut escape_sources: Vec<(String, String)> = Vec::new();
+
     // Build one frozen hop plan per recorded migration in the range.
     let mut hops = Vec::new();
     for m in &hop_migrations {
@@ -1104,9 +1147,12 @@ fn emit_transform_crate(app: &ResolvedApp, kind: &PackageKind) -> Result<()> {
             .expect("range parsed every version")
             .1;
         let model_ops = build_model_ops(&m.changes, dest_schema);
-        let authored_src = if m.authored_changes().is_empty() {
-            None
-        } else {
+        let language = escape_language_of(m);
+        let authored_src = if language == Some(forgedb_migrations::EscapeLanguage::Rust)
+            || (language.is_none() && !m.authored_changes().is_empty())
+        {
+            // Rust — embedded verbatim (C13). `language.is_none()` with authored
+            // residue is a pre-#374 record, whose body is always `transform.rs`.
             let p = forgedb_migrations::authored_body_path(&migrations_dir, &m.id);
             Some(std::fs::read_to_string(&p).map_err(|e| {
                 CliError::Migration(format!(
@@ -1115,13 +1161,24 @@ fn emit_transform_crate(app: &ResolvedApp, kind: &PackageKind) -> Result<()> {
                     m.id, p, e
                 ))
             })?)
+        } else {
+            None
         };
+
+        let escape = match language {
+            Some(lang) if lang != forgedb_migrations::EscapeLanguage::Rust => Some(
+                stage_escape(app, &member, &migrations_dir, m, lang, &parsed, &mut escape_sources)?,
+            ),
+            _ => None,
+        };
+
         hops.push(HopPlan {
             from_version: m.from_version,
             to_version: m.to_version,
             migration_id: m.id.clone(),
             model_ops,
             authored_src,
+            escape,
         });
     }
 
@@ -1135,10 +1192,95 @@ fn emit_transform_crate(app: &ResolvedApp, kind: &PackageKind) -> Result<()> {
     let plan = TransformPlan { versions, hops };
 
     let package = app.package(kind);
-    let crate_out = TransformGenerator::generate(&plan, &package)
+    let mut crate_out = TransformGenerator::generate(&plan, &package)
         .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+    // The author's script and ForgeDB's support files ride the same emission as
+    // the crate's own sources, so they land under the member with everything
+    // else and are rewritten on every build.
+    crate_out.sources.extend(escape_sources);
 
     write_class_c_member(app, kind, &crate_out)
+}
+
+/// The one escape language a migration's answers name, if any (#374).
+///
+/// Every escape in one migration shares one file and therefore one language —
+/// `resolve_answers` writes them that way. Reading the first is enough, and
+/// disagreement is impossible by construction rather than by convention.
+fn escape_language_of(m: &forgedb_migrations::Migration) -> Option<forgedb_migrations::EscapeLanguage> {
+    use forgedb_migrations::Answer;
+    m.changes.iter().find_map(|c| match c.answer() {
+        Some(Answer::Escape { language, .. }) => Some(*language),
+        _ => None,
+    })
+}
+
+/// Regenerate ForgeDB's support files, copy the author's script into the cache
+/// member, and resolve the interpreter that will run it (#374 step 12).
+///
+/// The **copy** is what makes `migrate run` execute exactly what `migrate build`
+/// checked: the hash comparison happened a moment ago against
+/// `migrations/<id>/transform.<ext>`, and a path baked to that file would run
+/// whatever is there at run time instead.
+fn stage_escape(
+    app: &ResolvedApp,
+    member: &Path,
+    migrations_dir: &Path,
+    m: &forgedb_migrations::Migration,
+    lang: forgedb_migrations::EscapeLanguage,
+    parsed: &[(u32, forgedb_parser::Schema)],
+    sources: &mut Vec<(String, String)>,
+) -> Result<forgedb_codegen::EscapeBridge> {
+    // Regenerated from the committed snapshots, in the author's own directory,
+    // so a CLI upgrade reaches them and the drift shows up in their `git diff`.
+    let versions: Vec<(u32, &forgedb_parser::Schema)> = parsed
+        .iter()
+        .filter(|(v, _)| *v == m.from_version || *v == m.to_version)
+        .map(|(v, s)| (*v, s))
+        .collect();
+    escape::write_support_files(migrations_dir, &m.id, lang, &versions)?;
+
+    // Everything in the migration's body dir rides into the member: the
+    // author's transform plus ForgeDB's host loop and typed modules, which the
+    // transform imports.
+    let body_dir = forgedb_migrations::migration_body_dir(migrations_dir, &m.id);
+    let rel_dir = format!("escape/{}", m.id);
+    for entry in std::fs::read_dir(&body_dir)
+        .map_err(|e| CliError::Migration(format!("reading {}: {e}", body_dir.display())))?
+        .flatten()
+    {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| CliError::Migration(format!("reading {}: {e}", path.display())))?;
+        sources.push((format!("{rel_dir}/{name}"), content));
+    }
+
+    let interpreter = crate::toolchain::resolve(
+        &app.governing.toolchain,
+        &app.project_root,
+        lang,
+    )?;
+    ui::detail(&format!(
+        "Escape runtime: {} ({}) — {}",
+        interpreter.name,
+        interpreter.version,
+        interpreter.program.display()
+    ));
+
+    Ok(forgedb_codegen::EscapeBridge {
+        program: interpreter.program.display().to_string(),
+        args: vec![
+            member
+                .join(&rel_dir)
+                .join(lang.transform_file())
+                .display()
+                .to_string(),
+        ],
+    })
 }
 
 /// Build the frozen per-model structural ops for one hop from its recorded schema

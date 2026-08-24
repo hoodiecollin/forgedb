@@ -81,6 +81,41 @@ pub struct HopPlan {
     /// The frozen authored `transform.rs` source, embedded verbatim (C13) when the
     /// hop carries `Authored` residue; `None` for a fully-automatic hop.
     pub authored_src: Option<String>,
+    /// A non-Rust escape: everything needed to reach the author's OWN runtime,
+    /// **all baked at generation time** (#374 direction C).
+    ///
+    /// Mutually exclusive with [`authored_src`](Self::authored_src): a Rust
+    /// escape is compiled INTO this crate, a TypeScript or Python one runs out
+    /// of process on the interpreter the author already has.
+    pub escape: Option<EscapeBridge>,
+}
+
+/// How the emitted hop reaches the author's own runtime (#374).
+///
+/// # Where the identity temptation lives
+///
+/// The bridge is schema-agnostic *by construction* — it reads JSON lines and
+/// writes JSON lines — which makes it look like the one piece of this design
+/// that should be a shipped crate or a shared runtime helper. It is not, and the
+/// violation that matters is one step further and much easier to reach by
+/// accident: giving the bridge a **list of models**, or a **table of per-field
+/// ops**, so one loop could drive every model. That is a descriptor loop — the
+/// schema, at run time, in a generic evaluator.
+///
+/// So there is no model list and no op descriptor in this struct, and there is
+/// none in the emitted code either: the copy loop is emitted **per model**, and
+/// the model name is a **string literal at its own call site**, exactly where
+/// `authored_transform(#model_str, __j)` already puts it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EscapeBridge {
+    /// Absolute path to the interpreter, resolved from `[toolchain]` at
+    /// `migrate build` and version-checked there — never looked up at run time.
+    pub program: String,
+    /// Baked argv. The last element is the **copy** of the author's script
+    /// inside the cache member: `migrate build` verifies the script against the
+    /// recorded scaffold hash and then copies it, so what runs is exactly what
+    /// was checked.
+    pub args: Vec<String>,
 }
 
 /// The structural row ops for one model across one hop (all applied to the row's
@@ -223,6 +258,14 @@ impl TransformGenerator {
             })
             .collect();
 
+        // The bridge's process glue, emitted only when some hop needs it.
+        let escape_support = plan
+            .hops
+            .iter()
+            .any(|h| h.escape.is_some())
+            .then(escape_support)
+            .unwrap_or_default();
+
         let run = Self::generate_run(plan);
 
         let usage = format!(
@@ -235,6 +278,8 @@ impl TransformGenerator {
 
             #(#version_mods)*
             #(#authored_mods)*
+
+            #escape_support
 
             #(#hop_fns)*
 
@@ -280,6 +325,20 @@ impl TransformGenerator {
             .authored_src
             .as_ref()
             .map(|_| format_ident!("{}", authored_mod_name(hop)));
+
+        // The author's own runtime, spawned ONCE per hop. Not once per model and
+        // not once per row: a process per row would be the same work done N
+        // times, and a process per model would need a model list to drive it.
+        let escape_spawn = hop.escape.as_ref().map(|b| {
+            let program = &b.program;
+            let args = &b.args;
+            quote! {
+                let mut __escape = __Escape::spawn(#program, &[#(#args),*])?;
+            }
+        });
+        let escape_finish = hop.escape.as_ref().map(|_| {
+            quote! { __escape.finish()?; }
+        });
 
         // One copy loop per dest model that has a source in `v_from`.
         let mut model_loops = Vec::new();
@@ -362,6 +421,12 @@ impl TransformGenerator {
             let authored_call = authored.as_ref().map(|am| {
                 quote! { __j = #am::authored_transform(#model_str, __j); }
             });
+            // Same shape as the line above it, and deliberately so: the model
+            // name is a LITERAL at this call site, not an entry in a table the
+            // bridge walks.
+            let escape_call = hop.escape.as_ref().map(|_| {
+                quote! { __j = __escape.row(#model_str, __j)?; }
+            });
 
             model_loops.push(quote! {
                 for __row in __src.#src_field.all() {
@@ -369,6 +434,7 @@ impl TransformGenerator {
                         .map_err(|e| format!("serialize {}: {}", #model_str, e))?;
                     #(#ops)*
                     #authored_call
+                    #escape_call
                     let __rec: #vto::#dst_ty = serde_json::from_value(__j)
                         .map_err(|e| format!("decode {} at v{}: {}", #model_str, #to_v, e))?;
                     __dst.#dst_field.insert(__rec)
@@ -399,6 +465,7 @@ impl TransformGenerator {
                 __dst_dir: &std::path::Path,
             ) -> ::std::result::Result<(), String> {
                 std::fs::create_dir_all(__dst_dir).map_err(|e| format!("mkdir dst: {}", e))?;
+                #escape_spawn
                 // Read via the v_from typed structs. `vN::Database::open_at` runs
                 // the #74 Phase 1 format guard, refusing a dir not stamped at
                 // format v{from} — the version interlock, for free. Both dirs are
@@ -407,6 +474,7 @@ impl TransformGenerator {
                 let mut __dst = #vto::Database::open_at(__dst_dir.to_path_buf());
                 #(#model_loops)*
                 #(#junction_loops)*
+                #escape_finish
                 // Materialize + fsync the destination-version columns.
                 __dst.commit().map_err(|e| format!("commit v{}: {}", #to_v, e))?;
                 Ok(())
@@ -584,5 +652,147 @@ impl TransformGenerator {
             code,
             description: "ForgeDB migration transformer entrypoint".to_string(),
         })
+    }
+}
+
+/// The process glue for a non-Rust escape (#374 direction C), emitted into the
+/// transformer's `main.rs` only when some hop in the range needs it.
+///
+/// # It knows no schema, and cannot be given one
+///
+/// `row` takes a model **name** and a row, one call at a time, and the name
+/// arrives as a string literal from the emitted per-model copy loop. There is no
+/// model list here, no field table, and no descriptor — which is the difference
+/// between generated transport glue and a generic evaluator.
+///
+/// # Three failure modes, all named rather than hung
+///
+/// * **EOF before a reply.** The runtime exited early. Reported as exactly that,
+///   with the row count and the child's stderr, instead of blocking forever — a
+///   buffering bug in an author's script would otherwise present as a hung
+///   migration with no output.
+/// * **A malformed line.** Reported with the line.
+/// * **A non-zero exit.** Reported with the status and stderr.
+///
+/// Any of them fails the whole hop, which is already safe: the transformer
+/// writes a fresh destination and leaves the source dir untouched.
+///
+/// Stderr is drained on its own thread. Reading it after the exchange would
+/// deadlock the moment a script wrote more than a pipe buffer's worth while the
+/// parent was blocked writing a row.
+///
+/// **No timeouts.** A migration that is slow because the author's transform is
+/// slow is not a migration to abandon halfway.
+fn escape_support() -> TokenStream {
+    quote! {
+        struct __Escape {
+            child: std::process::Child,
+            stdin: std::process::ChildStdin,
+            stdout: std::io::BufReader<std::process::ChildStdout>,
+            stderr: Option<std::thread::JoinHandle<String>>,
+            rows: u64,
+            program: String,
+        }
+
+        impl __Escape {
+            fn spawn(program: &str, args: &[&str]) -> ::std::result::Result<Self, String> {
+                use std::io::Read;
+                let mut child = std::process::Command::new(program)
+                    .args(args)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .map_err(|e| format!(
+                        "could not start the transform runtime `{}`: {}", program, e
+                    ))?;
+                let stdin = child.stdin.take().expect("stdin was piped");
+                let stdout = std::io::BufReader::new(
+                    child.stdout.take().expect("stdout was piped")
+                );
+                let mut err = child.stderr.take().expect("stderr was piped");
+                let stderr = std::thread::spawn(move || {
+                    let mut s = String::new();
+                    let _ = err.read_to_string(&mut s);
+                    s
+                });
+                Ok(Self {
+                    child,
+                    stdin,
+                    stdout,
+                    stderr: Some(stderr),
+                    rows: 0,
+                    program: program.to_string(),
+                })
+            }
+
+            fn row(
+                &mut self,
+                model: &str,
+                row: serde_json::Value,
+            ) -> ::std::result::Result<serde_json::Value, String> {
+                use std::io::{BufRead, Write};
+                let req = serde_json::json!({ "model": model, "row": row });
+                let line = serde_json::to_string(&req)
+                    .map_err(|e| format!("serialize {} for the transform runtime: {}", model, e))?;
+                self.stdin
+                    .write_all(line.as_bytes())
+                    .and_then(|_| self.stdin.write_all(b"\n"))
+                    .and_then(|_| self.stdin.flush())
+                    .map_err(|e| self.died(&format!("writing a {} row: {}", model, e)))?;
+
+                let mut reply = String::new();
+                match self.stdout.read_line(&mut reply) {
+                    Err(e) => Err(self.died(&format!("reading the reply for {}: {}", model, e))),
+                    Ok(0) => Err(self.died(&format!(
+                        "it exited after {} row(s), before replying about {}",
+                        self.rows, model
+                    ))),
+                    Ok(_) => {
+                        self.rows += 1;
+                        serde_json::from_str(reply.trim()).map_err(|e| {
+                            format!(
+                                "the transform runtime replied with something that is not a \
+                                 JSON row for {}: {}\n  reply: {}",
+                                model, e, reply.trim()
+                            )
+                        })
+                    }
+                }
+            }
+
+            fn died(&mut self, what: &str) -> String {
+                format!(
+                    "the transform runtime `{}` failed while {}.{}",
+                    self.program,
+                    what,
+                    self.drain_stderr()
+                )
+            }
+
+            fn drain_stderr(&mut self) -> String {
+                match self.stderr.take().and_then(|h| h.join().ok()) {
+                    Some(s) if !s.trim().is_empty() => format!("\n--- its output ---\n{}", s.trim()),
+                    _ => String::new(),
+                }
+            }
+
+            fn finish(mut self) -> ::std::result::Result<(), String> {
+                // Dropping stdin is the EOF that ends the child's read loop.
+                drop(self.stdin);
+                let status = self
+                    .child
+                    .wait()
+                    .map_err(|e| format!("waiting for the transform runtime: {}", e))?;
+                if status.success() {
+                    return Ok(());
+                }
+                let tail = self.drain_stderr();
+                Err(format!(
+                    "the transform runtime `{}` exited {} after {} row(s).{}",
+                    self.program, status, self.rows, tail
+                ))
+            }
+        }
     }
 }

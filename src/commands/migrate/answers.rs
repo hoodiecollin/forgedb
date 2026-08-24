@@ -64,6 +64,9 @@ pub fn resolve_answers(
     migration_id: &str,
     mut ask: Option<&mut dyn Ask>,
     non_interactive_reason: &str,
+    // The hop's `(from, to)` schema serials — the two typed modules an escape
+    // transform reads from and writes to.
+    versions: (u32, u32),
 ) -> Result<Option<std::path::PathBuf>> {
     let questions = collect_questions(changes, dest_schema);
     if questions.is_empty() {
@@ -112,6 +115,7 @@ pub fn resolve_answers(
         escape,
         changes,
         dest_schema,
+        versions,
     )?;
     for i in escapes {
         changes[i].set_answer(Answer::Escape {
