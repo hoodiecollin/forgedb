@@ -1,0 +1,127 @@
+---
+title: "[placement]"
+description: "The [placement] table — emitting the generated Rust database as a cargo package in your own tree, so your cargo compiles it."
+purpose: "reference"
+---
+The `[placement]` table says **where an already-generated artifact lands**. It is separate
+from `[generate]` on purpose, and the line is sharp: `[generate]`'s knobs change generated
+*bytes*; this one changes only *where a byte-identical artifact goes*.
+
+It has one key today.
+
+```toml
+[placement]
+rust_package = "generated/core"   # relative to the SCHEMA's directory
+```
+
+## Keys
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `rust_package` | string (path) | *absent* | Emit the generated database into your tree as a ForgeDB-owned cargo package. |
+
+**The key's absence is the opt-out.** There is no affirmative "cache-only" spelling: with no
+`[placement]` table, nothing is emitted into your tree and nothing changes. Writing a cargo
+package into a repository ForgeDB does not own is opt-in, and one key is the whole of that
+opt-in.
+
+The path is resolved against **the schema's** directory, exactly as `[generate].output` is.
+Under one shared root config, `rust_package = "generated/core"` therefore means
+`apps/api/generated/core` and `apps/web/generated/core` — a per-app pattern, not one
+directory two apps overwrite each other in.
+
+## What it emits
+
+Exactly two files, and nothing else:
+
+```
+generated/core/
+  Cargo.toml     # ForgeDB's — rewritten in full on every generate
+  src/lib.rs     # the generated database, byte-identical to generated/database.rs
+```
+
+No `api.rs`, no `main.rs`, no `[[bin]]` — whatever `[generate].targets` declares. In-tree
+placement gives you the *database*, not a server. If your app declares `api`, the REST layer
+is still built in ForgeDB's cache, as always.
+
+<Callout type="warning" title="This package is ForgeDB's file">
+`Cargo.toml` and `src/lib.rs` are both **rewritten in full** on every `forgedb generate`.
+Do not edit them: an edit is lost on the next run, and that is the point — a CLI upgrade
+that bumps a substrate pin has to reach an existing project, which it cannot do if your
+copy is allowed to freeze at whatever the first run wrote.
+</Callout>
+
+## Wiring it up
+
+ForgeDB **prints** the one dependency line and never writes it. Which of your crates should
+depend on the database is not knowable — a workspace may hold many — so picking one would be
+guessing in a file ForgeDB did not author.
+
+```
+✓ In-tree Rust package: generated/core (2 files)
+ℹ   Add this one line to the [dependencies] of whichever crate should use it,
+ℹ   with `path` re-based against THAT crate's directory:
+ℹ     forgedb_core = { package = "myapp-core", path = "generated/core" }
+```
+
+`package =` is **not** optional. Cargo matches a path dependency's *key* against the
+package's own name, and the emitted package is named `<app>-core` — so the obvious
+`forgedb_core = { path = "…" }` fails with `no matching package named 'forgedb_core' found`.
+The rename is also what keeps your generated source free of the app's derived name.
+
+The `path` is written relative to the directory `generate` ran in. If the crate you paste
+into is a subdirectory, re-base it — ForgeDB cannot compute it for you without knowing which
+crate receives the line, and an absolute path would be correct on exactly one machine.
+
+Two ForgeDB apps in **one** crate need one of the two keys renamed by hand; one member crate
+per app needs no edit.
+
+## Cargo needs no `members` entry
+
+A path dependency residing inside the workspace directory becomes a workspace member
+automatically. ForgeDB does not touch your `[workspace] members`, your `exclude`, your
+`.gitignore` or your lockfile.
+
+That is not merely tidiness. A `members` entry naming a path with no manifest is a **hard
+error that breaks every build in that workspace**, including `cargo build -p` on unrelated
+crates — a failure mode ForgeDB would then own, in exchange for a line cargo does not need.
+
+The emitted package carries no `[workspace]` table of its own either. A nested package with
+one that any member path-depends on makes cargo fail the whole workspace with `multiple
+workspace roots found in the same workspace`; it is buildable only while nothing depends on
+it. No `[workspace]` is the correct shape.
+
+A plain, non-workspace cargo package gets the same benefit — the shared compilation comes
+from being a path dependency, not from being listed.
+
+<Callout type="warning" title="Commit the generated package">
+A path dependency naming a missing directory fails the workspace load for **every** crate in
+it, a fresh clone and a cold CI checkout included. Check the emitted package in, like every
+other generated text artifact. If you insist on ignoring generated source, accept that your
+repo does not build until `forgedb generate` has run.
+</Callout>
+
+## What this does not do
+
+- **`forgedb build` never compiles it.** Your cargo does — one dependency resolution, one
+  `target/`, your profiles, your toolchain, your lockfile. ForgeDB's release profile floor
+  does not apply and does not need to: it exists to keep the `catch_unwind` boundaries in the
+  generated `ffi` and `napi` wrappers real, and neither is in-tree.
+- **It changes no generated byte.** The package receives the same value
+  `generated/database.rs` receives. Those two, and the copy in ForgeDB's build cache, are
+  byte-identical by construction.
+- **It does not bring back an editable `src/main.rs`.** In-tree carries `core` alone.
+- **A crate that path-depends on it cannot be published.** `cargo package` fails with *"all
+  dependencies must have a version requirement specified when packaging"*. In-tree serves
+  consumers who build their own binary, not consumers who ship a library.
+
+## Checked by `--check`
+
+The emitted package is committed source, so `forgedb generate --check` compares it and exits
+non-zero when it is stale or missing — naming the path, and writing nothing.
+
+## Refused placements
+
+A `rust_package` that resolves inside ForgeDB's build cache (`~/.forgedb`, or `FORGEDB_HOME`)
+is refused before anything is written. The cache is derived state that may be deleted at any
+time; committed source cannot live there.

@@ -212,7 +212,7 @@ fn the_server_manifest_pins_every_crate_its_source_names() {
         .and_then(|mut p| p.parse())
         .expect("fixture schema parses");
     let api = ApiGenerator::generate_with_config(&schema, GenConfig::DEFAULT).expect("api.rs");
-    let main = ServerPackage::main_rs(forgedb_codegen::ServerLayout::Cache);
+    let main = ServerPackage::main_rs();
     let manifest = ServerPackage::cargo_toml("app-server", "app-core");
 
     let deps = manifest_deps(&manifest);

@@ -72,6 +72,14 @@ pub struct Chain {
     /// for commands that take no schema.
     pub start: PathBuf,
     links: Vec<Link>,
+    /// The schema this walk was started *for*, when there was one.
+    ///
+    /// Carried only so a diagnostic can print the remedy command with the
+    /// `--schema` the failing invocation already resolved (#367).  In a monorepo
+    /// `forgedb project name X` run from another directory walks a **different
+    /// chain**, so a remedy printed without the schema is copy-pasteable and
+    /// subtly wrong — it would name a different project.
+    schema: Option<PathBuf>,
 }
 
 impl Chain {
@@ -109,7 +117,28 @@ impl Chain {
             }
         }
 
-        Ok(Chain { start, links })
+        Ok(Chain {
+            start,
+            links,
+            schema: None,
+        })
+    }
+
+    /// The walk a schema-taking command runs: up from the schema's directory,
+    /// remembering which schema it was for.
+    ///
+    /// Identical to [`Chain::walk`] in every answer it gives.  The only
+    /// difference is [`Chain::schema`], which diagnostics use to print a remedy
+    /// that resolves the same project the failing invocation did.
+    pub fn walk_from_schema(schema: &Path) -> Result<Chain> {
+        let mut chain = Chain::walk(schema_dir(schema))?;
+        chain.schema = Some(schema.to_path_buf());
+        Ok(chain)
+    }
+
+    /// The schema this walk was started for, when there was one.
+    pub fn schema(&self) -> Option<&Path> {
+        self.schema.as_deref()
     }
 
     /// The config whose knobs apply: the nearest one.  Knobs do **not** layer or
@@ -188,12 +217,96 @@ pub struct ProjectId {
     pub source: IdSource,
 }
 
-/// Resolve the project identity for a chain.
+/// A decision ForgeDB cannot make on its own, put to whoever can (#367).
+///
+/// Both variants carry the facts ForgeDB *already computed*, structurally
+/// rather than pre-formatted, so the prompt and the non-interactive diagnostic
+/// render from **one** derivation.  Re-deriving "which manifests name this
+/// root" at the prompt is the drift class this repo has been bitten by
+/// repeatedly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Question {
+    /// Two or more ecosystem manifests name the project root.
+    WhichName {
+        /// The directory identity is keyed on.
+        root: PathBuf,
+        /// `(manifest, name)` in `MANIFESTS` order.
+        candidates: Vec<(&'static str, String)>,
+        /// The schema the failing invocation resolved, for the remedy command.
+        schema_hint: Option<PathBuf>,
+    },
+    /// The resolved id is already claimed by another root.
+    Collision {
+        /// The contested id.
+        id: String,
+        /// Our project root.
+        root: PathBuf,
+        /// The root the ledger says holds it.
+        held_by: PathBuf,
+        /// Whether that root still exists.  **The answer set depends on this**,
+        /// which is the strongest reason this decision cannot be a flag: it is a
+        /// fact about the filesystem the user cannot know when they type the
+        /// command.
+        holder_exists: bool,
+        /// The schema the failing invocation resolved, for the remedy command.
+        schema_hint: Option<PathBuf>,
+    },
+}
+
+/// What came back.  Deliberately *not* an `Option<String>`: the two answers act
+/// on different files — a name is a resolution and goes in the project's own
+/// config, a take-over is detection state and goes in the ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    /// Use this `[project].name`, and persist it.
+    Name(String),
+    /// The holding root is gone; take the id over.  Writes the ledger and
+    /// **nothing else** — the project keeps its name.
+    TakeOverClaim,
+}
+
+/// Who answers a [`Question`].
+///
+/// The seam that makes the interactive path testable without a terminal: the
+/// *decision* ([`crate::ask::Askability`]) and the *act* ([`record_name`],
+/// [`take_over_claim`]) are on this side, the widget is on the far side.
+pub trait Asker {
+    /// `Ok(None)` = not answered — the caller takes the **unchanged**
+    /// non-interactive error.  "Cannot ask" and "declined" are deliberately the
+    /// same path; declining must not be a third behaviour.
+    fn ask(&self, q: &Question) -> Result<Option<Answer>>;
+
+    /// Consent to a format-preserving edit of a `forgedb.toml` ForgeDB did not
+    /// author.  *Creating* one where none exists needs no consent — there is
+    /// nothing to damage — but editing one does.
+    fn confirm_edit(&self, path: &Path) -> Result<bool>;
+}
+
+/// What [`identify_or_ask`] resolved, or why it could not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Identified {
+    /// A single answer.
+    Resolved(ProjectId),
+    /// Two or more manifests name the root and nothing chooses between them.
+    Ambiguous {
+        /// The directory identity is keyed on.
+        root: PathBuf,
+        /// `(manifest, name)` in `MANIFESTS` order.
+        candidates: Vec<(&'static str, String)>,
+    },
+}
+
+/// Resolve the project identity for a chain, or report the one case that has no
+/// single answer.
 ///
 /// Order at the **project root** config — not the nearest one: explicit name,
 /// then exactly one detectable ecosystem manifest, then a hash of the root's
 /// absolute path.
-pub fn identify(chain: &Chain) -> Result<ProjectId> {
+///
+/// [`identify`] is the thin wrapper that turns [`Identified::Ambiguous`] back
+/// into today's error, which keeps that message in exactly one place while
+/// letting a prompt reach the candidates **without re-deriving them**.
+pub fn identify_or_ask(chain: &Chain) -> Result<Identified> {
     let root_link = chain.project_root();
     let root = chain.root_dir();
 
@@ -232,49 +345,97 @@ pub fn identify(chain: &Chain) -> Result<ProjectId> {
 
     if let Some(name) = root_link.and_then(|l| l.config.project.name()) {
         validate_name(name, "[project].name")?;
-        return Ok(ProjectId {
+        return Ok(Identified::Resolved(ProjectId {
             name: name.to_string(),
             root,
             source: IdSource::Explicit,
-        });
+        }));
     }
 
-    let detected: Vec<(&'static str, String)> = MANIFESTS
-        .iter()
-        .filter_map(|m| manifest_name(&root.join(m)).map(|n| (*m, n)))
-        .collect();
+    let detected = detect_manifest_names(&root);
 
     match detected.len() {
         1 => {
             let (manifest, name) = &detected[0];
             validate_name(name, manifest)?;
-            Ok(ProjectId {
+            Ok(Identified::Resolved(ProjectId {
                 name: name.clone(),
                 root,
                 source: IdSource::Manifest(manifest),
-            })
+            }))
         }
-        0 => Ok(ProjectId {
+        0 => Ok(Identified::Resolved(ProjectId {
             name: path_hash_name(&root),
             root,
             source: IdSource::PathHash,
+        })),
+        _ => Ok(Identified::Ambiguous {
+            root,
+            candidates: detected,
         }),
-        _ => {
-            let list = detected
-                .iter()
-                .map(|(m, n)| format!("  {m} → {n}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            Err(CliError::ConfigDiagnostic(format!(
-                "{}: cannot pick a project name — {} ecosystem manifests name this \
-                 directory:\n{}\n\n\
-                 Set `[project].name` in {} to say which one ForgeDB should use.",
-                root.display(),
-                detected.len(),
-                list,
-                root.join(CONFIG_FILE).display(),
-            )))
+    }
+}
+
+/// Every ecosystem manifest beside `root` that declares a name, in `MANIFESTS`
+/// order.
+///
+/// One definition, reached by both the prompt payload and the diagnostic.
+fn detect_manifest_names(root: &Path) -> Vec<(&'static str, String)> {
+    MANIFESTS
+        .iter()
+        .filter_map(|m| manifest_name(&root.join(m)).map(|n| (*m, n)))
+        .collect()
+}
+
+/// Resolve the project identity, refusing an ambiguous root.
+///
+/// Signature and message unchanged from #333; the ambiguity branch now formats
+/// from [`identify_or_ask`]'s value rather than deriving the candidates a second
+/// time.
+pub fn identify(chain: &Chain) -> Result<ProjectId> {
+    match identify_or_ask(chain)? {
+        Identified::Resolved(id) => Ok(id),
+        Identified::Ambiguous { root, candidates } => {
+            Err(ambiguity_error(&root, &candidates, chain.schema()))
         }
+    }
+}
+
+/// Today's ambiguity diagnostic, plus the **command** that records the answer.
+///
+/// The command is the whole difference between "here is a remedy you must apply
+/// by hand" and "here is a remedy, and here is how to apply it in your CI
+/// script" — and it carries the resolved `--schema`, because in a monorepo the
+/// same command run from elsewhere resolves a different project.
+fn ambiguity_error(
+    root: &Path,
+    candidates: &[(&'static str, String)],
+    schema_hint: Option<&Path>,
+) -> CliError {
+    let list = candidates
+        .iter()
+        .map(|(m, n)| format!("  {m} → {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    CliError::ConfigDiagnostic(format!(
+        "{}: cannot pick a project name — {} ecosystem manifests name this \
+         directory:\n{}\n\n\
+         Set `[project].name` in {} to say which one ForgeDB should use.\n\n\
+         Or record it with:\n  {}",
+        root.display(),
+        candidates.len(),
+        list,
+        root.join(CONFIG_FILE).display(),
+        name_command(candidates.first().map(|(_, n)| n.as_str()), schema_hint),
+    ))
+}
+
+/// The copy-pasteable `forgedb project name …` line a diagnostic prints.
+fn name_command(example: Option<&str>, schema_hint: Option<&Path>) -> String {
+    let name = example.unwrap_or("<NAME>");
+    match schema_hint {
+        Some(s) => format!("forgedb project name {name} --schema {}", s.display()),
+        None => format!("forgedb project name {name}"),
     }
 }
 
@@ -369,7 +530,32 @@ pub enum Claim {
     /// We already hold it.
     Ours,
     /// Another root holds it.
-    Conflict { held_by: PathBuf },
+    Conflict {
+        /// The root the ledger names.
+        held_by: PathBuf,
+        /// Whether that root still exists.
+        ///
+        /// The ledger is **append-only** — nothing anywhere removes a `.claim` —
+        /// so a project that was moved, renamed or deleted collides with its own
+        /// ghost, and the remedy is to release a dead claim rather than to
+        /// rename a project that has no actual conflict (#367).
+        holder_exists: bool,
+    },
+}
+
+/// Who holds an id, and whether that root is still there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Holder {
+    /// The absolute root path recorded in the ledger.
+    pub path: PathBuf,
+    /// Whether that path exists **right now**.
+    ///
+    /// Deliberately shallow: a directory that still exists but was emptied
+    /// counts as live.  Probing further ("does it still resolve to this id?")
+    /// would be a second identity derivation over a tree we are not walking, and
+    /// an absent path can mean an unmounted volume — which is precisely when
+    /// taking the id over is wrong.  Detect and offer; never reap.
+    pub exists: bool,
 }
 
 /// Claim a project id, or report who already holds it.
@@ -407,8 +593,10 @@ pub fn claim(id: &ProjectId) -> Result<Claim> {
             if held.trim() == ours {
                 Ok(Claim::Ours)
             } else {
+                let held_by = PathBuf::from(held.trim());
                 Ok(Claim::Conflict {
-                    held_by: PathBuf::from(held.trim()),
+                    holder_exists: held_by.exists(),
+                    held_by,
                 })
             }
         }
@@ -421,36 +609,379 @@ pub fn claim(id: &ProjectId) -> Result<Claim> {
 /// C12 asks `init` to report a conflict at the point the name is chosen, which is
 /// before anything should be reserved: a scaffold that claims an id it may never
 /// generate leaves a stale claim behind for every abandoned `init`.
-pub fn held_by(name: &str) -> Result<Option<PathBuf>> {
+pub fn held_by(name: &str) -> Result<Option<Holder>> {
     let path = cache::ledger_root()?.join(format!("{name}.claim"));
     match std::fs::read_to_string(&path) {
-        Ok(held) => Ok(Some(PathBuf::from(held.trim()))),
+        Ok(held) => {
+            let path = PathBuf::from(held.trim());
+            Ok(Some(Holder {
+                exists: path.exists(),
+                path,
+            }))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
 }
 
-/// Resolve an identity and refuse a collision.
+/// Take an id over from whoever the ledger says holds it.
 ///
-/// Non-interactive by construction: a taken id is an error naming the remedy,
-/// never a silently-picked alternative.  The remedy is written into the
+/// **Ledger only — no config is touched.** The ledger records *who currently
+/// holds an id*, which is detection state and legitimately lives in a directory
+/// GC may empty at any time. A chosen *name* is a resolution and goes in the
+/// project's own `forgedb.toml`; recording one here would resurrect a resolved
+/// collision as a silent merge of two projects the moment the cache is wiped
+/// (the C1 line, and `scenario_14`'s standing guard).
+///
+/// `force` is required when the holding root still exists. Gate 1 forbids
+/// *automatic* reaping — a path can be absent because a network mount is not
+/// mounted, which is exactly when taking the id over is wrong — but an explicit
+/// human act over a live holder is a different thing, and it prints what it
+/// displaced.
+///
+/// **Not atomic, unlike [`claim`].** Claiming is `O_EXCL` on a file that must
+/// not exist; a take-over is read-then-write and cannot have that guarantee.
+/// The holder is re-read immediately before the write and the write is a
+/// temp-file rename, which is as close as this gets. Saying so here rather than
+/// implying an atomicity the code does not have: the ledger is documented as
+/// GC-able derived state, so a lock around it would be pretending.
+pub fn take_over_claim(id: &ProjectId, force: bool) -> Result<Option<Holder>> {
+    if id.source == IdSource::PathHash {
+        return Err(CliError::Config(format!(
+            "Project id {:?} is derived from a path hash, so it is never claimed \
+             and there is nothing to take over. Two different absolute paths hash \
+             differently, so this id cannot collide with itself.",
+            id.name
+        )));
+    }
+
+    let dir = cache::ledger_root()?;
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.claim", id.name));
+    let ours = id.root.to_string_lossy().to_string();
+
+    // Re-read immediately before the write: the gap between the read that
+    // produced the diagnostic and this one is where another process could have
+    // claimed it.
+    let previous = held_by(&id.name)?;
+    match &previous {
+        Some(h) if h.path == id.root => return Ok(None),
+        Some(h) if h.exists && !force => {
+            return Err(CliError::ConfigDiagnostic(format!(
+                "Project name {:?} is held by {}, and that path still \
+                 exists.\n\n\
+                 This is a real collision, not a stale claim: two projects sharing \
+                 an id would share one build cache, one lockfile and one target \
+                 directory. The usual answer is a different `[project].name` \
+                 here.\n\n\
+                 If you are certain that root is no longer a ForgeDB project, \
+                 pass --force to displace it.",
+                id.name,
+                h.path.display(),
+            )));
+        }
+        _ => {}
+    }
+
+    let temp = dir.join(format!(".{}.claim.forgedb-tmp", id.name));
+    std::fs::write(&temp, ours.as_bytes())?;
+    if let Err(e) = std::fs::rename(&temp, &path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(e.into());
+    }
+    Ok(previous)
+}
+
+/// Drop our own claim on an id.
+///
+/// Refuses to release a claim held by another root: the ledger entry is that
+/// root's, and deleting it from here would hand the id to whoever ran next
+/// rather than resolve anything. Returns whether a claim was actually removed.
+pub fn release_claim(id: &ProjectId) -> Result<bool> {
+    if id.source == IdSource::PathHash {
+        return Ok(false);
+    }
+    let path = cache::ledger_root()?.join(format!("{}.claim", id.name));
+    match held_by(&id.name)? {
+        None => Ok(false),
+        Some(h) if h.path == id.root => {
+            std::fs::remove_file(&path)?;
+            Ok(true)
+        }
+        Some(h) => Err(CliError::ConfigDiagnostic(format!(
+            "Project name {:?} is claimed by {}, not by {}.\n\n\
+             `release` drops this project's own claim. Releasing another root's \
+             would not resolve anything — it would hand the id to whichever \
+             project ran next.",
+            id.name,
+            h.path.display(),
+            id.root.display(),
+        ))),
+    }
+}
+
+/// Resolve an identity and refuse a collision, asking nothing.
+///
+/// The non-interactive contract, unchanged: a taken id is an error naming the
+/// remedy, never a silently-picked alternative.  The remedy is written into the
 /// project's *own* config, which is why it survives a cache wipe.
 pub fn identify_and_claim(chain: &Chain) -> Result<ProjectId> {
-    let id = identify(chain)?;
-    if let Claim::Conflict { held_by } = claim(&id)? {
-        return Err(CliError::ConfigDiagnostic(format!(
+    identify_and_claim_with(chain, &crate::ask::NeverAsk)
+}
+
+/// Resolve an identity, putting each undecidable case to `asker` first.
+///
+/// Every decline — and every context that cannot ask at all — falls through to
+/// exactly the errors [`identify_and_claim`] produces.  A prompt only ever fills
+/// an answer that is otherwise absent.
+pub fn identify_and_claim_with(chain: &Chain, asker: &dyn Asker) -> Result<ProjectId> {
+    let schema_hint = chain.schema().map(Path::to_path_buf);
+
+    // Decision 1 — two manifests name the root and nothing chooses between them.
+    //
+    // `Chain` is deliberately not `Clone` (it owns parsed configs), so the
+    // post-write walk is held beside the borrow rather than replacing it.
+    let mut after_write: Option<Chain> = None;
+    let id = match identify_or_ask(chain)? {
+        Identified::Resolved(id) => id,
+        Identified::Ambiguous { root, candidates } => {
+            let question = Question::WhichName {
+                root: root.clone(),
+                candidates: candidates.clone(),
+                schema_hint: schema_hint.clone(),
+            };
+            // `TakeOverClaim` is not an answer to "which of these names";
+            // treating it as a decline keeps every unanswered shape on one path.
+            let Some(Answer::Name(name)) = asker.ask(&question)? else {
+                return Err(ambiguity_error(&root, &candidates, schema_hint.as_deref()));
+            };
+            record_name(chain, &name, false, asker)?;
+            // The chain is STALE the instant a config is written: in the create
+            // case the link does not exist in it at all, and a patched chain
+            // differs from a re-walked one in `name_pos`. Re-walk; never patch.
+            let rewalked = rewalk(chain)?;
+            let id = identify(&rewalked)?;
+            after_write = Some(rewalked);
+            id
+        }
+    };
+    let chain: &Chain = after_write.as_ref().unwrap_or(chain);
+
+    // Decision 2 — the resolved id is already claimed.
+    let Claim::Conflict {
+        held_by,
+        holder_exists,
+    } = claim(&id)?
+    else {
+        return Ok(id);
+    };
+    let holder = Holder {
+        path: held_by,
+        exists: holder_exists,
+    };
+    let question = Question::Collision {
+        id: id.name.clone(),
+        root: id.root.clone(),
+        held_by: holder.path.clone(),
+        holder_exists: holder.exists,
+        schema_hint: schema_hint.clone(),
+    };
+
+    match asker.ask(&question)? {
+        // The LEDGER, and nothing else — the project keeps its name. This is the
+        // common instance of the decision, because nothing removes a claim.
+        Some(Answer::TakeOverClaim) => {
+            take_over_claim(&id, false)?;
+            Ok(id)
+        }
+        // A real collision: the answer is a new name in THIS project's own
+        // config, which is what makes the resolution survive a cache wipe.
+        // `overwrite` is true here and false above because the name being
+        // replaced is the one the user was just shown colliding — being shown it
+        // and answering with a replacement IS the in-session confirmation.
+        // `record_name` still gates the file write on `confirm_edit`.
+        Some(Answer::Name(name)) => {
+            record_name(chain, &name, true, asker)?;
+            let rewalked = rewalk(chain)?;
+            let id = identify(&rewalked)?;
+            // Claimed once, not recursively: an asker that keeps answering with
+            // a colliding name would otherwise loop forever, and a bounded
+            // retry that ends in the unchanged diagnostic is the honest shape.
+            match claim(&id)? {
+                Claim::Conflict {
+                    held_by,
+                    holder_exists,
+                } => Err(collision_error(
+                    &id,
+                    &Holder {
+                        path: held_by,
+                        exists: holder_exists,
+                    },
+                    schema_hint.as_deref(),
+                )),
+                _ => Ok(id),
+            }
+        }
+        None => Err(collision_error(&id, &holder, schema_hint.as_deref())),
+    }
+}
+
+/// Walk the same starting point again, after a config was written.
+fn rewalk(chain: &Chain) -> Result<Chain> {
+    match chain.schema() {
+        Some(schema) => Chain::walk_from_schema(schema),
+        None => Chain::walk(&chain.start),
+    }
+}
+
+/// The collision diagnostic — **two messages, because there are two remedies.**
+///
+/// A live holder is a real collision and the answer is a different name.  A dead
+/// holder is a project colliding with its own ghost, and the answer is to take
+/// the claim over; telling that user to rename themselves is the bug #367 fixes,
+/// so the dead-holder branch deliberately does **not** mention
+/// `[project].name`.
+fn collision_error(id: &ProjectId, holder: &Holder, schema_hint: Option<&Path>) -> CliError {
+    let schema = schema_hint
+        .map(|s| format!(" --schema {}", s.display()))
+        .unwrap_or_default();
+    if holder.exists {
+        CliError::ConfigDiagnostic(format!(
             "Project name {:?} is already claimed by {}.\n\n\
              Two projects sharing an id would share one build cache, one lockfile \
              and one target directory.\n\n\
              Set a different `[project].name` in {} — writing it there (rather than \
-             in the cache) is what makes the resolution survive `rm -rf ~/.forgedb`.",
+             in the cache) is what makes the resolution survive `rm -rf ~/.forgedb`.\n\n\
+             Or record it with:\n  forgedb project name <NAME>{schema}",
             id.name,
-            held_by.display(),
+            holder.path.display(),
             id.root.join(CONFIG_FILE).display(),
+        ))
+    } else {
+        CliError::ConfigDiagnostic(format!(
+            "Project name {:?} is held in the ledger by {}, which no longer \
+             exists.\n\n\
+             Nothing removes a claim, so a project that was moved, renamed or \
+             deleted collides with its own record. This is very likely that — but \
+             a missing path can also mean an unmounted volume or an unplugged \
+             disk, which is exactly when taking the id over would be wrong, so \
+             ForgeDB will not do it for you.\n\n\
+             If that path is gone for good, take the id over with:\n  \
+             forgedb project claim --take-over{schema}",
+            id.name,
+            holder.path.display(),
+        ))
+    }
+}
+/// Where a name was recorded, and whether the file had to be created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recorded {
+    /// The `forgedb.toml` that now declares the name.
+    pub path: PathBuf,
+    /// Whether ForgeDB created that file.
+    pub created: bool,
+}
+
+/// **THE PERSISTING ACT.**  Record `[project].name` for this chain's project.
+///
+/// Writes at [`Chain::root_dir`] — *never* at [`Chain::nearest`].  "One walk,
+/// two answers" means the knob config and the identity config are usually
+/// different directories in a monorepo, and recording a name at the nearest one
+/// produces [`identify`]'s "declared at a config that is not the project root"
+/// error on the very next run: a failure that appears one invocation later, in a
+/// different message, reading as a user mistake.
+///
+/// Two shapes, per the accepted split:
+///
+/// * **Create**, unconditionally, when the chain holds no config at all.  There
+///   is nothing to damage, nothing to preserve and no name to clobber — and this
+///   is the common instance, because a project ForgeDB scaffolded already has a
+///   name and never reaches either decision.
+/// * **Edit**, format-preserving, only with `asker.confirm_edit`.  Typing
+///   `forgedb project name` IS that consent
+///   ([`crate::ask::CommandConsent`]); a `generate` that merely wanted the answer
+///   is not ([`crate::ask::NeverAsk`]), and takes an error naming the file and
+///   the key instead.
+pub fn record_name(
+    chain: &Chain,
+    name: &str,
+    overwrite: bool,
+    asker: &dyn Asker,
+) -> Result<Recorded> {
+    validate_name(name, "the requested project name")?;
+    let root = chain.root_dir();
+
+    let Some(link) = chain.project_root() else {
+        // The premise that makes an unconditional create safe: with no config
+        // anywhere, `root_dir()` is the schema's own directory and `isolated`
+        // takes its `true` default, so the created file regroups nothing. If a
+        // config existed in the chain, `root_dir()` would BE that config's
+        // directory and this would be an edit.
+        debug_assert!(
+            chain.links().is_empty(),
+            "a chain with links always has a project root"
+        );
+        let path = config::create_project_config(&root, name)?;
+        return Ok(Recorded {
+            path,
+            created: true,
+        });
+    };
+
+    let path = link.path.clone();
+    if !asker.confirm_edit(&path)? {
+        return Err(CliError::ConfigDiagnostic(format!(
+            "{} already exists, and ForgeDB does not edit a config it did not \
+             author without being asked.\n\n\
+             Add this under `[project]`:\n  name = \"{name}\"\n\n\
+             Or let ForgeDB write it:\n  forgedb project name {name}{}",
+            path.display(),
+            chain
+                .schema()
+                .map(|s| format!(" --schema {}", s.display()))
+                .unwrap_or_default(),
         )));
     }
-    Ok(id)
+    config::set_project_name(&path, name, overwrite)?;
+    Ok(Recorded {
+        path,
+        created: false,
+    })
 }
+
+/// The directory a schema's governing config is walked up from, and the directory its
+/// `migrations/` sits beside.
+///
+/// A bare `schema.forge` has no parent component, and walking from `""` would resolve
+/// against the filesystem **root** rather than the CWD — the difference between "the
+/// config beside my schema" and "any config on the machine".
+///
+/// This lived in three private copies (`main.rs`, `commands/migrate.rs`, and open-coded
+/// in `commands/validate.rs` in a form that missed the empty-parent case). #333/#361 made
+/// this module the one place a path question is answered; the copies predate that, and
+/// their existence is what let #437 happen — `generate` had no `project::` spelling to
+/// reach for, so it reached for a bare relative string instead.
+pub fn schema_dir(schema: &Path) -> &Path {
+    match schema.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    }
+}
+
+/// Where a schema's migration lineage lives: `<the schema's directory>/migrations`.
+///
+/// `migrate` appends to this and `generate` bakes its serial into the generated app's
+/// `EXPECTED_SCHEMA_VERSION`. If the two disagree about where it is, the interlock guards
+/// nothing — **silently**, because both halves still compile and both still produce a
+/// number (#437).
+///
+/// The failure is not merely "reads nothing and falls back to baseline". It reads whatever
+/// `migrations/` the *current directory* happens to have, so generating app B from app A's
+/// directory bakes A's lineage into B.
+pub fn migrations_dir(schema: &Path) -> PathBuf {
+    schema_dir(schema).join("migrations")
+}
+
 
 /// Which schema an invocation is about: `--schema` if given, else the first
 /// candidate name found beside the caller.
@@ -547,9 +1078,34 @@ impl Governing {
         self.resolve_path(declared).display().to_string()
     }
 
+    /// Where the in-tree Rust package goes (#338), or `None` when the knob is
+    /// absent — which is the opt-out.
+    ///
+    /// **A knob, not a project-wide fact**, so it comes from `Chain::nearest()`
+    /// via [`Self::config`] rather than from `Chain::project_root()`: two apps
+    /// under one root may legitimately place differently, exactly as they may
+    /// set `output` differently.
+    ///
+    /// Resolved through [`Self::resolve_path`] — against the **schema's**
+    /// directory, never the CWD. A root config's `rust_package = "generated/core"`
+    /// is therefore a per-app pattern; the CWD-relative reading is what had every
+    /// app in a project overwriting its siblings' `output`.
+    ///
+    /// This is the ONE reader of `[placement].rust_package`. Config is reached
+    /// from this module and nowhere else (#361's one-loader invariant), so a
+    /// `config.placement` access anywhere in the tree is the bug this placement
+    /// prevents.
+    pub fn rust_package(&self) -> Option<PathBuf> {
+        self.config()
+            .placement
+            .rust_package
+            .as_deref()
+            .map(|declared| self.resolve_path(declared))
+    }
+
     /// The project this app belongs to, with its id claimed.
-    pub fn identify(&self) -> Result<ProjectId> {
-        identify_and_claim(&self.chain)
+    pub fn identify(&self, asker: &dyn Asker) -> Result<ProjectId> {
+        identify_and_claim_with(&self.chain, asker)
     }
 
     /// Resolve the project, report it, and warn when the id had to be invented.
@@ -557,8 +1113,12 @@ impl Governing {
     /// The warning is on the path-hash fallback only, and it fires at most once
     /// per invocation: an id nobody chose is fine as a default and bad as a
     /// surprise, since it is what a `projects/` listing will be full of.
-    pub fn identify_reported(&self) -> Result<ProjectId> {
-        let id = self.identify()?;
+    ///
+    /// `asker` decides what happens at the two points identity cannot decide
+    /// alone (#367).  Callers pass `&*crate::ask::asker()`, which is
+    /// [`crate::ask::NeverAsk`] in every context that must not block.
+    pub fn identify_reported(&self, asker: &dyn Asker) -> Result<ProjectId> {
+        let id = self.identify(asker)?;
         match &id.source {
             IdSource::Explicit => {
                 crate::ui::detail(&format!("Project: {} (from [project].name)", id.name))
@@ -585,7 +1145,21 @@ impl Governing {
 /// which project a schema belongs to is a fact about the tree, not about the
 /// invocation.
 pub fn govern(explicit_config: Option<&str>, base: &Path) -> Result<Governing> {
-    let chain = Chain::walk(base)?;
+    govern_chain(explicit_config, base, Chain::walk(base)?)
+}
+
+/// [`govern`] for a command that names a schema — the walk still starts at the
+/// schema's directory, and the chain remembers which schema it was for.
+///
+/// The remembering is what lets a diagnostic print `--schema <resolved path>`
+/// alongside its remedy command.  Without it, the remedy is copy-pasteable and
+/// resolves a different project when run from another directory in a monorepo.
+pub fn govern_for_schema(explicit_config: Option<&str>, schema: &Path) -> Result<Governing> {
+    let base = schema_dir(schema);
+    govern_chain(explicit_config, base, Chain::walk_from_schema(schema)?)
+}
+
+fn govern_chain(explicit_config: Option<&str>, base: &Path, chain: Chain) -> Result<Governing> {
     let explicit = match explicit_config {
         Some(p) => Some(config::load_config_file(Path::new(p))?),
         None => None,

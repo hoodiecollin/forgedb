@@ -166,7 +166,13 @@ compiled *that crate* and reported success.
 the same generator run, so the two cannot drift — and the scaffold's
 `#[path = "../generated/database.rs"]` modules keep resolving. For a while you will have two ways
 to run one server: your crate, and the cache's `server/`. That is stated rather than hidden. It
-ends when you delete your scaffold crate, or when in-tree Rust output lands (#338).
+ends when you delete your scaffold crate.
+
+In-tree Rust output (#338) does **not** end it — it is a different route, not a replacement.
+`[placement].rust_package` emits a ForgeDB-owned cargo *package* holding the database as a
+library; the `#[path]` bridge reaches a loose `.rs` file from a crate you own. If you move to
+the package you delete your scaffold, and with it the server; if you keep the scaffold you keep
+the bridge.
 
 **What you lose, stated plainly:** the editable `src/main.rs`. If you had added a route, a
 middleware layer or a tracing subscriber there, keep your crate — the mirror is exactly what

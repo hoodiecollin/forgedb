@@ -60,6 +60,9 @@ cargo clippy --workspace             # no dead-code warnings (style lints remain
 ```
 
 CLI commands: `init`, `generate`, `validate`, `build`, `dev`, `migrate`, `compact`, `backup`,
+`project` (`name|claim|release|show` — #367; records the two identity decisions a flag cannot
+make *stick*, since the id keys the cache directory and the invocations that would carry a flag
+are ones ForgeDB itself scaffolds),
 `tenant` (`create|list|drop` — #59 multi-tenancy dir management),
 `coordinate <root>` (#75/#84 MVCC Tier 3 — run the multi-process write coordinator for a data dir).
 Example: `cargo run -- generate all --output ./generated`.
@@ -140,7 +143,20 @@ they own (epic #332) — do not re-derive either inline:
   the greppable form of #361's one-loader invariant. Id order: `[project].name` → exactly one
   ecosystem manifest → hash of the root's **absolute** path. The claim ledger under
   `~/.forgedb/ledger/` **detects** collisions; a resolution is recorded in the project's own
-  `forgedb.toml`, never in the cache.
+  `forgedb.toml`, never in the cache. The ledger is **append-only** — nothing removes a
+  `.claim` — so a moved project collides with its own ghost; that case has its own
+  diagnostic and its own remedy (`forgedb project claim --take-over`), and a *live* holder
+  is never displaced without `--force`.
+- `src/ask.rs` (#367) — **may ForgeDB ask a question, and who answers it.** The ONE
+  `IsTerminal` call in the tree, behind `Askability` — a pure predicate over four booleans
+  (stdin tty, stderr tty, `--quiet`, `forbid()`), each a veto for a different reason. Prompts
+  render to **stderr**, unlike `ui.rs`. `ask::forbid()` latches the contexts that must never
+  ask however the process was started: `build`'s machine-readable modes and `dev`'s watch
+  loop. The `Asker` trait is the seam that makes the interactive path testable with no pty —
+  the decision and the persisting act are on this side of it, the widget on the far side, and
+  **the widget must stay the last and smallest layer**. `FORGEDB_ASK_TRACE=<path>` appends
+  the boundary's reason, which is the only way a piped harness can tell "did not ask because
+  forbidden" from "did not ask because piped".
 - `src/cache.rs` (#334) — **where generated code is built.** `~/.forgedb/projects/<id>/` as a
   ForgeDB-owned cargo workspace: virtual manifest pinning `resolver = "3"`, one `Cargo.lock`
   and one `target/` shared by every member, `apps/<member-hash>/` per app. The member hash is
@@ -156,6 +172,20 @@ built-in `generated` default included** (`Governing::output` owns all three case
 `--output` flag is the invocation's own word and stays verbatim). Under one root config,
 `output` is a per-app pattern; the CWD-relative reading had every app in a project
 overwriting its siblings.
+
+**A THIRD destination is opt-in: `[placement].rust_package` (#338).** A Rust consumer who builds
+with cargo can have the generated database emitted into their own tree as a ForgeDB-owned cargo
+package — `Cargo.toml` + `src/lib.rs`, **never** an `api.rs`/`main.rs`/`[[bin]]`, whatever
+`[generate].targets` says. The cache emitter, the in-tree emitter and `--check` all render through
+`CorePackage::files`, so the three copies of `database.rs` (mirror, cache, in-tree) are
+byte-identical by construction. `Governing::rust_package()` is the knob's ONE reader (schema-relative,
+from `Chain::nearest()` — it is a knob, not a project-wide fact). The key's **absence is the
+opt-out**; there is no affirmative "cache-only" spelling. `forgedb build` never compiles it (class D
+has no delivery step), and **ForgeDB prints the dep line rather than writing it** — it edits no
+manifest it did not author, emits no `[workspace]` table (a nested one that a member path-depends on
+fails the whole workspace), and writes no `members` entry (a path dep inside the workspace directory
+joins on its own). The table name is a **one-way door**: `deny_unknown_fields` means every released
+CLI rejects a config carrying it.
 
 **`src/main.rs` links the library** (`use forgedb::{…}`) rather than re-declaring its
 modules. Re-declaring compiles each twice and makes every `pub` item only the tests use read
@@ -659,7 +689,7 @@ of truth.
 - `rust-core-library` — idiomatic Rust for core library/crate work.
 
 <!-- pm-playbook:begin -->
-## Project management — pm-playbook v2.2.1
+## Project management — pm-playbook v2.3.0
 
 Issue tracking in this repo follows the **pm-playbook** two-axis model. The full doctrine is
 vendored at `.pm-playbook/` and is authoritative; this block is only a summary.

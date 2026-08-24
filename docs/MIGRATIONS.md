@@ -69,8 +69,11 @@ the change as a versioned hop and classifies it:
 - **`Auto`** — the differ can prove the new-row body (drop a field/model, rename, add a
   `&unique`). No authoring needed.
 - **`Authored`** — the differ cannot know the value (a type re-encode, a nullable→NOT-NULL
-  fill, a required-add-without-default). `migrate create` writes a scaffold at
-  `migrations/<id>/transform.rs` for you to fill in and freeze.
+  fill, a required-add-without-default, a removed or renamed enum variant). `migrate create`
+  writes a scaffold at `migrations/<id>/transform.rs` for you to fill in and freeze.
+
+Changes to an `enum`'s variants or an inline `struct`'s layout are diffed too, and most of them
+are breaking — see [below](#enum-and-struct-definitions-are-part-of-the-diff).
 
 ### Lifecycle
 
@@ -95,6 +98,48 @@ forgedb migrate run   --from 1 --to 2 --schema schema.forge \
 
 # 5. Point the regenerated app at ./data-migrated.
 ```
+
+### Enum and struct definitions are part of the diff
+
+An `enum` variant is stored as a **1-byte discriminant keyed by declaration order**, and an
+inline `struct` is `#[repr(C)]` with every field's offset a function of the whole declaration.
+Neither carries a name on disk. So an edit to a *definition* moves what the already-written
+bytes MEAN, while changing no byte and no field's declared type — and the reference that names
+it (`status: Status`) does not move either.
+
+`migrate create --auto` compares the definitions themselves, and reports the change against
+every field that stores one:
+
+```
+  • Enum 'Status' behind 'Post.status': REORDER Draft, Published — every stored
+    discriminant re-maps (⚠️  BREAKING)
+```
+
+| edit | at rest | recorded as |
+|---|---|---|
+| **enum**: append a variant at the end | benign — every existing byte still decodes to its own variant | not breaking, `Auto` |
+| **enum**: insert a variant in the middle | every byte at or past it decodes as its predecessor | breaking, `Auto` |
+| **enum**: reorder two variants | each swapped byte decodes as the other variant; nothing is ever out of range, so nothing fails | breaking, `Auto` |
+| **enum**: remove a variant | most rows re-map; a row holding the retired last variant is out of range | breaking, **`Authored`** |
+| **enum**: rename a variant in place | the byte still decodes to the same slot, but the *name* is the wire form | breaking, **`Authored`** |
+| **struct**: reorder fields | each field reads its neighbour's bytes | breaking, `Auto` |
+| **struct**: retype / add / remove a field | the bytes are reinterpreted, or the row width changes and every row re-frames | breaking, **`Authored`** |
+
+**A struct has no benign edit except a rename.** The enum's one safe case — appending — has no
+struct analogue, because a struct's every offset depends on the whole declaration.
+
+The `Auto` rows are automatic for a reason worth knowing: an enum crosses the transformer's
+JSON transport as its variant **name** and a struct as its field **names**, so the identity hop
+body re-encodes them to the new discriminant / the new offsets with nothing for you to write.
+The `Authored` rows are the ones where a name has gone away, so there is nothing for the old
+value to decode into and you must say what it becomes.
+
+An enum or struct that **no stored field reaches** produces no change. Nothing of it is on
+disk, so there is nothing to migrate.
+
+Append at the end when you can. It is the only enum edit that leaves stored rows alone — and
+even then the hop is recorded, so the schema version moves and an older binary meeting the new
+byte is told to migrate instead of panicking on a discriminant it does not know.
 
 `migrate build` emits the transformer crate for the version range and compiles it; `migrate run`
 executes it over the data dir. It writes a **fresh destination** and leaves the source untouched,

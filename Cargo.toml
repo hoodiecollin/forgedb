@@ -102,8 +102,32 @@ colored = "3.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
+# Format-preserving config editing (#367). ForgeDB may record `[project].name`
+# into a `forgedb.toml` it did not author, and a round-trip through `toml` would
+# silently drop every comment and reorder every table in a file the user owns.
+#
+# Naming it directly on `toml`'s CURRENT 0.8.x line is what makes this cost ONE
+# crate (`toml_write`) instead of three: `toml` 0.8.2 pins `toml_edit` 0.20, so a
+# direct `0.22` there resolves BOTH and compiles two copies of `toml_edit` and of
+# `winnow`. The bump is inside the existing `"0.8"` requirement — a lockfile move,
+# not a manifest change.
+toml_edit = "0.22"
 ctrlc = "3.4"
 home = "0.5"
+# The two prompt widgets (#367), DEFAULT FEATURES OFF.
+#
+# Priced against the SHIPPED graph (`cargo tree -e normal -p forgedb`), never
+# `cargo metadata` — which counts dev-deps and would make this look free. +4 on
+# a host target (`dialoguer`, `console`, `unicode-width`, `shell-words`; `libc`
+# is already present) and **+5 on `x86_64-pc-windows-msvc`**, which adds
+# `encode_unicode`. cargo-dist ships Windows archives, so +5 is the number that
+# belongs in a release note. Default features are 9.
+#
+# The alternatives were measured too: `cliclack` +11, `inquire` +23, and a
+# hand-roll over `std::io::stdin()` +0. The hand-roll's zero is real; taking the
+# dependency is consistency with the accepted #340 §8 recommendation. TTY
+# detection needs nothing either way — `std::io::IsTerminal` is std.
+dialoguer = { version = "0.12", default-features = false }
 
 [dev-dependencies]
 forgedb-parser = { path = "crates/parser", version = "0.4.0" }

@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 // library's consumers use — the tests, and #335's callers — read as dead code in
 // the binary, which is a warning that can only be silenced by an `#[allow]` that
 // then outlives its reason and hides a real hole.
-use forgedb::{cache, commands, error, naming, project, targets, ui};
+use forgedb::{ask, cache, commands, error, naming, project, targets, ui};
 
 use error::Result;
 
@@ -33,8 +33,21 @@ struct Cli {
 enum Commands {
     /// Initialize a new ForgeDB project
     Init {
-        /// Project name
+        /// Directory to scaffold (its last path component is the default id)
         project_name: String,
+
+        /// Project id, decoupled from the directory name
+        ///
+        /// `forgedb init apps/api --project-name storefront` scaffolds `apps/api`
+        /// and names the project `storefront`. The non-interactive twin of the
+        /// prompt: a scaffold whose directory name is already claimed needs a
+        /// different id, and CI cannot answer a question.
+        //
+        // Spelled explicitly because the field cannot BE `project_name` — that
+        // is the positional. The user-facing name is what the diagnostics print,
+        // and it is the one that matters.
+        #[arg(long = "project-name", value_name = "NAME")]
+        project_name_override: Option<String>,
 
         /// Use a template (blog, ecommerce, todo, blank)
         #[arg(short, long)]
@@ -213,6 +226,27 @@ enum Commands {
     #[command(subcommand)]
     Tenant(TenantCommands),
 
+    /// Record this project's identity decisions (#367)
+    ///
+    /// Two identity decisions cannot be settled by a flag *and made to stick*:
+    /// which ecosystem manifest names an ambiguous project root, and what to do
+    /// when the resolved id is already claimed. A flag could express either —
+    /// but the id keys `~/.forgedb/projects/<id>/`, so an answer living in one
+    /// `argv` is a different project on the next invocation that omits it, and
+    /// the invocations that omit it are the ones ForgeDB scaffolds. This
+    /// subcommand persists the answer, and is the command the non-interactive
+    /// diagnostics name.
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommands,
+
+        /// Schema file path — the app this is about. Resolved exactly as
+        /// `generate`/`build` resolve it, because identity is keyed on the
+        /// schema's chain, not on the working directory.
+        #[arg(short, long, global = true)]
+        schema: Option<String>,
+    },
+
     /// Run the ForgeDB language server over stdio (used by editor extensions).
     ///
     /// Thin launcher for the sibling `forgedb-lsp` binary shipped alongside the
@@ -261,6 +295,49 @@ enum Commands {
         #[arg(long)]
         max_frame_mib: Option<u64>,
     },
+}
+
+#[derive(Subcommand)]
+enum ProjectCommands {
+    /// Persist `[project].name` at this project's root
+    ///
+    /// Creates a `forgedb.toml` when the chain holds none; otherwise edits the
+    /// existing one, preserving its comments and formatting.
+    Name {
+        /// The project id to record
+        name: String,
+
+        /// Replace an existing `[project].name`
+        ///
+        /// A rename re-keys the build cache, so the directory the old id points
+        /// at is reported as orphaned rather than moved or deleted.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Take this project's id over from the root the ledger names
+    ///
+    /// Nothing removes a claim, so a project that was moved or renamed collides
+    /// with its own record. This releases that record and keeps the name.
+    Claim {
+        /// Required. Claiming happens on its own during `generate`/`build`;
+        /// this command exists only to displace a stale holder.
+        #[arg(long)]
+        take_over: bool,
+
+        /// Take over even though the holding root still exists
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Drop this project's own claim on its id
+    Release,
+
+    /// Report every fact identity is derived from, deciding nothing
+    ///
+    /// Works in exactly the cases `generate` refuses to: an ambiguous root is
+    /// listed rather than resolved.
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -536,19 +613,6 @@ enum BackupCommands {
     },
 }
 
-/// The directory a schema's governing config is walked up from.
-///
-/// A bare `schema.forge` has no parent component, and walking from `""` would
-/// resolve against the filesystem root rather than the CWD — which is the
-/// difference between "the config beside my schema" and "any config on the
-/// machine".
-fn schema_dir(schema: &std::path::Path) -> &std::path::Path {
-    match schema.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => std::path::Path::new("."),
-    }
-}
-
 /// Reserve an app's container and report where it is — the BEFORE half of the
 /// old `place_in_cache` (#335 §3).
 ///
@@ -664,6 +728,7 @@ fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Init {
             project_name,
+            project_name_override,
             template,
             rust,
             api_only,
@@ -671,6 +736,7 @@ fn run(cli: Cli) -> Result<()> {
             no_isolated,
         } => commands::init::run(commands::init::InitOptions {
             project_name,
+            project_name_override,
             template,
             rust,
             api_only,
@@ -697,11 +763,11 @@ fn run(cli: Cli) -> Result<()> {
         } => {
             // The schema names itself; no config participates (#333 §10).
             let schema_path = project::find_schema(schema.as_deref())?;
-            let governing = project::govern(explicit_config, schema_dir(&schema_path))?;
+            let governing = project::govern_for_schema(explicit_config, &schema_path)?;
             // Resolved (and claimed) here rather than lazily: a project id is a
             // precondition of generating, so a collision must be refused before
             // any bytes are written, not after.
-            let project = governing.identify_reported()?;
+            let project = governing.identify_reported(&*ask::asker())?;
             // Reserve BEFORE emission (it needs the path); re-derive the
             // workspace root AFTER, once this app's packages exist (#335 §3).
             let reserved = reserve_in_cache(&project, &schema_path, governing.symbol_naming())?;
@@ -758,6 +824,7 @@ fn run(cli: Cli) -> Result<()> {
                 from,
                 to,
                 cache_container: Some(reserved.container.clone()),
+                in_tree: governing.rust_package(),
             })?;
             sync_after_emission(&reserved, declared.as_deref())?;
             Ok(())
@@ -811,13 +878,23 @@ fn run(cli: Cli) -> Result<()> {
                 report.as_deref(),
             ) {
                 ui::set_verbosity(false, true);
+                // …and a question is forbidden OUTRIGHT here, not merely
+                // silenced (#367). `set_verbosity(false, true)` above already
+                // satisfies the quiet clause, so this line looks redundant and
+                // is not: it is the difference between "did not ask because the
+                // output level happens to be quiet" and "did not ask because
+                // this stdout belongs to a `$(…)` capture". The first is a
+                // coincidence a future `--quiet`-handling change can undo; the
+                // second is the reason. `FORGEDB_ASK_TRACE` is what lets a test
+                // tell them apart, and therefore what proves THIS call runs.
+                ask::forbid();
             }
             // Resolved exactly as `Commands::Generate` does, from the same walk —
             // `build` must compile in the same place `generate` emitted into, and
             // must bake what `generate` would (#361, extended to identity by #333).
             let schema_path = project::find_schema(schema.as_deref())?;
-            let governing = project::govern(explicit_config, schema_dir(&schema_path))?;
-            let project = governing.identify_reported()?;
+            let governing = project::govern_for_schema(explicit_config, &schema_path)?;
+            let project = governing.identify_reported(&*ask::asker())?;
             let reserved = reserve_in_cache(&project, &schema_path, governing.symbol_naming())?;
             let forge_config = governing.config();
             let resolved_output = Some(governing.output(output.as_deref()));
@@ -856,6 +933,7 @@ fn run(cli: Cli) -> Result<()> {
                 // loaded config — `build` must bake what `generate` would (#361).
                 gen_config,
                 cache_container: Some(container),
+                in_tree: governing.rust_package(),
                 cache_project: Some(project_root),
                 plan_only: plan,
                 report,
@@ -878,8 +956,12 @@ fn run(cli: Cli) -> Result<()> {
             // config at all: every save rewrote `database.rs` with
             // `GenConfig::DEFAULT` and `schema_version = 1`.
             let schema_path = project::find_schema(schema.as_deref())?;
-            let governing = project::govern(explicit_config, schema_dir(&schema_path))?;
-            let project = governing.identify_reported()?;
+            let governing = project::govern_for_schema(explicit_config, &schema_path)?;
+            // The STARTUP resolution may ask — it is before the loop, the
+            // terminal is not yet showing watch output, and a `dev` that cannot
+            // name its project has nothing to watch for. `dev::run` forbids
+            // immediately before entering the loop (#367).
+            let project = governing.identify_reported(&*ask::asker())?;
             let reserved = reserve_in_cache(&project, &schema_path, governing.symbol_naming())?;
             let forge_config = governing.config();
             let resolved_output = governing.output(output.as_deref());
@@ -903,6 +985,7 @@ fn run(cli: Cli) -> Result<()> {
                     config_targets,
                     gen_config,
                     cache_container: Some(container),
+                    in_tree: governing.rust_package(),
                 },
                 debounce,
                 clear,
@@ -969,6 +1052,22 @@ fn run(cli: Cli) -> Result<()> {
             // Swallowed args and all: the tombstone answers, not clap.
             MigrateCommands::Up { args: _ } => commands::migrate::up(),
         },
+
+        Commands::Project { command, schema } => {
+            commands::project::run(commands::project::ProjectOptions {
+                command: match command {
+                    ProjectCommands::Name { name, force } => {
+                        commands::project::ProjectCommand::Name { name, force }
+                    }
+                    ProjectCommands::Claim { take_over, force } => {
+                        commands::project::ProjectCommand::Claim { take_over, force }
+                    }
+                    ProjectCommands::Release => commands::project::ProjectCommand::Release,
+                    ProjectCommands::Show => commands::project::ProjectCommand::Show,
+                },
+                schema,
+            })
+        }
 
         Commands::Lsp { server_path, args } => {
             commands::lsp::run(commands::lsp::LspOptions { server_path, args })
