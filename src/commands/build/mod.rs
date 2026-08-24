@@ -64,6 +64,15 @@ pub struct BuildOptions {
     /// already computed both, and a second derivation is a second thing that can
     /// disagree.
     pub cache_project: Option<PathBuf>,
+    /// Where the in-tree Rust package goes (#338), or `None` when the knob is
+    /// absent.
+    ///
+    /// `build` regenerates before it plans, so it must carry this or a project
+    /// with the knob set would have `generate` and `build` emit different
+    /// project states — the exact class of defect #364 was. `build` does **not**
+    /// compile it: class D has no delivery step, and `driver::plan` never sees
+    /// this path.
+    pub in_tree: Option<PathBuf>,
     /// Print the cargo invocations and compile nothing.
     pub plan_only: bool,
     /// Write the JSON artifact report here; `-` means stdout.
@@ -167,6 +176,7 @@ pub fn run(options: BuildOptions) -> Result<()> {
         schema: options.schema.clone(),
         config_targets: Some(selected_targets.clone()),
         cache_container: options.cache_container.clone(),
+        in_tree: options.in_tree.clone(),
         gen_config: options.gen_config,
         force: true,
         from: None,

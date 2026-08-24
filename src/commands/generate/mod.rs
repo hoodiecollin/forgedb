@@ -8,6 +8,8 @@ use forgedb_parser::Parser;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod in_tree;
+
 /// The `--sdk`/`--runtime`/`--replica` mode axis (#122). Orthogonal to the
 /// runtime/language axis (`python`, `node`, `bun`, `browser`): a target names a
 /// runtime, a mode names *how* to bind it.
@@ -62,6 +64,12 @@ pub struct GenerateOptions {
     /// root AFTER this returns, because a root rendered before emission lists
     /// the previous run's packages.
     pub cache_container: Option<PathBuf>,
+    /// Where the in-tree Rust package goes (#338), already resolved against the
+    /// **schema's** directory by `Governing::rust_package`.
+    ///
+    /// `None` means `[placement].rust_package` is absent — which is the opt-out,
+    /// and the only opt-out there is. Nothing is emitted and nothing changes.
+    pub in_tree: Option<PathBuf>,
 }
 
 /// Every app-derived name one `generate` invocation builds under (#335 §2).
@@ -233,7 +241,13 @@ pub fn run(options: GenerateOptions) -> Result<()> {
     // migrations yet).  The open guard compares this opaque integer and refuses a
     // stale data dir; it is threaded into every `database.rs` emission (the server
     // and the wasm replica share one lineage).
-    let schema_version = forgedb_migrations::current_schema_version("migrations");
+    // #437: resolved from the SCHEMA's directory, never the CWD. The bare relative
+    // string this used to pass read whatever `migrations/` the current directory had —
+    // so generating from a repo root baked baseline 1, and generating app B from app A's
+    // directory baked A's lineage into B. Both compile, both emit a number, and the
+    // interlock silently stops guarding.
+    let lineage_dir = crate::project::migrations_dir(Path::new(&schema_path));
+    let schema_version = forgedb_migrations::current_schema_version(&lineage_dir);
 
     // Determine the committed output directory.
     let output_dir = options.output.as_deref().unwrap_or("./generated");
@@ -250,6 +264,15 @@ pub fn run(options: GenerateOptions) -> Result<()> {
     };
     // A stale scratch dir must never block a write, so check mode always forces.
     let force = options.force || options.check;
+
+    // #338 C1/C8: a placement inside the build cache is refused BEFORE anything
+    // is written — before the output directory is created, before the mirror.
+    // A refusal that fires after the mirror lands has already done the damage it
+    // exists to prevent, and "nothing was written" is the half of the scenario a
+    // guard placed at the emitter would silently fail.
+    if let Some(dir) = options.in_tree.as_deref() {
+        in_tree::guard(dir)?;
+    }
 
     // Create the output directory (a fresh scratch dir in check mode).
     if options.check {
@@ -388,6 +411,23 @@ pub fn run(options: GenerateOptions) -> Result<()> {
                 Err(_) => missing.push(committed),
             }
         }
+        // The in-tree package is committed source too, so `--check` — CI's
+        // staleness gate — has to cover it. Compared in memory against the live
+        // location: it never gets a scratch path, because a placement may sit
+        // outside the output directory and the scratch-relative join above would
+        // then resolve back to the real one.
+        if let (Some(dir), Some(core_lib)) = (options.in_tree.as_deref(), cache.core_lib.as_deref())
+        {
+            let (m, s) = in_tree::check(
+                dir,
+                &naming.package(&crate::naming::PackageKind::Core),
+                &ctx.gen_config,
+                core_lib,
+            )?;
+            missing.extend(m);
+            stale.extend(s);
+        }
+
         let _ = fs::remove_dir_all(&output_path);
 
         if missing.is_empty() && stale.is_empty() {
@@ -427,7 +467,24 @@ pub fn run(options: GenerateOptions) -> Result<()> {
     // `<output>/database.rs` got — one value, two writes — never a second
     // generator invocation.
     if let Some(container) = &options.cache_container {
-        emit_cache_packages(container, &naming, &cache)?;
+        emit_cache_packages(container, &naming, &ctx.gen_config, &cache)?;
+    }
+
+    // The in-tree placement (#338). A SECOND DESTINATION for the package the
+    // cache emitter just wrote, never a second generator: both read
+    // `CorePackage::files` over the same memoized `core_lib`, so the two copies
+    // are byte-identical by construction.
+    //
+    // Keyed on `options.in_tree` alone, independent of whether a cache container
+    // was reserved: the two placements answer different questions and a project
+    // may want either, both, or neither.
+    if let (Some(dir), Some(core_lib)) = (options.in_tree.as_deref(), cache.core_lib.as_deref()) {
+        in_tree::emit(
+            dir,
+            &naming.package(&crate::naming::PackageKind::Core),
+            &ctx.gen_config,
+            core_lib,
+        )?;
     }
 
     // Report results
@@ -1106,9 +1163,35 @@ pub use forgedb_types;\n";
 /// substrate pin would never reach an existing member, and the stale pin would
 /// sit in a directory the user never opens where the publish-gap check cannot
 /// see it.
+/// Write one rendered `core` package to `dir`, and return the paths written.
+///
+/// **Both destinations go through here** — the cache member and #338's in-tree
+/// placement. One renderer (`CorePackage::files`) and one writer is what makes
+/// "the same package, two destinations" structural rather than two emitters that
+/// happen to agree.
+///
+/// `fs::write`, never `write_file`: `write_file` refuses an existing file
+/// without `--force`, and a `core` package — in the cache or in the user's tree
+/// (#338) — is **ForgeDB's file**, rewritten in full on every generate. That is
+/// what makes a CLI upgrade's substrate pin reach an existing project instead of
+/// freezing at whatever the first run wrote (#290's floor problem).
+fn write_core_package(dir: &Path, files: &[(&'static str, String)]) -> Result<Vec<PathBuf>> {
+    let mut written = Vec::with_capacity(files.len());
+    for (rel, body) in files {
+        let path = dir.join(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, body)?;
+        written.push(path);
+    }
+    Ok(written)
+}
+
 fn emit_cache_packages(
     container: &Path,
     naming: &AppNaming,
+    gen_config: &forgedb_codegen::GenConfig,
     cache: &CacheEmission,
 ) -> Result<()> {
     let Some(core_lib) = cache.core_lib.as_deref() else {
@@ -1120,15 +1203,29 @@ fn emit_cache_packages(
 
     let core_pkg = naming.package(&crate::naming::PackageKind::Core);
     let core_dir = container.join(crate::naming::PackageKind::Core.dir());
-    fs::create_dir_all(core_dir.join("src"))?;
-    // utoipa is pinned iff this app emits a server (#335 §10): with the derive
-    // in `core` and its `#[openapi(components(schemas(...)))]` consumer in
-    // `server`, the orphan rule blocks supplying the impl from `server`.
-    fs::write(
-        core_dir.join("Cargo.toml"),
-        forgedb_codegen::CorePackage::cargo_toml(&core_pkg, cache.api.is_some()),
+    // Rendered by `CorePackage::files` — the ONE definition of what a `core`
+    // package is, shared with the in-tree emitter and `--check`'s comparer
+    // (#338). Two destinations, one renderer; a second enumeration here is how
+    // an in-tree package would come to hold a different file set than a cache
+    // one while both looked right.
+    //
+    // The manifest is rendered from THE SAME `GenConfig` that rendered
+    // `core_lib` (#445). `utoipa` is pinned iff `GenConfig::needs_utoipa` — the
+    // one condition — and that is also what put `use utoipa::ToSchema;` and the
+    // derives into the source this manifest compiles.
+    //
+    // It used to read `cache.api.is_some()`: "did the command I just ran emit an
+    // api". That is a DIFFERENT condition, and it disagrees for exactly the
+    // invocations that narrow — `generate rust` under `targets = ["all"]`, and
+    // `build --no-api` — emitting a `core` whose source names a crate its own
+    // manifest does not pin (`error[E0432]: unresolved import 'utoipa'`).
+    //
+    // The parameter that carried the divergent condition is gone: `cargo_toml`
+    // takes the config, so there is nothing here left to compute.
+    write_core_package(
+        &core_dir,
+        &forgedb_codegen::CorePackage::files(&core_pkg, gen_config, core_lib),
     )?;
-    fs::write(core_dir.join("src/lib.rs"), core_lib)?;
     ui::detail(&format!("  ✓ {} (cache package)", core_dir.display()));
 
     if let Some(api) = cache.api.as_deref() {
@@ -1144,7 +1241,7 @@ fn emit_cache_packages(
         fs::write(server_dir.join("src/api.rs"), api)?;
         fs::write(
             server_dir.join("src/main.rs"),
-            forgedb_codegen::ServerPackage::main_rs(forgedb_codegen::ServerLayout::Cache),
+            forgedb_codegen::ServerPackage::main_rs(),
         )?;
         ui::detail(&format!("  ✓ {} (cache package)", server_dir.display()));
     }

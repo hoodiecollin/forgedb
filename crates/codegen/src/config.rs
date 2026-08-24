@@ -203,6 +203,35 @@ impl GenConfig {
         replication_log_retention: 0,
     };
 
+    /// **The one condition deciding whether `utoipa` is in play for this app**
+    /// (#445).
+    ///
+    /// Both halves of that decision have to read *this* — the `ToSchema` derive
+    /// and `use utoipa::ToSchema;` that [`crate::RustGenerator`] emits into
+    /// `core/src/lib.rs`, and the `utoipa` pin that
+    /// [`crate::CorePackage::cargo_toml`] writes into `core/Cargo.toml`. They are
+    /// a matched pair: source naming a crate its own manifest does not pin is
+    /// `error[E0432]: unresolved import 'utoipa'`.
+    ///
+    /// It shipped as two conditions that were merely *expected* to agree — the
+    /// derive on `web` (the app's **declared** targets) and the pin on whether
+    /// *this invocation* happened to emit an `api.rs`. Those differ for exactly
+    /// the invocations that narrow: `generate rust` under `targets = ["all"]`,
+    /// and `build --no-api`. Naming the condition once is what makes the
+    /// disagreement unrepresentable rather than merely fixed.
+    ///
+    /// It cannot be deferred to the consumer: `ToSchema` and the generated types
+    /// are both foreign to `server`, so the **orphan rule** means `server` can
+    /// never supply the impl. It is a generate-time decision or it is nothing.
+    ///
+    /// The asymmetry is deliberate — `web` is resolved from the declared target
+    /// set and falls back to ON, because a `utoipa` pin nothing derives against
+    /// is inert while a missing derive is an `E0277` in `server` that no
+    /// downstream change can fix.
+    pub const fn needs_utoipa(&self) -> bool {
+        self.web
+    }
+
     /// The config that reproduces the *pre-#126* emitted code byte-for-byte,
     /// including the unconditional replication broker. Used by the replication
     /// guard tests (which assert the broker IS attached) and anywhere the legacy

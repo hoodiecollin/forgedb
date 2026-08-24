@@ -34,7 +34,7 @@
 //! test fails loudly if either anchor moves — a silently-empty extraction would
 //! be a test that compiles nothing and passes.
 
-use forgedb_codegen::{ServerLayout, ServerPackage};
+use forgedb_codegen::ServerPackage;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
@@ -60,7 +60,7 @@ fn lift_fn(source: &str, name: &str) -> String {
 
 /// The guard, as a standalone `std`-only program.
 fn guard_program() -> String {
-    let main_rs = ServerPackage::main_rs(ServerLayout::Cache);
+    let main_rs = ServerPackage::main_rs();
 
     let start = main_rs.find(REGION_START).unwrap_or_else(|| {
         panic!("the generated server no longer starts its data-dir resolution with:\n{REGION_START}")

@@ -108,9 +108,12 @@ fn test_schema_differ() {
                 indexed: false,
                 index_type: "Hash".to_string(),
                 constraints: vec![],
+                depends_on: vec![],
             }],
             composite_indexes: vec![],
         }],
+        enums: vec![],
+        structs: vec![],
     };
 
     let new_schema = SimpleSchema {
@@ -125,6 +128,7 @@ fn test_schema_differ() {
                     indexed: false,
                     index_type: "Hash".to_string(),
                     constraints: vec![],
+                    depends_on: vec![],
                 },
                 SimpleField {
                     name: "email".to_string(),
@@ -137,10 +141,13 @@ fn test_schema_differ() {
                         name: "email".to_string(),
                         params: vec![],
                     }],
+                    depends_on: vec![],
                 },
             ],
             composite_indexes: vec![],
         }],
+        enums: vec![],
+        structs: vec![],
     };
 
     let changes = SchemaDiffer::diff(&old_schema, &new_schema);

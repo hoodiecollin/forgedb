@@ -153,11 +153,15 @@ fn run_command(workflow_file: &str, step_name: &str) -> String {
 
 /// The specific regression #390's design was built around.
 ///
-/// A "run all the ignored tests" target is most naturally written as a loop over the ten
-/// per-scenario targets that already exist. That form covers 13 of the 20 ignored tests
-/// and looks complete: it silently drops all four in `build_cache_compile_test` plus one
-/// each from `pyo3_component_compile_test`, `placement_flip_test` and `migrate_tests`,
-/// because those four files have no target at all.
+/// A "run all the ignored tests" target is most naturally written as a loop over the
+/// per-scenario targets that already exist. That form covers 15 of the 29 ignored tests
+/// and looks complete: it silently drops every one in `build_cache_compile_test`,
+/// `in_tree_package_test`, `prompt_boundary_test`, `pyo3_component_compile_test`,
+/// `placement_flip_test`, `migrate_tests` and `core_utoipa_gate_test`, because those
+/// seven files have no target at all.
+///
+/// The count in that sentence is prose and drifts; the ASSERTIONS below derive their set
+/// from source, which is why a new ignored test cannot fall outside them.
 ///
 /// `--workspace` needs no list, and so cannot have a stale one. This asserts the
 /// invocation has not been narrowed back down — by target, by package, or by both.
@@ -176,8 +180,9 @@ fn tier_two_runs_the_whole_workspace_not_a_list_of_binaries() {
     assert!(
         !recipe.contains("--test "),
         "`make test-ignored` restricts to specific test binaries (`--test`). That form \
-         covers 13 of the 20 ignored tests and looks complete — the four files with no \
-         per-scenario target are exactly the ones it drops. Got: {recipe}"
+         covers only the ignored tests whose file happens to have a per-scenario target, \
+         and looks complete — the files with no target are exactly the ones it drops. \
+         Got: {recipe}"
     );
     for narrowing in ["--package ", "-p ", "--lib", "--bins"] {
         assert!(
