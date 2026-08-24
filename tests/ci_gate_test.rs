@@ -154,11 +154,11 @@ fn run_command(workflow_file: &str, step_name: &str) -> String {
 /// The specific regression #390's design was built around.
 ///
 /// A "run all the ignored tests" target is most naturally written as a loop over the
-/// per-scenario targets that already exist. That form covers 13 of the 24 ignored tests
-/// and looks complete: it silently drops all four in `build_cache_compile_test`, all
-/// three in `in_tree_package_test`, and one each from `pyo3_component_compile_test`,
-/// `placement_flip_test`, `migrate_tests` and `core_utoipa_gate_test`, because those six
-/// files have no target at all.
+/// per-scenario targets that already exist. That form covers 15 of the 29 ignored tests
+/// and looks complete: it silently drops every one in `build_cache_compile_test`,
+/// `in_tree_package_test`, `prompt_boundary_test`, `pyo3_component_compile_test`,
+/// `placement_flip_test`, `migrate_tests` and `core_utoipa_gate_test`, because those
+/// seven files have no target at all.
 ///
 /// The count in that sentence is prose and drifts; the ASSERTIONS below derive their set
 /// from source, which is why a new ignored test cannot fall outside them.
