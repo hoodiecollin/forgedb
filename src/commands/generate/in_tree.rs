@@ -84,16 +84,11 @@ pub(super) fn emit(
     core_lib: &str,
 ) -> Result<Vec<PathBuf>> {
     let files = CorePackage::files(core_pkg, config, core_lib);
-    let mut written = Vec::with_capacity(files.len());
-
-    for (rel, body) in &files {
-        let path = dir.join(rel);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, body)?;
-        written.push(path);
-    }
+    // The SAME writer the cache emitter uses. A second copy of "create the
+    // parent, write the bytes" here would be a second emitter of one artifact —
+    // the shape #335 exists to end — and it is where the two destinations would
+    // start disagreeing about, say, whether a stale file is removed first.
+    let written = super::write_core_package(dir, &files)?;
 
     ui::success(&format!(
         "In-tree Rust package: {} ({} files)",

@@ -1163,22 +1163,29 @@ pub use forgedb_types;\n";
 /// substrate pin would never reach an existing member, and the stale pin would
 /// sit in a directory the user never opens where the publish-gap check cannot
 /// see it.
-/// Write one rendered `core` package to `dir`.
+/// Write one rendered `core` package to `dir`, and return the paths written.
+///
+/// **Both destinations go through here** — the cache member and #338's in-tree
+/// placement. One renderer (`CorePackage::files`) and one writer is what makes
+/// "the same package, two destinations" structural rather than two emitters that
+/// happen to agree.
 ///
 /// `fs::write`, never `write_file`: `write_file` refuses an existing file
 /// without `--force`, and a `core` package — in the cache or in the user's tree
 /// (#338) — is **ForgeDB's file**, rewritten in full on every generate. That is
 /// what makes a CLI upgrade's substrate pin reach an existing project instead of
 /// freezing at whatever the first run wrote (#290's floor problem).
-fn write_core_package(dir: &Path, files: &[(&'static str, String)]) -> Result<()> {
+fn write_core_package(dir: &Path, files: &[(&'static str, String)]) -> Result<Vec<PathBuf>> {
+    let mut written = Vec::with_capacity(files.len());
     for (rel, body) in files {
         let path = dir.join(rel);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         fs::write(&path, body)?;
+        written.push(path);
     }
-    Ok(())
+    Ok(written)
 }
 
 fn emit_cache_packages(
