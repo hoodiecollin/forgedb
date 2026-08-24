@@ -1112,6 +1112,24 @@ pub use forgedb_types;\n";
 /// substrate pin would never reach an existing member, and the stale pin would
 /// sit in a directory the user never opens where the publish-gap check cannot
 /// see it.
+/// Write one rendered `core` package to `dir`.
+///
+/// `fs::write`, never `write_file`: `write_file` refuses an existing file
+/// without `--force`, and a `core` package — in the cache or in the user's tree
+/// (#338) — is **ForgeDB's file**, rewritten in full on every generate. That is
+/// what makes a CLI upgrade's substrate pin reach an existing project instead of
+/// freezing at whatever the first run wrote (#290's floor problem).
+fn write_core_package(dir: &Path, files: &[(&'static str, String)]) -> Result<()> {
+    for (rel, body) in files {
+        let path = dir.join(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, body)?;
+    }
+    Ok(())
+}
+
 fn emit_cache_packages(
     container: &Path,
     naming: &AppNaming,
@@ -1127,7 +1145,12 @@ fn emit_cache_packages(
 
     let core_pkg = naming.package(&crate::naming::PackageKind::Core);
     let core_dir = container.join(crate::naming::PackageKind::Core.dir());
-    fs::create_dir_all(core_dir.join("src"))?;
+    // Rendered by `CorePackage::files` — the ONE definition of what a `core`
+    // package is, shared with the in-tree emitter and `--check`'s comparer
+    // (#338). Two destinations, one renderer; a second enumeration here is how
+    // an in-tree package would come to hold a different file set than a cache
+    // one while both looked right.
+    //
     // The manifest is rendered from THE SAME `GenConfig` that rendered
     // `core_lib` (#445). `utoipa` is pinned iff `GenConfig::needs_utoipa` — the
     // one condition — and that is also what put `use utoipa::ToSchema;` and the
@@ -1141,11 +1164,10 @@ fn emit_cache_packages(
     //
     // The parameter that carried the divergent condition is gone: `cargo_toml`
     // takes the config, so there is nothing here left to compute.
-    fs::write(
-        core_dir.join("Cargo.toml"),
-        forgedb_codegen::CorePackage::cargo_toml(&core_pkg, gen_config),
+    write_core_package(
+        &core_dir,
+        &forgedb_codegen::CorePackage::files(&core_pkg, gen_config, core_lib),
     )?;
-    fs::write(core_dir.join("src/lib.rs"), core_lib)?;
     ui::detail(&format!("  ✓ {} (cache package)", core_dir.display()));
 
     if let Some(api) = cache.api.as_deref() {
@@ -1161,7 +1183,7 @@ fn emit_cache_packages(
         fs::write(server_dir.join("src/api.rs"), api)?;
         fs::write(
             server_dir.join("src/main.rs"),
-            forgedb_codegen::ServerPackage::main_rs(forgedb_codegen::ServerLayout::Cache),
+            forgedb_codegen::ServerPackage::main_rs(),
         )?;
         ui::detail(&format!("  ✓ {} (cache package)", server_dir.display()));
     }

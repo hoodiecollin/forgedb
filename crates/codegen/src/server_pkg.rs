@@ -1,65 +1,27 @@
 //! The `server/` cache package: the generated REST API as a binary crate
 //! (#335 §1, epic #332).
 //!
-//! # One `main.rs`, two preambles
+//! # One `main.rs`, one preamble
 //!
 //! The body of the generated server — env-driven config, the tenant data dir,
 //! the JWT authenticator, CORS, the router, graceful shutdown — is **one
-//! definition**, in `templates/server_main_body.rs.txt`.  Only the module
-//! preamble differs between the two places it is used:
+//! definition**, in `templates/server_main_body.rs.txt`, and there is now
+//! exactly one preamble in front of it: `server/` links `core` as an ordinary
+//! cargo dependency.
 //!
-//! * **in-tree** (`forgedb init`'s scaffold, until #335 step 10 removes it)
-//!   reaches the generated files through `#[path]` modules;
-//! * **cache** (`server/` here) links `core` as an ordinary dependency.
-//!
-//! Copying the body for the second case would create exactly the drift this
-//! issue exists to end — two emitters of one artifact, agreeing today and
-//! diverging on the first edit that touches only one of them.
+//! There used to be a second, `ServerLayout::InTree`, which reached the
+//! generated files through `#[path]` modules for `forgedb init`'s cargo
+//! scaffold.  #335 §15 deleted that scaffold and #338 decided in-tree carries
+//! **no server at all** — an in-tree placement emits `core` and nothing else —
+//! so the variant had no caller outside its own test.  A layout parameter with
+//! one variant is an invitation to add a second emitter of one artifact, which
+//! is the drift #335 exists to end.
 //!
 //! # Why `api.rs` needs no generator change
 //!
 //! It opens with `use super::*;`, re-globbing whatever the crate root imported —
 //! the same mechanism the `init` scaffold already relies on.  A `main.rs` that
 //! says `use forgedb_core::*; mod api;` compiles it verbatim.
-
-/// Where the generated server is being emitted, which decides only how it
-/// reaches `database` and `api`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ServerLayout {
-    /// `forgedb init`'s scaffold: `#[path]` modules pointing at the output dir.
-    InTree,
-    /// The cache `server/` package: `core` is a cargo dependency, `api` a sibling
-    /// module in `src/`.
-    Cache,
-}
-
-impl ServerLayout {
-    fn preamble(self) -> &'static str {
-        match self {
-            ServerLayout::InTree => {
-                "#[path = \"../generated/database.rs\"]\n\
-                 mod database;\n\
-                 use database::*;\n\
-                 \n\
-                 #[path = \"../generated/api.rs\"]\n\
-                 mod api;\n"
-            }
-            // `use forgedb_core as database;` keeps the body's one
-            // `database::Database::open_at` reference working unchanged — which
-            // is what lets the body be shared rather than parameterised.
-            //
-            // The per-app package name never appears here: the MANIFEST renames
-            // the dependency to `forgedb_core`, so no generated `.rs` byte
-            // carries the app hash.
-            ServerLayout::Cache => {
-                "use forgedb_core as database;\n\
-                 use database::*;\n\
-                 \n\
-                 mod api;\n"
-            }
-        }
-    }
-}
 
 /// The `server/` package.
 pub struct ServerPackage;
@@ -68,9 +30,29 @@ impl ServerPackage {
     /// The shared body — everything below the module preamble.
     const BODY: &'static str = include_str!("templates/server_main_body.rs.txt");
 
-    /// Render `main.rs` for one layout.
-    pub fn main_rs(layout: ServerLayout) -> String {
-        format!("{}{}", layout.preamble(), Self::BODY)
+    /// The module preamble: `server/` links `core` as a cargo dependency.
+    ///
+    /// `use forgedb_core as database;` keeps the body's one
+    /// `database::Database::open_at` reference resolving unchanged — which is
+    /// what let the body be shared when there were two layouts, and what keeps
+    /// the body free of any knowledge of how it is reached now there is one.
+    ///
+    /// The per-app package name never appears here: the MANIFEST renames the
+    /// dependency to `forgedb_core`, so no generated `.rs` byte carries the
+    /// app's derived name.
+    const PREAMBLE: &'static str = "use forgedb_core as database;\n\
+                                    use database::*;\n\
+                                    \n\
+                                    mod api;\n";
+
+    /// Render `main.rs`.
+    ///
+    /// **It takes no layout argument** (#338). The `#[path]`-module layout had
+    /// no caller once `forgedb init` stopped scaffolding a cargo package
+    /// (#335 §15), and in-tree placement emits `core` alone — no `api.rs`, no
+    /// `main.rs`, no `[[bin]]`.
+    pub fn main_rs() -> String {
+        format!("{}{}", Self::PREAMBLE, Self::BODY)
     }
 
     /// Render `server/Cargo.toml`.
@@ -140,24 +122,58 @@ tracing-subscriber = {{ version = "0.3", features = ["env-filter", "json"] }}
 mod tests {
     use super::*;
 
+    /// **#338 scenario 15.** `main_rs()` takes no layout argument, its preamble
+    /// links `forgedb_core`, and no `#[path = "../generated/…"]` string survives
+    /// anywhere in this crate's source.
+    ///
+    /// The last clause is asserted over the crate's own files with comments
+    /// stripped, because this file EXPLAINS the deleted layout at length and a
+    /// naive `contains` would be satisfied by the explanation. A guard a comment
+    /// can satisfy is not a guard, and a well-commented deletion makes that
+    /// worse rather than better: the prose restates the removed construct in the
+    /// exact words the assertion greps for.
     #[test]
-    fn both_layouts_share_one_body() {
-        let in_tree = ServerPackage::main_rs(ServerLayout::InTree);
-        let cache = ServerPackage::main_rs(ServerLayout::Cache);
-
-        assert!(in_tree.ends_with(ServerPackage::BODY));
-        assert!(cache.ends_with(ServerPackage::BODY));
-        assert_ne!(in_tree, cache, "the preambles must differ");
-    }
-
-    #[test]
-    fn the_cache_layout_links_core_rather_than_path_modules() {
-        let cache = ServerPackage::main_rs(ServerLayout::Cache);
-        assert!(cache.contains("use forgedb_core as database;"), "{}", &cache[..200]);
+    fn the_generated_main_links_core() {
+        let main = ServerPackage::main_rs();
+        assert!(main.ends_with(ServerPackage::BODY));
         assert!(
-            !cache.contains("#[path"),
-            "the cache layout must not use #[path] modules"
+            main.starts_with("use forgedb_core as database;"),
+            "{}",
+            &main[..200]
         );
+        assert!(
+            !main.contains("#[path"),
+            "the generated main must not use #[path] modules"
+        );
+
+        // Assembled from two halves so THIS assertion's own source does not
+        // contain the string it forbids. The reflex fix for a self-matching
+        // scanner is to skip its own file, and that would blind it to exactly
+        // the file the deleted layout lived in.
+        //
+        // `ServerLayout` itself needs no text scan: it is gone from the crate,
+        // so naming it is a compile error. Only a string LITERAL can come back
+        // invisibly, and that is what this looks for.
+        let forbidden = format!("..{}", "/generated/");
+
+        for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/src")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let body = std::fs::read_to_string(&path).unwrap();
+            let code: String = body
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !code.contains(&forbidden),
+                "{} still emits a #[path] into the output directory — the in-tree \
+                 server layout is deleted, not merely unused",
+                path.display()
+            );
+        }
     }
 
     /// The body's one `database::` reference must keep resolving under the
@@ -180,7 +196,7 @@ mod tests {
 
     #[test]
     fn no_generated_byte_carries_the_app_hash() {
-        let cache = ServerPackage::main_rs(ServerLayout::Cache);
+        let cache = ServerPackage::main_rs();
         // The manifest carries the hashed package name; the source never does.
         let manifest = ServerPackage::cargo_toml("blog-3f2a1b-server", "blog-3f2a1b-core");
         assert!(manifest.contains("blog-3f2a1b-core"));
