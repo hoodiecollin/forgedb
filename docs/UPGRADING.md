@@ -14,8 +14,8 @@ Version policy is [`SEMVER.md`](SEMVER.md); pre-1.0, a **minor** bump is where b
 
 ## 0.5.0
 
-Seven breaks — four in `forgedb.toml`, three in the CLI surface — plus one rename that
-breaks no input you write. **None of them touch a data
+Nine breaks — four in `forgedb.toml`, four in the CLI surface, and one in the migration-record
+format — plus one rename that breaks no input you write. **None of them touch a data
 directory** — nothing on disk needs migrating, and every one of them is loud (a removed key,
 flag or command errors and names its replacement; nothing silently changes behavior).
 
@@ -188,7 +188,7 @@ your convenience, and delete your scaffold crate when you no longer want the sec
 directory. It no longer resolves anything from the CWD:
 
 ```bash
-forgedb migrate create "add note" --auto --schema schema.forge
+forgedb migrate create "add note"        --schema schema.forge
 forgedb migrate status                   --schema schema.forge
 forgedb migrate build --from 1 --to 2    --schema schema.forge
 forgedb migrate run   --from 1 --to 2    --schema schema.forge --src ./data --dest ./data-v2
@@ -225,11 +225,62 @@ whole point — a flag that reads as applied and is not is the failure mode this
 | `forgedb init --api-only` | *(nothing — it is the only mode)* | Same: with no Rust scaffold, every project is what `--api-only` used to mean. |
 | `forgedb migrate build -o/--output <dir>` | *(nothing — the cache decides)* | It named a directory for a crate ForgeDB now places itself, in the workspace it owns. |
 | `forgedb migrate run --bin-dir <dir>` | `--from`/`--to` | Same: the transformer is resolved by app + range, not by a path you keep. |
+| `forgedb migrate create --auto` | *(nothing — it is what the command does)* | Detecting schema changes is not a mode; there is no second mode to choose. To opt out of the *prompt* — and only the prompt — pass `--no-auto`. |
+| `forgedb generate transform` | `forgedb migrate build` | It emitted the transformer source into a directory of your choosing; the transformer is a member of ForgeDB's build cache now. |
 
 **Remedy:** grep your scripts and CI for these. Every one of them is a one-line substitution,
 and every one of them fails loudly rather than quietly doing the wrong thing.
 
-### 8. Generated package names and exported C symbols were renamed
+### 8. `migrate create` asks, and refuses to guess (#374)
+
+Writing a **Rust** migration transform used to be the main path, and it inverted the project's
+premise: a `.forge` schema is readable by someone who has never written Rust, and
+`migrations/<id>/transform.rs` handed that same person a `serde_json::Value` and a `match` arm.
+
+Three behaviour changes follow, and each of them can stop a script that worked in 0.4.
+
+**a. There is no empty-template mode.** `migrate create` without `--auto` used to write a record
+with `changes: []` and tell you to edit it by hand. Both are gone. A record's `changes` array is
+derived from a schema diff, so it can no longer disagree with `migrations/schemas/vN.forge`.
+
+**b. A change ForgeDB cannot prove is asked about — and in a non-interactive session it is a hard
+error.** In a terminal you get a menu (a constant, a copy of another field, or "I'll write the
+transform"). With stdin piped, stderr redirected, `--quiet`, or `--no-auto`, the **first** such
+change exits non-zero naming it, and nothing is written.
+
+```
+Post.slug needs an answer and this session cannot ask for one (stdin is not a terminal…).
+```
+
+**Remedy:** run `migrate create` from a terminal, or give the field a `@default` in the schema so
+there is nothing to ask. `@default` is now applied to existing rows on a migration — identically
+by the reopen backfill and by the transformer — for `bool`, the integer types, `f64`, bare
+`string`, `json`, `decimal` and a declared `enum` variant.
+
+**c. A rename is now proposed rather than assumed.** One field dropped and one added of the same
+type used to be recorded as a `RenameField` outright. It is a guess, and the two readings produce
+opposite data: a rename carries every stored value across, a drop+add empties the column. ForgeDB
+now asks, and with nobody to ask it records the **drop+add** — what the schema literally says.
+
+**Remedy:** if you relied on rename inference in a script, re-run `migrate create` interactively
+and confirm the rename, or accept the drop+add.
+
+### 9. The migration-record format moved to version 1
+
+Every record `migrate create` writes now carries `"record_version": 1` and, on any change that
+needed one, an `answer`. **Records written by 0.4 keep working**: an absent `record_version`
+reads as legacy, the on-disk key names are unchanged, and such a record re-serializes byte for
+byte, so its checksum still verifies. A legacy hop with authored residue builds from its
+`transform.rs` exactly as before, with a note that the next `migrate create` records answers.
+
+What does change: `migrate build` **refuses a hop whose answer is missing**, before it generates
+anything and before cargo is invoked. The check is against the record and the recorded scaffold
+hash — never a grep for `TODO`, which you can delete without answering anything.
+
+**Remedy:** none for existing lineages. If you hand-edited a record to strip an answer, re-run
+`migrate create` for that hop.
+
+### 10. Generated package names and exported C symbols were renamed
 
 Not a break in anything you *write* — no key, flag or command changed — but every derived name
 changed, so **the first build after upgrading rebuilds from scratch** and any already-linked FFI
@@ -267,6 +318,17 @@ The cache's own member directories are unaffected: they are still keyed by the p
 data directory and no cache layout needs migrating.
 
 ### What is new rather than broken
+
+**`[toolchain]` is a new table**, and its name is a one-way door. It says where the interpreter a
+non-Rust migration transform runs on lives, and which version will do — location and version
+only, never which language (that is derived from `[generate].targets`). Because config parsing is
+`deny_unknown_fields`, a project that adopts it can no longer be built by a 0.4 CLI.
+
+```toml
+[toolchain]
+bun    = { path = "/opt/homebrew/bin/bun", min_version = "1.1" }
+python = { path = ".venv/bin/python",      min_version = "3.11" }
+```
 
 `[project]` is now read rather than ignored. `[project].name` is your project's id, and
 `isolated` says whether the schemas beneath a config form their own project or join an

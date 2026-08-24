@@ -105,6 +105,7 @@ is a documented follow-up. See [`[storage]`](/docs/config/storage/).
 | `[storage]` | fsync policy, WAL checkpoint, compaction (Tier A/B). | [\[storage\]](/docs/config/storage/) |
 | `[tenant]` | The per-tenant data root. | [\[tenant\] & \[auth\]](/docs/config/tenant-auth/) |
 | `[auth]` | Verify-only JWT tenant guard settings (bridges to `FORGEDB_*`). | [\[tenant\] & \[auth\]](/docs/config/tenant-auth/) |
+| `[toolchain]` | Where the interpreter a non-Rust migration transform runs on lives, and which version will do. Location and version only — the language is derived from `[generate].targets`. | [Migrations](/docs/features/migrations/) |
 
 Unknown top-level tables are ignored, so `forgedb.toml` is forward-compatible with future
 keys.
