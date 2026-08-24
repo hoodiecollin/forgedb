@@ -354,6 +354,35 @@ pub struct WasmConfig {
     pub commit_max_frames: Option<u64>,
 }
 
+/// Where an already-generated artifact is **placed** (`[placement]` table) —
+/// epic #332's C14, and its first real knob (#338).
+///
+/// Separate from `[generate]` on purpose, and the line is sharp: `[generate]`'s
+/// knobs change generated **bytes** (`targets` changes what exists, the
+/// `[runtime]`/`[storage]` knobs change what `database.rs` says).  This table
+/// changes only **where a byte-identical artifact lands**.  Folding it into
+/// `[generate]` would put a knob that cannot change output beside nine that can.
+///
+/// **The table name is a one-way door.**  [`ForgeConfig`] is
+/// `deny_unknown_fields` at every level, so every already-released CLI rejects
+/// outright any config carrying `[placement]`, and every future CLI must accept
+/// this spelling forever.  There is no deprecation path for a table name: an
+/// alias would be a second name for one thing, in a parser whose entire premise
+/// is that an unrecognized name is an error.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PlacementConfig {
+    /// Where the in-tree Rust package is emitted, resolved against the
+    /// **schema's** directory exactly as `[generate].output` is.
+    ///
+    /// **Absent means no package is emitted.**  The opt-out is the key's
+    /// absence, not a second negative flag — writing a cargo package into a tree
+    /// ForgeDB does not own is opt-in, and one key is the whole of that opt-in.
+    ///
+    /// Read in exactly one place, [`crate::project::Governing::rust_package`].
+    pub rust_package: Option<String>,
+}
+
 /// Top-level config struct.  An unknown top-level table is an error (#333) —
 /// a misspelled `[projekt]` would otherwise be ignored, identity would fall
 /// through to manifest detection or the path hash, and two projects could
@@ -383,6 +412,8 @@ pub struct ForgeConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub wasm: WasmConfig,
+    #[serde(default)]
+    pub placement: PlacementConfig,
 }
 
 impl ForgeConfig {

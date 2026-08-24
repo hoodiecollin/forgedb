@@ -242,3 +242,39 @@ fn the_gitignore_no_longer_ignores_generated_wholesale() {
         ".gitignore stopped ignoring the data directory:\n{gitignore}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #338 scenario 14 — the scaffold parses against its own CLI, and opts out.
+// ---------------------------------------------------------------------------
+
+/// **#338 scenario 14.** The scaffolded `forgedb.toml` parses with the REAL
+/// loader and contains no `[placement]` table.
+///
+/// Two halves, and both are load-bearing.
+///
+/// *Parses*: `ForgeConfig` is `deny_unknown_fields` at every level, so adding a
+/// table the scaffold does not know about cannot break it — but adding a table
+/// the scaffold DOES write and the struct does not declare would break every
+/// scaffolded project against its own CLI. This is the guard `src/config.rs`
+/// names, and until now it did not exist as a test.
+///
+/// *No `[placement]`*: a scaffolded project is opted out **by absence**, which
+/// is the whole contract of #338. There is no affirmative "cache-only"
+/// spelling to assert instead, so the assertion is that the table is not there.
+#[test]
+fn s338_14_the_scaffolded_config_parses_and_carries_no_placement() {
+    let (_tmp, project) = scaffold("myapp");
+    let body = read(&project.join("forgedb.toml"));
+
+    let config = forgedb::config::parse_config(&body, &project.join("forgedb.toml"))
+        .unwrap_or_else(|e| panic!("the scaffolded config does not parse: {e}\n{body}"));
+
+    assert!(
+        config.placement.rust_package.is_none(),
+        "the scaffold declared a placement; a new project is opted out by absence"
+    );
+    assert!(
+        !body.contains("[placement]"),
+        "the scaffold wrote a [placement] table:\n{body}"
+    );
+}
