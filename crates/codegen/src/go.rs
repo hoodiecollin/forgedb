@@ -1256,6 +1256,14 @@ CGO_ENABLED=1 go build ./...
 Re-run `forgedb build` after every `.forge` schema change — the C ABI is tailored
 per schema, and the archive is linked into your binary at `go build` time.
 
+If you forget, the package refuses to load. Both halves carry a fingerprint of
+the generated source they came from, and `init()` compares them, so a stale
+archive is a panic naming the mismatch rather than a method set that no longer
+matches your schema. Most schema changes already fail at link time; this also
+covers the ones that do not — a `[storage]` or `[runtime]` setting changes what
+the engine does without changing a single exported symbol, and the linker cannot
+see that at all.
+
 ForgeDB compiles the engine inside its own build cache, and that cache is a
 cache: it can be cleared at any time. Static linking is what makes your binary
 survive that. Do not point cgo at a `.dylib`/`.so` in the cache instead — rustc
