@@ -708,6 +708,9 @@ impl SchemaDiffer {
                         field_name: field_name.clone(),
                         old_type: old_field.ty.clone(),
                         new_type: new_field.ty.clone(),
+                        // The differ records the question; `resolve_answers`
+                        // records the answer. Never both in one pass.
+                        answer: None,
                     });
                 }
 
@@ -718,6 +721,7 @@ impl SchemaDiffer {
                         field_name: field_name.clone(),
                         old_nullable: old_field.nullable,
                         new_nullable: new_field.nullable,
+                        answer: None,
                     });
                 }
 
@@ -763,7 +767,12 @@ impl SchemaDiffer {
                     field_name: field_name.clone(),
                     field_type: new_field.ty.clone(),
                     nullable: new_field.nullable,
+                    // Both filled by the CLI after the diff: `default_json`
+                    // from the destination field's `@default`, `answer` from
+                    // the operator. Neither is knowable here — this crate has
+                    // no parser and no terminal.
                     default_json: None,
+                    answer: None,
                 });
             }
         }

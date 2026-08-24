@@ -16,6 +16,7 @@ fn test_generate_and_load_migration() {
             field_type: "string".parse().unwrap(),
             nullable: false,
             default_json: None,
+            answer: None,
         },
     ];
 
@@ -46,6 +47,7 @@ fn test_migration_report() {
             field_type: "string".parse().unwrap(),
             nullable: false,
             default_json: None,
+            answer: None,
         },
         SchemaChange::RemoveField {
             model_name: "User".to_string(),

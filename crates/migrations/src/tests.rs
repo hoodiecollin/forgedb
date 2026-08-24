@@ -18,6 +18,7 @@ fn test_migration_generate_and_load_roundtrip() {
             field_type: "u32".parse().unwrap(),
             nullable: true,
             default_json: Some("0".to_string()),
+            answer: None,
         },
     ];
 
@@ -49,6 +50,7 @@ fn test_breaking_change_detection() {
             field_type: "string".parse().unwrap(),
             nullable: false,
             default_json: None,
+            answer: None,
         },
         SchemaChange::RemoveField {
             model_name: "User".to_string(),
@@ -59,6 +61,7 @@ fn test_breaking_change_detection() {
             field_name: "age".to_string(),
             old_type: "u32".parse().unwrap(),
             new_type: "u64".parse().unwrap(),
+            answer: None,
         },
     ];
 
@@ -175,12 +178,14 @@ fn test_diff_classifies_authored_body_residue() {
         field_name: "age".to_string(),
         old_type: "u32".parse().unwrap(),
         new_type: "string".parse().unwrap(),
+        answer: None,
     };
     let narrow_nullable = SchemaChange::ChangeFieldNullability {
         model_name: "User".to_string(),
         field_name: "email".to_string(),
         old_nullable: true,
         new_nullable: false,
+        answer: None,
     };
     let required_no_default = SchemaChange::AddField {
         model_name: "User".to_string(),
@@ -188,6 +193,7 @@ fn test_diff_classifies_authored_body_residue() {
         field_type: "string".parse().unwrap(),
         nullable: false,
         default_json: None,
+        answer: None,
     };
     for c in [&type_change, &narrow_nullable, &required_no_default] {
         assert_eq!(
@@ -228,6 +234,7 @@ fn test_diff_classifies_authored_body_residue() {
         field_type: "string".parse().unwrap(),
         nullable: true,
         default_json: None,
+        answer: None,
     };
     let rename = SchemaChange::RenameField {
         model_name: "User".to_string(),
@@ -278,6 +285,7 @@ fn test_migration_lineage_expands_range() {
                 field_type: "string".parse().unwrap(),
                 nullable: true,
                 default_json: None,
+                answer: None,
             }],
             *from,
             *to,
@@ -328,6 +336,7 @@ fn test_scaffold_authored_body_only_for_residue() {
             field_type: "string".parse().unwrap(),
             nullable: true,
             default_json: None,
+            answer: None,
         }],
         1,
         2,
@@ -342,6 +351,7 @@ fn test_scaffold_authored_body_only_for_residue() {
             field_name: "age".to_string(),
             old_type: "u32".parse().unwrap(),
             new_type: "string".parse().unwrap(),
+            answer: None,
         }],
         2,
         3,
@@ -559,6 +569,7 @@ fn scenario_2_the_classifier_calls_the_widening_table() {
         field_name: "views".into(),
         old_type: old,
         new_type: new,
+        answer: None,
     };
 
     for (old, new) in [
@@ -606,6 +617,7 @@ fn scenario_3b_widening_nullability_is_provable_and_narrowing_is_not() {
         field_name: "views".into(),
         old_nullable: old,
         new_nullable: new,
+        answer: None,
     };
     assert_eq!(n(false, true).hop_body_class(), HopBodyClass::Auto);
     assert!(!n(false, true).is_breaking());
