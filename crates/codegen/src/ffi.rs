@@ -70,6 +70,43 @@ use forgedb_parser::Schema;
 use quote::{format_ident, quote};
 
 /// Generates the native FFI spine (`ffi.rs`) for a schema.
+/// The fingerprint macro and the advisory check, emitted into `forgedb.h`.
+///
+/// ForgeDB generates no C that runs, so this **cannot be enforced** — the header
+/// offers the comparison and nothing can require it. Saying so in the header is
+/// the honest form; implying a guarantee that does not exist is worse than
+/// offering nothing.
+fn fingerprint_block(pfx: &str, fingerprint: &str) -> String {
+    format!(
+        r#"
+/* --- source fingerprint (#337) ---------------------------------------------
+ *
+ * The fingerprint of the generated source this header was emitted from. The
+ * archive beside it exposes the same value through {pfx}fingerprint(); if the
+ * two disagree, the library was built from a different schema than these
+ * declarations describe and every prototype below is a guess.
+ *
+ * This is NOT a version. A ForgeDB upgrade that changes nothing about the
+ * emitted source leaves it untouched.
+ *
+ * ADVISORY. ForgeDB generates no C that executes, so nothing here can force the
+ * check to run — call it yourself at startup.
+ */
+#define FORGEDB_FINGERPRINT "{fingerprint}"
+
+const char* {pfx}fingerprint(void);
+
+/* Non-zero when the linked archive was generated together with this header. */
+static inline int forgedb_fingerprint_ok(void) {{
+  const char* built = {pfx}fingerprint();
+  const char* want = FORGEDB_FINGERPRINT;
+  while (*built && *want && *built == *want) {{ built++; want++; }}
+  return *built == *want;
+}}
+"#
+    )
+}
+
 pub struct FfiGenerator;
 
 impl FfiGenerator {
@@ -99,6 +136,7 @@ impl FfiGenerator {
         // Go binary. `symbol_prefix` is the ONE definition of the prefix
         // (`forgedb::naming::symbol_prefix`) — it is never re-derived here.
         let sym_version = format_ident!("{}version", p);
+        let sym_fingerprint = format_ident!("{}fingerprint", p);
         let sym_open = format_ident!("{}open", p);
         let sym_close = format_ident!("{}close", p);
         let sym_commit = format_ident!("{}commit", p);
@@ -251,6 +289,30 @@ impl FfiGenerator {
                 let ptr = Box::into_raw(boxed) as *mut u8;
                 *out = ptr;
                 *out_len = len;
+            }
+
+            // #337: the source fingerprint of this package, written beside this
+            // file by `forgedb generate` and excluded from its own hash input by
+            // name. The generated `forgedb.h` carries the same value as a macro,
+            // and the generated Go package compares it in `init()`.
+            mod fingerprint;
+
+            /// The fingerprint of the generated source this engine was compiled
+            /// from, as a stable NUL-terminated C string. Owned by the process —
+            /// the caller must NOT free it.
+            ///
+            /// This is NOT a version. A CLI upgrade that changes nothing about the
+            /// emitted source leaves it untouched, which is the property that keeps
+            /// the mismatch error worth reading.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn #sym_fingerprint() -> *const c_char {
+                static FINGERPRINT: OnceLock<CString> = OnceLock::new();
+                FINGERPRINT
+                    .get_or_init(|| {
+                        CString::new(fingerprint::FINGERPRINT)
+                            .unwrap_or_else(|_| CString::new("").unwrap())
+                    })
+                    .as_ptr()
             }
 
             /// The generated engine crate's version (`CARGO_PKG_VERSION`), as a
@@ -2138,6 +2200,94 @@ impl FfiGenerator {
     /// `catch_unwind` boundary read as applied while doing nothing. The unwind
     /// floor is applied by the build driver on the cargo invocation, where a
     /// hostile `$CARGO_HOME/config.toml` cannot beat it.
+    /// Generate the `forgedb.h` C header declaring every prototype this
+    /// package defines (the schema-invariant spine + the per-model + relation
+    /// symbols), plus the fingerprint macro and the advisory check.
+    ///
+    /// **It lives here, not in `GoGenerator`, because the symbols it declares
+    /// are DEFINED here.** It was written on the Go path only because Go was the
+    /// first consumer to need it; a C consumer of ForgeDB had no declarations at
+    /// all. It still reads go.rs's model/relation walks — unifying those two
+    /// walks, which today agree only by review, is a separate change.
+    ///
+    /// `symbol_prefix` MUST be the same value handed to `FfiGenerator::generate`
+    /// for this app. A mismatch is not a compile error on either side — it is an
+    /// undefined-symbol error at link time.
+    pub fn generate_header(
+        schema: &Schema,
+        symbol_prefix: &str,
+        fingerprint: &str,
+    ) -> Result<GeneratedCode> {
+        use crate::go::{GoGenerator, GoRelOp, HEADER_PREAMBLE, subst};
+        let pfx = symbol_prefix;
+        let models = GoGenerator::crud_models(schema);
+        let rel_ops = GoGenerator::relation_ops(schema);
+
+        let mut h = String::new();
+        h.push_str(&subst(HEADER_PREAMBLE, pfx));
+        h.push_str(&fingerprint_block(pfx, fingerprint));
+
+        for m in &models {
+            let s = &m.snake;
+            h.push_str(&format!(
+                "\n/* --- {name} --- */\n\
+                 bool {pfx}{s}_insert(Db* db, const uint8_t* record, size_t record_len, uint8_t** id_out, size_t* id_len_out, ForgeError** err_out);\n\
+                 bool {pfx}{s}_get(Db* db, const uint8_t* id, size_t id_len, uint8_t** out, size_t* out_len, ForgeError** err_out);\n\
+                 int64_t {pfx}{s}_count(Db* db, ForgeError** err_out);\n\
+                 bool {pfx}{s}_all(Db* db, uint8_t** out, size_t* out_len, ForgeError** err_out);\n\
+                 int32_t {pfx}{s}_update(Db* db, const uint8_t* id, size_t id_len, const uint8_t* record, size_t record_len, ForgeError** err_out);\n\
+                 int32_t {pfx}{s}_delete(Db* db, const uint8_t* id, size_t id_len, ForgeError** err_out);\n\
+                 bool {pfx}{s}_get_at(Db* db, const Snapshot* snap, const uint8_t* id, size_t id_len, uint8_t** out, size_t* out_len, ForgeError** err_out);\n\
+                 bool {pfx}{s}_all_at(Db* db, const Snapshot* snap, uint8_t** out, size_t* out_len, ForgeError** err_out);\n\
+                 void {pfx}{s}_insert_async(Db* db, const uint8_t* record, size_t record_len, uint64_t token);\n\
+                 void {pfx}{s}_get_async(Db* db, const uint8_t* id, size_t id_len, uint64_t token);\n\
+                 void {pfx}{s}_count_async(Db* db, uint64_t token);\n\
+                 void {pfx}{s}_all_async(Db* db, uint64_t token);\n\
+                 void {pfx}{s}_update_async(Db* db, const uint8_t* id, size_t id_len, const uint8_t* record, size_t record_len, uint64_t token);\n\
+                 void {pfx}{s}_delete_async(Db* db, const uint8_t* id, size_t id_len, uint64_t token);\n",
+                name = m.name,
+                s = s,
+            ));
+        }
+
+        if !rel_ops.is_empty() {
+            h.push_str("\n/* --- relations --- */\n");
+            for op in &rel_ops {
+                h.push_str(&match op {
+                    GoRelOp::ForwardFk { sym, .. } | GoRelOp::Vec { sym, .. } => format!(
+                        "bool {pfx}{sym}(Db* db, const uint8_t* id, size_t id_len, uint8_t** out, size_t* out_len, ForgeError** err_out);\n"
+                    ),
+                    GoRelOp::VecAt { sym, .. } => format!(
+                        "bool {pfx}{sym}(Db* db, const Snapshot* snap, const uint8_t* id, size_t id_len, uint8_t** out, size_t* out_len, ForgeError** err_out);\n"
+                    ),
+                    GoRelOp::Link { sym, .. } => format!(
+                        "bool {pfx}{sym}(Db* db, const uint8_t* left, size_t left_len, const uint8_t* right, size_t right_len, ForgeError** err_out);\n"
+                    ),
+                    GoRelOp::Unlink { sym, .. } => format!(
+                        "int32_t {pfx}{sym}(Db* db, const uint8_t* left, size_t left_len, const uint8_t* right, size_t right_len, ForgeError** err_out);\n"
+                    ),
+                });
+            }
+        }
+
+        let arrow = GoGenerator::arrow_columns(schema);
+        if !arrow.is_empty() {
+            h.push_str("\n/* --- Arrow columnar export --- */\n");
+            for c in &arrow {
+                h.push_str(&format!(
+                    "bool {}{}(Db* db, struct ArrowSchema* out_schema, struct ArrowArray* out_array, ForgeError** err_out);\n",
+                    pfx, c.sym
+                ));
+            }
+        }
+
+        h.push_str("\n#endif /* FORGEDB_H */\n");
+        Ok(GeneratedCode {
+            description: format!("C header ({} models)", models.len()),
+            code: h,
+        })
+    }
+
     pub fn cargo_toml(crate_name: &str, core_package: &str) -> String {
         format!(
             r#"# Generated by ForgeDB. Do not edit — rewritten in full on every generate.
