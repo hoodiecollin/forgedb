@@ -265,6 +265,15 @@ pub fn run(options: GenerateOptions) -> Result<()> {
     // A stale scratch dir must never block a write, so check mode always forces.
     let force = options.force || options.check;
 
+    // #338 C1/C8: a placement inside the build cache is refused BEFORE anything
+    // is written — before the output directory is created, before the mirror.
+    // A refusal that fires after the mirror lands has already done the damage it
+    // exists to prevent, and "nothing was written" is the half of the scenario a
+    // guard placed at the emitter would silently fail.
+    if let Some(dir) = options.in_tree.as_deref() {
+        in_tree::guard(dir)?;
+    }
+
     // Create the output directory (a fresh scratch dir in check mode).
     if options.check {
         let _ = fs::remove_dir_all(&output_path);
@@ -402,6 +411,23 @@ pub fn run(options: GenerateOptions) -> Result<()> {
                 Err(_) => missing.push(committed),
             }
         }
+        // The in-tree package is committed source too, so `--check` — CI's
+        // staleness gate — has to cover it. Compared in memory against the live
+        // location: it never gets a scratch path, because a placement may sit
+        // outside the output directory and the scratch-relative join above would
+        // then resolve back to the real one.
+        if let (Some(dir), Some(core_lib)) = (options.in_tree.as_deref(), cache.core_lib.as_deref())
+        {
+            let (m, s) = in_tree::check(
+                dir,
+                &naming.package(&crate::naming::PackageKind::Core),
+                &ctx.gen_config,
+                core_lib,
+            )?;
+            missing.extend(m);
+            stale.extend(s);
+        }
+
         let _ = fs::remove_dir_all(&output_path);
 
         if missing.is_empty() && stale.is_empty() {

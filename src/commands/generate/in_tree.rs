@@ -97,3 +97,73 @@ pub(super) fn emit(
 
     Ok(written)
 }
+
+/// Refuse a placement that resolves inside the build cache (C1/C8) **before
+/// anything is written**.
+///
+/// The cache is derived state: `forgedb` prunes it, and a GC may delete it at
+/// any time. A placement inside it is committed source in a directory whose
+/// contract is "may vanish", so the two claims are irreconcilable and the config
+/// is refused rather than repaired.
+///
+/// It asks [`crate::cache::home_containing`] the same question
+/// `assert_not_in_cache` asks, and writes its own diagnostic: the two refusals
+/// are about different things (a *data* root, a *placement*) and a shared
+/// message would name the wrong one in half the cases.
+///
+/// **Where this is called matters more than what it does.** It runs before the
+/// output directory is created and before the mirror is written, so a refused
+/// config leaves the tree untouched. #345's lesson is the reason that is
+/// asserted rather than assumed: `cache::assert_not_in_cache` was fully
+/// mutation-tested while having executed zero times, because mutating a
+/// predicate proves the check works and only mutating the CALL SITE proves it
+/// runs.
+pub(super) fn guard(dir: &Path) -> Result<()> {
+    if let Some(home) = crate::cache::home_containing(dir)? {
+        return Err(crate::error::CliError::Config(format!(
+            "[placement].rust_package = {} resolves inside the ForgeDB build cache ({}).\n\
+             The build cache is derived state and may be deleted at any time, so it must \
+             never hold committed source — and an in-tree package is committed source: a \
+             path dependency naming a missing directory fails the workspace load for every \
+             crate in it.\n\
+             Point `[placement].rust_package` at a directory in your own repository, or \
+             remove the key to opt out.",
+            dir.display(),
+            home.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Compare only — **`--check` writes nothing, anywhere.**
+///
+/// Returns `(missing, stale)` for the in-tree package, to be joined into the
+/// existing check-mode report.
+///
+/// It renders in memory and compares against the live location. It deliberately
+/// does **not** piggyback on `generated_files`: that path computes
+/// `committed.join(scratch.strip_prefix(output).unwrap_or(scratch))`, and
+/// joining an *absolute* path replaces the base. A placement can sit anywhere,
+/// including outside the output directory, so the `unwrap_or` would fall through
+/// to the absolute scratch path and the join would silently resolve to the live
+/// location — a check mode that writes.
+pub(super) fn check(
+    dir: &Path,
+    core_pkg: &str,
+    config: &GenConfig,
+    core_lib: &str,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let mut missing = Vec::new();
+    let mut stale = Vec::new();
+
+    for (rel, body) in CorePackage::files(core_pkg, config, core_lib) {
+        let path = dir.join(rel);
+        match std::fs::read_to_string(&path) {
+            Ok(existing) if existing == body => {}
+            Ok(_) => stale.push(path),
+            Err(_) => missing.push(path),
+        }
+    }
+
+    Ok((missing, stale))
+}

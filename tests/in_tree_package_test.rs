@@ -570,3 +570,129 @@ fn scenarios_9_and_17_build_regenerates_the_package_but_never_plans_it() {
         );
     }
 }
+
+// ===========================================================================
+// Scenario 8 — `--check` compares and writes nothing
+// ===========================================================================
+
+/// **Scenario 8.** A stale committed in-tree package makes `generate --check`
+/// exit non-zero naming the stale path, and leaves the on-disk bytes
+/// **unchanged**; a current one exits 0, also unchanged.
+///
+/// Both assertions are load-bearing. `--check` is CI's staleness gate for
+/// committed generated source, and the in-tree package IS committed source — so
+/// a check that skipped it would report a clean tree while the package cargo
+/// compiles is a schema behind. And a check that *fixed* the file would be
+/// worse than useless in CI: it would pass on every run and gate nothing.
+#[test]
+fn scenario_8_check_compares_and_writes_nothing() {
+    let tmp = project("s8", "\"rust\"", PLACEMENT);
+    let root = tmp.path();
+    ok(&forgedb(root, &["generate", "all", "--force"]), "generate all");
+
+    let lib = root.join("generated/core/src/lib.rs");
+    let manifest = root.join("generated/core/Cargo.toml");
+
+    // Current → exit 0, bytes untouched.
+    let before_lib = read(&lib);
+    let before_manifest = read(&manifest);
+    let out = forgedb(root, &["generate", "all", "--check"]);
+    assert!(
+        out.status.success(),
+        "--check failed on a current tree:\n{}",
+        combined(&out)
+    );
+    assert_eq!(read(&lib), before_lib, "--check rewrote the source");
+    assert_eq!(read(&manifest), before_manifest, "--check rewrote the manifest");
+
+    // Stale → non-zero, names the path, bytes STILL untouched.
+    write(&lib, "// a schema behind\n");
+    let out = forgedb(root, &["generate", "all", "--check"]);
+    assert!(
+        !out.status.success(),
+        "--check passed on a stale in-tree package:\n{}",
+        combined(&out)
+    );
+    let report = combined(&out);
+    assert!(
+        report.contains("core/src/lib.rs"),
+        "--check did not name the stale in-tree path:\n{report}"
+    );
+    assert_eq!(
+        read(&lib),
+        "// a schema behind\n",
+        "--check repaired the file it was supposed to report"
+    );
+
+    // A MISSING package is reported too — the fresh-clone case, where the
+    // directory a path dep names does not exist at all.
+    std::fs::remove_dir_all(root.join("generated/core")).unwrap();
+    let out = forgedb(root, &["generate", "all", "--check"]);
+    assert!(
+        !out.status.success(),
+        "--check passed on a missing in-tree package:\n{}",
+        combined(&out)
+    );
+    assert!(
+        !root.join("generated/core").exists(),
+        "--check recreated the package it was supposed to report"
+    );
+}
+
+// ===========================================================================
+// Scenario 12 — a placement inside the build cache is refused
+// ===========================================================================
+
+/// **Scenario 12.** A `rust_package` resolving inside `$FORGEDB_HOME` exits
+/// non-zero naming the cache and why — **and nothing was written**: no in-tree
+/// directory, and the mirror was never written either.
+///
+/// The second half is the [[red-for-the-wrong-reason]] lesson from #345, applied
+/// in advance. Mutating the predicate proves the guard *works*; only the
+/// "nothing was written" assertion can fail when the guard is *not called*, or
+/// is called too late. `cache::assert_not_in_cache` was fully mutation-tested
+/// while having executed zero times.
+#[test]
+fn scenario_12_a_placement_inside_the_cache_is_refused() {
+    // `.home` is this fixture's FORGEDB_HOME (see `forgedb`), so this is a
+    // placement literally inside the build cache.
+    let tmp = project(
+        "s12",
+        "\"rust\"",
+        "\n[placement]\nrust_package = \".home/projects/sneaky/core\"\n",
+    );
+    let root = tmp.path();
+
+    let out = forgedb(root, &["generate", "all", "--force"]);
+    assert!(
+        !out.status.success(),
+        "a placement inside the build cache was accepted:\n{}",
+        combined(&out)
+    );
+
+    let report = combined(&out);
+    assert!(
+        report.contains("build cache"),
+        "the refusal does not name the cache:\n{report}"
+    );
+    assert!(
+        report.contains("deleted at any time"),
+        "the refusal does not say WHY (C1/C8 — the cache is derived state):\n{report}"
+    );
+    assert!(
+        report.contains("rust_package"),
+        "the refusal does not name the key at fault:\n{report}"
+    );
+
+    // Nothing was written — this is the half that fails when the guard is not
+    // CALLED, or is called after the emitters have already run.
+    assert!(
+        !root.join(".home/projects/sneaky").exists(),
+        "the refused placement was written anyway"
+    );
+    assert!(
+        !root.join("generated/database.rs").exists(),
+        "the mirror was written before the placement was refused — the guard \
+         runs too late"
+    );
+}
