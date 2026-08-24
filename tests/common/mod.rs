@@ -77,6 +77,23 @@ fn cargo_toml(name: &str) -> String {
 /// The driver's `Output` comes back for the caller to assert on; the project dir
 /// is left in place on failure and removed by `cleanup` on success.
 pub fn generate_compile_run(tag: &str, schema: &str, driver: &str) -> (Output, PathBuf) {
+    generate_compile_run_in(tag, schema, driver, None)
+}
+
+/// As [`generate_compile_run`], but the driver's data dir is the caller's to
+/// choose (#438).
+///
+/// `None` keeps the historical `<project>/data`. `Some(dir)` is what lets **two
+/// separately generated crates be pointed at one directory** — which is the only
+/// way to observe a stored-byte reinterpretation at all: the corruption lives in
+/// the disagreement between the schema that wrote a byte and the schema that
+/// reads it, so a single crate can never see it, however it is exercised.
+pub fn generate_compile_run_in(
+    tag: &str,
+    schema: &str,
+    driver: &str,
+    data_dir: Option<&Path>,
+) -> (Output, PathBuf) {
     let proj = std::env::temp_dir().join(format!("forgedb-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&proj);
     std::fs::create_dir_all(&proj).unwrap();
@@ -124,7 +141,11 @@ pub fn generate_compile_run(tag: &str, schema: &str, driver: &str) -> (Output, P
     // which is the only way to prove a multi-process property from one test.
     // Additive: drivers that read only `argv[1]` are unaffected.
     let out = Command::new(target.join(format!("debug/{tag}")))
-        .arg(proj.join("data"))
+        .arg(
+            data_dir
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| proj.join("data")),
+        )
         .arg(forgedb)
         .output()
         .expect("run driver");

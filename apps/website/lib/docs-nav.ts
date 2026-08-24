@@ -82,6 +82,7 @@ export const docsNav: NavGroup[] = [
       { title: "[storage]", href: "/docs/config/storage/" },
       { title: "[tenant] & [auth]", href: "/docs/config/tenant-auth/" },
       { title: "[generate] & [project]", href: "/docs/config/generate/" },
+      { title: "[placement]", href: "/docs/config/placement/" },
     ],
   },
   {

@@ -708,3 +708,166 @@ fn test_migrate_spawns_no_cargo_of_its_own() {
         "migrate run no longer asks the driver where cargo writes"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #438 — an enum reorder reaches the lineage
+// ---------------------------------------------------------------------------
+
+const ENUM_V1: &str = "enum Status { Draft  Published  Archived }\n\
+                       Post {\n  id: +uuid\n  title: string\n  status: Status\n}\n";
+/// The first two variants swapped, and NOTHING else. Every stored `status` byte
+/// stays in range, so no read anywhere fails — it just means something different.
+const ENUM_V2: &str = "enum Status { Published  Draft  Archived }\n\
+                       Post {\n  id: +uuid\n  title: string\n  status: Status\n}\n";
+
+/// End to end through the real binary: reordering an enum's variants must
+/// **record a hop**, and must leave the recorded v1 schema alone.
+///
+/// Not `#[ignore]`d — it runs the CLI and compiles nothing, the same class as
+/// the scenario-32/33 tests above.
+///
+/// Part (c) is the assertion most likely to be left out, and it is the only one
+/// that pins the second half of the defect (#442). The `changes.is_empty()`
+/// branch of `migrate create` does not merely return: it rewrites
+/// `.schema-snapshot.forge` **and** `migrations/schemas/v{current}.forge` with
+/// the new source. So before the fix, the run that failed to notice the reorder
+/// also overwrote the record of what v1 actually was — destroying the evidence
+/// the transformer needs to repair the data. Detection is what keeps that branch
+/// untaken.
+#[test]
+fn test_an_enum_reorder_records_a_hop_and_leaves_v1_intact() {
+    let temp = TempDir::new().unwrap();
+    let dir = temp.path();
+    fs::write(dir.join("forgedb.toml"), CONFIG).unwrap();
+
+    fs::write(dir.join("schema.forge"), ENUM_V1).unwrap();
+    let baseline = forgedb(dir)
+        .args([
+            "migrate",
+            "create",
+            "baseline",
+            "--auto",
+            "--schema",
+            "schema.forge",
+        ])
+        .output()
+        .expect("run migrate create");
+    assert!(
+        baseline.status.success(),
+        "baseline:\n{}",
+        combined(&baseline)
+    );
+
+    fs::write(dir.join("schema.forge"), ENUM_V2).unwrap();
+    let reorder = forgedb(dir)
+        .args([
+            "migrate",
+            "create",
+            "swap_status",
+            "--auto",
+            "--schema",
+            "schema.forge",
+        ])
+        .output()
+        .expect("run migrate create");
+    assert!(reorder.status.success(), "reorder:\n{}", combined(&reorder));
+
+    let said = strip_ansi(&combined(&reorder));
+    assert!(
+        !said.contains("No schema changes detected"),
+        "the reorder went unseen — this is #438 verbatim:\n{said}"
+    );
+
+    // (a) a migration record exists.
+    let records: Vec<PathBuf> = fs::read_dir(dir.join("migrations"))
+        .expect("migrations/ exists")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+        .collect();
+    assert_eq!(
+        records.len(),
+        1,
+        "expected exactly one recorded migration, got {records:?}\n{said}"
+    );
+
+    // (b) it bumps the serial the generated open guard reads.
+    let body = fs::read_to_string(&records[0]).unwrap();
+    let record: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(record["from_version"], 1, "from_version:\n{body}");
+    assert_eq!(record["to_version"], 2, "to_version:\n{body}");
+
+    // (c) the recorded v1 schema still describes the bytes that are on disk.
+    let v1 = fs::read_to_string(dir.join("migrations/schemas/v1.forge"))
+        .expect("v1.forge was recorded at baseline");
+    assert!(
+        v1.contains("Draft  Published"),
+        "migrations/schemas/v1.forge was overwritten with the NEW variant order. \
+         The lineage now asserts that v1 — the version the existing rows were \
+         written under — always had the new ordering, and the transformer would \
+         reproduce the corruption faithfully. Got:\n{v1}"
+    );
+    let v2 = fs::read_to_string(dir.join("migrations/schemas/v2.forge"))
+        .expect("v2.forge is recorded for the destination version");
+    assert!(v2.contains("Published  Draft"), "v2.forge:\n{v2}");
+}
+
+/// `Color` lives inside `struct Badge`, which lives inside `[Badge; 4]` on the
+/// model. Reordering `Color` moves nothing in `Badge`'s declaration text and
+/// nothing in the model field's type — so this is the case a dependency walk
+/// that stops at depth one misses while passing everything else.
+///
+/// It runs through the REAL `to_simple_schema`, which is the only thing that
+/// exercises the transitive walk: the differ's own unit tests hand it a
+/// `depends_on` list, so they cannot tell whether the CLI computes one
+/// correctly.
+const NESTED_V1: &str = "enum Color { Red  Green  Blue }\n\n\
+                         struct Badge {\n  rank: u32\n  tint: Color\n}\n\n\
+                         Sticker {\n  id: +uuid\n  badges: [Badge; 4]\n}\n";
+const NESTED_V2: &str = "enum Color { Green  Red  Blue }\n\n\
+                         struct Badge {\n  rank: u32\n  tint: Color\n}\n\n\
+                         Sticker {\n  id: +uuid\n  badges: [Badge; 4]\n}\n";
+/// Same tree, `Badge`'s own two fields swapped instead — the struct-layout half,
+/// which exercises the `structs` projection rather than the `enums` one.
+const NESTED_V3: &str = "enum Color { Green  Red  Blue }\n\n\
+                         struct Badge {\n  tint: Color\n  rank: u32\n}\n\n\
+                         Sticker {\n  id: +uuid\n  badges: [Badge; 4]\n}\n";
+
+#[test]
+fn test_a_nested_enum_and_struct_change_reach_the_differ() {
+    let temp = TempDir::new().unwrap();
+    let dir = temp.path();
+    fs::write(dir.join("forgedb.toml"), CONFIG).unwrap();
+
+    let create = |body: &str, desc: &str| {
+        fs::write(dir.join("schema.forge"), body).unwrap();
+        let out = forgedb(dir)
+            .args([
+                "migrate",
+                "create",
+                desc,
+                "--auto",
+                "--schema",
+                "schema.forge",
+            ])
+            .output()
+            .expect("run migrate create");
+        assert!(out.status.success(), "{desc}:\n{}", combined(&out));
+        strip_ansi(&combined(&out))
+    };
+
+    create(NESTED_V1, "baseline");
+
+    let reorder_enum = create(NESTED_V2, "swap_color");
+    assert!(
+        reorder_enum.contains("Enum 'Color'") && reorder_enum.contains("Sticker.badges"),
+        "an enum nested inside a struct inside a fixed array must project onto the \
+         model field that stores it:\n{reorder_enum}"
+    );
+
+    let reorder_struct = create(NESTED_V3, "swap_badge_fields");
+    assert!(
+        reorder_struct.contains("Struct 'Badge'") && reorder_struct.contains("Sticker.badges"),
+        "a struct field reorder must be reported against the storing field:\n{reorder_struct}"
+    );
+}

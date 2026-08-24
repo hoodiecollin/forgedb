@@ -889,3 +889,68 @@ fn s335_18_all_reaches_the_opt_in_targets() {
         "`all` did not reach the opt-in ffi target"
     );
 }
+
+// ===========================================================================
+// #338 scenario 13 — the new `[placement]` table is strict on both axes
+// ===========================================================================
+
+/// **#338 scenario 13a.** A misspelled key *inside* `[placement]` is a
+/// positioned error naming the key.
+///
+/// The sibling of scenario 12, written for the new table rather than assumed to
+/// follow from it: `deny_unknown_fields` is per-struct, so a new table with the
+/// attribute omitted would silently accept `rust_packge` and emit nothing, and
+/// the user's only signal would be a missing directory.
+#[test]
+fn s338_13a_a_misspelled_placement_key_errors() {
+    let err = forgedb::config::parse_config(
+        "[project]\nname = \"x\"\n\n[placement]\nrust_packge = \"generated/core\"\n",
+        Path::new("forgedb.toml"),
+    )
+    .expect_err("a misspelled key inside [placement] must not be ignored");
+    let msg = err.to_string();
+    assert!(msg.contains("line 5"), "positions the key: {msg}");
+    assert!(msg.contains("rust_packge"), "names the key: {msg}");
+}
+
+/// **#338 scenario 13b.** A misspelled *table* is a positioned error naming it.
+///
+/// This is the one-way door read from the other side: the spelling `[placement]`
+/// is the only one that will ever be accepted, so `[placment]` has to fail
+/// loudly rather than being ignored as a forward-compatible unknown.
+#[test]
+fn s338_13b_a_misspelled_placement_table_errors() {
+    let err = forgedb::config::parse_config(
+        "[project]\nname = \"x\"\n\n[placment]\nrust_package = \"generated/core\"\n",
+        Path::new("forgedb.toml"),
+    )
+    .expect_err("a misspelled table must not be ignored");
+    let msg = err.to_string();
+    assert!(msg.contains("line 4"), "positions the table: {msg}");
+    assert!(msg.contains("placment"), "names the table: {msg}");
+}
+
+/// **#338 scenario 13c.** The accepted spelling parses, and its absence is the
+/// opt-out — an absent table yields `None`, not a default path.
+///
+/// The second half is the whole opt-in contract, and it is the half a
+/// `#[serde(default)]` on a `String` field would silently break.
+#[test]
+fn s338_13c_the_accepted_spelling_parses_and_absence_means_none() {
+    let with = forgedb::config::parse_config(
+        "[placement]\nrust_package = \"generated/core\"\n",
+        Path::new("forgedb.toml"),
+    )
+    .expect("[placement] rust_package must parse");
+    assert_eq!(with.placement.rust_package.as_deref(), Some("generated/core"));
+
+    let without = forgedb::config::parse_config(
+        "[project]\nname = \"x\"\n",
+        Path::new("forgedb.toml"),
+    )
+    .expect("a config with no [placement] table must parse");
+    assert_eq!(
+        without.placement.rust_package, None,
+        "absence of the table must not invent a placement"
+    );
+}

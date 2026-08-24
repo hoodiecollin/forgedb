@@ -454,6 +454,20 @@ auto-increment-test:
 	cargo test --test auto_increment_coordinated_test -- --ignored --nocapture
 	cargo test --test sequence_claim_test -- --ignored --nocapture
 
+.PHONY: enum-remap-test
+
+## Enum discriminant positionality (#438): an enum is stored as a 1-byte discriminant
+## keyed by DECLARATION ORDER, so reordering two variants re-maps every already-stored
+## row while changing no byte on disk. Nothing that compares generated code as strings
+## can see that — a snapshot shows the two match arms swapping, which is the change the
+## author intended. So this generates and compiles TWO crates over ONE data directory:
+## one writes a row, the other reads it back through the reordered schema. It also
+## proves the other half — that the transformer's JSON-by-name round trip repairs it,
+## which is the entire justification for classifying a reorder `Auto` rather than
+## `Authored`. #[ignore]d out of the fast suite (compiles two crates).
+enum-remap-test:
+	cargo test --test enum_discriminant_remap_test -- --ignored --nocapture
+
 .PHONY: scripts-typecheck
 
 ## Typecheck the root-level repo tooling in scripts/. The scripts run under bun with no

@@ -420,11 +420,23 @@ folded into the cycle in flight.
 **One hotfix, one milestone.** A patch milestone that accumulates "while we're in there" work has
 lost the boundedness that made it cheap, which is why this is an invariant (PM015) and not a habit.
 
+**"Nothing else" means no other *work*.** A `release-gate` may — and for the ledger below, must —
+sit on a patch milestone. It is a release obligation, not something anyone could defer, which is
+the whole reason §5.2 gave it its own label. PM015 exempts it for the same reason PM010 and PM013
+do.
+
 Two things this does *not* waive:
 
-- **The §5.2 asset ledger applies.** A patch publishes artifacts, so the stale-source-behind-a-
-  correct-version failure is exactly as live as it is for a minor.
+- **The §5.2 asset ledger applies, and it lives in the same place it always does** — a `release-gate`
+  issue on the patch milestone. §5.2 describes the ledger being created "when the milestone opens",
+  which for a patch is the moment the warrant is accepted and the milestone is cut, not some earlier
+  planning step. A one-row table still gets the issue: the ledger's value is the **"no change"** rows
+  that prove an asset was considered, and a patch is where the temptation to skip that is strongest
+  because exactly one thing usually moved.
 - **`release-check` is unchanged.** A patch milestone is an ordinary core milestone for gating.
+
+> Do not improvise the ledger into the fix gate's body. It works once and teaches the next person to
+> improvise somewhere else, and it puts the ledger where no query can find it.
 
 And note the interaction with §5.3: a patch milestone sorts *below* the cycle in flight, which is
 why the cycle is derived as "the lowest open core milestone **on an unreleased line**". Without

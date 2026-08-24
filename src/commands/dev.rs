@@ -42,6 +42,14 @@ pub struct DevGenerate {
     pub gen_config: forgedb_codegen::GenConfig,
     /// The app's container in the build cache, reserved by the caller.
     pub cache_container: Option<PathBuf>,
+    /// Where the in-tree Rust package goes (#338), or `None` when the knob is
+    /// absent.
+    ///
+    /// Without it a watch-driven regeneration would refresh the mirror and the
+    /// cache while leaving the in-tree package stale — one command silently
+    /// emitting a different project state than the others, which is the defect
+    /// class #364 was.
+    pub in_tree: Option<PathBuf>,
 }
 
 /// Re-derive the cache workspace root after an emission.
@@ -78,6 +86,7 @@ fn regenerate(opts: &DevGenerate) -> Result<()> {
         from: None,
         to: None,
         cache_container: opts.cache_container.clone(),
+        in_tree: opts.in_tree.clone(),
     })
 }
 
@@ -129,6 +138,16 @@ pub fn run(options: DevOptions) -> Result<()> {
         ui::info("Waiting for changes...");
         println!();
     });
+
+    // NOTHING BEYOND THIS POINT MAY ASK A QUESTION (#367).
+    //
+    // A prompt raised by a save-triggered regeneration is a hang with no visible
+    // cause: the terminal is at that moment showing watch output, not a
+    // question, and the user is not sitting at a prompt waiting to answer one.
+    // This is unconditional on how `dev` was started — the startup resolution
+    // above already ran, and it is the only place in `dev` where asking is ever
+    // right.
+    crate::ask::forbid();
 
     // Run watcher (blocks until Ctrl+C). `output` still rides along because the
     // published `auto_watch` signature takes it; nothing in the watcher writes
