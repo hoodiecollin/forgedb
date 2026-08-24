@@ -429,6 +429,33 @@ cache, which is the only copy any ForgeDB-driven build reads:
 so `cat generated/user.rs` never worked. You do not have to guess either path: `generate` and
 `build` print `Project: …` and `Build cache: …` on every run.
 
+**A third destination is opt-in: `[placement]` (#338).** A Rust consumer who builds with cargo
+can have the database emitted into their own tree as a ForgeDB-owned package, so their cargo
+compiles it — one resolution, one `target/`, their profiles.
+
+```toml
+[placement]
+rust_package = "generated/core"     # relative to the SCHEMA's directory, like [generate].output
+```
+
+The key's **absence is the opt-out**; there is no affirmative "cache-only" spelling. What lands
+there is `Cargo.toml` + `src/lib.rs` and nothing else — no `api.rs`, no `main.rs`, no `[[bin]]`,
+whatever `[generate].targets` says. `forgedb build` does not compile it.
+
+`generate` **prints** the one dependency line to add; it never edits a manifest it does not own,
+so the `path` is written relative to the directory `generate` ran in and you re-base it against
+the crate that receives it. `package =` is not optional — cargo matches a path dep's key against
+the package's own name:
+
+```toml
+forgedb_core = { package = "myapp-core", path = "generated/core" }
+```
+
+The emitted package is **committed source**: a path dependency naming a missing directory fails
+the workspace load for every crate in it, a fresh clone included. It carries no `[workspace]`
+table (a nested one that a member path-depends on fails the whole workspace), and cargo needs no
+`members` entry — a path dependency inside the workspace directory joins on its own.
+
 ```bash
 ls -la /tmp/forgedb-codegen/generated/
 head -40 /tmp/forgedb-codegen/generated/database.rs
