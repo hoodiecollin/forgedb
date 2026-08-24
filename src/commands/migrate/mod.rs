@@ -283,7 +283,9 @@ pub fn create(opts: MigrateCreateOptions) -> Result<()> {
         .and_then(|mut p| p.parse())
         .map_err(|e| CliError::Migration(format!("Failed to parse schema: {}", e)))?;
 
-    let mut changes = detect_schema_changes(&migrations_dir, &new_src)?;
+    let detected = detect_schema_changes(&migrations_dir, &new_src)?;
+    let mut changes = detected.changes;
+    let rename_proposals = detected.rename_proposals;
 
     if changes.is_empty() {
         // First run records a baseline snapshot with no prior schema to diff.
@@ -301,16 +303,6 @@ pub fn create(opts: MigrateCreateOptions) -> Result<()> {
         .map_err(map_err)?;
         ui::success("No schema changes detected (snapshot up to date)");
         return Ok(());
-    }
-
-    ui::info(&format!("Detected {} change(s)", changes.len()));
-    for change in &changes {
-        let marker = if change.hop_body_class() == HopBodyClass::Authored {
-            " [needs an answer]".yellow()
-        } else {
-            "".normal()
-        };
-        println!("  • {}{}", change.description(), marker);
     }
 
     // Assign the serial version interlock (#74 Phase 2) from the committed
@@ -341,16 +333,32 @@ pub fn create(opts: MigrateCreateOptions) -> Result<()> {
     // leaves a partial lineage behind.
     let askable = crate::prompt::askable();
     let mut tty = crate::prompt::Tty;
-    let ask: Option<&mut dyn crate::prompt::Ask> = if opts.no_auto || !askable.is_yes() {
-        None
-    } else {
-        Some(&mut tty)
-    };
+    let interactive = !opts.no_auto && askable.is_yes();
     let reason = if opts.no_auto {
         "--no-auto"
     } else {
         askable.reason()
     };
+    let ask_for_renames: Option<&mut dyn crate::prompt::Ask> =
+        if interactive { Some(&mut tty) } else { None };
+    // A rename is PROPOSED by the differ and decided here (#374 decision 10).
+    // Resolved before the answers, because accepting one REPLACES a drop+add
+    // pair — and the add in that pair is itself unprovable, so asking about it
+    // first would ask a question the rename makes disappear.
+    answers::resolve_rename_proposals(&rename_proposals, &mut changes, ask_for_renames)?;
+
+    ui::info(&format!("Detected {} change(s)", changes.len()));
+    for change in &changes {
+        let marker = if change.hop_body_class() == HopBodyClass::Authored {
+            " [needs an answer]".yellow()
+        } else {
+            "".normal()
+        };
+        println!("  • {}{}", change.description(), marker);
+    }
+
+    let ask: Option<&mut dyn crate::prompt::Ask> =
+        if interactive { Some(&mut tty) } else { None };
     let scaffold = answers::resolve_answers(
         &mut changes,
         &dest_schema,
@@ -1564,7 +1572,7 @@ fn print_migration_next_steps(schema: &Path, from: u32, to: u32, has_authored: b
 fn detect_schema_changes(
     migrations_dir: &std::path::Path,
     new_src: &str,
-) -> Result<Vec<SchemaChange>> {
+) -> Result<forgedb_migrations::DiffResult> {
     let new_schema = forgedb_parser::Parser::new(new_src)
         .and_then(|mut p| p.parse())
         .map_err(|e| CliError::Migration(format!("Failed to parse schema: {}", e)))?;
@@ -1573,7 +1581,10 @@ fn detect_schema_changes(
     let snap = snapshot_path(migrations_dir);
     let Ok(old_src) = std::fs::read_to_string(&snap) else {
         // No prior snapshot — nothing to diff against (baseline recorded by caller).
-        return Ok(Vec::new());
+        return Ok(forgedb_migrations::DiffResult {
+            changes: Vec::new(),
+            rename_proposals: Vec::new(),
+        });
     };
     let old_schema = forgedb_parser::Parser::new(&old_src)
         .and_then(|mut p| p.parse())
@@ -1582,9 +1593,9 @@ fn detect_schema_changes(
         })?;
     let old_simple = to_simple_schema(&old_schema);
 
-    let mut changes = forgedb_migrations::SchemaDiffer::diff(&old_simple, &new_simple);
-    resolve_schema_defaults(&new_schema, &mut changes);
-    Ok(changes)
+    let mut diff = forgedb_migrations::SchemaDiffer::diff(&old_simple, &new_simple);
+    resolve_schema_defaults(&new_schema, &mut diff.changes);
+    Ok(diff)
 }
 
 /// Fill each `AddField`'s `default_json` from the destination field's

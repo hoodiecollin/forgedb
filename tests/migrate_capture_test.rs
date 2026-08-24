@@ -329,3 +329,187 @@ fn scenario_22_the_escape_language_is_derived_never_declared() {
     assert_eq!(l(&["rust", "pyo3"]), EscapeLanguage::Python);
     assert_eq!(l(&[]), EscapeLanguage::Rust, "no target implies no runtime");
 }
+
+// ---------------------------------------------------------------------------
+// Scenario 10 — a rename is proposed, never assumed
+// ---------------------------------------------------------------------------
+
+use forgedb::commands::migrate::answers::resolve_rename_proposals;
+use forgedb_migrations::{RenameProposal, SchemaDiffer, SimpleField, SimpleModel, SimpleSchema};
+
+fn field(name: &str, ty: SimpleType) -> SimpleField {
+    SimpleField {
+        name: name.into(),
+        ty,
+        nullable: false,
+        unique: false,
+        indexed: false,
+        index_type: "Hash".into(),
+        constraints: vec![],
+        depends_on: vec![],
+    }
+}
+
+fn schema(fields: Vec<SimpleField>) -> SimpleSchema {
+    SimpleSchema {
+        models: vec![SimpleModel {
+            name: "Post".into(),
+            fields,
+            composite_indexes: vec![],
+        }],
+        enums: vec![],
+        structs: vec![],
+    }
+}
+
+/// The differ **proposes** and emits the drop+add; it decides nothing.
+///
+/// A guess that is right most of the time is the worst shape available here:
+/// a rename carries every stored value across, a drop+add empties the column,
+/// and the wrong half succeeds silently.
+#[test]
+fn scenario_10a_the_differ_proposes_and_still_emits_the_pair() {
+    let old = schema(vec![field("id", SimpleType::Uuid), field("email", SimpleType::Str)]);
+    let new = schema(vec![
+        field("id", SimpleType::Uuid),
+        field("username", SimpleType::Str),
+    ]);
+    let d = SchemaDiffer::diff(&old, &new);
+
+    assert_eq!(
+        d.rename_proposals,
+        vec![RenameProposal::Field {
+            model_name: "Post".into(),
+            old_name: "email".into(),
+            new_name: "username".into(),
+        }]
+    );
+    let kinds: Vec<&str> = d
+        .changes
+        .iter()
+        .map(|c| match c {
+            SchemaChange::RemoveField { .. } => "remove",
+            SchemaChange::AddField { .. } => "add",
+            SchemaChange::RenameField { .. } => "rename",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["remove", "add"],
+        "the diff itself must carry the drop+add, so DECLINING the proposal needs \
+         nothing added: {:?}",
+        d.changes
+    );
+}
+
+/// Answering "no, these are unrelated" leaves the drop+add — and the add is
+/// itself unprovable, so it gets its own question.
+#[test]
+fn scenario_10b_declining_leaves_a_drop_and_an_add() {
+    let old = schema(vec![field("id", SimpleType::Uuid), field("email", SimpleType::Str)]);
+    let new = schema(vec![
+        field("id", SimpleType::Uuid),
+        field("username", SimpleType::Str),
+    ]);
+    let mut d = SchemaDiffer::diff(&old, &new);
+
+    let mut ask = Scripted::new(["n"]);
+    resolve_rename_proposals(&d.rename_proposals, &mut d.changes, Some(&mut ask)).unwrap();
+
+    assert_eq!(d.changes.len(), 2, "{:?}", d.changes);
+    assert!(
+        d.changes
+            .iter()
+            .any(|c| matches!(c, SchemaChange::RemoveField { field_name, .. } if field_name == "email"))
+    );
+    let add = d
+        .changes
+        .iter()
+        .find(|c| matches!(c, SchemaChange::AddField { .. }))
+        .expect("the add survives");
+    assert_eq!(
+        add.hop_body_class(),
+        forgedb_migrations::HopBodyClass::Authored,
+        "a required add with no default is unprovable and gets its own question"
+    );
+    assert!(
+        ask.is_exhausted(),
+        "exactly one question was asked about the rename"
+    );
+}
+
+/// Answering "yes" replaces the pair with exactly one `RenameField`.
+#[test]
+fn scenario_10c_accepting_replaces_the_pair_with_one_rename() {
+    let old = schema(vec![field("id", SimpleType::Uuid), field("email", SimpleType::Str)]);
+    let new = schema(vec![
+        field("id", SimpleType::Uuid),
+        field("username", SimpleType::Str),
+    ]);
+    let mut d = SchemaDiffer::diff(&old, &new);
+
+    let mut ask = Scripted::new(["y"]);
+    resolve_rename_proposals(&d.rename_proposals, &mut d.changes, Some(&mut ask)).unwrap();
+
+    assert_eq!(
+        d.changes,
+        vec![SchemaChange::RenameField {
+            model_name: "Post".into(),
+            old_name: "email".into(),
+            new_name: "username".into(),
+        }],
+        "accepting is a REPLACEMENT: the drop and the add must both be gone"
+    );
+}
+
+/// Non-interactively the proposal is **declined**.
+///
+/// A drop+add is what the schema literally says; inferring otherwise with
+/// nobody to check is exactly the guess #374 removes. It is also the safe
+/// direction to be wrong in — a spurious drop+add is visible in the report and
+/// costs a re-run, while a spurious rename is silent.
+#[test]
+fn scenario_10d_a_proposal_with_nobody_to_ask_is_declined() {
+    let old = schema(vec![field("id", SimpleType::Uuid), field("email", SimpleType::Str)]);
+    let new = schema(vec![
+        field("id", SimpleType::Uuid),
+        field("username", SimpleType::Str),
+    ]);
+    let mut d = SchemaDiffer::diff(&old, &new);
+    resolve_rename_proposals(&d.rename_proposals, &mut d.changes, None).unwrap();
+    assert_eq!(d.changes.len(), 2, "{:?}", d.changes);
+    assert!(!d.changes.iter().any(|c| matches!(c, SchemaChange::RenameField { .. })));
+}
+
+/// A model rename is the same shape, and accepting it must clear BOTH the
+/// `RemoveModel` and the `AddModel`.
+#[test]
+fn a_model_rename_is_proposed_and_replaces_both_halves() {
+    let one = |name: &str| SimpleSchema {
+        models: vec![SimpleModel {
+            name: name.into(),
+            fields: vec![field("id", SimpleType::Uuid)],
+            composite_indexes: vec![],
+        }],
+        enums: vec![],
+        structs: vec![],
+    };
+    let mut d = SchemaDiffer::diff(&one("Post"), &one("Article"));
+    assert_eq!(
+        d.rename_proposals,
+        vec![RenameProposal::Model {
+            old_name: "Post".into(),
+            new_name: "Article".into(),
+        }]
+    );
+    let mut ask = Scripted::new(["y"]);
+    resolve_rename_proposals(&d.rename_proposals, &mut d.changes, Some(&mut ask)).unwrap();
+    assert_eq!(
+        d.changes,
+        vec![SchemaChange::RenameModel {
+            old_name: "Post".into(),
+            new_name: "Article".into(),
+        }]
+    );
+}

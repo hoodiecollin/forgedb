@@ -363,6 +363,43 @@ pub struct SimpleConstraint {
     pub params: Vec<String>,
 }
 
+/// A candidate rename the differ **noticed but did not decide** (#374 step 9).
+///
+/// One field dropped and one added of the same type inside one model — or one
+/// model dropped and one added with the same shape — is *usually* a rename, and
+/// the differ used to say so. It is a guess: `email` dropped and `username`
+/// added of the same type is a rename half the time and two unrelated edits the
+/// other half, and the two produce **opposite data**. A guess that is right
+/// most of the time is the worst kind here, because the wrong half succeeds
+/// silently — a drop+add empties the column, a rename carries the values across.
+///
+/// So the differ proposes and the operator decides. The proposal carries no
+/// verdict, exactly like `ChangeEnumVariants` carries its variant lists rather
+/// than a severity (#438).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenameProposal {
+    Field {
+        model_name: String,
+        old_name: String,
+        new_name: String,
+    },
+    Model {
+        old_name: String,
+        new_name: String,
+    },
+}
+
+/// What a diff produced: the changes it is sure of, and the renames it noticed.
+///
+/// The `changes` are complete and correct **as they stand** — a proposal that is
+/// declined needs nothing added, because the drop and the add are already in
+/// there. Accepting one is a replacement, never an insertion.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiffResult {
+    pub changes: Vec<SchemaChange>,
+    pub rename_proposals: Vec<RenameProposal>,
+}
+
 /// Schema differ - compares two schemas and generates change list
 pub struct SchemaDiffer;
 
@@ -371,8 +408,9 @@ impl SchemaDiffer {
     ///
     /// The returned list is sorted deterministically so that checksums are stable
     /// across runs (M2).
-    pub fn diff(old_schema: &SimpleSchema, new_schema: &SimpleSchema) -> Vec<SchemaChange> {
+    pub fn diff(old_schema: &SimpleSchema, new_schema: &SimpleSchema) -> DiffResult {
         let mut changes = Vec::new();
+        let mut proposals = Vec::new();
 
         // Build ordered maps (BTreeMap) for deterministic iteration (M2)
         let old_models: BTreeMap<_, _> = old_schema
@@ -400,29 +438,24 @@ impl SchemaDiffer {
             .cloned()
             .collect();
 
-        // Track which models were resolved as renames so they are not also emitted
-        // as add/remove.
-        let mut renamed_old: HashSet<String> = HashSet::new();
-        let mut renamed_new: HashSet<String> = HashSet::new();
-
+        // H4/#374: one model dropped and one added with the same shape is
+        // PROPOSED as a rename, never decided. The drop and the add are emitted
+        // regardless — accepting the proposal replaces them, declining it needs
+        // nothing added.
         if removed_model_names.len() == 1 && added_model_names.len() == 1 {
             let old_name = &removed_model_names[0];
             let new_name = &added_model_names[0];
-            let old_model = old_models[old_name];
-            let new_model = new_models[new_name];
-            if Self::models_structurally_equal(old_model, new_model) {
-                changes.push(SchemaChange::RenameModel {
+            if Self::models_structurally_equal(old_models[old_name], new_models[new_name]) {
+                proposals.push(RenameProposal::Model {
                     old_name: old_name.clone(),
                     new_name: new_name.clone(),
                 });
-                renamed_old.insert(old_name.clone());
-                renamed_new.insert(new_name.clone());
             }
         }
 
         // Detect removed models (M2: sorted by key via BTreeMap)
         for old_model_name in old_models.keys() {
-            if !new_models.contains_key(old_model_name) && !renamed_old.contains(old_model_name) {
+            if !new_models.contains_key(old_model_name) {
                 changes.push(SchemaChange::RemoveModel {
                     model_name: old_model_name.clone(),
                 });
@@ -431,7 +464,7 @@ impl SchemaDiffer {
 
         // Detect added models
         for new_model_name in new_models.keys() {
-            if !old_models.contains_key(new_model_name) && !renamed_new.contains(new_model_name) {
+            if !old_models.contains_key(new_model_name) {
                 changes.push(SchemaChange::AddModel {
                     model_name: new_model_name.clone(),
                 });
@@ -441,8 +474,10 @@ impl SchemaDiffer {
         // Detect field changes in existing models (M2: sorted by model name via BTreeMap)
         for (model_name, new_model) in new_models.iter() {
             if let Some(old_model) = old_models.get(model_name) {
-                let field_changes = Self::diff_fields(model_name, old_model, new_model);
+                let (field_changes, field_proposals) =
+                    Self::diff_fields(model_name, old_model, new_model);
                 changes.extend(field_changes);
+                proposals.extend(field_proposals);
 
                 let index_changes = Self::diff_composite_indexes(model_name, old_model, new_model);
                 changes.extend(index_changes);
@@ -456,7 +491,10 @@ impl SchemaDiffer {
         changes.extend(Self::diff_enums(old_schema, new_schema));
         changes.extend(Self::diff_structs(old_schema, new_schema));
 
-        changes
+        DiffResult {
+            changes,
+            rename_proposals: proposals,
+        }
     }
 
     /// Diff the declared `enum`s and project each change onto the model fields
@@ -638,8 +676,9 @@ impl SchemaDiffer {
         model_name: &str,
         old_model: &SimpleModel,
         new_model: &SimpleModel,
-    ) -> Vec<SchemaChange> {
+    ) -> (Vec<SchemaChange>, Vec<RenameProposal>) {
         let mut changes = Vec::new();
+        let mut proposals = Vec::new();
 
         // M2: BTreeMap gives stable, sorted iteration
         let old_fields: BTreeMap<_, _> = old_model
@@ -664,31 +703,25 @@ impl SchemaDiffer {
             .cloned()
             .collect();
 
-        // H4: single unambiguous field rename — one removed, one added, same type
-        let mut renamed_old_fields: HashSet<String> = HashSet::new();
-        let mut renamed_new_fields: HashSet<String> = HashSet::new();
-
+        // H4/#374: one removed and one added of the same type is PROPOSED as a
+        // rename, never decided — see `RenameProposal`.
         if removed_field_names.len() == 1 && added_field_names.len() == 1 {
             let old_name = &removed_field_names[0];
             let new_name = &added_field_names[0];
             if old_fields[old_name].ty == new_fields[new_name].ty
                 && old_fields[old_name].nullable == new_fields[new_name].nullable
             {
-                changes.push(SchemaChange::RenameField {
+                proposals.push(RenameProposal::Field {
                     model_name: model_name.to_string(),
                     old_name: old_name.clone(),
                     new_name: new_name.clone(),
                 });
-                renamed_old_fields.insert(old_name.clone());
-                renamed_new_fields.insert(new_name.clone());
             }
         }
 
         // Detect removed fields (M2: sorted via BTreeMap)
         for old_field_name in old_fields.keys() {
-            if !new_fields.contains_key(old_field_name)
-                && !renamed_old_fields.contains(old_field_name)
-            {
+            if !new_fields.contains_key(old_field_name) {
                 changes.push(SchemaChange::RemoveField {
                     model_name: model_name.to_string(),
                     field_name: old_field_name.clone(),
@@ -760,7 +793,7 @@ impl SchemaDiffer {
                 let constraint_changes =
                     Self::diff_constraints(model_name, field_name, old_field, new_field);
                 changes.extend(constraint_changes);
-            } else if !renamed_new_fields.contains(field_name) {
+            } else {
                 // New field
                 changes.push(SchemaChange::AddField {
                     model_name: model_name.to_string(),
@@ -777,7 +810,7 @@ impl SchemaDiffer {
             }
         }
 
-        changes
+        (changes, proposals)
     }
 
     /// Diff constraints between two fields.

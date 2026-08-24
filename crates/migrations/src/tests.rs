@@ -153,7 +153,7 @@ fn test_schema_differ() {
         structs: vec![],
     };
 
-    let changes = SchemaDiffer::diff(&old_schema, &new_schema);
+    let changes = SchemaDiffer::diff(&old_schema, &new_schema).changes;
 
     // Should detect: AddField, AddIndex, AddUniqueConstraint, AddConstraint
     assert!(changes.len() >= 1);

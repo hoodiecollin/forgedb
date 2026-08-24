@@ -110,9 +110,9 @@
 //! };
 //!
 //! // SchemaDiffer is a unit struct; call diff() as a static method
-//! let changes = SchemaDiffer::diff(&old_schema, &new_schema);
-//! println!("Detected {} changes", changes.len());
-//! assert_eq!(changes.len(), 1);
+//! let diff = SchemaDiffer::diff(&old_schema, &new_schema);
+//! println!("Detected {} changes", diff.changes.len());
+//! assert_eq!(diff.changes.len(), 1);
 //! ```
 //!
 //! ## Applying Migrations
@@ -234,8 +234,8 @@ mod tracker;
 mod types;
 
 pub use diff::{
-    SchemaDiffer, SimpleConstraint, SimpleEnum, SimpleField, SimpleModel, SimpleSchema,
-    SimpleStruct, SimpleType,
+    DiffResult, RenameProposal, SchemaDiffer, SimpleConstraint, SimpleEnum, SimpleField,
+    SimpleModel, SimpleSchema, SimpleStruct, SimpleType,
 };
 pub use generator::MigrationGenerator;
 pub use lineage::{

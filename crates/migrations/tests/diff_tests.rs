@@ -17,7 +17,7 @@ fn test_detect_added_model() {
         structs: vec![],
     };
 
-    let changes = SchemaDiffer::diff(&old_schema, &new_schema);
+    let changes = SchemaDiffer::diff(&old_schema, &new_schema).changes;
     assert_eq!(changes.len(), 1);
     assert!(matches!(changes[0], SchemaChange::AddModel { .. }));
 }
@@ -39,7 +39,7 @@ fn test_detect_removed_model() {
         structs: vec![],
     };
 
-    let changes = SchemaDiffer::diff(&old_schema, &new_schema);
+    let changes = SchemaDiffer::diff(&old_schema, &new_schema).changes;
     assert_eq!(changes.len(), 1);
     assert!(matches!(changes[0], SchemaChange::RemoveModel { .. }));
 }
@@ -74,7 +74,7 @@ fn test_detect_added_field() {
         structs: vec![],
     };
 
-    let changes = SchemaDiffer::diff(&old_schema, &new_schema);
+    let changes = SchemaDiffer::diff(&old_schema, &new_schema).changes;
     assert_eq!(changes.len(), 1);
     assert!(matches!(changes[0], SchemaChange::AddField { .. }));
 }
@@ -118,7 +118,7 @@ fn test_detect_type_change() {
         structs: vec![],
     };
 
-    let changes = SchemaDiffer::diff(&old_schema, &new_schema);
+    let changes = SchemaDiffer::diff(&old_schema, &new_schema).changes;
     assert_eq!(changes.len(), 1);
     assert!(matches!(changes[0], SchemaChange::ChangeFieldType { .. }));
     assert!(changes[0].is_breaking());
@@ -209,7 +209,7 @@ fn shape_with_point(fields: &[(&str, &str)]) -> SimpleSchema {
 }
 
 fn only_change(old: &SimpleSchema, new: &SimpleSchema) -> SchemaChange {
-    let mut changes = SchemaDiffer::diff(old, new);
+    let mut changes = SchemaDiffer::diff(old, new).changes;
     assert_eq!(
         changes.len(),
         1,
@@ -451,7 +451,7 @@ fn an_unreferenced_enum_emits_nothing() {
     let changes = SchemaDiffer::diff(
         &schema(&["Draft", "Published"]),
         &schema(&["Published", "Draft"]),
-    );
+    ).changes;
     assert!(
         changes.is_empty(),
         "an enum no storage-backed field reaches has no rows to migrate: {changes:#?}"
@@ -469,7 +469,7 @@ fn an_unreferenced_struct_emits_nothing() {
     let changes = SchemaDiffer::diff(
         &schema(&[("x", "I32"), ("y", "I32")]),
         &schema(&[("y", "I32"), ("x", "I32")]),
-    );
+    ).changes;
     assert!(
         changes.is_empty(),
         "a struct no storage-backed field reaches has no rows to migrate: {changes:#?}"
@@ -495,7 +495,7 @@ fn one_change_is_emitted_per_storing_field() {
     let changes = SchemaDiffer::diff(
         &schema(&["Draft", "Published"]),
         &schema(&["Published", "Draft"]),
-    );
+    ).changes;
     assert_eq!(changes.len(), 2, "one per storing field: {changes:#?}");
     let mut fields: Vec<&str> = changes
         .iter()

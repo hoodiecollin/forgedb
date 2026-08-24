@@ -25,7 +25,7 @@
 
 use crate::prompt::{Ask, Choice};
 use crate::{Result, error::CliError};
-use forgedb_migrations::{Answer, EscapeLanguage, HopBodyClass, SchemaChange};
+use forgedb_migrations::{Answer, EscapeLanguage, HopBodyClass, RenameProposal, SchemaChange};
 use std::path::Path;
 
 /// A change the differ could not prove, with everything needed to ask about it.
@@ -331,4 +331,129 @@ fn language_label(l: EscapeLanguage) -> &'static str {
         EscapeLanguage::TypeScript => "TypeScript",
         EscapeLanguage::Python => "Python",
     }
+}
+
+/// Decide each proposed rename (#374 decision 10) — the differ's second half.
+///
+/// # Why the differ stopped deciding
+///
+/// One field dropped and one added of the same type is *usually* a rename, and
+/// the differ used to say so outright. It is a guess, and the two readings
+/// produce **opposite data**: a rename carries every stored value across, a
+/// drop+add empties the column. A guess that is right most of the time is the
+/// worst shape available here, because the wrong half succeeds silently — the
+/// operator sees "Rename field 'Post.email' -> 'Post.username'" in a report they
+/// have no reason to doubt, and finds out when the column is empty.
+///
+/// So: accepted, the proposal REPLACES the drop+add pair; declined, the pair is
+/// already correct and nothing is added. Non-interactively the proposal is
+/// **declined**, because a drop+add is what the schema literally says and
+/// inferring otherwise is exactly the guess this removes.
+pub fn resolve_rename_proposals(
+    proposals: &[RenameProposal],
+    changes: &mut Vec<SchemaChange>,
+    mut ask: Option<&mut dyn Ask>,
+) -> Result<()> {
+    for proposal in proposals {
+        let (question, accepted_change, drops_and_adds): (String, SchemaChange, Vec<SchemaChange>) =
+            match proposal {
+                RenameProposal::Field {
+                    model_name,
+                    old_name,
+                    new_name,
+                } => (
+                    format!(
+                        "{model_name}.{old_name} is gone and {model_name}.{new_name} is new, \
+                         with the same type.\nIs that a rename? (yes keeps the stored values; \
+                         no drops the column and starts the new one empty)"
+                    ),
+                    SchemaChange::RenameField {
+                        model_name: model_name.clone(),
+                        old_name: old_name.clone(),
+                        new_name: new_name.clone(),
+                    },
+                    vec![
+                        SchemaChange::RemoveField {
+                            model_name: model_name.clone(),
+                            field_name: old_name.clone(),
+                        },
+                        SchemaChange::AddField {
+                            model_name: model_name.clone(),
+                            field_name: new_name.clone(),
+                            // Matched by model+field below, so the remaining
+                            // fields do not participate.
+                            field_type: forgedb_migrations::SimpleType::Opaque(String::new()),
+                            nullable: false,
+                            default_json: None,
+                            answer: None,
+                        },
+                    ],
+                ),
+                RenameProposal::Model { old_name, new_name } => (
+                    format!(
+                        "Model {old_name} is gone and {new_name} is new, with the same \
+                         shape.\nIs that a rename? (yes carries every row across; no drops \
+                         {old_name}'s rows and starts {new_name} empty)"
+                    ),
+                    SchemaChange::RenameModel {
+                        old_name: old_name.clone(),
+                        new_name: new_name.clone(),
+                    },
+                    vec![
+                        SchemaChange::RemoveModel {
+                            model_name: old_name.clone(),
+                        },
+                        SchemaChange::AddModel {
+                            model_name: new_name.clone(),
+                        },
+                    ],
+                ),
+            };
+
+        let accepted = match ask.as_deref_mut() {
+            Some(a) => a
+                .confirm(&question)
+                .map_err(|e| CliError::Migration(format!("could not ask: {e}")))?,
+            // Declined. A drop+add is what the schema literally says.
+            None => false,
+        };
+        if !accepted {
+            continue;
+        }
+
+        // Replace the pair. Matched on identity (model + field / model name)
+        // rather than on full equality, because the `AddField` in the diff
+        // carries a real type and a resolved default that the placeholder above
+        // deliberately does not.
+        changes.retain(|c| !same_subject(c, &drops_and_adds));
+        changes.push(accepted_change);
+    }
+    Ok(())
+}
+
+/// Does `c` name the same subject as one of `pair`?
+fn same_subject(c: &SchemaChange, pair: &[SchemaChange]) -> bool {
+    fn key(c: &SchemaChange) -> Option<(&str, Option<&str>)> {
+        match c {
+            SchemaChange::RemoveField {
+                model_name,
+                field_name,
+            } => Some((model_name, Some(field_name))),
+            SchemaChange::AddField {
+                model_name,
+                field_name,
+                ..
+            } => Some((model_name, Some(field_name))),
+            SchemaChange::RemoveModel { model_name } | SchemaChange::AddModel { model_name } => {
+                Some((model_name, None))
+            }
+            _ => None,
+        }
+    }
+    // Kinds must match too: a `RemoveField` must not cancel an `AddField` of
+    // the same name in a model that has both (which cannot happen today, but a
+    // key-only match would silently do the wrong thing if it ever could).
+    let kind = |c: &SchemaChange| std::mem::discriminant(c);
+    pair.iter()
+        .any(|p| kind(p) == kind(c) && key(p).is_some() && key(p) == key(c))
 }
