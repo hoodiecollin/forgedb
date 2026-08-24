@@ -513,39 +513,155 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
 // S20 — the widget itself
 // ---------------------------------------------------------------------------
 
-/// **Tier 2, and manual, because no harness in this repo can allocate a pty.**
+/// **Tier 2, and it drives a REAL terminal** — gate 2 recorded "no harness in
+/// this repo can allocate a pty" as a limit, and that turned out to be false:
+/// `script(1)` allocates one, on both BSD and util-linux. So the widget is
+/// covered by an assertion rather than by a procedure someone has to remember
+/// to run.
 ///
-/// That is a limit, not a hope — and S1 (the exhaustive truth table) and S13
-/// (the whole resolution, driven by a scripted `Asker`) are what make it a small
-/// one: everything except the rendering is covered without a terminal.
+/// What it proves, none of which any tier-1 scenario can see:
 ///
-/// Run by hand from a real terminal:
-///
-/// ```text
-/// mkdir -p /tmp/s20 && cd /tmp/s20 && git init -q .
-/// printf '[package]\nname = "backend"\nversion = "0.1.0"\n' > Cargo.toml
-/// printf '{ "name": "storefront" }\n' > package.json
-/// printf 'Note {\n  id: +uuid\n  body: string\n}\n' > schema.forge
-/// FORGEDB_HOME=/tmp/s20/.home forgedb generate rust > /tmp/s20/out.log
-/// ```
-///
-/// What to check, none of which tier 1 can see:
-///
-/// 1. The select lists each `manifest → name` plus a free-text entry.
-/// 2. It renders on **stderr** — the redirect above captures stdout, and the
-///    question must still be visible.
-/// 3. `ESC` and `^C` both produce the unchanged diagnostic and the unchanged
-///    exit status, rather than a third outcome.
-/// 4. Answering writes `forgedb.toml`, and a second `forgedb generate` with the
-///    same command asks nothing.
-/// 5. `NO_COLOR=1` is honoured. `dialoguer` pulls `console`, which does its own
-///    terminal and `NO_COLOR`/`CLICOLOR` detection alongside `colored`'s. They
-///    can disagree — but only at a TTY, so tier 1 is blind to it by
-///    construction.
+/// 1. At a terminal the boundary says `terminal` — so this test genuinely got a
+///    pty. **Asserted first**, because a harness that silently failed to
+///    allocate one would otherwise take the piped path and pass vacuously.
+/// 2. The question renders on **stderr**: stdout is redirected to a file inside
+///    the pty session, and the question must not be in it.
+/// 3. Answering persists, and a second run asks nothing.
+/// 4. `ESC` is a decline — the unchanged diagnostic and the unchanged exit
+///    status (10, `ConfigDiagnostic`), not a third outcome.
 #[test]
-#[ignore = "tier 2: needs a real pty; the procedure is in this test's doc comment"]
+#[ignore = "tier 2: allocates a pty via script(1)"]
 fn s20_the_widget_renders_on_stderr_and_cancels_cleanly() {
-    // Deliberately empty. The value of this test is the recorded procedure
-    // above; an assertion here could only re-test what S1/S13/S19 already cover
-    // without a terminal, and would read as coverage it is not.
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let root = ambiguous_root(&tmp);
+    let trace = tmp.path().join("ask.trace");
+    let stdout_log = tmp.path().join("stdout.log");
+    let out_dir = root.join("generated");
+
+    // Answer the select by taking its default (the first candidate, from
+    // `Cargo.toml`).
+    let session = pty_run(
+        &root,
+        home.path(),
+        &trace,
+        "\n",
+        &format!(
+            "{BIN} generate rust --output {} > {}",
+            out_dir.display(),
+            stdout_log.display()
+        ),
+    );
+
+    assert_eq!(
+        trace_lines(&trace),
+        vec!["terminal".to_string()],
+        "this test is worthless without a real pty, so that is asserted before \
+         anything else — a harness that failed to allocate one would take the \
+         piped path and pass while proving nothing.\n{session}"
+    );
+
+    let config = std::fs::read_to_string(root.join("forgedb.toml"))
+        .expect("answering the prompt persisted the answer");
+    assert!(config.contains("name = \"backend\""), "{config}");
+
+    // The question is on STDERR: the redirect above captured stdout, and it
+    // must not hold it. `forgedb generate > build.log` has to still show the
+    // question to the person running it.
+    let captured = std::fs::read_to_string(&stdout_log).unwrap_or_default();
+    assert!(
+        !captured.contains("Which name is this project"),
+        "the question leaked into a captured stdout:\n{captured}"
+    );
+    assert!(
+        session.contains("Which name is this project"),
+        "…and it must have been on stderr, which the pty saw:\n{session}"
+    );
+
+    // A second, wholly non-interactive run asks nothing.
+    let again = run_traced(
+        &root,
+        home.path(),
+        &trace,
+        &[
+            "generate",
+            "rust",
+            "--force",
+            "--output",
+            out_dir.to_str().unwrap(),
+        ],
+    );
+    assert!(again.status.success(), "{}", combined(&again));
+
+    // ESC declines: the unchanged diagnostic, and the unchanged exit status.
+    let tmp2 = tempfile::tempdir().unwrap();
+    let home2 = tempfile::tempdir().unwrap();
+    let root2 = ambiguous_root(&tmp2);
+    let trace2 = tmp2.path().join("ask.trace");
+    let escaped = pty_run(
+        &root2,
+        home2.path(),
+        &trace2,
+        "\x1b",
+        &format!(
+            "{BIN} generate rust --output {}; echo FORGEDB_EXIT=$?",
+            root2.join("generated").display()
+        ),
+    );
+    assert_eq!(trace_lines(&trace2), vec!["terminal".to_string()]);
+    assert!(
+        escaped.contains("cannot pick a project name"),
+        "ESC produces the UNCHANGED diagnostic:\n{escaped}"
+    );
+    assert!(
+        escaped.contains("FORGEDB_EXIT=10"),
+        "…and the unchanged exit status (ConfigDiagnostic = 10):\n{escaped}"
+    );
+    assert!(
+        !root2.join("forgedb.toml").exists(),
+        "a decline writes nothing"
+    );
+}
+
+/// Run a shell command inside a real pty, feeding `input` to it.
+///
+/// `script(1)` is the portable-enough way to get one: BSD/macOS takes the
+/// command as argv, util-linux takes it as `-c`. Both forms are tried, and a
+/// failure to obtain a pty is caught by the caller's `terminal` assertion
+/// rather than by a silent skip here.
+fn pty_run(cwd: &Path, home: &Path, trace: &Path, input: &str, command: &str) -> String {
+    // BSD: `script -q /dev/null sh -c '<command>'`
+    // util-linux: `script -qec '<command>' /dev/null`
+    for args in [
+        vec!["-q", "/dev/null", "sh", "-c", command],
+        vec!["-qec", command, "/dev/null"],
+    ] {
+        let mut child = Command::new("script")
+            .args(&args)
+            .current_dir(cwd)
+            .env("FORGEDB_HOME", home)
+            .env("FORGEDB_ASK_TRACE", trace)
+            .env("TERM", "xterm")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("script(1) is available");
+        {
+            use std::io::Write;
+            let mut stdin = child.stdin.take().expect("stdin");
+            let _ = stdin.write_all(unescape(input).as_bytes());
+            let _ = stdin.flush();
+        }
+        let out = child.wait_with_output().expect("script(1) runs");
+        let text = combined(&out);
+        if std::fs::metadata(trace).is_ok() {
+            return text;
+        }
+    }
+    panic!("neither `script(1)` invocation form produced a session");
+}
+
+fn unescape(s: &str) -> String {
+    s.replace("\\n", "\n").replace("\\x1b", "\x1b")
 }

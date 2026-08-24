@@ -577,3 +577,82 @@ fn s12_release_drops_only_our_own_claim() {
     assert!(again.status.success(), "{}", combined(&again));
     assert!(ledger.exists());
 }
+
+// ---------------------------------------------------------------------------
+// The `root_dir()` / `nearest()` trap (gate #371, execution gotcha 1)
+// ---------------------------------------------------------------------------
+
+/// A name is recorded at the **project root**, never at the nearest config.
+///
+/// "One walk, two answers" makes those different directories in any monorepo:
+/// knobs come from `Chain::nearest()`, identity from `Chain::project_root()`.
+/// Recording a name at the nearest one compiles, runs, writes a plausible file,
+/// and then fails on the NEXT invocation with `identify`'s "declared at a config
+/// that is not the project root" — a different message, one command later,
+/// reading as a user mistake.
+///
+/// Nothing else in this suite can see it: every other fixture is flat, where
+/// the two answers coincide.
+#[test]
+fn a_name_is_recorded_at_the_project_root_not_the_nearest_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let root = repo_root(&tmp);
+    // A monorepo root that names nothing, and an app config below it that joins
+    // the enclosing project — so `nearest()` is `apps/api` and
+    // `project_root()` is the root.
+    write(&root.join("forgedb.toml"), "[project]\nisolated = true\n");
+    write(
+        &root.join("apps/api/forgedb.toml"),
+        "[project]\nisolated = false\n[storage]\nfsync = \"never\"\n",
+    );
+    write(&root.join("apps/api/schema.forge"), SCHEMA);
+
+    let out = run(
+        &root,
+        home.path(),
+        &[
+            "project",
+            "name",
+            "mono",
+            "--schema",
+            "apps/api/schema.forge",
+        ],
+    );
+    assert!(out.status.success(), "{}", combined(&out));
+
+    assert!(
+        std::fs::read_to_string(root.join("forgedb.toml"))
+            .unwrap()
+            .contains("name = \"mono\""),
+        "the name belongs at the project root"
+    );
+    assert!(
+        !std::fs::read_to_string(root.join("apps/api/forgedb.toml"))
+            .unwrap()
+            .contains("name ="),
+        "…and NOT at the nearest config, which is a different directory here"
+    );
+
+    // The proof that matters is the next invocation: a name at the wrong config
+    // is a positioned error one command later.
+    let after = run(
+        &root,
+        home.path(),
+        &[
+            "-v",
+            "generate",
+            "rust",
+            "--schema",
+            "apps/api/schema.forge",
+            "--output",
+            root.join("out").to_str().unwrap(),
+        ],
+    );
+    assert!(after.status.success(), "{}", combined(&after));
+    assert!(
+        combined(&after).contains("Project: mono (from [project].name)"),
+        "{}",
+        combined(&after)
+    );
+}
