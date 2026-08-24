@@ -53,22 +53,41 @@ fn scenario_1_order_does_not_change_the_value_and_the_value_is_pinned() {
     assert!(value.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
 }
 
-/// **Scenario 2 — framing.** Without the length prefix these two collide.
+/// **Scenario 2 — framing must be INJECTIVE.**
+///
+/// The gate 2 plan names `("a","bc")` vs `("ab","c")` as the collision. That
+/// pair collides under *bare concatenation* — with the `\0` separator it does
+/// not, so asserting only that pair leaves the length prefix unguarded, and a
+/// mutation deleting the prefix survives. Verified by mutating it.
+///
+/// The separator marks the boundary between a path and its bytes. It does NOT
+/// mark the boundary between one entry's bytes and the next entry's path, and
+/// that unmarked seam is what the length prefix closes. Both pairs are asserted:
+/// the plan's, because it must hold, and the real one, because only it has teeth.
 #[test]
-fn scenario_2_the_length_prefix_makes_the_encoding_injective() {
-    let left = [e("a", "bc")];
-    let right = [e("ab", "c")];
+fn scenario_2_the_framing_is_injective() {
     assert_ne!(
-        fingerprint::compute(&left),
-        fingerprint::compute(&right),
-        "`path + bytes` concatenation collides — the length prefix is not decoration"
+        fingerprint::compute(&[e("a", "bc")]),
+        fingerprint::compute(&[e("ab", "c")]),
+        "`path + bytes` concatenation collides"
     );
 
-    // The separator alone does not save it either: a body may contain a NUL.
-    let with_nul = [e("a", "\u{0}bc")];
+    // The real collision. Without the length prefix both render `a\0bc\0`:
+    // one entry whose body ends in a NUL, versus two entries whose seam falls
+    // inside it.
+    let one = [e("a", "bc\u{0}")];
+    let two = [e("a", "b"), e("c", "")];
     assert_ne!(
-        fingerprint::compute(&left),
-        fingerprint::compute(&with_nul),
+        fingerprint::compute(&one),
+        fingerprint::compute(&two),
+        "the length prefix is not decoration: an entry's bytes running into the \
+         next entry's path is a boundary the separator does not mark"
+    );
+
+    // A body containing a NUL must also not be confusable with a shorter one.
+    assert_ne!(
+        fingerprint::compute(&[e("a", "bc")]),
+        fingerprint::compute(&[e("a", "\u{0}bc")]),
     );
 }
 

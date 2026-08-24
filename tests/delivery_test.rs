@@ -313,15 +313,21 @@ fn scenario_9_generated_code_carries_no_version_string_and_no_timestamp() {
 
     // `x.y.z` and an ISO date. Deliberately crude: this is about a CLASS of
     // token, and a precise matcher would be one more thing to keep in step.
+    // Punctuation is trimmed off each end FIRST. Without it `0.4.1.` at the end
+    // of a sentence tokenises to four parts and slips through — which is exactly
+    // how a version would enter generated code, in a comment.
+    fn strip(w: &str) -> &str {
+        w.trim_matches(|c| c == '.' || c == '-')
+    }
     let is_version = |w: &str| {
-        let parts: Vec<&str> = w.split('.').collect();
+        let parts: Vec<&str> = strip(w).split('.').collect();
         parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
     };
     let is_date = |w: &str| {
-        let parts: Vec<&str> = w.split('-').collect();
+        let parts: Vec<&str> = strip(w).split('-').collect();
         parts.len() == 3
             && parts[0].len() == 4
-            && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit()))
+            && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
     };
 
     let mut violations = Vec::new();
@@ -443,6 +449,13 @@ fn scenario_11_delivery_errors_on_a_reported_path_that_is_not_there() {
     assert!(
         err.contains(&ghost.display().to_string()),
         "the error does not name the missing path: {err}"
+    );
+    // The message must say WHY this is not a path ForgeDB could have guessed
+    // wrong. `fs::copy`'s own ENOENT names the syscall, and a reader who has
+    // just been burned by #292 will assume delivery reconstructed the path.
+    assert!(
+        err.contains("does not reconstruct"),
+        "the error does not distinguish a moved file from a guessed path: {err}"
     );
     assert!(
         !dir.join("napi/forgedb.node").exists(),
@@ -906,4 +919,100 @@ fn scenario_22_a_second_generate_and_build_changes_nothing() {
             "{p} changed across a no-op regenerate + rebuild"
         );
     }
+}
+
+/// **Scenario 20 — C6, and the epic's main drift guard.**
+///
+/// Two different schemas at ONE app path must produce different exported
+/// surfaces **and** different fingerprints. Two assertions, deliberately not
+/// collapsed: the fingerprint is over SOURCE, and C6 is about the exported
+/// surface. An artifact ForgeDB could build once and hand to everybody cannot be
+/// per-schema — it would have to read a schema at runtime, which is the red line.
+///
+/// This is not `scenario_3_the_two_staticlibs_export_disjoint_symbols`: that one
+/// is about two APPS, which is placement. This is about two SCHEMAS.
+#[test]
+#[ignore = "compiles two release cargo workspaces"]
+fn scenario_20_two_schemas_at_one_path_differ_in_symbols_and_in_fingerprint() {
+    require_tool("nm", "--version");
+
+    let dir = generate_and_build("s20", "\"rust\", \"ffi\"");
+    let archive = dir.join("generated/ffi/libforgedb.a");
+    let first_syms = defined_symbols(&archive);
+    let first_fp = header_fingerprint(&dir.join("generated/ffi/forgedb.h"));
+
+    // A DIFFERENT schema at the same path: same project, same app, same symbol
+    // prefix. Only the models change.
+    std::fs::write(
+        dir.join("schema.forge"),
+        "Widget {\n  id: +uuid\n  sku: &string\n  weight: f64\n}\n",
+    )
+    .unwrap();
+    ok(&forgedb(&dir, &["generate", "all", "--force"]), "regenerate");
+    ok(&forgedb(&dir, &["build"]), "rebuild");
+
+    let second_syms = defined_symbols(&archive);
+    let second_fp = header_fingerprint(&dir.join("generated/ffi/forgedb.h"));
+
+    // C6: the EXPORTED SURFACE differs. Named symbols, not a count — a count
+    // would pass for two schemas with the same number of models.
+    let gone: Vec<&String> = first_syms.difference(&second_syms).collect();
+    let arrived: Vec<&String> = second_syms.difference(&first_syms).collect();
+    assert!(
+        !gone.is_empty() && !arrived.is_empty(),
+        "the two schemas export the same symbols, so the artifact is not \
+         per-schema: {} defined before, {} after",
+        first_syms.len(),
+        second_syms.len()
+    );
+    assert!(
+        arrived.iter().any(|s| s.contains("widget")),
+        "the second schema's model has no symbol of its own: {arrived:?}"
+    );
+
+    // …and the FINGERPRINT differs. A separate claim over a separate input.
+    assert_ne!(
+        first_fp, second_fp,
+        "two different schemas produced the same source fingerprint"
+    );
+}
+
+/// Every defined text symbol in an archive.
+///
+/// The exit status is deliberately not asserted: Xcode's `nm` reports `Unknown
+/// attribute kind` on rustc bitcode and exits 1 while still printing tens of
+/// thousands of symbols. Emptiness is the real failure, and it panics.
+fn defined_symbols(archive: &Path) -> std::collections::BTreeSet<String> {
+    let nm = Command::new("nm").arg("-g").arg(archive).output().expect("nm runs");
+    let out: std::collections::BTreeSet<String> = String::from_utf8_lossy(&nm.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut parts = l.split_whitespace().collect::<Vec<_>>();
+            let name = parts.pop()?;
+            let kind = parts.pop()?;
+            (kind == "T").then(|| name.trim_start_matches('_').to_string())
+        })
+        .collect();
+    assert!(
+        !out.is_empty(),
+        "nm found no defined symbols in {}:\n{}",
+        archive.display(),
+        String::from_utf8_lossy(&nm.stderr)
+    );
+    out
+}
+
+/// The `FORGEDB_FINGERPRINT` macro's value. PANICS on a miss rather than
+/// degrading to the whole file.
+fn header_fingerprint(header: &Path) -> String {
+    let src = read(header);
+    let key = "#define FORGEDB_FINGERPRINT \"";
+    let open = src
+        .find(key)
+        .unwrap_or_else(|| panic!("no fingerprint macro in {}", header.display()))
+        + key.len();
+    let close = src[open..]
+        .find('"')
+        .unwrap_or_else(|| panic!("unterminated fingerprint macro in {}", header.display()));
+    src[open..open + close].to_string()
 }
