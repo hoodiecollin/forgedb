@@ -944,3 +944,117 @@ jobs:
           # `members` was never edited — adoption is a path dep from a crate the
           # consumer owns, and cargo joins the package on its own.
           test "$(sha256sum Cargo.toml | cut -d' ' -f1)" = "$ROOT_SHA"
+
+      - name: P4 in-tree — the consumer's own build graph resolves the substrate
+        shell: bash
+        env:
+          FORGEDB: ${{ github.workspace }}/target/release/forgedb
+        run: |
+          set -euxo pipefail
+          # THE SEVENTH RECLOSE SURFACE (#338, checklist item on #339).
+          #
+          # In-tree placement is the FIRST surface where ForgeDB's substrate pins
+          # land in the USER's own build graph — their lockfile, their feature
+          # unification, their toolchain — rather than in a directory ForgeDB
+          # owns. #338's own tier-2 coverage builds the consumer workspace through
+          # `[patch.crates-io]` pointing at the checkout, which proves the emitted
+          # package COMPILES and says nothing about registry resolution: a patch
+          # table is precisely the thing that makes a registry lookup not happen.
+          #
+          # There is no `[patch.crates-io]` anywhere in this job.
+          cd "$APP"
+          cat >> forgedb.toml <<'PLACE'
+
+          [placement]
+          rust_package = "forgedb-core"
+          PLACE
+          "$FORGEDB" generate all --force | tee intree.log
+
+          # THE DEP LINE IS EXTRACTED FROM THE CLI'S OWN OUTPUT, NOT SPELLED HERE.
+          #
+          # ForgeDB prints this line and never writes it — which of a consumer's
+          # crates should depend on the database is not knowable. The package name
+          # is derived (`<app>-core`), so a literal here would be wrong at the
+          # first rename, and the `package =` rename is not optional: cargo
+          # matches a path dep's KEY against the package's own name.
+          #
+          # `test -n` is not decoration. An empty extraction makes the append a
+          # no-op, `cargo build` then succeeds having compiled nothing new, and
+          # the step reports green having proved nothing. That is not
+          # hypothetical: it is how the first draft of this step behaved, because
+          # the CLI prefixes the line with an info glyph.
+          DEP_LINE="$(perl -pe 's/\e\[[0-9;]*m//g' intree.log \
+                      | perl -ne 'print "$1\n" if /(forgedb_core = \{[^}]*\})/' | head -1)"
+          test -n "$DEP_LINE"
+
+          # Re-based against the consumer crate's own directory, exactly as the
+          # CLI's message instructs: the printed `path` is relative to the
+          # directory `generate` ran in, and the consumer is a sibling of it.
+          REBASED="$(printf '%s\n' "$DEP_LINE" | perl -pe 's{path = "}{path = "../app/}')"
+          REL="$(printf '%s\n' "$REBASED" | perl -ne 'print $1 if /path = "([^"]+)"/')"
+          test -n "$REL"
+          # The re-base is checked before it is pasted, so a broken one fails as
+          # itself rather than as a cargo error about a missing manifest.
+          test -f "$WORK/consumer/$REL/Cargo.toml"
+          printf '%s\n' "$REBASED" >> "$WORK/consumer/Cargo.toml"
+
+          cd "$WORK"
+          cargo build -p consumer
+
+          # Every forgedb-* in the CONSUMER's lockfile carries the crates.io
+          # source. `forgedb-client` is excluded by name because it is the path
+          # dep P3 adopted — a local member, legitimately sourceless.
+          python3 - "$WORK/Cargo.lock" <<'PY'
+          import re, sys
+
+          lock = open(sys.argv[1]).read()
+          REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
+          LOCAL = {"forgedb-client"}
+
+          # Named rather than counted, so a missing one says WHICH. `server` is not
+          # emitted in-tree by design (class D is `core` only), so auth and
+          # query-params are not expected here; the storage facade's wasm side is
+          # pulled in by the manifest's own target table.
+          REQUIRED = {
+              "forgedb-changefeed", "forgedb-compaction", "forgedb-coordinator",
+              "forgedb-storage", "forgedb-storage-native", "forgedb-txn",
+              "forgedb-types", "forgedb-wal",
+          }
+
+          seen, bad = {}, []
+          for block in lock.split("[[package]]"):
+              m = re.search(r'^name = "(.+)"$', block, re.M)
+              if not m or not m.group(1).startswith("forgedb-") or m.group(1) in LOCAL:
+                  continue
+              name = m.group(1)
+              src = re.search(r'^source = "(.+)"$', block, re.M)
+              seen[name] = src.group(1) if src else None
+              if seen[name] != REGISTRY:
+                  bad.append((name, seen[name]))
+
+          for n in sorted(seen):
+              print("ok: %s <- %s" % (n, seen[n]))
+
+          fail = False
+          if bad:
+              fail = True
+              print("\nFAIL: these resolved from something other than crates.io:")
+              for n, s in bad:
+                  print("  %s: %r (a null source means a PATH dependency)" % (n, s))
+              print("This is the CONSUMER's lockfile. A path source here means the")
+              print("in-tree package reached something outside the registry, which an")
+              print("installed user's build cannot.")
+
+          missing = REQUIRED - set(seen)
+          if missing:
+              fail = True
+              print("\nFAIL: absent from the consumer's lockfile: %s" % sorted(missing))
+              print("Either the in-tree package stopped pinning it — in which case this")
+              print("check has silently lost coverage — or the required set is stale.")
+              print("Do not simply delete the row.")
+
+          sys.exit(1 if fail else 0)
+          PY
+
+          # Still untouched, after two adoptions.
+          test "$(sha256sum Cargo.toml | cut -d' ' -f1)" = "$ROOT_SHA"

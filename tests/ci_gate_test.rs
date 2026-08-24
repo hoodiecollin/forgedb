@@ -1016,3 +1016,83 @@ fn the_sdk_arm_builds_rather_than_greps() {
          fails the entire workspace:\n{body}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// S339-4 — the in-tree arm pastes a line it EXTRACTED.
+// ---------------------------------------------------------------------------
+
+/// In-tree placement is the first surface where ForgeDB's substrate pins land in
+/// the *user's own* build graph. #338's tier-2 coverage builds the consumer
+/// workspace through `[patch.crates-io]` pointing at the checkout — which proves
+/// the emitted package compiles and says nothing about registry resolution, a
+/// patch table being precisely the thing that makes a registry lookup not happen.
+///
+/// Two properties, and the second is the one that fails quietly. The line the
+/// consumer pastes must come out of the CLI's own output — the package name is
+/// derived, so a literal spelling here is wrong at the first rename — and the
+/// extraction must be asserted non-empty before use, because an empty one makes
+/// the append a no-op and `cargo build` then passes having compiled nothing new.
+/// That is not hypothetical: the first draft of the step extracted nothing,
+/// because the CLI prefixes the line with an info glyph.
+#[test]
+fn the_in_tree_arm_pastes_a_line_it_extracted() {
+    let body = run_block(
+        "substrate-reclose.yml",
+        "P4 in-tree — the consumer's own build graph resolves the substrate",
+    );
+
+    assert!(
+        body.contains("rust_package"),
+        "P4 no longer sets `[placement].rust_package`, so no in-tree package is \
+         emitted and the step measures the cache again:\n{body}"
+    );
+    // Scoped to the ASSIGNMENT, not to the step. A file-wide `contains` here
+    // survived a mutation that replaced the extraction with a hardcoded line:
+    // `intree.log` still appeared, on the `tee` a few lines above. Both bounds
+    // panic on a miss rather than widening to the rest of the step.
+    let assign = {
+        let after = body.split_once("DEP_LINE=").unwrap_or_else(|| {
+            panic!("P4 no longer assigns DEP_LINE at all:\n{body}")
+        }).1;
+        after
+            .split_once("\ntest -n")
+            .unwrap_or_else(|| {
+                panic!("P4's DEP_LINE assignment is no longer followed by its non-empty check:\n{body}")
+            })
+            .0
+    };
+    assert!(
+        assign.contains("intree.log"),
+        "P4's DEP_LINE is not derived from the CLI's output — the assignment reads \
+         `{assign}`. The package name is derived (`<app>-core`), so a literal \
+         spelling here is wrong at the first rename, and the `package =` key is not \
+         optional: cargo matches a path dep's KEY against the package's own name."
+    );
+    assert!(
+        body.contains("test -n \"$DEP_LINE\""),
+        "P4 pastes the extracted line without asserting it is non-empty. An empty \
+         extraction makes the append a no-op; `cargo build` then succeeds having \
+         compiled nothing new, and the step reports green having proved \
+         nothing:\n{body}"
+    );
+    assert!(
+        body.contains("cargo build -p consumer"),
+        "P4 no longer builds the consumer. Emitting the package proves it was \
+         written, not that a user can compile it:\n{body}"
+    );
+    assert!(
+        body.contains("$WORK/Cargo.lock") && body.contains("crates.io-index"),
+        "P4 no longer inspects the CONSUMER's lockfile for the registry source. \
+         That resolution is the entire property — the package compiling is \
+         already covered by #338's own tier-2 tests, through a `[patch.crates-io]` \
+         that makes the registry lookup not happen:\n{body}"
+    );
+
+    // The one thing that would make the whole step vacuous.
+    assert!(
+        !body.contains("patch.crates-io"),
+        "P4 introduces a `[patch.crates-io]`. A patch table is exactly what makes \
+         a registry lookup not happen, so the step would prove only what #338's \
+         tier-2 tests already prove:\n{body}"
+    );
+}
