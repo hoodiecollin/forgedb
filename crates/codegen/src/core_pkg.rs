@@ -32,14 +32,30 @@
 //! (`#[cfg(not(target_arch = "wasm32"))]`), so the only manifest-level split is
 //! `forgedb-coordinator`, which the replica cfg-gates out entirely.
 
+use crate::GenConfig;
+
 /// The `core/` package manifest.
 pub struct CorePackage;
 
 impl CorePackage {
-    /// Render `core/Cargo.toml`.
+    /// Render `core/Cargo.toml` for the app this `config` generated.
     ///
-    /// `needs_utoipa` is true **iff this app also emits `server/`** (#335 §10).
-    /// That is a generate-time decision baked into source, deliberately **not** a
+    /// **It takes the `GenConfig`, not a `bool`, and that is the fix for #445.**
+    /// The `utoipa` pin is one half of a matched pair whose other half —
+    /// `use utoipa::ToSchema;` and the per-model derives — is emitted into
+    /// *this same package's* `src/lib.rs` by [`crate::RustGenerator`] reading
+    /// [`GenConfig::needs_utoipa`]. A `bool` parameter let the call site compute
+    /// a **second** condition (`cache.api.is_some()` — "did the command I just
+    /// ran emit an api"), and the two disagree for exactly the invocations that
+    /// narrow: `generate rust` under `targets = ["all"]`, and `build --no-api`.
+    /// The result is a `core` whose source names a crate its own manifest does
+    /// not pin — `error[E0432]: unresolved import 'utoipa'`.
+    ///
+    /// Taking the config removes the parameter a divergent condition could be
+    /// passed through. There is one definition, in [`GenConfig::needs_utoipa`],
+    /// and both sides read it.
+    ///
+    /// It is a generate-time decision baked into source, deliberately **not** a
     /// cargo feature: C11 forbids a generate-time knob becoming a feature of a
     /// shared member, and a feature is exactly what an implementer reaches for
     /// here by reflex.
@@ -57,8 +73,8 @@ impl CorePackage {
     /// ignored`), and a block that reads as applied and is not is precisely what
     /// #333's strict parsing exists to prevent.  The release profile floor is
     /// applied by the build driver on the cargo invocation.
-    pub fn cargo_toml(crate_name: &str, needs_utoipa: bool) -> String {
-        let utoipa = if needs_utoipa {
+    pub fn cargo_toml(crate_name: &str, config: &GenConfig) -> String {
+        let utoipa = if config.needs_utoipa() {
             "utoipa = { version = \"5\", features = [\"uuid\"] }\n"
         } else {
             ""
@@ -107,24 +123,64 @@ forgedb-coordinator = "0.2"
 mod tests {
     use super::*;
 
+    /// A `GenConfig` with `web` set explicitly — the one input this manifest reads.
+    fn cfg(web: bool) -> GenConfig {
+        GenConfig {
+            web,
+            ..GenConfig::DEFAULT
+        }
+    }
+
     #[test]
-    fn utoipa_is_present_only_when_the_app_has_a_server() {
-        let with = CorePackage::cargo_toml("app-core", true);
-        let without = CorePackage::cargo_toml("app-core", false);
+    fn utoipa_is_present_only_when_the_app_declares_a_web_surface() {
+        let with = CorePackage::cargo_toml("app-core", &cfg(true));
+        let without = CorePackage::cargo_toml("app-core", &cfg(false));
 
         assert!(with.contains("utoipa"), "{with}");
         assert!(
             !without.contains("utoipa"),
-            "utoipa must not be pinned when no server consumes it:\n{without}"
+            "utoipa must not be pinned when nothing derives ToSchema:\n{without}"
         );
+    }
+
+    /// **The #445 pairing, asserted directly**: the manifest pins `utoipa`
+    /// exactly when the source that manifest compiles names it.
+    ///
+    /// Both sides are rendered from the SAME `GenConfig` here, which is what the
+    /// shipped call site failed to do — it computed a second condition
+    /// (`cache.api.is_some()`) and passed it as a `bool`. This is the cheap,
+    /// string-level half; `tests/core_utoipa_gate_test.rs` proves it end to end
+    /// by compiling what the CLI wrote.
+    #[test]
+    fn the_pin_and_the_import_agree_for_every_config() {
+        let src = "User {\n  id: +uuid\n  email: &string\n  name: string\n}\n";
+        let schema = forgedb_parser::Parser::new(src)
+            .and_then(|mut p| p.parse())
+            .expect("fixture schema parses");
+
+        for web in [true, false] {
+            let config = cfg(web);
+            let manifest = CorePackage::cargo_toml("app-core", &config);
+            let source = crate::RustGenerator::generate_with_config(&schema, 1, config)
+                .expect("database.rs")
+                .code;
+
+            assert_eq!(
+                manifest.contains("\nutoipa = "),
+                source.contains("use utoipa :: ToSchema")
+                    || source.contains("use utoipa::ToSchema"),
+                "core/Cargo.toml and core/src/lib.rs disagree about utoipa at \
+                 web={web} — the emitted crate does not compile.\n{manifest}"
+            );
+        }
     }
 
     /// A `[profile.*]` table in a workspace member is silently ignored, so
     /// emitting one would read as applied while doing nothing.
     #[test]
     fn no_profile_table_is_emitted() {
-        for needs_utoipa in [true, false] {
-            let manifest = CorePackage::cargo_toml("app-core", needs_utoipa);
+        for web in [true, false] {
+            let manifest = CorePackage::cargo_toml("app-core", &cfg(web));
             assert!(!manifest.contains("[profile"), "{manifest}");
         }
     }
@@ -132,7 +188,7 @@ mod tests {
     /// The coordinator must be host-only or `core` cannot build for the replica.
     #[test]
     fn the_coordinator_is_target_gated() {
-        let manifest = CorePackage::cargo_toml("app-core", false);
+        let manifest = CorePackage::cargo_toml("app-core", &cfg(false));
         let gate = manifest
             .find("[target.'cfg(not(target_arch = \"wasm32\"))'.dependencies]")
             .expect("no target gate");
@@ -145,8 +201,8 @@ mod tests {
 
     #[test]
     fn the_manifest_parses_as_toml() {
-        for needs_utoipa in [true, false] {
-            let manifest = CorePackage::cargo_toml("app-core", needs_utoipa);
+        for web in [true, false] {
+            let manifest = CorePackage::cargo_toml("app-core", &cfg(web));
             toml::from_str::<toml::Value>(&manifest)
                 .unwrap_or_else(|e| panic!("core manifest is not valid TOML: {e}\n{manifest}"));
         }
