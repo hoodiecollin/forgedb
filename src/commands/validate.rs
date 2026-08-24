@@ -117,9 +117,10 @@ pub fn run(options: ValidateOptions) -> Result<()> {
     // --components: check that component references are well-formed and that
     // tsx:// / jsx:// component files exist on disk relative to the schema directory.
     if options.components {
-        let schema_dir = Path::new(&schema_path)
-            .parent()
-            .unwrap_or_else(|| Path::new("."));
+        // #437: `parent()` on a bare `schema.forge` yields `Some("")`, not `None`, so
+        // the `unwrap_or` this used to be never fired and component paths resolved against
+        // the filesystem root. `project::schema_dir` is the one definition that handles it.
+        let schema_dir = crate::project::schema_dir(Path::new(&schema_path));
 
         for model in &schema.models {
             for field in &model.fields {

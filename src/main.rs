@@ -536,19 +536,6 @@ enum BackupCommands {
     },
 }
 
-/// The directory a schema's governing config is walked up from.
-///
-/// A bare `schema.forge` has no parent component, and walking from `""` would
-/// resolve against the filesystem root rather than the CWD — which is the
-/// difference between "the config beside my schema" and "any config on the
-/// machine".
-fn schema_dir(schema: &std::path::Path) -> &std::path::Path {
-    match schema.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => std::path::Path::new("."),
-    }
-}
-
 /// Reserve an app's container and report where it is — the BEFORE half of the
 /// old `place_in_cache` (#335 §3).
 ///
@@ -697,7 +684,7 @@ fn run(cli: Cli) -> Result<()> {
         } => {
             // The schema names itself; no config participates (#333 §10).
             let schema_path = project::find_schema(schema.as_deref())?;
-            let governing = project::govern(explicit_config, schema_dir(&schema_path))?;
+            let governing = project::govern(explicit_config, project::schema_dir(&schema_path))?;
             // Resolved (and claimed) here rather than lazily: a project id is a
             // precondition of generating, so a collision must be refused before
             // any bytes are written, not after.
@@ -816,7 +803,7 @@ fn run(cli: Cli) -> Result<()> {
             // `build` must compile in the same place `generate` emitted into, and
             // must bake what `generate` would (#361, extended to identity by #333).
             let schema_path = project::find_schema(schema.as_deref())?;
-            let governing = project::govern(explicit_config, schema_dir(&schema_path))?;
+            let governing = project::govern(explicit_config, project::schema_dir(&schema_path))?;
             let project = governing.identify_reported()?;
             let reserved = reserve_in_cache(&project, &schema_path, governing.symbol_naming())?;
             let forge_config = governing.config();
@@ -878,7 +865,7 @@ fn run(cli: Cli) -> Result<()> {
             // config at all: every save rewrote `database.rs` with
             // `GenConfig::DEFAULT` and `schema_version = 1`.
             let schema_path = project::find_schema(schema.as_deref())?;
-            let governing = project::govern(explicit_config, schema_dir(&schema_path))?;
+            let governing = project::govern(explicit_config, project::schema_dir(&schema_path))?;
             let project = governing.identify_reported()?;
             let reserved = reserve_in_cache(&project, &schema_path, governing.symbol_naming())?;
             let forge_config = governing.config();
