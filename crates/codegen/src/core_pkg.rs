@@ -32,6 +32,8 @@
 //! (`#[cfg(not(target_arch = "wasm32"))]`), so the only manifest-level split is
 //! `forgedb-coordinator`, which the replica cfg-gates out entirely.
 
+use std::path::Path;
+
 use crate::GenConfig;
 
 /// The `core/` package manifest.
@@ -117,6 +119,84 @@ forgedb-coordinator = "0.2"
 "#
         )
     }
+
+    /// The `src/lib.rs` a `core` package holds: the generated database plus the
+    /// substrate re-exports, exactly as the caller assembled it.
+    ///
+    /// Named rather than inlined so [`Self::files`] has one entry per file and
+    /// no call site has to remember which relative path goes with which string.
+    pub const LIB_RS: &'static str = "src/lib.rs";
+
+    /// The manifest's relative path.
+    pub const CARGO_TOML: &'static str = "Cargo.toml";
+
+    /// **Every file of a `core` package**, as (relative path, contents).
+    ///
+    /// This is the ONE definition of what a `core` package *is*. The cache
+    /// emitter, the in-tree emitter (#338) and `generate --check`'s comparer all
+    /// read it — which is what makes "one renderer, two destinations" a
+    /// structural property rather than a rule three call sites are trusted to
+    /// keep.
+    ///
+    /// It takes the `GenConfig`, not a `bool`, for #445's reason: a `bool` is a
+    /// parameter a call site can compute a *second*, divergent condition into,
+    /// and the two halves of the utoipa pairing then disagree for exactly the
+    /// invocations that narrow. There is nothing here left to compute.
+    ///
+    /// The list is exhaustive on purpose. `#338` scenario 2 asserts the emitted
+    /// directory holds **nothing else**, and it can only do that against a
+    /// complete enumeration — a renderer that returned "the files I happened to
+    /// think of" would make that assertion vacuous.
+    pub fn files(crate_name: &str, config: &GenConfig, lib_rs: &str) -> Vec<(&'static str, String)> {
+        vec![
+            (Self::CARGO_TOML, Self::cargo_toml(crate_name, config)),
+            (Self::LIB_RS, lib_rs.to_string()),
+        ]
+    }
+
+    /// The dependency line a consumer pastes into their own `Cargo.toml`.
+    ///
+    /// **`package =` is not optional.** Cargo matches a path dependency's *key*
+    /// against the package's own name, and this package is named
+    /// `<app_name>-core` — so the obvious `forgedb_core = { path = "…" }` is a
+    /// hard error (`no matching package named 'forgedb_core' found`), not a
+    /// stylistic choice. The rename is the same idiom
+    /// [`crate::ServerPackage::cargo_toml`] already uses for the same reason:
+    /// no generated `.rs` byte carries the app's derived name.
+    ///
+    /// ForgeDB **prints** this line; it never writes it. Which of a consumer's
+    /// crates should depend on the database is not knowable — a workspace may
+    /// hold many — and picking one is guessing in a file ForgeDB does not own.
+    pub fn dep_line(package: &str, path: &Path) -> String {
+        format!(
+            "forgedb_core = {{ package = {}, path = {} }}",
+            toml_string(package),
+            toml_string(&path.display().to_string()),
+        )
+    }
+}
+
+
+/// A TOML basic string, escaped.
+///
+/// Hand-rolled rather than reached for through `toml`: that crate is a
+/// dev-dependency here, and pulling a serializer into the shipped graph to quote
+/// two strings is a poor trade. The escape set is TOML's own for basic strings.
+fn toml_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 #[cfg(test)]
@@ -172,6 +252,67 @@ mod tests {
                 "core/Cargo.toml and core/src/lib.rs disagree about utoipa at \
                  web={web} — the emitted crate does not compile.\n{manifest}"
             );
+        }
+    }
+
+
+    /// **#338 scenario 4a.** The printed dep line carries `package =` and a
+    /// `path`, and it parses as TOML.
+    ///
+    /// The `package =` half is the one gate 1 got wrong: cargo matches a path
+    /// dep's KEY against the package's own name, so `forgedb_core = { path = … }`
+    /// against a package named `demo-core` fails with `no matching package named
+    /// 'forgedb_core' found`. Asserted here as a string property and, in
+    /// `tests/in_tree_package_test.rs`, against the manifest ForgeDB actually
+    /// wrote — never against a literal, which is how the wrong line survived a
+    /// design gate.
+    #[test]
+    fn the_dep_line_renames_the_package_and_parses() {
+        let line = CorePackage::dep_line("demo-core", Path::new("generated/core"));
+        let parsed: toml::Value = toml::from_str(&line).expect("the dep line must be valid TOML");
+        let dep = &parsed["forgedb_core"];
+
+        assert_eq!(dep["package"].as_str(), Some("demo-core"));
+        assert_eq!(dep["path"].as_str(), Some("generated/core"));
+        assert!(
+            dep.get("version").is_none(),
+            "a version requirement would give the consumer a pin to go stale: {line}"
+        );
+    }
+
+    /// A path with a character TOML must escape does not produce a broken line.
+    ///
+    /// Reachable: `[placement].rust_package` resolves against the schema's
+    /// directory, and nothing forbids a backslash or a quote in a directory name.
+    #[test]
+    fn the_dep_line_escapes_its_path() {
+        let line = CorePackage::dep_line("demo-core", Path::new("gen\"er\\ated/core"));
+        let parsed: toml::Value = toml::from_str(&line).expect("an escaped path is still TOML");
+        assert_eq!(
+            parsed["forgedb_core"]["path"].as_str(),
+            Some("gen\"er\\ated/core")
+        );
+    }
+
+    /// **#338 scenario 2 (the renderer half).** `files` enumerates the WHOLE
+    /// package: two entries, and the manifest is rendered from the same config
+    /// the source was.
+    ///
+    /// The count is asserted because the emitters that consume this are what
+    /// makes "the emitted directory holds nothing else" true — a third file
+    /// appearing here must be a deliberate edit, not a silent one.
+    #[test]
+    fn files_enumerates_the_whole_package() {
+        for web in [true, false] {
+            let config = cfg(web);
+            let files = CorePackage::files("demo-core", &config, "// the database\n");
+
+            assert_eq!(files.len(), 2, "a core package is exactly two files: {files:?}");
+            let names: Vec<&str> = files.iter().map(|(n, _)| *n).collect();
+            assert_eq!(names, vec!["Cargo.toml", "src/lib.rs"]);
+
+            assert_eq!(files[0].1, CorePackage::cargo_toml("demo-core", &config));
+            assert_eq!(files[1].1, "// the database\n");
         }
     }
 

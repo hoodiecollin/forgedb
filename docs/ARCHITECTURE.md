@@ -751,10 +751,12 @@ a guard test, not only by a doc comment.
 - **ForgeDB owns the build, over scaffolding a crate the user compiles.** One `core` per app
   makes a second, differently-configured `database.rs` unrepresentable, and the driver can
   enforce a profile floor a manifest cannot. The costs are stated rather than discovered: the
-  editable `src/main.rs` is gone until #338's in-tree mode (a user's existing scaffold is never
-  deleted, and the mirror keeps its `#[path]` modules resolving), `panic` is irreducibly
-  project-wide because cargo makes it so, and one shared `target/` serializes concurrent builds
-  of sibling apps.
+  editable `src/main.rs` is **gone**, and in-tree placement (#338) does not bring it back — a
+  Rust consumer may have the generated *database* emitted into their tree as a ForgeDB-owned
+  cargo package (`[placement].rust_package`), but that package carries `core` alone: no
+  `api.rs`, no `main.rs`, no `[[bin]]`. A user's existing scaffold is never deleted, and the
+  mirror keeps its `#[path]` modules resolving. `panic` is irreducibly project-wide because
+  cargo makes it so, and one shared `target/` serializes concurrent builds of sibling apps.
 
 ---
 

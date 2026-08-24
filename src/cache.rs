@@ -447,19 +447,7 @@ pub fn orphans(project: &Path, live: &[PathBuf]) -> Result<Vec<PathBuf>> {
 /// A build cache that also holds data is an installation, and an installation is
 /// where a runtime lives.
 pub fn assert_not_in_cache(data_root: &Path) -> Result<()> {
-    let home = forgedb_home()?;
-
-    // Compare against the closest existing ancestor: the data root itself
-    // usually does not exist yet, so it cannot be canonicalized directly.
-    let absolute = if data_root.is_absolute() {
-        data_root.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(data_root)
-    };
-    let resolved = closest_real_ancestor(&absolute);
-    let home_resolved = closest_real_ancestor(&home);
-
-    if resolved.starts_with(&home_resolved) {
+    if let Some(home_resolved) = home_containing(data_root)? {
         return Err(CliError::Config(format!(
             "Data root {} resolves inside the ForgeDB build cache ({}).\n\
              The build cache is derived state and may be deleted at any time, so it \
@@ -472,6 +460,36 @@ pub fn assert_not_in_cache(data_root: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The **resolved** `$FORGEDB_HOME` when `path` lands inside it, else `None`.
+///
+/// The half of [`assert_not_in_cache`] that is a question rather than a refusal,
+/// extracted so #338's in-tree placement guard can ask it and write its own
+/// diagnostic. Two callers, two messages, one resolution — and the resolution is
+/// the part with the subtleties in it.
+///
+/// Two of them. The path is made **absolute** first, because a relative
+/// configured value is exactly the dangerous case (nobody writes "put it in the
+/// build cache"; they run somewhere whose CWD is inside it). And the comparison
+/// is against the closest *existing* ancestor of each side, because neither the
+/// candidate nor the home necessarily exists yet — and `~/.forgedb` behind a
+/// symlink would otherwise compare unequal to the same directory reached
+/// literally.
+pub fn home_containing(path: &Path) -> Result<Option<PathBuf>> {
+    let home = forgedb_home()?;
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let resolved = closest_real_ancestor(&absolute);
+    let home_resolved = closest_real_ancestor(&home);
+
+    Ok(resolved
+        .starts_with(&home_resolved)
+        .then_some(home_resolved))
 }
 
 /// One app's container directory, and the project root above it.

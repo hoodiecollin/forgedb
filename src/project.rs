@@ -1078,6 +1078,31 @@ impl Governing {
         self.resolve_path(declared).display().to_string()
     }
 
+    /// Where the in-tree Rust package goes (#338), or `None` when the knob is
+    /// absent — which is the opt-out.
+    ///
+    /// **A knob, not a project-wide fact**, so it comes from `Chain::nearest()`
+    /// via [`Self::config`] rather than from `Chain::project_root()`: two apps
+    /// under one root may legitimately place differently, exactly as they may
+    /// set `output` differently.
+    ///
+    /// Resolved through [`Self::resolve_path`] — against the **schema's**
+    /// directory, never the CWD. A root config's `rust_package = "generated/core"`
+    /// is therefore a per-app pattern; the CWD-relative reading is what had every
+    /// app in a project overwriting its siblings' `output`.
+    ///
+    /// This is the ONE reader of `[placement].rust_package`. Config is reached
+    /// from this module and nowhere else (#361's one-loader invariant), so a
+    /// `config.placement` access anywhere in the tree is the bug this placement
+    /// prevents.
+    pub fn rust_package(&self) -> Option<PathBuf> {
+        self.config()
+            .placement
+            .rust_package
+            .as_deref()
+            .map(|declared| self.resolve_path(declared))
+    }
+
     /// The project this app belongs to, with its id claimed.
     pub fn identify(&self, asker: &dyn Asker) -> Result<ProjectId> {
         identify_and_claim_with(&self.chain, asker)
