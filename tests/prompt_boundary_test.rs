@@ -467,6 +467,43 @@ fn s19_the_widget_is_constructed_in_exactly_one_place() {
     );
 }
 
+/// The **second** question kind shares the first one's boundary (#374).
+///
+/// `migrate create` asks a different shape of question — pick one of N, or
+/// yes/no — and needs its own trait, because `Asker`'s `Question` is a closed
+/// two-variant enum about project identity. What it must NOT have is its own
+/// *boundary*: a second definition of "is this interactive" would agree with
+/// this one until the day either grew a clause.
+///
+/// So the row is here, beside `TerminalAsk`'s, and it asserts the same two
+/// things: `prompt()` is the only constructor of `TerminalPrompt`, and it is
+/// gated by `Askability::may_ask()` in the same function.
+///
+/// It is a **test-file** guard rather than a `#[cfg(test)]` one inside
+/// `ask.rs`, and that is not a preference: a module counting occurrences of a
+/// literal in its own source counts its own assertion too, and reads 2 where it
+/// means 1.
+#[test]
+fn s19c_the_migrate_prompt_shares_the_one_boundary() {
+    let ask_rs = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ask.rs"),
+    )
+    .expect("src/ask.rs");
+    assert_eq!(
+        ask_rs.matches("Box::new(TerminalPrompt)").count(),
+        1,
+        "`TerminalPrompt` has exactly one constructor, like `TerminalAsk`"
+    );
+    let start = ask_rs
+        .find("pub fn prompt() -> Option<Box<dyn Prompt>> {")
+        .expect("`prompt()` is that constructor");
+    let body = &ask_rs[start..start + 400];
+    assert!(
+        body.contains("Askability::detect()") && body.contains("may_ask()"),
+        "the construction is gated by the boundary in the same function: {body}"
+    );
+}
+
 /// `std::io::IsTerminal` has exactly one call site, for the same reason.
 ///
 /// A second one would be a second definition of "is this interactive" — and the

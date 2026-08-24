@@ -15,7 +15,7 @@
 //! Nothing here runs at app time; it is `migrate create`/`generate`-time only.
 
 use crate::generator::MigrationGenerator;
-use crate::types::Migration;
+use crate::types::{Answer, EscapeLanguage, Migration, checksum};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -251,4 +251,151 @@ pub fn current_schema_version<P: AsRef<Path>>(migrations_dir: P) -> u32 {
     MigrationLineage::load(migrations_dir)
         .map(|l| l.current_schema_version())
         .unwrap_or(BASELINE_SCHEMA_VERSION)
+}
+
+/// Why a hop cannot be built (#374 step 6).
+///
+/// `Ok(())` from [`hop_answer_status`] is the ONLY state that admits a build.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Unanswered {
+    /// The record carries no answer for a change that needs one.
+    NoAnswer {
+        /// The change's own description, so the operator reads the same
+        /// sentence `migrate create` printed.
+        change: String,
+    },
+    /// [`Answer::Escape`] names a file that is not there.
+    EscapeFileMissing { path: PathBuf, change: String },
+    /// The file is byte-identical to the scaffold ForgeDB wrote, so nothing was
+    /// authored.
+    EscapeFileUnedited { path: PathBuf, change: String },
+    /// A pre-#374 record with authored residue and no body on disk.
+    LegacyBodyMissing { path: PathBuf },
+}
+
+impl std::fmt::Display for Unanswered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unanswered::NoAnswer { change } => write!(
+                f,
+                "{change}\n    no answer was recorded. Re-run `forgedb migrate create` \
+                 for this hop, or answer it there when it is first detected."
+            ),
+            Unanswered::EscapeFileMissing { path, change } => write!(
+                f,
+                "{change}\n    its transform {} is missing.",
+                path.display()
+            ),
+            Unanswered::EscapeFileUnedited { path, change } => write!(
+                f,
+                "{change}\n    {} is byte-identical to the scaffold ForgeDB wrote, \
+                 so nothing has been authored yet.",
+                path.display()
+            ),
+            Unanswered::LegacyBodyMissing { path } => write!(
+                f,
+                "this migration predates #374 and has authored residue, but its \
+                 transform {} is missing.",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// Can this hop be built? (#374 step 6, gate 1 decision 4.)
+///
+/// Decided from the **record** plus the recorded scaffold hash. Never from the
+/// file's text: a `TODO` grep is satisfied by deleting a comment, which is the
+/// reason gate 1 forbade it.
+///
+/// Three rules, in the order they apply:
+///
+/// 1. **`record_version == 0`** — a record written before #374, which could not
+///    have recorded an answer. The legacy rule applies instead: `transform.rs`
+///    must exist, with no hash to compare it against. Written first, not last:
+///    every lineage already committed is in this state, and skipping this rule
+///    refuses all of them with a message about an answer that could never have
+///    been recorded.
+/// 2. **`answer == None`** on an `Authored` change — `NoAnswer`. That is the
+///    whole decision for `Constant` and `CopyField`: the answer is *in* the
+///    record, so nothing on disk is consulted.
+/// 3. **`Answer::Escape`** — the file must exist, and its bytes must differ
+///    from the recorded `scaffold_checksum`.
+///
+/// # The honest limit of rule 3
+///
+/// Hash equality proves **untouched**. It cannot prove **answered**. An author
+/// who deletes the `// TODO:` lines and changes nothing else passes this check
+/// — which is exactly the case a `TODO` grep also gets wrong, in the opposite
+/// direction. What covers it is the *other* half of the same pair: with the
+/// defensive type-zero gone, that hop's rows reach the destination decode
+/// without the required key and the hop **fails, naming the field**, instead of
+/// writing `""` and exiting 0. Decisions 4 and 5 are one mechanism; do not land
+/// one and describe it as the guarantee of both.
+pub fn hop_answer_status(
+    migrations_dir: &Path,
+    migration: &Migration,
+) -> Result<(), Vec<Unanswered>> {
+    let authored = migration.authored_changes();
+    if authored.is_empty() {
+        return Ok(());
+    }
+
+    // Rule 1 — the legacy arm.
+    if migration.record_version == 0 {
+        let path = authored_body_path(migrations_dir, &migration.id);
+        return if path.exists() {
+            Ok(())
+        } else {
+            Err(vec![Unanswered::LegacyBodyMissing { path }])
+        };
+    }
+
+    let mut problems = Vec::new();
+    for change in authored {
+        let description = change.description();
+        match change.answer() {
+            // Rule 2.
+            None => problems.push(Unanswered::NoAnswer {
+                change: description,
+            }),
+            // Rule 3.
+            Some(Answer::Escape {
+                file,
+                scaffold_checksum,
+                ..
+            }) => {
+                let path = migration_body_dir(migrations_dir, &migration.id).join(file);
+                match fs::read(&path) {
+                    Err(_) => problems.push(Unanswered::EscapeFileMissing {
+                        path,
+                        change: description,
+                    }),
+                    Ok(bytes) if &checksum::compute(&bytes) == scaffold_checksum => problems
+                        .push(Unanswered::EscapeFileUnedited {
+                            path,
+                            change: description,
+                        }),
+                    Ok(_) => {}
+                }
+            }
+            // The answer is in the record; nothing on disk is consulted.
+            Some(Answer::Constant { .. } | Answer::CopyField { .. }) => {}
+        }
+    }
+
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems)
+    }
+}
+
+/// The path of an escape transform inside a migration's body dir (#374).
+pub fn escape_body_path(
+    migrations_dir: &Path,
+    migration_id: &str,
+    lang: EscapeLanguage,
+) -> PathBuf {
+    migration_body_dir(migrations_dir, migration_id).join(lang.transform_file())
 }

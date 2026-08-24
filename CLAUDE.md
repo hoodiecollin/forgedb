@@ -312,6 +312,14 @@ The root `forgedb` crate is now published **with** that `lsp` feature (2026-07-2
 `codegen` for the REST-SDK generators and `compaction`/`query-params` for bugfixes), so
 `cargo install forgedb --features lsp` builds both `forgedb` + `forgedb-lsp` from the registry.
 - `parser` — lexer + parser → AST (`crates/parser/src/ast.rs`)
+- `migrations` — the differ + the migration record. Since #374 the record carries the operator's
+  **`Answer`** (`Constant` / `CopyField` / `Escape`) beside each change the differ cannot prove, plus a
+  `record_version`; `migrate build` **lowers** an answer into the emitted hop and refuses a hop that has
+  none (decided from the record + the recorded scaffold hash, never a `TODO` grep). `SimpleField.ty` is a
+  structured `SimpleType` — the crate still has **no parser dependency**, and the AST projection stays in
+  the CLI's `to_simple_type`. `SchemaDiffer::diff` returns a `DiffResult`: the changes it is sure of plus
+  `RenameProposal`s, because a drop+add of the same type is a *guess* and the two readings produce
+  opposite data.
 - `codegen` — code generators; exports `RustGenerator`, `TypeScriptGenerator`,
   `ApiGenerator`, `StubGenerator`, and the REST client SDK generators
   `RustSdkGenerator` / `PythonSdkGenerator` / `GoSdkGenerator` (#206/#118/#205 — the
@@ -424,7 +432,13 @@ ones are `@min @max @length @email @url @pattern`/`@regex` `@utf8`, all ENFORCED
 single-arg `@length(n)` means **exactly** n, NOT a maximum (#235); `@pattern` is a per-field `LazyLock<Regex>`,
 #104). **Semantic-only markers** (parsed, carried,
 never checked at write): `@default @index @computed @fulltext @materialized` — for a real index use the `^`
-modifier. Per-directive truth table: `docs/SCHEMA.md`. **`@on_delete(restrict|cascade|set_null)`
+modifier. **`@default` is the one exception, and only outside the write path (#374):** it is the value
+existing rows get when a required field is added, applied identically by the generated reopen backfill and by
+the offline transformer through ONE lowering (`forgedb_codegen::default_fill`), which is why such an add needs
+no answer from the operator. It resolves for `bool`, the integer types, `f64`, bare `string`, `json`, `decimal`
+and a declared enum variant — never for a nullable field, `timestamp`, `uuid`, `bytes(N)`, `string(N)`, arrays,
+structs, relations, or a literal that does not fit its field; each of those routes to the prompt instead of to
+a substituted zero. Insert still requires the field. Per-directive truth table: `docs/SCHEMA.md`. **`@on_delete(restrict|cascade|set_null)`
 ENFORCED** (relation-FK field; default `restrict` refuses deleting a referenced parent → 409, `cascade` recursive,
 `set_null` optional-FK only), `@soft_delete` + composite `@index(a,b)` + `@projection(name: a, b)` (#113 —
 model-level; generates a partial-read struct/methods over PK + the named columns), `@relations(*|fields)`

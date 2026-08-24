@@ -1,3 +1,6 @@
+pub mod answers;
+pub mod escape;
+
 use crate::naming::PackageKind;
 use crate::{error::CliError, ui, Result};
 use colored::Colorize;
@@ -34,7 +37,21 @@ pub struct AppRef {
 pub struct MigrateCreateOptions {
     pub app: AppRef,
     pub description: String,
-    pub auto: bool,
+    /// TOMBSTONE for the deleted `--auto` (#374 direction A).
+    ///
+    /// Detection is what `migrate create` **does** — there is no second mode to
+    /// choose, so there is no flag. It still parses so that passing it is an
+    /// error naming that fact, rather than clap's "unexpected argument", which
+    /// names nothing; six examples in `docs/MIGRATIONS.md` and any runbook
+    /// written against 0.4 pass it. Same shape as `migrate build -o`,
+    /// `migrate run --bin-dir` and `migrate up` (#335 §9).
+    pub removed_auto: bool,
+    /// Opt out of the **prompt**, not of detection (#374 direction A).
+    ///
+    /// A migration whose every change is provable succeeds identically with and
+    /// without it. What it decides is whether an unprovable change stops the run
+    /// or asks a question.
+    pub no_auto: bool,
 }
 
 pub struct MigrateStatusOptions {
@@ -95,6 +112,13 @@ struct ResolvedApp {
     /// The app's legible derived identity, e.g. `foo_services_blog`.
     app_name: String,
     reserved: crate::cache::Reserved,
+    /// The project root a relative `[toolchain].path` resolves against — never
+    /// the CWD (#333/#361).
+    project_root: PathBuf,
+    /// The governing config, kept so a later step can read a knob without
+    /// walking the chain a second time (and possibly getting a different
+    /// answer).
+    governing: crate::config::ForgeConfig,
 }
 
 impl ResolvedApp {
@@ -138,10 +162,14 @@ fn resolve_app(app: &AppRef) -> Result<ResolvedApp> {
         )));
     }
 
-    let governing = crate::project::govern_for_schema(app.config.as_deref(), schema)?;
-    let project = governing.identify_reported(&*crate::ask::asker())?;
-    let reserved =
-        crate::cache::reserve(&project.name, &project.root, schema, governing.symbol_naming())?;
+    let governing_chain = crate::project::govern_for_schema(app.config.as_deref(), schema)?;
+    let project = governing_chain.identify_reported(&*crate::ask::asker())?;
+    let symbol_naming = governing_chain.symbol_naming();
+    // Taken by value: `migrate build` reads `[toolchain]` much later, and
+    // re-walking the chain there could answer a different question than the one
+    // this app's identity was resolved against.
+    let governing = governing_chain.into_config();
+    let reserved = crate::cache::reserve(&project.name, &project.root, schema, symbol_naming)?;
     // C7: every command that writes into the cache prints where it wrote.
     // Once the build happens in a hashed directory the user has never seen, a
     // silent path is the difference between a build they can inspect and one
@@ -153,27 +181,46 @@ fn resolve_app(app: &AppRef) -> Result<ResolvedApp> {
         migrations_dir: crate::project::migrations_dir(schema),
         app_name: reserved.app_name.clone(),
         reserved,
+        project_root: project.root.clone(),
+        governing,
     })
 }
 
 /// A deleted flag that still **parses**, so that passing it is an error naming
-/// the replacement (#335 §9).
+/// the replacement (#335 §9, #374).
 ///
 /// Removing the flag outright hands the user clap's "unexpected argument",
 /// which names no replacement. Keeping it and ignoring it is worse still: a
 /// flag that reads as applied and is not is the exact failure mode this design
 /// deletes everywhere else. So the flag survives as a tombstone whose entire
 /// behavior is this refusal.
-fn refuse_removed_flag(flag: &str, value: Option<&PathBuf>, replacement: &str) -> Result<()> {
-    match value {
+///
+/// `given` is the rendered value the operator passed, or `Some("")` for a
+/// valueless flag — every removed flag routes through here, so that
+/// `scenario_34_every_refusal_site_has_a_row` counts them all. Adding a
+/// removal without adding a row is then a failure rather than a silence.
+fn refuse_removed_flag(flag: &str, given: Option<String>, explanation: &str) -> Result<()> {
+    match given {
         None => Ok(()),
-        Some(v) => Err(CliError::Migration(format!(
-            "`{flag} {}` was removed (#335): ForgeDB owns where this is built, and it is \
-             built as a member of the project's own cache workspace rather than into a \
-             directory of your choosing. {replacement}",
-            v.display()
-        ))),
+        Some(v) => {
+            let shown = if v.is_empty() {
+                flag.to_string()
+            } else {
+                format!("{flag} {v}")
+            };
+            Err(CliError::Migration(format!("`{shown}` was removed. {explanation}")))
+        }
     }
+}
+
+/// The shared explanation for the three flags #335 §9 removed, so the sentence
+/// has one home rather than three.
+fn cache_owns_the_build(replacement: &str) -> String {
+    format!(
+        "ForgeDB owns where this is built, and it is built as a member of the \
+         project's own cache workspace rather than into a directory of your \
+         choosing (#335). {replacement}"
+    )
 }
 
 /// `forgedb migrate up`, removed (#335 §9, maintainer decision 3).
@@ -200,163 +247,226 @@ pub fn up() -> Result<()> {
     ))
 }
 
-/// Create a new migration
+/// Create a new migration by diffing the app's schema against the recorded
+/// snapshot, capturing an answer for anything the differ cannot prove (#374).
+///
+/// # There is no way to create a migration ForgeDB did not detect
+///
+/// The old `--auto`-less branch wrote an empty record with `changes: []` and
+/// told the operator to edit it by hand. It is gone, and so is the flag: a
+/// record's `changes` array is DERIVED from a schema diff, so it cannot
+/// disagree with `migrations/schemas/vN.forge`. Anything the diff cannot prove
+/// is answered by prompt or escapes to the author's own runtime — never by
+/// hand-editing the record.
 pub fn create(opts: MigrateCreateOptions) -> Result<()> {
+    // Routed through the SAME refusal as the three flags #335 removed, so
+    // `scenario_34_every_refusal_site_has_a_row` counts it. Giving it a private
+    // error here instead would have kept that test green while adding a
+    // removed surface it does not cover.
+    refuse_removed_flag(
+        "--auto",
+        opts.removed_auto.then(String::new),
+        "Detecting schema changes is what `migrate create` DOES (#374), so there is no \
+         flag for it and no second mode to choose — drop it. To opt out of the \
+         *prompt*, and only the prompt, pass `--no-auto`: detection still runs, and a \
+         change ForgeDB cannot prove becomes a hard error naming itself instead of a \
+         question.",
+    )?;
+
     let app = resolve_app(&opts.app)?;
     // Derived from the app the operator named, never from the working directory
     // (#335 §9): one root config can govern many apps, and a CWD-relative
     // `migrations/` gave whichever of them the operator happened to `cd` into.
     let migrations_dir = app.migrations_dir.clone();
+    let schema_path = app.schema.clone();
 
-    if opts.auto {
-        // Auto-detect changes by diffing the current schema against the recorded
-        // snapshot.  Since #74 Phase 4 the gate no longer REFUSES breaking changes:
-        // every non-empty diff is recorded as a versioned hop (`from -> to`), and
-        // any residue the differ cannot prove a value for (a type change, a
-        // nullable→NOT-NULL narrowing, a required-add-without-default) is
-        // classified `Authored` and gets a `migrations/{id}/transform.rs` scaffold
-        // the operator fills in.  Purely-additive changes still get the cheap
-        // reopen-backfill fast path; anything that rewrites data-at-rest routes
-        // through the offline transformer (`forgedb migrate build` + `run`).
-        //
-        // The schema is the one the operator named. The CWD-relative
-        // `schema.forge` default that used to sit here died with the rest of
-        // the discovery (#335 §9): a defaulted schema path is the same defect
-        // wearing a different name — it picks an app out of the working
-        // directory and diffs *that* app's snapshot.
-        let schema_path = app.schema.clone();
-        ui::info(&format!(
-            "Auto-detecting schema changes ({})...",
-            schema_path.display()
-        ));
+    ui::info(&format!(
+        "Detecting schema changes ({})...",
+        schema_path.display()
+    ));
 
-        let new_src = std::fs::read_to_string(&schema_path).map_err(|e| {
-            CliError::Migration(format!(
-                "Failed to read schema '{}': {}",
-                schema_path.display(),
-                e
-            ))
-        })?;
+    let new_src = std::fs::read_to_string(&schema_path).map_err(|e| {
+        CliError::Migration(format!(
+            "Failed to read schema '{}': {}",
+            schema_path.display(),
+            e
+        ))
+    })?;
+    let dest_schema = forgedb_parser::Parser::new(&new_src)
+        .and_then(|mut p| p.parse())
+        .map_err(|e| CliError::Migration(format!("Failed to parse schema: {}", e)))?;
 
-        let changes = detect_schema_changes(&migrations_dir, &new_src)?;
+    let detected = detect_schema_changes(&migrations_dir, &new_src)?;
+    let mut changes = detected.changes;
+    let rename_proposals = detected.rename_proposals;
 
-        if changes.is_empty() {
-            // First run records a baseline snapshot with no prior schema to diff.
-            // Also record the full-schema snapshot for the CURRENT format version
-            // (the baseline is v1 for a fresh lineage) so the transformer (#74
-            // Phase 3) has every version's `.forge` in its range.
-            save_schema_snapshot(&migrations_dir, &new_src)?;
-            let lineage = forgedb_migrations::MigrationLineage::load(&migrations_dir)
-                .map_err(map_err)?;
-            forgedb_migrations::save_versioned_schema(
-                &migrations_dir,
-                lineage.current_schema_version(),
-                &new_src,
-            )
-            .map_err(map_err)?;
-            ui::success("No schema changes detected (snapshot up to date)");
-            return Ok(());
-        }
-
-        // Classify the diff.  `Authored` residue is the semantic mapping the differ
-        // cannot synthesize; a "breaking" change may still be fully `Auto` (drop a
-        // field/model, add `&unique`) — the row transform is provable, uniqueness
-        // is *validated* during replay.  The two classifications are independent.
-        let authored: Vec<_> = changes
-            .iter()
-            .filter(|c| c.hop_body_class() == HopBodyClass::Authored)
-            .collect();
-        let has_breaking = changes.iter().any(|c| c.is_breaking());
-        let authored_count = authored.len();
-
-        ui::info(&format!("Detected {} change(s)", changes.len()));
-        for change in &changes {
-            let marker = if change.hop_body_class() == HopBodyClass::Authored {
-                " [authored]".yellow()
-            } else {
-                "".normal()
-            };
-            println!("  • {}{}", change.description(), marker);
-        }
-
-        // Assign the serial version interlock (#74 Phase 2) from the committed
-        // lineage: this migration bumps the on-disk format version by one, so a
-        // regenerated app expects the new version and refuses a not-yet-migrated
-        // data dir (the Phase 1 open guard).  `EXPECTED_SCHEMA_VERSION` is derived
-        // from this lineage at `generate` time — never hand-edited (red line #8).
-        let lineage = forgedb_migrations::MigrationLineage::load(&migrations_dir)
-            .map_err(map_err)?;
-        let (from_version, to_version) = lineage.next_version_span();
-
-        let migration = MigrationGenerator::generate_versioned(
+    if changes.is_empty() {
+        // First run records a baseline snapshot with no prior schema to diff.
+        // Also record the full-schema snapshot for the CURRENT format version
+        // (the baseline is v1 for a fresh lineage) so the transformer (#74
+        // Phase 3) has every version's `.forge` in its range.
+        save_schema_snapshot(&migrations_dir, &new_src)?;
+        let lineage =
+            forgedb_migrations::MigrationLineage::load(&migrations_dir).map_err(map_err)?;
+        forgedb_migrations::save_versioned_schema(
             &migrations_dir,
+            lineage.current_schema_version(),
+            &new_src,
+        )
+        .map_err(map_err)?;
+        ui::success("No schema changes detected (snapshot up to date)");
+        return Ok(());
+    }
+
+    // Assign the serial version interlock (#74 Phase 2) from the committed
+    // lineage: this migration bumps the on-disk format version by one, so a
+    // regenerated app expects the new version and refuses a not-yet-migrated
+    // data dir (the Phase 1 open guard).  `EXPECTED_SCHEMA_VERSION` is derived
+    // from this lineage at `generate` time — never hand-edited (red line #8).
+    let lineage = forgedb_migrations::MigrationLineage::load(&migrations_dir).map_err(map_err)?;
+    let (from_version, to_version) = lineage.next_version_span();
+
+    // The id is allocated HERE, before the record exists, so an escape
+    // scaffold can be written under `migrations/<id>/` and hashed into the
+    // answer that the record's own checksum then covers (#374).
+    let migration_id = forgedb_migrations::Migration::next_id();
+
+    // Which language an escape transform would be written in — DERIVED from
+    // `[generate].targets`, never declared (gate 1 decision 2).
+    let governing = crate::project::govern(
+        opts.app.config.as_deref(),
+        crate::project::schema_dir(&schema_path),
+    )?;
+    let (internal_targets, _) = governing.config().resolved_targets()?;
+    let escape_language = escape::language_for(&internal_targets);
+
+    // EVERY answer is resolved BEFORE the first write. `create` writes the
+    // record, then the snapshot, then the versioned schema; prompting in the
+    // middle would add a window in which the operator answers, hits Ctrl-C, and
+    // leaves a partial lineage behind.
+    // The SAME boundary `forgedb project` asks past (#367): `ask::prompt()`
+    // returns `None` unless stdin and stderr are both terminals, output is not
+    // suppressed, and nothing has forbidden asking. `--no-auto` is #374's own
+    // veto on top of it.
+    let mut widget = if opts.no_auto {
+        None
+    } else {
+        crate::ask::prompt()
+    };
+    let reason = if opts.no_auto {
+        "--no-auto"
+    } else {
+        crate::ask::Askability::detect().reason()
+    };
+    answers::resolve_rename_proposals(
+        &rename_proposals,
+        &mut changes,
+        widget.as_deref_mut(),
+    )?;
+    // A rename is PROPOSED by the differ and decided here (#374 decision 10).
+    // Resolved before the answers, because accepting one REPLACES a drop+add
+    // pair — and the add in that pair is itself unprovable, so asking about it
+    // first would ask a question the rename makes disappear.
+    ui::info(&format!("Detected {} change(s)", changes.len()));
+    for change in &changes {
+        let marker = if change.hop_body_class() == HopBodyClass::Authored {
+            " [needs an answer]".yellow()
+        } else {
+            "".normal()
+        };
+        println!("  • {}{}", change.description(), marker);
+    }
+
+    let scaffold = answers::resolve_answers(
+        &mut changes,
+        &dest_schema,
+        escape_language,
+        &migrations_dir,
+        &migration_id,
+        widget.as_deref_mut(),
+        reason,
+        (from_version, to_version),
+    )?;
+
+    let has_breaking = changes.iter().any(|c| c.is_breaking());
+    let authored_count = changes
+        .iter()
+        .filter(|c| c.hop_body_class() == HopBodyClass::Authored)
+        .count();
+
+    let migration = MigrationGenerator::write_migration(
+        &migrations_dir,
+        forgedb_migrations::Migration::with_id(
+            migration_id,
             opts.description,
-            changes.clone(),
+            changes,
             from_version,
             to_version,
-        )
+        ),
+    )
+    .map_err(map_err)?;
+    save_schema_snapshot(&migrations_dir, &new_src)?;
+    // Record the destination version's full-schema snapshot so the transformer
+    // (#74 Phase 3) can emit this version's typed structs for the range.
+    forgedb_migrations::save_versioned_schema(&migrations_dir, to_version, &new_src)
         .map_err(map_err)?;
-        save_schema_snapshot(&migrations_dir, &new_src)?;
-        // Record the destination version's full-schema snapshot so the transformer
-        // (#74 Phase 3) can emit this version's typed structs for the range.
-        forgedb_migrations::save_versioned_schema(&migrations_dir, to_version, &new_src)
-            .map_err(map_err)?;
 
-        // Scaffold an authored-transform stub for any `Authored` residue (#74 Phase
-        // 2/4).  Never clobbers a frozen body — an existing `transform.rs` is left
-        // untouched.
-        let scaffold = forgedb_migrations::scaffold_authored_body(&migrations_dir, &migration)
-            .map_err(map_err)?;
+    ui::success(&format!(
+        "Created migration: {} (format v{} → v{})",
+        migration.filename(),
+        from_version,
+        to_version
+    ));
+    println!("\n{}", MigrationGenerator::generate_report(&migration));
 
-        ui::success(&format!(
-            "Created migration: {} (format v{} → v{})",
-            migration.filename(),
-            from_version,
-            to_version
+    // ForgeDB's own files beside the author's transform: the host loop and one
+    // typed module per version in this hop. Always rewritten — a CLI upgrade
+    // must reach them, and the drift belongs in the author's `git diff`.
+    if scaffold.is_some() {
+        let from_schema = forgedb_migrations::load_versioned_schema(&migrations_dir, from_version)
+            .map_err(map_err)
+            .and_then(|src| {
+                forgedb_parser::Parser::new(&src)
+                    .and_then(|mut p| p.parse())
+                    .map_err(|e| {
+                        CliError::Migration(format!("committed schema v{from_version}: {e}"))
+                    })
+            })?;
+        escape::write_support_files(
+            &migrations_dir,
+            &migration.id,
+            escape_language,
+            &[(from_version, &from_schema), (to_version, &dest_schema)],
+        )?;
+    }
+
+    if let Some(path) = &scaffold {
+        ui::warning(&format!(
+            "Write your transform in {} — `forgedb migrate build` refuses this hop \
+             until its bytes differ from the scaffold ForgeDB just wrote.",
+            path.display()
         ));
-        println!("\n{}", MigrationGenerator::generate_report(&migration));
+    }
 
-        // A change needs the offline transformer when it rewrites data-at-rest:
-        // any `Authored` residue, or any breaking-but-`Auto` change (drop/unique).
-        // A purely-additive diff keeps the cheap reopen-backfill path.
-        let needs_transform = has_breaking || authored_count > 0;
-        if !needs_transform {
-            ui::info(
-                "Additive change: run `forgedb generate` and restart your app — existing \
-                 rows are backfilled with defaults on reopen (no data step needed).",
-            );
-        } else {
-            if let Some((path, created)) = &scaffold {
-                if *created {
-                    ui::warning(&format!(
-                        "Authored transform scaffolded at {} — fill in every TODO before building.",
-                        path.display()
-                    ));
-                } else {
-                    ui::info(&format!(
-                        "Authored transform already present at {} (left unchanged).",
-                        path.display()
-                    ));
-                }
-            }
-            print_migration_next_steps(&app.schema, from_version, to_version, authored_count > 0);
-        }
+    // A change needs the offline transformer when it rewrites data-at-rest.
+    // A purely-additive diff keeps the cheap reopen-backfill path.
+    if has_breaking || authored_count > 0 {
+        print_migration_next_steps(&app.schema, from_version, to_version, scaffold.is_some());
     } else {
-        // Manual migration - create empty template
-        ui::warning("Manual migration mode - you'll need to edit the migration file manually");
-
-        let migration = MigrationGenerator::generate(
-            migrations_dir,
-            opts.description,
-            vec![], // Empty changes
-        )
-        .map_err(map_err)?;
-
-        ui::success(&format!(
-            "Created migration template: {}",
-            migration.filename()
-        ));
-        ui::info("Edit the migration file to add your changes");
+        // CORRECTED (#374 gate 1's carried item). This message used to say
+        // "restart your app — existing rows are backfilled with defaults on
+        // reopen (no data step needed)", which describes a path this very
+        // command has just foreclosed: `next_version_span` bumps the serial for
+        // EVERY non-empty diff, `generate` bakes it, and the generated open
+        // guard PANICS on a mismatch. So a recorded migration always needs the
+        // transformer, however additive it is; the reopen backfill applies only
+        // to a schema edit with no recorded migration at all.
+        ui::info(
+            "Every change in this hop is provable, so no transform has to be written — \
+             but the on-disk format version still moved, and a regenerated app refuses a \
+             data dir that has not been migrated.",
+        );
+        print_migration_next_steps(&app.schema, from_version, to_version, false);
     }
 
     Ok(())
@@ -439,9 +549,11 @@ pub fn status(opts: MigrateStatusOptions) -> Result<()> {
 pub fn build(opts: MigrateBuildOptions) -> Result<()> {
     refuse_removed_flag(
         "--output",
-        opts.removed_output.as_ref(),
-        "Pass `--schema <app.forge>` instead: the transformer is emitted into that app's \
-         build-cache container as `transform-<from>-<to>/`, and the command prints the path.",
+        opts.removed_output.as_ref().map(|p| p.display().to_string()),
+        &cache_owns_the_build(
+            "Pass `--schema <app.forge>` instead: the transformer is emitted into that app's \
+             build-cache container as `transform-<from>-<to>/`, and the command prints the path.",
+        ),
     )?;
     let app = resolve_app(&opts.app)?;
     let kind = PackageKind::Transform {
@@ -687,9 +799,11 @@ fn run_transformer(bin: &Path, src: &Path, dest: &Path) -> Result<()> {
 pub fn run(opts: MigrateRunOptions) -> Result<()> {
     refuse_removed_flag(
         "--bin-dir",
-        opts.removed_bin_dir.as_ref(),
-        "Pass `--schema <app.forge> --from <F> --to <T>` instead: those name the exact \
-         cache member `migrate build` produced, which a directory alone cannot.",
+        opts.removed_bin_dir.as_ref().map(|p| p.display().to_string()),
+        &cache_owns_the_build(
+            "Pass `--schema <app.forge> --from <F> --to <T>` instead: those name the exact \
+             cache member `migrate build` produced, which a directory alone cannot.",
+        ),
     )?;
     let app = resolve_app(&opts.app)?;
     let kind = PackageKind::Transform {
@@ -732,9 +846,11 @@ pub fn run(opts: MigrateRunOptions) -> Result<()> {
 pub fn engine(opts: MigrateEngineOptions) -> Result<()> {
     refuse_removed_flag(
         "--output",
-        opts.removed_output.as_ref(),
-        "Pass `--schema <app.forge>` instead: the hop crate is emitted into that app's \
-         build-cache container as `engine-<from>-<to>/`, and the command prints the path.",
+        opts.removed_output.as_ref().map(|p| p.display().to_string()),
+        &cache_owns_the_build(
+            "Pass `--schema <app.forge>` instead: the hop crate is emitted into that app's \
+             build-cache container as `engine-<from>-<to>/`, and the command prints the path.",
+        ),
     )?;
 
     let Some((schema_version, from_engine)) = detect_src_versions(&opts.src)? else {
@@ -922,6 +1038,50 @@ pub fn emit_transform(from: u32, to: u32, _output: &Path, _force: bool) -> Resul
     )))
 }
 
+/// Refuse to build any hop in the range that has no answer (#374 step 6).
+///
+/// The classification and the file-level checks are
+/// `forgedb_migrations::hop_answer_status`; this is the CLI's half — the
+/// diagnostic, and the decision to check the whole range up front.
+///
+/// It runs before `emit_transform_crate` parses a schema, so a refused range
+/// leaves **nothing** in the cache member and never invokes cargo.
+fn refuse_unanswered_hops(
+    migrations_dir: &Path,
+    hops: &[forgedb_migrations::Migration],
+) -> Result<()> {
+    let mut lines = Vec::new();
+    for m in hops {
+        // A pre-#374 record is admitted by the legacy rule inside
+        // `hop_answer_status`; say so once, here, rather than letting the
+        // operator discover the format bump from a diff.
+        if m.record_version == 0 && !m.authored_changes().is_empty() {
+            ui::warning(&format!(
+                "Migration {} predates the answer format; its transform is read from \
+                 disk with no recorded answer to check it against. The next \
+                 `forgedb migrate create` records answers for the hops it detects.",
+                m.id
+            ));
+        }
+        if let Err(problems) = forgedb_migrations::hop_answer_status(migrations_dir, m) {
+            for p in problems {
+                lines.push(format!("  • [{} v{}→v{}] {p}", m.id, m.from_version, m.to_version));
+            }
+        }
+    }
+    if lines.is_empty() {
+        return Ok(());
+    }
+    Err(CliError::Migration(format!(
+        "this range cannot be built — {} change(s) in it have no answer:\n{}\n\n\
+         An answer is recorded at `migrate create` time, when you have the change in \
+         your head; it is not something `migrate build` can infer. Nothing was written \
+         to the build cache.",
+        lines.len(),
+        lines.join("\n"),
+    )))
+}
+
 /// Generate the transformer crate for a version range and write it into the
 /// app's cache container as `transform-<from>-<to>/` (#74 Phase 3, #335 §9).
 ///
@@ -954,6 +1114,14 @@ fn emit_transform_crate(app: &ResolvedApp, kind: &PackageKind) -> Result<()> {
         )));
     }
 
+    // #374 step 6 — REFUSE an unanswered hop, over the WHOLE range, before a
+    // line is generated and before cargo is ever invoked.
+    //
+    // Range-wide rather than per-hop: a range containing one unanswered hop
+    // cannot produce a correct migration, so failing at the first one after
+    // emitting the others would leave a half-written member in the cache.
+    refuse_unanswered_hops(&migrations_dir, &hop_migrations)?;
+
     // Parse each version's committed full schema (from..=to).  These own the
     // parsed ASTs the plan borrows, so they must outlive the plan.
     let mut parsed: Vec<(u32, forgedb_parser::Schema)> = Vec::new();
@@ -967,6 +1135,13 @@ fn emit_transform_crate(app: &ResolvedApp, kind: &PackageKind) -> Result<()> {
         parsed.push((v, schema));
     }
 
+    // The escape language a hop records, if any. Resolved for the WHOLE range
+    // before anything is generated (#374): an interpreter that is missing is
+    // missing whether or not the crate compiles, and learning it after a cargo
+    // build costs a compile to discover what a `--version` could have said.
+    let member = app.member(kind);
+    let mut escape_sources: Vec<(String, String)> = Vec::new();
+
     // Build one frozen hop plan per recorded migration in the range.
     let mut hops = Vec::new();
     for m in &hop_migrations {
@@ -976,9 +1151,22 @@ fn emit_transform_crate(app: &ResolvedApp, kind: &PackageKind) -> Result<()> {
             .expect("range parsed every version")
             .1;
         let model_ops = build_model_ops(&m.changes, dest_schema);
-        let authored_src = if m.authored_changes().is_empty() {
-            None
-        } else {
+        let language = escape_language_of(m);
+        // A `transform.rs` is read for exactly two records, and the second is
+        // decided by the RECORD VERSION rather than by the absence of a
+        // language.
+        //
+        // "No language recorded" is NOT the same fact as "written before #374":
+        // a current record whose only authored change was answered with a
+        // constant or a field copy also names no escape language, and that is
+        // the common case this issue creates. Keying on it demanded a
+        // `transform.rs` that was never scaffolded, for a hop that is fully
+        // answered.
+        let is_legacy = m.record_version == 0;
+        let authored_src = if language == Some(forgedb_migrations::EscapeLanguage::Rust)
+            || (is_legacy && !m.authored_changes().is_empty())
+        {
+            // Rust — embedded verbatim (C13).
             let p = forgedb_migrations::authored_body_path(&migrations_dir, &m.id);
             Some(std::fs::read_to_string(&p).map_err(|e| {
                 CliError::Migration(format!(
@@ -987,13 +1175,24 @@ fn emit_transform_crate(app: &ResolvedApp, kind: &PackageKind) -> Result<()> {
                     m.id, p, e
                 ))
             })?)
+        } else {
+            None
         };
+
+        let escape = match language {
+            Some(lang) if lang != forgedb_migrations::EscapeLanguage::Rust => Some(
+                stage_escape(app, &member, &migrations_dir, m, lang, &parsed, &mut escape_sources)?,
+            ),
+            _ => None,
+        };
+
         hops.push(HopPlan {
             from_version: m.from_version,
             to_version: m.to_version,
             migration_id: m.id.clone(),
             model_ops,
             authored_src,
+            escape,
         });
     }
 
@@ -1007,10 +1206,95 @@ fn emit_transform_crate(app: &ResolvedApp, kind: &PackageKind) -> Result<()> {
     let plan = TransformPlan { versions, hops };
 
     let package = app.package(kind);
-    let crate_out = TransformGenerator::generate(&plan, &package)
+    let mut crate_out = TransformGenerator::generate(&plan, &package)
         .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+    // The author's script and ForgeDB's support files ride the same emission as
+    // the crate's own sources, so they land under the member with everything
+    // else and are rewritten on every build.
+    crate_out.sources.extend(escape_sources);
 
     write_class_c_member(app, kind, &crate_out)
+}
+
+/// The one escape language a migration's answers name, if any (#374).
+///
+/// Every escape in one migration shares one file and therefore one language —
+/// `resolve_answers` writes them that way. Reading the first is enough, and
+/// disagreement is impossible by construction rather than by convention.
+fn escape_language_of(m: &forgedb_migrations::Migration) -> Option<forgedb_migrations::EscapeLanguage> {
+    use forgedb_migrations::Answer;
+    m.changes.iter().find_map(|c| match c.answer() {
+        Some(Answer::Escape { language, .. }) => Some(*language),
+        _ => None,
+    })
+}
+
+/// Regenerate ForgeDB's support files, copy the author's script into the cache
+/// member, and resolve the interpreter that will run it (#374 step 12).
+///
+/// The **copy** is what makes `migrate run` execute exactly what `migrate build`
+/// checked: the hash comparison happened a moment ago against
+/// `migrations/<id>/transform.<ext>`, and a path baked to that file would run
+/// whatever is there at run time instead.
+fn stage_escape(
+    app: &ResolvedApp,
+    member: &Path,
+    migrations_dir: &Path,
+    m: &forgedb_migrations::Migration,
+    lang: forgedb_migrations::EscapeLanguage,
+    parsed: &[(u32, forgedb_parser::Schema)],
+    sources: &mut Vec<(String, String)>,
+) -> Result<forgedb_codegen::EscapeBridge> {
+    // Regenerated from the committed snapshots, in the author's own directory,
+    // so a CLI upgrade reaches them and the drift shows up in their `git diff`.
+    let versions: Vec<(u32, &forgedb_parser::Schema)> = parsed
+        .iter()
+        .filter(|(v, _)| *v == m.from_version || *v == m.to_version)
+        .map(|(v, s)| (*v, s))
+        .collect();
+    escape::write_support_files(migrations_dir, &m.id, lang, &versions)?;
+
+    // Everything in the migration's body dir rides into the member: the
+    // author's transform plus ForgeDB's host loop and typed modules, which the
+    // transform imports.
+    let body_dir = forgedb_migrations::migration_body_dir(migrations_dir, &m.id);
+    let rel_dir = format!("escape/{}", m.id);
+    for entry in std::fs::read_dir(&body_dir)
+        .map_err(|e| CliError::Migration(format!("reading {}: {e}", body_dir.display())))?
+        .flatten()
+    {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| CliError::Migration(format!("reading {}: {e}", path.display())))?;
+        sources.push((format!("{rel_dir}/{name}"), content));
+    }
+
+    let interpreter = crate::toolchain::resolve(
+        &app.governing.toolchain,
+        &app.project_root,
+        lang,
+    )?;
+    ui::detail(&format!(
+        "Escape runtime: {} ({}) — {}",
+        interpreter.name,
+        interpreter.version,
+        interpreter.program.display()
+    ));
+
+    Ok(forgedb_codegen::EscapeBridge {
+        program: interpreter.program.display().to_string(),
+        args: vec![
+            member
+                .join(&rel_dir)
+                .join(lang.transform_file())
+                .display()
+                .to_string(),
+        ],
+    })
 }
 
 /// Build the frozen per-model structural ops for one hop from its recorded schema
@@ -1019,7 +1303,7 @@ fn emit_transform_crate(app: &ResolvedApp, kind: &PackageKind) -> Result<()> {
 /// semantic residue is carried by the hop's embedded authored transform.
 fn build_model_ops(
     changes: &[SchemaChange],
-    dest_schema: &forgedb_parser::Schema,
+    _dest_schema: &forgedb_parser::Schema,
 ) -> Vec<forgedb_codegen::ModelOp> {
     use std::collections::BTreeMap;
 
@@ -1030,6 +1314,8 @@ fn build_model_ops(
         renames: Vec<(String, String)>,
         removes: Vec<String>,
         adds: Vec<(String, String)>,
+        copies: Vec<(String, String)>,
+        null_fills: Vec<(String, String)>,
     }
     let mut acc: BTreeMap<String, Acc> = BTreeMap::new();
 
@@ -1062,20 +1348,38 @@ fn build_model_ops(
                 model_name,
                 field_name,
                 nullable,
-                default_value,
+                default_json,
+                answer,
                 ..
             } => {
-                let json = add_field_default_json(
-                    dest_schema,
-                    model_name,
-                    field_name,
-                    *nullable,
-                    default_value.as_deref(),
-                );
-                acc.entry(model_name.clone())
-                    .or_default()
-                    .adds
-                    .push((field_name.clone(), json));
+                let entry = acc.entry(model_name.clone()).or_default();
+                match lower_fill(*nullable, default_json.as_deref(), answer.as_ref()) {
+                    Some(Fill::Json(json)) => entry.adds.push((field_name.clone(), json)),
+                    Some(Fill::Copy(from)) => entry.copies.push((from, field_name.clone())),
+                    // Nothing to emit: an unanswered required add. The key is
+                    // absent, so the destination decode fails NAMING the field
+                    // rather than accepting a substituted zero. Reachable only
+                    // if the refusal above was bypassed.
+                    None => {}
+                }
+            }
+            // A narrowing to NOT NULL: the answer is the fill for the existing
+            // `None`s, written over the key only when it is null.
+            SchemaChange::ChangeFieldNullability {
+                model_name,
+                field_name,
+                old_nullable: true,
+                new_nullable: false,
+                answer,
+            } => {
+                let entry = acc.entry(model_name.clone()).or_default();
+                match lower_fill(false, None, answer.as_ref()) {
+                    Some(Fill::Json(json)) => {
+                        entry.null_fills.push((field_name.clone(), json))
+                    }
+                    Some(Fill::Copy(from)) => entry.copies.push((from, field_name.clone())),
+                    None => {}
+                }
             }
             // #438 — named explicitly rather than absorbed by the catch-all
             // below, because "a new variant silently swallowed by `_ => {}`" is
@@ -1107,101 +1411,53 @@ fn build_model_ops(
             field_renames: a.renames,
             field_removes: a.removes,
             field_adds: a.adds,
+            field_copies: a.copies,
+            field_null_fills: a.null_fills,
         })
         .collect()
 }
 
-/// Compute the JSON default literal for an additive field, resolving the field's
-/// real type from the destination schema (#74 Phase 3).  A nullable add with no
-/// default is `null`; a defaulted add is encoded to match the field's serde
-/// representation (numbers for numeric types, quoted strings for string-repr
-/// types like `string`/`uuid`/`decimal`/enum).
-fn add_field_default_json(
-    dest_schema: &forgedb_parser::Schema,
-    model_name: &str,
-    field_name: &str,
+/// What a hop emits for one field's value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Fill {
+    /// A JSON literal inserted verbatim.
+    Json(String),
+    /// A per-row copy of another field of the same model.
+    Copy(String),
+}
+
+/// Lower the ONE source of a field's value into what the hop emits (#374).
+///
+/// The precedence is not arbitrary and there is deliberately no merging:
+///
+/// 1. the schema's `@default`, already lowered by
+///    `forgedb_codegen::default_fill` and recorded as a JSON literal;
+/// 2. the operator's recorded answer;
+/// 3. `null` for a nullable add — the only value a nullable field can be given
+///    without asking;
+/// 4. nothing. A required add with no default and no answer contributes no op,
+///    so the key is ABSENT and the destination decode fails with `missing
+///    field`. Reachable only if `refuse_unanswered_hops` was bypassed, which is
+///    exactly what scenario 15 does on purpose.
+///
+/// `Answer::Escape` returns `None` here too: an escape's value comes from the
+/// author's own transform, which runs after these structural ops.
+pub fn lower_fill(
     nullable: bool,
-    default_value: Option<&str>,
-) -> String {
-    use forgedb_parser::FieldType;
-
-    // Resolve the (non-nullable) base type of the field from the dest schema.
-    fn base(ft: &FieldType) -> &FieldType {
-        match ft {
-            FieldType::Nullable(inner) => base(inner),
-            other => other,
-        }
+    default_json: Option<&str>,
+    answer: Option<&forgedb_migrations::Answer>,
+) -> Option<Fill> {
+    use forgedb_migrations::Answer;
+    if let Some(j) = default_json {
+        return Some(Fill::Json(j.to_string()));
     }
-    let ftype = dest_schema
-        .models
-        .iter()
-        .find(|m| m.name == model_name)
-        .and_then(|m| m.fields.iter().find(|f| f.name == field_name))
-        .map(|f| base(&f.field_type));
-
-    let quote_str = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string());
-
-    match default_value {
-        None => {
-            if nullable {
-                return "null".to_string();
-            }
-            // Non-null add with no default is Authored residue, not Auto — but be
-            // defensive: emit a type-zero so a mis-tagged hop still compiles.
-            match ftype {
-                Some(FieldType::Bool) => "false".to_string(),
-                Some(FieldType::F64) => "0.0".to_string(),
-                Some(
-                    FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64
-                    | FieldType::Timestamp(_),
-                ) => "0".to_string(),
-                // #238: an inline `string(N)` is a `String` in the generated
-                // struct, so its type-zero is the empty string like any other.
-                // (`string(N!)` would reject `""` at write, but this arm is
-                // defensive residue for a mis-tagged hop, not a real default.)
-                Some(FieldType::String | FieldType::StringN { .. } | FieldType::Bytes(_)) => {
-                    "\"\"".to_string()
-                }
-                _ => "null".to_string(),
-            }
-        }
-        Some(d) => match ftype {
-            Some(FieldType::Bool) => {
-                if d == "true" || d == "false" {
-                    d.to_string()
-                } else {
-                    "false".to_string()
-                }
-            }
-            Some(FieldType::F64) => {
-                if d.parse::<f64>().is_ok() {
-                    d.to_string()
-                } else {
-                    "0.0".to_string()
-                }
-            }
-            Some(
-                FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64
-                | FieldType::Timestamp(_),
-            ) => {
-                if d.parse::<i64>().is_ok() {
-                    d.to_string()
-                } else {
-                    "0".to_string()
-                }
-            }
-            Some(FieldType::Json) => {
-                // A raw JSON default is used verbatim; otherwise quote it.
-                if serde_json::from_str::<serde_json::Value>(d).is_ok() {
-                    d.to_string()
-                } else {
-                    quote_str(d)
-                }
-            }
-            // string / uuid / decimal / enum: string serde repr → quote.
-            _ => quote_str(d),
-        },
+    match answer {
+        Some(Answer::Constant { json }) => return Some(Fill::Json(json.clone())),
+        Some(Answer::CopyField { field }) => return Some(Fill::Copy(field.clone())),
+        Some(Answer::Escape { .. }) => return None,
+        None => {}
     }
+    nullable.then(|| Fill::Json("null".to_string()))
 }
 
 /// Path of the recorded schema snapshot (the last schema a migration was created
@@ -1276,6 +1532,74 @@ fn type_dependencies(
     }
 }
 
+/// Project one AST type onto the differ's [`SimpleType`], with its
+/// **nullability removed** (#374 steps 1 and 2).
+///
+/// Two jobs, one walk, because they are the same walk.
+///
+/// **Nullability is stripped.** It is carried by `SimpleField.nullable` and by
+/// nothing else, and it reaches the AST three different ways — `T?`, `?Model`,
+/// `Struct?` — all three unwrapped here. Before this, the projected type kept
+/// the `Nullable` wrapper, so editing `views: u32` to `views: u32?` moved *two*
+/// projected values and the differ emitted a `ChangeFieldNullability` **and** a
+/// spurious `ChangeFieldType`. The second classifies `Authored`, so the safest
+/// edit in the language demanded a hand-written Rust transform for a type that
+/// did not change (gate 1 finding 6, decision 6).
+///
+/// **The result is structured, not a `Debug` string.** `format!("{:?}", ty)`
+/// could answer "same or not" and nothing else, which is all the *differ*
+/// needed and not what the *classifier* needs: `u32 -> u64` maps every value
+/// unchanged and there is nothing for a human to decide. This is the only place
+/// the AST is read for the differ, which is why `SimpleType` can live in
+/// `crates/migrations` with no parser dependency.
+///
+/// The match is **exhaustive on purpose** — no catch-all arm. A new
+/// `FieldType` variant must be classified here rather than silently becoming
+/// whatever the fallback said.
+fn to_simple_type(ty: &forgedb_parser::FieldType) -> forgedb_migrations::SimpleType {
+    use forgedb_migrations::SimpleType as S;
+    use forgedb_parser::{FieldType as F, RelationType as R, TimestampPrecision as P};
+    match ty {
+        F::Nullable(inner) => to_simple_type(inner),
+        F::OptionalStructType(name) => S::Struct(name.clone()),
+        F::Relation(R::OptionalReference(m)) => S::Relation(m.clone()),
+        F::U32 => S::U32,
+        F::U64 => S::U64,
+        F::I32 => S::I32,
+        F::I64 => S::I64,
+        F::F64 => S::F64,
+        F::Bool => S::Bool,
+        F::String => S::Str,
+        F::StringN { chars, exact } => S::StrN {
+            chars: *chars as usize,
+            exact: *exact,
+        },
+        F::Bytes(n) => S::Bytes(*n),
+        F::Uuid => S::Uuid,
+        // The rank IS the quantum order (#254): coarser -> finer is a widening,
+        // finer -> coarser floors stored values.
+        F::Timestamp(P::Seconds) => S::Timestamp(0),
+        F::Timestamp(P::Millis) => S::Timestamp(1),
+        F::Timestamp(P::Micros) => S::Timestamp(2),
+        F::Json => S::Json,
+        F::Decimal => S::Decimal,
+        F::Enum(n) => S::Enum(n.clone()),
+        F::StructType(n) => S::Struct(n.clone()),
+        F::FixedArray(inner, n) => S::Array(Box::new(to_simple_type(inner)), *n),
+        F::Relation(R::RequiredReference(m)) => S::Relation(m.clone()),
+        // Filtered out by `is_storage_backed` before it reaches the differ; kept
+        // so this projection is TOTAL rather than needing a catch-all that would
+        // absorb a future variant silently.
+        F::Relation(R::OneToMany(m)) | F::Relation(R::ManyToMany(m)) => S::Collection(m.clone()),
+        // A component reference is virtual — it names a UI artifact, occupies no
+        // column, and has no structure the differ can reason about. Kept opaque
+        // rather than given a variant, which preserves exactly what it projected
+        // to before #374 (an unstructured `Debug` string) and keeps any change to
+        // one classified `Authored`.
+        F::Component(c) => S::Opaque(format!("component {c:?}")),
+    }
+}
+
 /// Project one AST field onto the differ's `SimpleField`, resolving its
 /// transitive enum/struct dependencies against `schema`.
 fn to_simple_field(
@@ -1287,13 +1611,10 @@ fn to_simple_field(
     type_dependencies(schema, &f.field_type, &mut seen, &mut depends_on);
     forgedb_migrations::SimpleField {
         name: f.name.clone(),
-        // Debug repr is a stable, consistent stringification for both
-        // sides of the diff — equality is all the differ needs.
-        //
-        // For an enum/struct field it carries only the NAME
-        // (`Enum("Status")`), which is exactly why `depends_on` below has
-        // to exist: the definition changing does not move this string.
-        field_type: format!("{:?}", f.field_type),
+        // For an enum/struct field this carries only the NAME
+        // (`enum Status`), which is exactly why `depends_on` below has to
+        // exist: the definition changing does not move this value.
+        ty: to_simple_type(&f.field_type),
         nullable: f.is_nullable(),
         unique: f.unique,
         indexed: f.indexed,
@@ -1408,7 +1729,7 @@ fn print_migration_next_steps(schema: &Path, from: u32, to: u32, has_authored: b
 fn detect_schema_changes(
     migrations_dir: &std::path::Path,
     new_src: &str,
-) -> Result<Vec<SchemaChange>> {
+) -> Result<forgedb_migrations::DiffResult> {
     let new_schema = forgedb_parser::Parser::new(new_src)
         .and_then(|mut p| p.parse())
         .map_err(|e| CliError::Migration(format!("Failed to parse schema: {}", e)))?;
@@ -1417,7 +1738,10 @@ fn detect_schema_changes(
     let snap = snapshot_path(migrations_dir);
     let Ok(old_src) = std::fs::read_to_string(&snap) else {
         // No prior snapshot — nothing to diff against (baseline recorded by caller).
-        return Ok(Vec::new());
+        return Ok(forgedb_migrations::DiffResult {
+            changes: Vec::new(),
+            rename_proposals: Vec::new(),
+        });
     };
     let old_schema = forgedb_parser::Parser::new(&old_src)
         .and_then(|mut p| p.parse())
@@ -1426,5 +1750,41 @@ fn detect_schema_changes(
         })?;
     let old_simple = to_simple_schema(&old_schema);
 
-    Ok(forgedb_migrations::SchemaDiffer::diff(&old_simple, &new_simple))
+    let mut diff = forgedb_migrations::SchemaDiffer::diff(&old_simple, &new_simple);
+    resolve_schema_defaults(&new_schema, &mut diff.changes);
+    Ok(diff)
+}
+
+/// Fill each `AddField`'s `default_json` from the destination field's
+/// `@default` directive (#374 step 4).
+///
+/// It runs **here, in the CLI**, and not in the differ, for the same reason
+/// `depends_on` is populated here (#438): `crates/migrations` is a pure
+/// comparison over its own value types and has no parser dependency, so it
+/// cannot see a directive's typed parameters — `SimpleConstraint` carries them
+/// stringified. The one definition of what a `@default` lowers to is
+/// `forgedb_codegen::default_fill`, and this is one of its two call sites; the
+/// other is the generated reopen backfill.
+fn resolve_schema_defaults(
+    dest_schema: &forgedb_parser::Schema,
+    changes: &mut [forgedb_migrations::SchemaChange],
+) {
+    for change in changes.iter_mut() {
+        let SchemaChange::AddField {
+            model_name,
+            field_name,
+            default_json,
+            ..
+        } = change
+        else {
+            continue;
+        };
+        *default_json = dest_schema
+            .models
+            .iter()
+            .find(|m| &m.name == model_name)
+            .and_then(|m| m.fields.iter().find(|f| &f.name == field_name))
+            .and_then(|f| forgedb_codegen::default_fill(dest_schema, f))
+            .map(|fill| fill.json_literal());
+    }
 }

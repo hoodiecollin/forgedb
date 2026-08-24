@@ -386,6 +386,66 @@ pub struct PlacementConfig {
 /// Top-level config struct.  An unknown top-level table is an error (#333) —
 /// a misspelled `[projekt]` would otherwise be ignored, identity would fall
 /// through to manifest detection or the path hash, and two projects could
+/// Where the interpreters ForgeDB *links to* live, and which versions are
+/// acceptable (#374 direction C).
+///
+/// # ForgeDB embeds no runtime
+///
+/// A migration transform written in TypeScript or Python runs on the runtime
+/// **the author already has installed** — no QuickJS, no CPython, no bundled
+/// interpreter. That makes locating it a config concern, and this is the table.
+///
+/// # It holds LOCATION AND VERSION ONLY
+///
+/// Which language a transform is written in is **derived from
+/// `[generate].targets`** and is never declared here (gate 1 decision 2): a
+/// project that generates a TypeScript SDK writes its transforms in TypeScript
+/// because that is the language it already chose, and a second declaration
+/// could only disagree with the first.
+///
+/// # `[toolchain]`, and why the name is a one-way door
+///
+/// `[runtime]` was taken and means something else entirely — replication,
+/// change-feed capacity, cascade depth. And because config parsing is
+/// `deny_unknown_fields`, **every already-released `forgedb` rejects a config
+/// carrying a table it does not know**. So this spelling ships once and forever:
+/// a project that adopts `[toolchain]` can no longer be built by an older CLI,
+/// and a rename later would strand every config that had adopted the first name.
+///
+/// ```toml
+/// [toolchain]
+/// bun    = { path = "/opt/homebrew/bin/bun", min_version = "1.1" }
+/// node   = { path = "/usr/local/bin/node",   min_version = "20" }
+/// python = { path = ".venv/bin/python",      min_version = "3.11" }
+/// ```
+///
+/// # Three explicit fields, not a map
+///
+/// A `HashMap<String, InterpreterConfig>` accepts **every** key even under
+/// `deny_unknown_fields`, so `pythn = { ... }` would parse and be silently
+/// ignored — a configuration that reads as applied and is not. Adding a fourth
+/// runtime later is an additive optional field.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ToolchainConfig {
+    pub bun: Option<InterpreterConfig>,
+    pub node: Option<InterpreterConfig>,
+    pub python: Option<InterpreterConfig>,
+}
+
+/// One interpreter: where it is, and the oldest version that will do.
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct InterpreterConfig {
+    /// Absolute, or relative to the **project root** — not the CWD, per the
+    /// #333/#361 rule that a relative path in a config resolves against the
+    /// tree the config governs. Absent means "resolve the bare name on `PATH`".
+    pub path: Option<String>,
+    /// The oldest acceptable `--version`, as a dotted prefix (`"1.1"`, `"20"`,
+    /// `"3.11"`). Absent means any version.
+    pub min_version: Option<String>,
+}
+
 /// silently merge through the very mechanism meant to be a compatibility
 /// feature.
 ///
@@ -414,6 +474,10 @@ pub struct ForgeConfig {
     pub wasm: WasmConfig,
     #[serde(default)]
     pub placement: PlacementConfig,
+    /// Where the interpreters a non-Rust migration transform runs on live
+    /// (#374). See [`ToolchainConfig`] — the name is a **one-way door**.
+    #[serde(default)]
+    pub toolchain: ToolchainConfig,
 }
 
 impl ForgeConfig {

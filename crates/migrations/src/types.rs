@@ -1,5 +1,83 @@
+use crate::diff::SimpleType;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+/// The migration-record format this build writes (#374).
+///
+/// `0` on a record written before #374 — it has no `answer` on any change and
+/// nothing could have recorded one, which is why the build-time refusal has a
+/// legacy arm rather than refusing every lineage already committed.
+pub const RECORD_VERSION: u32 = 1;
+
+/// What an author said existing rows should get for a change the differ could
+/// not prove. Recorded beside the change, in ForgeDB's own file.
+///
+/// # This is a compile-time input to generation
+///
+/// `migrate build` **lowers** an `Answer` into the emitted hop: a `Constant`
+/// becomes a JSON literal baked at a call site, a `CopyField` becomes a field
+/// read, an `Escape` becomes a baked `Command` spawn. It is never carried into
+/// generated code as data and never matched on at run time.
+///
+/// The temptation runs the other way and is one line: `Answer` is `Serialize`
+/// and `serde_json` is already a dependency of the emitted crate, so embedding
+/// the answer as a JSON constant and matching on it inside the hop would
+/// compile immediately and look tidy. That is the exact inversion of the
+/// generator identity — *which branch is taken* instead of *which code is
+/// emitted* — and
+/// `crates/codegen/tests/codegen_snapshots.rs::test_transform_generation_answers_are_lowered`
+/// asserts the identifier's absence for that reason, not for style.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Answer {
+    /// A literal, stored as the JSON the emitted hop inserts verbatim.
+    Constant { json: String },
+    /// Copy another field of the SAME model, whose resolved type is identical.
+    CopyField { field: String },
+    /// The author writes the transform; `language` decides what runs it.
+    Escape {
+        language: EscapeLanguage,
+        /// Relative to `migrations/<id>/`.
+        file: String,
+        /// `checksum::compute` of the scaffold ForgeDB wrote at create time.
+        ///
+        /// Content still equal to this means nothing was authored. The hash is
+        /// captured **once, at create**, and never recomputed at build: a
+        /// scaffold regenerated at build time reads as equivalent and is not —
+        /// any improvement to the scaffold text would make every
+        /// previously-authored file compare unequal to a scaffold that was
+        /// never written, and an author whose file happened to match the *new*
+        /// scaffold would be refused for no reason.
+        scaffold_checksum: String,
+    },
+}
+
+/// The language an [`Answer::Escape`] transform is written in.
+///
+/// **Derived from `[generate].targets`, never declared** (gate 1 decision 2).
+/// There is no config key that can disagree with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EscapeLanguage {
+    /// The advanced escape hatch: embedded verbatim into the hop (C13).
+    Rust,
+    TypeScript,
+    Python,
+}
+
+impl EscapeLanguage {
+    /// The scaffold's file extension.
+    pub fn extension(&self) -> &'static str {
+        match self {
+            EscapeLanguage::Rust => "rs",
+            EscapeLanguage::TypeScript => "ts",
+            EscapeLanguage::Python => "py",
+        }
+    }
+
+    /// The authored file's name inside `migrations/<id>/`.
+    pub fn transform_file(&self) -> String {
+        format!("transform.{}", self.extension())
+    }
+}
 
 /// Represents a change detected in a schema migration
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -12,9 +90,42 @@ pub enum SchemaChange {
     AddField {
         model_name: String,
         field_name: String,
-        field_type: String,
+        /// The **base** type (nullability is `nullable`), structured since #374
+        /// so the classifier can ask whether the value is provable. On disk it
+        /// is still a plain string — see [`SimpleType`].
+        field_type: SimpleType,
         nullable: bool,
-        default_value: Option<String>,
+        /// The **JSON literal** existing rows get, resolved from the
+        /// destination field's `@default` directive (#374 step 4). `None` when
+        /// the field declares no default, or declares one this build cannot
+        /// resolve — see `forgedb_codegen::default_fill`.
+        ///
+        /// This is the *schema's* answer and is distinct from
+        /// [`SchemaChange`]'s operator-supplied one: generated code knows a
+        /// `@default` and applies it in the reopen backfill, so an add carrying
+        /// one is not breaking. An operator's answer is known only to the
+        /// transformer, so an add carrying one IS.
+        ///
+        /// It replaces the never-populated `default_value`, which the differ set
+        /// to `None` at its one construction site and no other producer ever
+        /// touched (gate 1 finding 3) — a carrier that read as "the default, if
+        /// any" while always meaning "no".
+        ///
+        /// # The on-disk key stays `default_value`, and that is deliberate
+        ///
+        /// A migration record's checksum is the thing that says nobody edited
+        /// it, and it is computed over the record's own JSON. Renaming the key
+        /// would make every already-committed record re-serialize differently,
+        /// fail `verify_checksum`, and be **refused at load** with a message
+        /// about a file the user never touched. The Rust name says what the
+        /// field holds; the wire name is frozen because it is load-bearing.
+        #[serde(rename = "default_value")]
+        default_json: Option<String>,
+        /// The operator's answer for a required add the schema does not default
+        /// (#374). `None` on every record written before #374, and on a change
+        /// that needs no answer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answer: Option<Answer>,
     },
     /// A field was removed from a model
     RemoveField {
@@ -25,8 +136,11 @@ pub enum SchemaChange {
     ChangeFieldType {
         model_name: String,
         field_name: String,
-        old_type: String,
-        new_type: String,
+        old_type: SimpleType,
+        new_type: SimpleType,
+        /// The operator's answer for a re-encode the differ cannot prove (#374).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answer: Option<Answer>,
     },
     /// A field's nullability was changed
     ChangeFieldNullability {
@@ -34,6 +148,10 @@ pub enum SchemaChange {
         field_name: String,
         old_nullable: bool,
         new_nullable: bool,
+        /// The operator's fill value for the existing `None`s when a field
+        /// narrows to NOT NULL (#374).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answer: Option<Answer>,
     },
     /// A field was renamed
     RenameField {
@@ -308,24 +426,41 @@ impl SchemaChange {
     /// residue the differ genuinely cannot PROVE a value for is `Authored`.
     pub fn hop_body_class(&self) -> HopBodyClass {
         match self {
-            // Re-encoding a value from one type to another is semantic — the
-            // differ cannot know the mapping (e.g. `u32 -> string`, `string ->
-            // enum`), so the developer authors it.
-            SchemaChange::ChangeFieldType { .. } => HopBodyClass::Authored,
+            // Re-encoding a value from one type to another is semantic — UNLESS
+            // the change is a value-preserving widening, in which case every
+            // value maps to itself and there is nothing for a human to decide.
+            // `widens_to` is the one definition of that (#374 direction B); the
+            // fixture that motivated this issue demanded a hand-written Rust
+            // function for `u32 -> u64`.
+            SchemaChange::ChangeFieldType {
+                old_type, new_type, ..
+            } => {
+                if old_type.widens_to(new_type) {
+                    HopBodyClass::Auto
+                } else {
+                    HopBodyClass::Authored
+                }
+            }
             // Narrowing nullable -> NOT NULL needs a fill value for the existing
-            // `None`s; the differ has none to offer.
+            // `None`s; the differ has none to offer. The other direction (`T ->
+            // ?T`) is provable: every existing value is still itself, and the
+            // column simply gains a presence tag.
             SchemaChange::ChangeFieldNullability {
                 old_nullable: true,
                 new_nullable: false,
                 ..
             } => HopBodyClass::Authored,
-            // A newly-required field with no default has no value the differ can
-            // synthesize for existing rows.
+            SchemaChange::ChangeFieldNullability { .. } => HopBodyClass::Auto,
+            // A newly-required field has no value the differ can synthesize for
+            // existing rows — unless the destination schema declares one, in
+            // which case the answer is written down in the `.forge` and is the
+            // same value the generated reopen-backfill writes.
             SchemaChange::AddField {
                 nullable: false,
-                default_value: None,
+                default_json: None,
                 ..
             } => HopBodyClass::Authored,
+            SchemaChange::AddField { .. } => HopBodyClass::Auto,
             // #438: positional, so the answer depends on WHICH way the list
             // moved. Delegated to the one classifier — never re-derived here.
             SchemaChange::ChangeEnumVariants {
@@ -338,10 +473,59 @@ impl SchemaChange {
                 new_fields,
                 ..
             } => Self::struct_verdict(old_fields, new_fields).1,
-            // Everything else is provable structural/constant: additive nullable/
-            // defaulted adds (backfill), removes (omit), renames (name map), and
-            // index/constraint changes (identity row body).
-            _ => HopBodyClass::Auto,
+            // The provable structural residue, named one variant at a time.
+            //
+            // This match has NO `_ =>` arm, and that is the point (#374 step 3).
+            // The catch-all here used to be `Auto`, so any variant added later —
+            // #438's `ChangeEnumVariants` among them, had it landed a week later
+            // — was silently provable, and a dropped enum variant would have
+            // become a hop no human ever looked at. Adding a variant must now be
+            // a compile error until someone decides what it means.
+            SchemaChange::AddModel { .. }
+            | SchemaChange::RemoveModel { .. }
+            | SchemaChange::RemoveField { .. }
+            | SchemaChange::RenameField { .. }
+            | SchemaChange::RenameModel { .. }
+            | SchemaChange::AddIndex { .. }
+            | SchemaChange::RemoveIndex { .. }
+            | SchemaChange::AddUniqueConstraint { .. }
+            | SchemaChange::RemoveUniqueConstraint { .. }
+            | SchemaChange::AddCompositeIndex { .. }
+            | SchemaChange::RemoveCompositeIndex { .. }
+            | SchemaChange::AddConstraint { .. }
+            | SchemaChange::RemoveConstraint { .. } => HopBodyClass::Auto,
+        }
+    }
+
+    /// The recorded answer, for the three variants that can carry one (#374).
+    ///
+    /// One accessor rather than a match at every use site: "which variants can
+    /// be answered" is one fact, and the classifier that decides *whether* an
+    /// answer is needed ([`hop_body_class`](Self::hop_body_class)) already has
+    /// exactly one home.
+    pub fn answer(&self) -> Option<&Answer> {
+        match self {
+            SchemaChange::AddField { answer, .. }
+            | SchemaChange::ChangeFieldType { answer, .. }
+            | SchemaChange::ChangeFieldNullability { answer, .. } => answer.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Record an answer, returning `false` for a variant that cannot carry one.
+    ///
+    /// The bool is not decoration: a caller answering a change that has no slot
+    /// for the answer has misread the classifier, and dropping that on the floor
+    /// would produce a record that looks answered and is not.
+    pub fn set_answer(&mut self, value: Answer) -> bool {
+        match self {
+            SchemaChange::AddField { answer, .. }
+            | SchemaChange::ChangeFieldType { answer, .. }
+            | SchemaChange::ChangeFieldNullability { answer, .. } => {
+                *answer = Some(value);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -383,13 +567,23 @@ impl SchemaChange {
                 new_nullable: false,
                 ..
             } => true,
+            SchemaChange::ChangeFieldNullability { .. } => false,
             // M4: Adding a NOT NULL column without a default to a populated table is
             // breaking — existing rows have no value to fill in.
             SchemaChange::AddField {
                 nullable: false,
-                default_value: None,
+                default_json: None,
                 ..
             } => true,
+            SchemaChange::AddField { .. } => false,
+            // A rename moves the bytes: the model's directory name and the
+            // column's file name are both derived from the declared name, so a
+            // renamed field's data does NOT follow the name across a reopen. It
+            // needs the offline transformer exactly as a drop does, and calling
+            // it non-breaking sent the operator down the "additive — just
+            // reopen" path, which silently empties the column.
+            SchemaChange::RenameField { .. } => true,
+            SchemaChange::RenameModel { .. } => true,
             SchemaChange::RemoveUniqueConstraint { .. } => false, // Safe to remove constraints
             SchemaChange::AddUniqueConstraint { .. } => true,     // May fail if duplicates exist
             // #438: an append is benign at rest; every other shape re-maps
@@ -404,7 +598,17 @@ impl SchemaChange {
                 new_fields,
                 ..
             } => Self::struct_verdict(old_fields, new_fields).0,
-            _ => false,
+            // Non-breaking at rest, named one variant at a time. Like
+            // `hop_body_class` above this match has NO `_ =>` arm, and for the
+            // sharper of the two reasons: its catch-all was `false`, so a
+            // variant added later was silently declared safe for data at rest.
+            SchemaChange::AddModel { .. }
+            | SchemaChange::AddIndex { .. }
+            | SchemaChange::RemoveIndex { .. }
+            | SchemaChange::AddCompositeIndex { .. }
+            | SchemaChange::RemoveCompositeIndex { .. }
+            | SchemaChange::AddConstraint { .. }
+            | SchemaChange::RemoveConstraint { .. } => false,
         }
     }
 
@@ -444,6 +648,7 @@ impl SchemaChange {
                 field_name,
                 old_type,
                 new_type,
+                ..
             } => {
                 format!(
                     "Change type of '{}.{}' from {} to {} (⚠️  BREAKING)",
@@ -455,6 +660,7 @@ impl SchemaChange {
                 field_name,
                 old_nullable: _,
                 new_nullable,
+                ..
             } => {
                 let change = if *new_nullable {
                     "nullable"
@@ -661,6 +867,22 @@ pub struct Migration {
     /// never hand-edited).
     #[serde(default)]
     pub to_version: u32,
+    /// The record format this file was written in (#374). See
+    /// [`RECORD_VERSION`].
+    ///
+    /// Skipped when `0` so that a record written before #374 re-serializes
+    /// **byte-identically** and its stored checksum still verifies. Adding an
+    /// always-present field here would have made every already-committed
+    /// migration fail `verify_checksum` on the day this landed, with a message
+    /// about a file the user never touched.
+    #[serde(default, skip_serializing_if = "is_legacy_record_version")]
+    pub record_version: u32,
+}
+
+/// `true` for the pre-#374 record format, whose fields are omitted so the
+/// stored checksum still covers the same bytes.
+fn is_legacy_record_version(v: &u32) -> bool {
+    *v == 0
 }
 
 /// What a build can say about a migration file's stored checksum (#366).
@@ -694,20 +916,42 @@ impl Migration {
         from_version: u32,
         to_version: u32,
     ) -> Self {
-        let now = Utc::now();
-        let id = format!("{}", now.format("%Y%m%d%H%M%S"));
+        Self::with_id(Self::next_id(), description, changes, from_version, to_version)
+    }
 
+    /// Allocate the timestamp id a migration created **now** would carry.
+    ///
+    /// Split out of [`new_versioned`](Self::new_versioned) because of a real
+    /// chicken-and-egg (#374): an `Answer::Escape` scaffold lives at
+    /// `migrations/<id>/transform.<ext>` and its hash has to be *inside* the
+    /// record before the record's own checksum is computed. Allocating the id
+    /// inside the constructor made that ordering impossible, and getting it
+    /// wrong produces a record whose checksum does not cover its answers —
+    /// which loads fine, and silently permits editing them afterwards.
+    pub fn next_id() -> String {
+        format!("{}", Utc::now().format("%Y%m%d%H%M%S"))
+    }
+
+    /// Build a migration around an id allocated by [`next_id`](Self::next_id).
+    pub fn with_id(
+        id: String,
+        description: String,
+        changes: Vec<SchemaChange>,
+        from_version: u32,
+        to_version: u32,
+    ) -> Self {
         let mut migration = Migration {
-            id: id.clone(),
+            id,
             description,
-            created_at: now,
+            created_at: Utc::now(),
             changes,
             checksum: String::new(),
             from_version,
             to_version,
+            record_version: RECORD_VERSION,
         };
 
-        // Calculate checksum
+        // Calculate checksum — LAST, so it covers every answer already in place.
         migration.checksum = migration.calculate_checksum();
         migration
     }
@@ -717,6 +961,20 @@ impl Migration {
     /// residue must be authored + frozen before the transformer can be generated.
     ///
     /// [`Authored`]: HopBodyClass::Authored
+    /// Every change in this migration the differ could not prove AND that
+    /// carries no answer (#374).
+    ///
+    /// This is what "unanswered" means at the level of the record. The
+    /// file-level half — an `Answer::Escape` whose file is missing or still
+    /// byte-identical to the scaffold — is
+    /// [`hop_answer_status`](crate::hop_answer_status), which calls this.
+    pub fn unanswered(&self) -> Vec<&SchemaChange> {
+        self.changes
+            .iter()
+            .filter(|c| c.hop_body_class() == HopBodyClass::Authored && c.answer().is_none())
+            .collect()
+    }
+
     pub fn authored_changes(&self) -> Vec<&SchemaChange> {
         self.changes
             .iter()

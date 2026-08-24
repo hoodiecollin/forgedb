@@ -326,23 +326,29 @@ fn test_generate_check_mode() {
     );
 }
 
-/// #74 Phase 4: `migrate create --auto` diffs the schema against a recorded
-/// snapshot, records EVERY non-empty diff as a versioned hop, and classifies the
-/// hop body.  A purely-additive change (new nullable field) succeeds with the
-/// reopen-backfill fast-path advice; a change whose new-row value the differ
-/// cannot prove (a type change) succeeds too but is classified `Authored`, gets a
-/// `migrations/<id>/transform.rs` scaffold, and prints the `migrate up` next
-/// steps.  The old refuse-breaking gate is gone.  Hermetic: real binary, explicit
-/// cwd.
+/// `migrate create` detects by default, records what it can prove, and REFUSES
+/// what it cannot when there is nobody to ask (#374).
+///
+/// Three steps over one evolving app:
+///
+/// 1. a baseline records a snapshot with nothing to diff;
+/// 2. an additive nullable field is fully provable and is recorded;
+/// 3. a type change (`u32 -> string`) is NOT provable, and in a session with no
+///    terminal it is a hard error naming the field — not a scaffold of TODOs
+///    the operator discovers weeks later at `migrate build`.
+///
+/// Step 3 is the behaviour change #374 exists for, and the assertion that
+/// **nothing is written** is the load-bearing half: a refusal that still left a
+/// record behind would leave a lineage whose hop can never be built.
 #[test]
-fn test_migrate_auto_records_and_scaffolds_authored_hop() {
+fn test_migrate_create_records_the_provable_and_refuses_the_rest() {
     let temp_dir = setup_test_dir();
     let dir = temp_dir.path();
 
     let v1 = "Widget {\n  id: +uuid\n  sku: &string\n  qty: u32\n}\n";
     let v2_additive = "Widget {\n  id: +uuid\n  sku: &string\n  qty: u32\n  note: string?\n}\n";
-    // Breaking + Authored: `qty` changes u32 -> string (the differ cannot know the
-    // re-encoding, so the developer must author it).
+    // Not provable: `qty` changes u32 -> string and the differ cannot know the
+    // re-encoding.
     let v3_authored =
         "Widget {\n  id: +uuid\n  sku: &string\n  qty: string\n  note: string?\n}\n";
     fs::write(dir.join("v1.forge"), v1).unwrap();
@@ -351,68 +357,44 @@ fn test_migrate_auto_records_and_scaffolds_authored_hop() {
 
     // 1. Baseline records a snapshot with nothing to diff (succeeds, no migration).
     let out = forgedb_cmd(dir)
-        .args(["migrate", "create", "baseline", "--auto", "--schema", "v1.forge"])
+        .args(["migrate", "create", "baseline", "--schema", "v1.forge"])
         .output()
         .expect("run migrate baseline");
     assert!(out.status.success(), "baseline should succeed");
     assert!(dir.join("migrations/.schema-snapshot.forge").exists(), "snapshot recorded");
     assert!(dir.join("migrations/schemas/v1.forge").exists(), "baseline versioned schema recorded");
 
-    // 2. Additive (new nullable field) succeeds; the fast-path advice mentions
-    //    backfill-on-reopen, and the destination version schema is recorded.
+    // 2. Additive (new nullable field): provable, recorded, version bumped.
     let out = forgedb_cmd(dir)
-        .args(["migrate", "create", "add_note", "--auto", "--schema", "v2.forge"])
+        .args(["migrate", "create", "add_note", "--schema", "v2.forge"])
         .output()
         .expect("run migrate additive");
     assert!(out.status.success(), "additive migration should succeed");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("note"), "reports the added field: {stdout}");
-    assert!(
-        stdout.to_lowercase().contains("backfill"),
-        "additive prints the reopen fast-path advice: {stdout}"
-    );
     assert!(dir.join("migrations/schemas/v2.forge").exists(), "v2 versioned schema recorded");
 
-    // 3. A type change (u32 -> string) is now RECORDED (non-zero exit gone),
-    //    classified Authored, scaffolded, and prints the `migrate up` steps.
+    // 3. A type change with nobody to ask: refused, naming the field.
     let out = forgedb_cmd(dir)
-        .args(["migrate", "create", "qty_to_string", "--auto", "--schema", "v3.forge"])
+        .args(["migrate", "create", "qty_to_string", "--schema", "v3.forge"])
         .output()
         .expect("run migrate authored");
-    assert!(
-        out.status.success(),
-        "authored migration is recorded, not refused: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(combined.contains("[authored]"), "marks the authored hop: {combined}");
-    // `migrate up` was removed (#335 §9): the next steps name the two commands
-    // it wrapped, and both are now `--schema`-addressed.
     assert!(
-        !combined.contains("migrate up"),
-        "still teaches the removed `migrate up`: {combined}"
+        !out.status.success(),
+        "a change ForgeDB cannot prove must not be recorded unanswered: {combined}"
     );
     assert!(
-        combined.contains("migrate build") && combined.contains("migrate run"),
-        "does not print the build+run next steps: {combined}"
+        combined.contains("Widget.qty"),
+        "the refusal must name the field: {combined}"
     );
-    assert!(dir.join("migrations/schemas/v3.forge").exists(), "v3 versioned schema recorded");
-
-    // The authored scaffold was written under migrations/<id>/transform.rs.
-    let scaffolds: Vec<_> = fs::read_dir(dir.join("migrations"))
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_dir() && p.join("transform.rs").exists())
-        .collect();
-    assert_eq!(scaffolds.len(), 1, "exactly one authored-body scaffold written");
-    let body = fs::read_to_string(scaffolds[0].join("transform.rs")).unwrap();
     assert!(
-        body.contains("authored_transform") && body.contains("TODO"),
-        "scaffold is the fill-in-the-TODO authored transform: {body}"
+        !dir.join("migrations/schemas/v3.forge").exists(),
+        "a refused create must write NOTHING — a recorded v3 with no answer is a \
+         lineage whose hop can never be built"
     );
 }

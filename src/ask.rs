@@ -27,6 +27,20 @@
 //! writes to stdout by design (its warnings are part of `validate`'s report).
 //! A question is the same class of thing as an error: it must not enter a
 //! captured stdout, and `forgedb generate > build.log` must still show it.
+//!
+//! # A second consumer, and why it lives here (#374)
+//!
+//! `migrate create` asks a different *kind* of question — pick one of N, or
+//! yes/no — about a change the schema differ cannot prove a value for. That
+//! needs its own trait, because [`Asker`]'s [`Question`] is a closed two-variant
+//! enum about project identity and widening it would put migration questions in
+//! `project.rs`.
+//!
+//! What it must NOT have is its own **boundary**. [`Askability`] is the one
+//! definition of "may ForgeDB ask", and `s19b_terminal_detection_has_one_definition`
+//! enforces that by refusing a second `is_terminal()` anywhere in `src/`. So the
+//! second trait — [`Prompt`] — lives here, beside the first, reached only
+//! through [`prompt`] and only past the same predicate.
 
 use std::io::IsTerminal;
 use std::path::Path;
@@ -368,4 +382,258 @@ fn free_text(
         .unwrap_or_default();
     let typed = typed.trim().to_string();
     Ok((!typed.is_empty()).then_some(typed))
+}
+
+
+// ---------------------------------------------------------------------------
+// The second question kind: pick one of N, or yes/no (#374)
+// ---------------------------------------------------------------------------
+
+/// What an operator picked from a menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Choice {
+    /// The index of one of the offered options.
+    Index(usize),
+    /// Free text, when the menu offered an escape for it.
+    Free(String),
+}
+
+/// A menu and a yes/no, for the questions `migrate create` asks (#374).
+///
+/// Separate from [`Asker`] because that trait's [`Question`] is a closed enum
+/// about project identity; widening it would put migration questions in
+/// `project.rs`. It shares the *boundary* — see [`prompt`] — which is the part
+/// that must have one definition.
+///
+/// The seam is also what gives the interactive path a test at all: the migrate
+/// harness drives `forgedb` as a subprocess with piped stdio, so by
+/// construction it can only ever walk the non-interactive branch.
+/// [`ScriptedPrompt`] executes the other one with no pty anywhere.
+pub trait Prompt {
+    /// Offer `options` by number. `free` is the label for a free-text answer
+    /// when the menu admits one (`None` means it does not).
+    fn select(&mut self, question: &str, options: &[String], free: Option<&str>)
+    -> Result<Choice>;
+
+    /// A yes/no question. Deliberately has **no default**: a `[Y/n]` whose
+    /// Enter key silently means yes is how an operator agrees to something they
+    /// did not read.
+    fn confirm(&mut self, question: &str) -> Result<bool>;
+}
+
+/// The prompt for this invocation, or `None` when asking is not allowed.
+///
+/// The **only constructor of [`TerminalPrompt`]**, and it is gated by the same
+/// [`Askability`] that gates [`asker`] — one boundary, two question kinds.
+/// `None` rather than a never-asking implementation, because #374's caller has
+/// to say *why* it could not ask, in the error it raises instead.
+pub fn prompt() -> Option<Box<dyn Prompt>> {
+    let askability = Askability::detect();
+    trace(askability.reason());
+    askability
+        .may_ask()
+        .then(|| Box::new(TerminalPrompt) as Box<dyn Prompt>)
+}
+
+/// The terminal menu. Everything renders on **stderr**, like [`TerminalAsk`].
+///
+/// Reached only through [`prompt`], and only past [`Askability::may_ask`] — so
+/// nothing here re-checks whether asking is allowed, and nothing here may be
+/// constructed by a caller that skipped the check.
+pub struct TerminalPrompt;
+
+impl Prompt for TerminalPrompt {
+    fn select(
+        &mut self,
+        question: &str,
+        options: &[String],
+        free: Option<&str>,
+    ) -> Result<Choice> {
+        let term = dialoguer::console::Term::stderr();
+        let theme = dialoguer::theme::ColorfulTheme::default();
+
+        // A menu with no options is the free-text form: there is nothing to
+        // pick between, only something to type.
+        if options.is_empty() {
+            let label = free.unwrap_or("value");
+            let typed: String = dialoguer::Input::with_theme(&theme)
+                .with_prompt(format!("{question}\n{label}"))
+                .interact_text_on(&term)
+                .unwrap_or_default();
+            return Ok(Choice::Free(typed.trim().to_string()));
+        }
+
+        let mut items: Vec<String> = options.to_vec();
+        if free.is_some() {
+            items.push(FREE_TEXT.to_string());
+        }
+        let picked = cancelled(
+            dialoguer::Select::with_theme(&theme)
+                .with_prompt(question)
+                .items(&items)
+                .default(0)
+                .interact_on_opt(&term),
+        )?
+        // A cancelled menu is the first option rather than a third outcome:
+        // every menu #374 raises is answered before anything is written, and a
+        // "no answer" here would be indistinguishable from a non-interactive
+        // session that is supposed to have errored already.
+        .unwrap_or(0);
+
+        if free.is_some() && picked == items.len() - 1 {
+            let label = free.unwrap_or("value");
+            let typed: String = dialoguer::Input::with_theme(&theme)
+                .with_prompt(label)
+                .interact_text_on(&term)
+                .unwrap_or_default();
+            return Ok(Choice::Free(typed.trim().to_string()));
+        }
+        Ok(Choice::Index(picked))
+    }
+
+    fn confirm(&mut self, question: &str) -> Result<bool> {
+        let term = dialoguer::console::Term::stderr();
+        let theme = dialoguer::theme::ColorfulTheme::default();
+        Ok(cancelled(
+            dialoguer::Confirm::with_theme(&theme)
+                .with_prompt(question)
+                .default(false)
+                .interact_on_opt(&term),
+        )?
+        .unwrap_or(false))
+    }
+}
+
+/// The trailing item on a menu that admits free text.
+const FREE_TEXT: &str = "Type a value instead…";
+
+/// A scripted operator, for tests.
+///
+/// This is why #374's interactive path has tests at all. An exhausted script is
+/// an **error**, never a default: a test whose script ran out has asked a
+/// question it did not expect, and answering it silently would hide exactly
+/// that.
+pub struct ScriptedPrompt {
+    answers: std::collections::VecDeque<String>,
+    /// Every question asked, in order — so a test can assert on what the
+    /// operator was shown, not only on what came out the far end.
+    pub asked: Vec<String>,
+}
+
+impl ScriptedPrompt {
+    pub fn new<I: IntoIterator<Item = S>, S: Into<String>>(answers: I) -> Self {
+        Self {
+            answers: answers.into_iter().map(Into::into).collect(),
+            asked: Vec::new(),
+        }
+    }
+
+    /// True when every scripted answer was consumed.
+    pub fn is_exhausted(&self) -> bool {
+        self.answers.is_empty()
+    }
+
+    fn next(&mut self, question: &str) -> Result<String> {
+        match self.answers.pop_front() {
+            Some(a) => Ok(a),
+            None => Err(std::io::Error::other(format!(
+                "the scripted operator ran out of answers at: {question}"
+            ))
+            .into()),
+        }
+    }
+}
+
+impl Prompt for ScriptedPrompt {
+    fn select(
+        &mut self,
+        question: &str,
+        options: &[String],
+        free: Option<&str>,
+    ) -> Result<Choice> {
+        self.asked.push(question.to_string());
+        let answer = self.next(question)?;
+        if let Ok(n) = answer.parse::<usize>()
+            && (1..=options.len()).contains(&n)
+        {
+            return Ok(Choice::Index(n - 1));
+        }
+        if free.is_some() {
+            return Ok(Choice::Free(answer));
+        }
+        Err(std::io::Error::other(format!(
+            "scripted answer {answer:?} is not one of the {} options for: {question}",
+            options.len()
+        ))
+        .into())
+    }
+
+    fn confirm(&mut self, question: &str) -> Result<bool> {
+        self.asked.push(question.to_string());
+        let answer = self.next(question)?;
+        match answer.to_ascii_lowercase().as_str() {
+            "y" | "yes" => Ok(true),
+            "n" | "no" => Ok(false),
+            other => Err(std::io::Error::other(format!(
+                "scripted answer {other:?} is not y/n for: {question}"
+            ))
+            .into()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::*;
+
+    /// The menu is 1-based to the operator and 0-based to the caller.
+    #[test]
+    fn a_scripted_index_selects_that_option() {
+        let mut s = ScriptedPrompt::new(["2"]);
+        let opts = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(s.select("pick", &opts, None).unwrap(), Choice::Index(1));
+        assert_eq!(s.asked, vec!["pick".to_string()]);
+        assert!(s.is_exhausted());
+    }
+
+    #[test]
+    fn free_text_is_only_accepted_where_the_menu_offers_it() {
+        let opts = vec!["a".to_string()];
+        assert_eq!(
+            ScriptedPrompt::new(["hello"])
+                .select("pick", &opts, Some("a value"))
+                .unwrap(),
+            Choice::Free("hello".to_string())
+        );
+        assert!(
+            ScriptedPrompt::new(["hello"])
+                .select("pick", &opts, None)
+                .is_err(),
+            "a menu with no free-text escape must reject free text rather than \
+             quietly taking it"
+        );
+    }
+
+    /// An exhausted script errors. A test whose script ran out asked a question
+    /// it did not expect, and a default would hide exactly that.
+    #[test]
+    fn an_exhausted_script_is_an_error() {
+        let err = ScriptedPrompt::new(Vec::<String>::new())
+            .confirm("really?")
+            .unwrap_err();
+        assert!(err.to_string().contains("really?"), "{err}");
+    }
+
+    #[test]
+    fn confirm_accepts_only_yes_or_no() {
+        assert!(ScriptedPrompt::new(["y"]).confirm("q").unwrap());
+        assert!(ScriptedPrompt::new(["yes"]).confirm("q").unwrap());
+        assert!(!ScriptedPrompt::new(["n"]).confirm("q").unwrap());
+        assert!(!ScriptedPrompt::new(["NO"]).confirm("q").unwrap());
+        assert!(
+            ScriptedPrompt::new([""]).confirm("q").is_err(),
+            "Enter must not mean yes — that is how an operator agrees to \
+             something they did not read"
+        );
+    }
 }
