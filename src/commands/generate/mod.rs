@@ -433,7 +433,7 @@ pub fn run(options: GenerateOptions) -> Result<()> {
     // `<output>/database.rs` got — one value, two writes — never a second
     // generator invocation.
     if let Some(container) = &options.cache_container {
-        emit_cache_packages(container, &naming, &cache)?;
+        emit_cache_packages(container, &naming, &ctx.gen_config, &cache)?;
     }
 
     // Report results
@@ -1115,6 +1115,7 @@ pub use forgedb_types;\n";
 fn emit_cache_packages(
     container: &Path,
     naming: &AppNaming,
+    gen_config: &forgedb_codegen::GenConfig,
     cache: &CacheEmission,
 ) -> Result<()> {
     let Some(core_lib) = cache.core_lib.as_deref() else {
@@ -1127,12 +1128,22 @@ fn emit_cache_packages(
     let core_pkg = naming.package(&crate::naming::PackageKind::Core);
     let core_dir = container.join(crate::naming::PackageKind::Core.dir());
     fs::create_dir_all(core_dir.join("src"))?;
-    // utoipa is pinned iff this app emits a server (#335 §10): with the derive
-    // in `core` and its `#[openapi(components(schemas(...)))]` consumer in
-    // `server`, the orphan rule blocks supplying the impl from `server`.
+    // The manifest is rendered from THE SAME `GenConfig` that rendered
+    // `core_lib` (#445). `utoipa` is pinned iff `GenConfig::needs_utoipa` — the
+    // one condition — and that is also what put `use utoipa::ToSchema;` and the
+    // derives into the source this manifest compiles.
+    //
+    // It used to read `cache.api.is_some()`: "did the command I just ran emit an
+    // api". That is a DIFFERENT condition, and it disagrees for exactly the
+    // invocations that narrow — `generate rust` under `targets = ["all"]`, and
+    // `build --no-api` — emitting a `core` whose source names a crate its own
+    // manifest does not pin (`error[E0432]: unresolved import 'utoipa'`).
+    //
+    // The parameter that carried the divergent condition is gone: `cargo_toml`
+    // takes the config, so there is nothing here left to compute.
     fs::write(
         core_dir.join("Cargo.toml"),
-        forgedb_codegen::CorePackage::cargo_toml(&core_pkg, cache.api.is_some()),
+        forgedb_codegen::CorePackage::cargo_toml(&core_pkg, gen_config),
     )?;
     fs::write(core_dir.join("src/lib.rs"), core_lib)?;
     ui::detail(&format!("  ✓ {} (cache package)", core_dir.display()));
