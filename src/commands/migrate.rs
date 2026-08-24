@@ -1276,6 +1276,35 @@ fn type_dependencies(
     }
 }
 
+/// The field type with its **nullability removed** (#374 step 1).
+///
+/// Nullability is carried by `SimpleField.nullable` and by nothing else. It
+/// reaches the AST three different ways — `T?`, `?Model`, `Struct?` — and all
+/// three are unwrapped here so that the projected type is the *base* type on
+/// both sides of the diff.
+///
+/// # Why this is not cosmetic
+///
+/// Before this, the projected type was `format!("{:?}", field_type)` with the
+/// `Nullable` wrapper still on it. Editing `views: u32` to `views: u32?` then
+/// moved **two** projected values — `nullable` false→true *and* the type
+/// string `U32`→`Nullable(U32)` — so the differ emitted a
+/// `ChangeFieldNullability` **and** a spurious `ChangeFieldType`. The second is
+/// classified `Authored`, so one of the safest edits in the language demanded a
+/// hand-written Rust transform for a type that did not change (gate 1 finding
+/// 6, acceptance decision 6).
+fn base_field_type(ty: &forgedb_parser::FieldType) -> forgedb_parser::FieldType {
+    use forgedb_parser::{FieldType, RelationType};
+    match ty {
+        FieldType::Nullable(inner) => base_field_type(inner),
+        FieldType::OptionalStructType(name) => FieldType::StructType(name.clone()),
+        FieldType::Relation(RelationType::OptionalReference(m)) => {
+            FieldType::Relation(RelationType::RequiredReference(m.clone()))
+        }
+        other => other.clone(),
+    }
+}
+
 /// Project one AST field onto the differ's `SimpleField`, resolving its
 /// transitive enum/struct dependencies against `schema`.
 fn to_simple_field(
@@ -1293,7 +1322,11 @@ fn to_simple_field(
         // For an enum/struct field it carries only the NAME
         // (`Enum("Status")`), which is exactly why `depends_on` below has
         // to exist: the definition changing does not move this string.
-        field_type: format!("{:?}", f.field_type),
+        //
+        // Nullability is stripped (see `base_field_type`): it lives in
+        // `nullable` below, and carrying it in both places made one edit
+        // report as two changes.
+        field_type: format!("{:?}", base_field_type(&f.field_type)),
         nullable: f.is_nullable(),
         unique: f.unique,
         indexed: f.indexed,

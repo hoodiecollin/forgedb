@@ -266,10 +266,26 @@ impl SchemaDiffer {
     }
 
     /// A struct's on-disk layout as `(field name, field type)` in declaration order.
+    ///
+    /// The rendered type carries a trailing `?` for a nullable field. Since
+    /// #374 step 1 the projected `field_type` has its nullability **stripped**
+    /// (it lives in `SimpleField.nullable`), so without re-attaching it here
+    /// `Point` and `Point?` inside an inline struct would render identically —
+    /// and an optional struct member occupies a discriminant slot the required
+    /// one does not, so that edit moves every following field's offset. The one
+    /// place the two facts have to be recombined is the place the layout is
+    /// named.
     fn layout(fields: &[SimpleField]) -> Vec<(String, String)> {
         fields
             .iter()
-            .map(|f| (f.name.clone(), f.field_type.clone()))
+            .map(|f| {
+                let ty = if f.nullable {
+                    format!("{}?", f.field_type)
+                } else {
+                    f.field_type.clone()
+                };
+                (f.name.clone(), ty)
+            })
             .collect()
     }
 
