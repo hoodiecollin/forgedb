@@ -60,7 +60,7 @@ fn test_detect_added_field() {
             name: "User".to_string(),
             fields: vec![SimpleField {
                 name: "email".to_string(),
-                field_type: "string".to_string(),
+                ty: "string".parse().unwrap(),
                 nullable: false,
                 unique: false,
                 indexed: false,
@@ -86,7 +86,7 @@ fn test_detect_type_change() {
             name: "User".to_string(),
             fields: vec![SimpleField {
                 name: "age".to_string(),
-                field_type: "u32".to_string(),
+                ty: "u32".parse().unwrap(),
                 nullable: false,
                 unique: false,
                 indexed: false,
@@ -104,7 +104,7 @@ fn test_detect_type_change() {
             name: "User".to_string(),
             fields: vec![SimpleField {
                 name: "age".to_string(),
-                field_type: "u64".to_string(),
+                ty: "u64".parse().unwrap(),
                 nullable: false,
                 unique: false,
                 indexed: false,
@@ -137,7 +137,7 @@ fn test_detect_type_change() {
 fn plain_field(name: &str, ty: &str) -> SimpleField {
     SimpleField {
         name: name.to_string(),
-        field_type: ty.to_string(),
+        ty: ty.parse().unwrap(),
         nullable: false,
         unique: false,
         indexed: false,

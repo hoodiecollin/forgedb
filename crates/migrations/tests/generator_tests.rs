@@ -13,7 +13,7 @@ fn test_generate_and_load_migration() {
         SchemaChange::AddField {
             model_name: "User".to_string(),
             field_name: "email".to_string(),
-            field_type: "string".to_string(),
+            field_type: "string".parse().unwrap(),
             nullable: false,
             default_value: None,
         },
@@ -43,7 +43,7 @@ fn test_migration_report() {
         SchemaChange::AddField {
             model_name: "User".to_string(),
             field_name: "name".to_string(),
-            field_type: "string".to_string(),
+            field_type: "string".parse().unwrap(),
             nullable: false,
             default_value: None,
         },

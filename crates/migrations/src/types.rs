@@ -1,3 +1,4 @@
+use crate::diff::SimpleType;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -12,7 +13,10 @@ pub enum SchemaChange {
     AddField {
         model_name: String,
         field_name: String,
-        field_type: String,
+        /// The **base** type (nullability is `nullable`), structured since #374
+        /// so the classifier can ask whether the value is provable. On disk it
+        /// is still a plain string — see [`SimpleType`].
+        field_type: SimpleType,
         nullable: bool,
         default_value: Option<String>,
     },
@@ -25,8 +29,8 @@ pub enum SchemaChange {
     ChangeFieldType {
         model_name: String,
         field_name: String,
-        old_type: String,
-        new_type: String,
+        old_type: SimpleType,
+        new_type: SimpleType,
     },
     /// A field's nullability was changed
     ChangeFieldNullability {

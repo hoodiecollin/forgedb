@@ -1276,32 +1276,71 @@ fn type_dependencies(
     }
 }
 
-/// The field type with its **nullability removed** (#374 step 1).
+/// Project one AST type onto the differ's [`SimpleType`], with its
+/// **nullability removed** (#374 steps 1 and 2).
 ///
-/// Nullability is carried by `SimpleField.nullable` and by nothing else. It
-/// reaches the AST three different ways — `T?`, `?Model`, `Struct?` — and all
-/// three are unwrapped here so that the projected type is the *base* type on
-/// both sides of the diff.
+/// Two jobs, one walk, because they are the same walk.
 ///
-/// # Why this is not cosmetic
+/// **Nullability is stripped.** It is carried by `SimpleField.nullable` and by
+/// nothing else, and it reaches the AST three different ways — `T?`, `?Model`,
+/// `Struct?` — all three unwrapped here. Before this, the projected type kept
+/// the `Nullable` wrapper, so editing `views: u32` to `views: u32?` moved *two*
+/// projected values and the differ emitted a `ChangeFieldNullability` **and** a
+/// spurious `ChangeFieldType`. The second classifies `Authored`, so the safest
+/// edit in the language demanded a hand-written Rust transform for a type that
+/// did not change (gate 1 finding 6, decision 6).
 ///
-/// Before this, the projected type was `format!("{:?}", field_type)` with the
-/// `Nullable` wrapper still on it. Editing `views: u32` to `views: u32?` then
-/// moved **two** projected values — `nullable` false→true *and* the type
-/// string `U32`→`Nullable(U32)` — so the differ emitted a
-/// `ChangeFieldNullability` **and** a spurious `ChangeFieldType`. The second is
-/// classified `Authored`, so one of the safest edits in the language demanded a
-/// hand-written Rust transform for a type that did not change (gate 1 finding
-/// 6, acceptance decision 6).
-fn base_field_type(ty: &forgedb_parser::FieldType) -> forgedb_parser::FieldType {
-    use forgedb_parser::{FieldType, RelationType};
+/// **The result is structured, not a `Debug` string.** `format!("{:?}", ty)`
+/// could answer "same or not" and nothing else, which is all the *differ*
+/// needed and not what the *classifier* needs: `u32 -> u64` maps every value
+/// unchanged and there is nothing for a human to decide. This is the only place
+/// the AST is read for the differ, which is why `SimpleType` can live in
+/// `crates/migrations` with no parser dependency.
+///
+/// The match is **exhaustive on purpose** — no catch-all arm. A new
+/// `FieldType` variant must be classified here rather than silently becoming
+/// whatever the fallback said.
+fn to_simple_type(ty: &forgedb_parser::FieldType) -> forgedb_migrations::SimpleType {
+    use forgedb_migrations::SimpleType as S;
+    use forgedb_parser::{FieldType as F, RelationType as R, TimestampPrecision as P};
     match ty {
-        FieldType::Nullable(inner) => base_field_type(inner),
-        FieldType::OptionalStructType(name) => FieldType::StructType(name.clone()),
-        FieldType::Relation(RelationType::OptionalReference(m)) => {
-            FieldType::Relation(RelationType::RequiredReference(m.clone()))
-        }
-        other => other.clone(),
+        F::Nullable(inner) => to_simple_type(inner),
+        F::OptionalStructType(name) => S::Struct(name.clone()),
+        F::Relation(R::OptionalReference(m)) => S::Relation(m.clone()),
+        F::U32 => S::U32,
+        F::U64 => S::U64,
+        F::I32 => S::I32,
+        F::I64 => S::I64,
+        F::F64 => S::F64,
+        F::Bool => S::Bool,
+        F::String => S::Str,
+        F::StringN { chars, exact } => S::StrN {
+            chars: *chars as usize,
+            exact: *exact,
+        },
+        F::Bytes(n) => S::Bytes(*n),
+        F::Uuid => S::Uuid,
+        // The rank IS the quantum order (#254): coarser -> finer is a widening,
+        // finer -> coarser floors stored values.
+        F::Timestamp(P::Seconds) => S::Timestamp(0),
+        F::Timestamp(P::Millis) => S::Timestamp(1),
+        F::Timestamp(P::Micros) => S::Timestamp(2),
+        F::Json => S::Json,
+        F::Decimal => S::Decimal,
+        F::Enum(n) => S::Enum(n.clone()),
+        F::StructType(n) => S::Struct(n.clone()),
+        F::FixedArray(inner, n) => S::Array(Box::new(to_simple_type(inner)), *n),
+        F::Relation(R::RequiredReference(m)) => S::Relation(m.clone()),
+        // Filtered out by `is_storage_backed` before it reaches the differ; kept
+        // so this projection is TOTAL rather than needing a catch-all that would
+        // absorb a future variant silently.
+        F::Relation(R::OneToMany(m)) | F::Relation(R::ManyToMany(m)) => S::Collection(m.clone()),
+        // A component reference is virtual — it names a UI artifact, occupies no
+        // column, and has no structure the differ can reason about. Kept opaque
+        // rather than given a variant, which preserves exactly what it projected
+        // to before #374 (an unstructured `Debug` string) and keeps any change to
+        // one classified `Authored`.
+        F::Component(c) => S::Opaque(format!("component {c:?}")),
     }
 }
 
@@ -1316,17 +1355,10 @@ fn to_simple_field(
     type_dependencies(schema, &f.field_type, &mut seen, &mut depends_on);
     forgedb_migrations::SimpleField {
         name: f.name.clone(),
-        // Debug repr is a stable, consistent stringification for both
-        // sides of the diff — equality is all the differ needs.
-        //
-        // For an enum/struct field it carries only the NAME
-        // (`Enum("Status")`), which is exactly why `depends_on` below has
-        // to exist: the definition changing does not move this string.
-        //
-        // Nullability is stripped (see `base_field_type`): it lives in
-        // `nullable` below, and carrying it in both places made one edit
-        // report as two changes.
-        field_type: format!("{:?}", base_field_type(&f.field_type)),
+        // For an enum/struct field this carries only the NAME
+        // (`enum Status`), which is exactly why `depends_on` below has to
+        // exist: the definition changing does not move this value.
+        ty: to_simple_type(&f.field_type),
         nullable: f.is_nullable(),
         unique: f.unique,
         indexed: f.indexed,

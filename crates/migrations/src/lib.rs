@@ -48,7 +48,9 @@
 //! ## Detecting Schema Changes
 //!
 //! ```rust
-//! use forgedb_migrations::{SchemaDiffer, SimpleSchema, SimpleModel, SimpleField, SimpleConstraint};
+//! use forgedb_migrations::{
+//!     SchemaDiffer, SimpleSchema, SimpleModel, SimpleField, SimpleConstraint, SimpleType,
+//! };
 //!
 //! // Create schemas directly (no file loading at the diff level)
 //! let old_schema = SimpleSchema {
@@ -58,7 +60,7 @@
 //!             fields: vec![
 //!                 SimpleField {
 //!                     name: "id".to_string(),
-//!                     field_type: "uuid".to_string(),
+//!                     ty: SimpleType::Uuid,
 //!                     nullable: false,
 //!                     unique: false,
 //!                     indexed: false,
@@ -81,7 +83,7 @@
 //!             fields: vec![
 //!                 SimpleField {
 //!                     name: "id".to_string(),
-//!                     field_type: "uuid".to_string(),
+//!                     ty: SimpleType::Uuid,
 //!                     nullable: false,
 //!                     unique: false,
 //!                     indexed: false,
@@ -91,7 +93,7 @@
 //!                 },
 //!                 SimpleField {
 //!                     name: "email".to_string(),
-//!                     field_type: "string".to_string(),
+//!                     ty: SimpleType::Str,
 //!                     nullable: false,
 //!                     unique: false,
 //!                     indexed: false,
@@ -233,7 +235,7 @@ mod types;
 
 pub use diff::{
     SchemaDiffer, SimpleConstraint, SimpleEnum, SimpleField, SimpleModel, SimpleSchema,
-    SimpleStruct,
+    SimpleStruct, SimpleType,
 };
 pub use generator::MigrationGenerator;
 pub use lineage::{
