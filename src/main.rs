@@ -33,8 +33,21 @@ struct Cli {
 enum Commands {
     /// Initialize a new ForgeDB project
     Init {
-        /// Project name
+        /// Directory to scaffold (its last path component is the default id)
         project_name: String,
+
+        /// Project id, decoupled from the directory name
+        ///
+        /// `forgedb init apps/api --project-name storefront` scaffolds `apps/api`
+        /// and names the project `storefront`. The non-interactive twin of the
+        /// prompt: a scaffold whose directory name is already claimed needs a
+        /// different id, and CI cannot answer a question.
+        //
+        // Spelled explicitly because the field cannot BE `project_name` — that
+        // is the positional. The user-facing name is what the diagnostics print,
+        // and it is the one that matters.
+        #[arg(long = "project-name", value_name = "NAME")]
+        project_name_override: Option<String>,
 
         /// Use a template (blog, ecommerce, todo, blank)
         #[arg(short, long)]
@@ -715,6 +728,7 @@ fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Init {
             project_name,
+            project_name_override,
             template,
             rust,
             api_only,
@@ -722,6 +736,7 @@ fn run(cli: Cli) -> Result<()> {
             no_isolated,
         } => commands::init::run(commands::init::InitOptions {
             project_name,
+            project_name_override,
             template,
             rust,
             api_only,
