@@ -94,13 +94,24 @@ impl PyO3Generator {
     /// act with a different payoff, and the delivered filename moves with it.
     pub const EXTENSION_STEM: &str = "_forgedb_native";
 
-    /// The delivered filename of the extension module.
+    /// The suffix the delivered extension carries.
     ///
     /// `.abi3.so` on both supported hosts: the crate is built `abi3-py38`, and
     /// `.abi3.so` is in `importlib.machinery.EXTENSION_SUFFIXES` on macOS as well
     /// as on Linux. Cargo writes `lib<pkg>.dylib` / `lib<pkg>.so`, so the
     /// delivered name is always a RENAME — CPython will not import a `.dylib`.
-    pub const EXTENSION_FILE: &str = "_forgedb_native.abi3.so";
+    pub const EXTENSION_SUFFIX: &str = ".abi3.so";
+
+    /// The delivered filename of the extension module.
+    ///
+    /// **Composed, never spelled out.** A literal `"_forgedb_native.abi3.so"`
+    /// beside [`Self::EXTENSION_STEM`] is a second spelling of the stem, and the
+    /// two coming apart is exactly the `PyInit_<stem>` mismatch this constant
+    /// exists to prevent — invisible to `cargo build`, to `cargo check` and to
+    /// every snapshot, surfacing only at `import`.
+    pub fn extension_file() -> String {
+        format!("{}{}", Self::EXTENSION_STEM, Self::EXTENSION_SUFFIX)
+    }
 
     /// Generate the PyO3 wrapper (`pyo3/src/lib.rs`) for a schema.
     pub fn generate(schema: &Schema) -> Result<GeneratedCode> {
@@ -1317,7 +1328,7 @@ if _built != __fingerprint__:
     )
 
 "#,
-            file = Self::EXTENSION_FILE,
+            file = Self::extension_file(),
             stem = stem,
             fingerprint = fingerprint,
         );
@@ -1605,7 +1616,7 @@ User {
              same constant"
         );
         assert!(
-            PyO3Generator::EXTENSION_FILE.starts_with(PyO3Generator::EXTENSION_STEM),
+            PyO3Generator::extension_file().starts_with(PyO3Generator::EXTENSION_STEM),
             "the delivered filename must carry the stem, or `import` cannot find PyInit_"
         );
     }

@@ -42,7 +42,12 @@ pub struct Destination {
     /// The delivered name — **always a rename**. Cargo writes
     /// `lib<pkg>.dylib`/`.so`; CPython will not import a `.dylib` and Node
     /// requires a `.node`. Do not "simplify" this by copying the basename.
-    pub file: &'static str,
+    ///
+    /// Owned rather than `&'static str` so the pyo3 row can COMPOSE its name
+    /// from `PyO3Generator::EXTENSION_STEM`. A `&'static str` here forces a
+    /// literal, and a literal is a second spelling of the stem — which is the
+    /// `PyInit_<stem>` mismatch the constant exists to prevent.
+    pub file: String,
 }
 
 /// Where each package kind's artifacts go.
@@ -53,26 +58,26 @@ pub struct Destination {
 /// reaches nobody.
 ///
 /// The undelivered kinds are listed explicitly for the same reason: an absent
-/// arm and a `&[]` arm look identical to a reader and mean opposite things
+/// arm and an empty arm look identical to a reader and mean opposite things
 /// (*never considered* vs *verified to have no destination*).
-pub fn destinations_for(kind: &PackageKind) -> &'static [Destination] {
+pub fn destinations_for(kind: &PackageKind) -> Vec<Destination> {
     match kind {
         // The Node-API addon. `dlopen`ed by path, records no dependency on
         // itself, so the cdylib is safe to copy.
-        PackageKind::Napi => &[Destination {
+        PackageKind::Napi => vec![Destination {
             kind: PackageKind::Napi,
             target_kind: TargetKind::Cdylib,
             dir: "napi",
-            file: "forgedb.node",
+            file: "forgedb.node".to_string(),
         }],
         // The CPython extension. The name is not cosmetic: CPython resolves
         // `PyInit_<stem>` from the DELIVERED FILENAME, so this must agree with
         // the `#[pymodule]` function name — one constant, read by both.
-        PackageKind::Pyo3 => &[Destination {
+        PackageKind::Pyo3 => vec![Destination {
             kind: PackageKind::Pyo3,
             target_kind: TargetKind::Cdylib,
             dir: "pyo3",
-            file: forgedb_codegen::PyO3Generator::EXTENSION_FILE,
+            file: forgedb_codegen::PyO3Generator::extension_file(),
         }],
         // Two destinations from ONE artifact, and not a mistake: a project that
         // declares both `ffi` and `go` gets a self-contained copy in each. Do
@@ -86,18 +91,18 @@ pub fn destinations_for(kind: &PackageKind) -> &'static [Destination] {
         // library for C is deferred on #335's terms (an `@rpath/` install name
         // plus `-Wl,-rpath,@loader_path`, and a smoke test run WITH THE CACHE
         // DELETED — without that guard both legs stay green on the broken shape).
-        PackageKind::Ffi => &[
+        PackageKind::Ffi => vec![
             Destination {
                 kind: PackageKind::Ffi,
                 target_kind: TargetKind::Staticlib,
                 dir: "ffi",
-                file: GO_STATICLIB,
+                file: GO_STATICLIB.to_string(),
             },
             Destination {
                 kind: PackageKind::Ffi,
                 target_kind: TargetKind::Staticlib,
                 dir: "go",
-                file: GO_STATICLIB,
+                file: GO_STATICLIB.to_string(),
             },
         ],
         // `core` is an rlib every wrapper links inside the cache; `server` is a
@@ -105,10 +110,10 @@ pub fn destinations_for(kind: &PackageKind) -> &'static [Destination] {
         // in the same invocation that produced it, so the deploy path has no
         // window in which it could have moved); `wasm` is the browser replica,
         // excluded by the epic's own scope note.
-        PackageKind::Core | PackageKind::Server | PackageKind::Wasm => &[],
+        PackageKind::Core | PackageKind::Server | PackageKind::Wasm => Vec::new(),
         // Class C. Written by `migrate build` / `migrate engine`, built and run
         // inside one invocation, and never leaving the cache.
-        PackageKind::Transform { .. } | PackageKind::Engine { .. } => &[],
+        PackageKind::Transform { .. } | PackageKind::Engine { .. } => Vec::new(),
     }
 }
 
@@ -125,7 +130,7 @@ pub const GO_STATICLIB: &str = "libforgedb.a";
 ///
 /// Enumerated from the kinds that can appear in a report rather than from a
 /// second list: `destinations_for` is the one table, and this walks it.
-fn all_destinations() -> Vec<&'static Destination> {
+fn all_destinations() -> Vec<Destination> {
     [
         PackageKind::Core,
         PackageKind::Server,
@@ -209,7 +214,7 @@ pub fn run(output: &Path, report: &BuildReport) -> Result<Vec<DeliveredArtifact>
             )));
         }
 
-        let to = dir.join(dest.file);
+        let to = dir.join(&dest.file);
         std::fs::copy(&source.path, &to).map_err(|e| {
             CliError::Build(format!(
                 "failed to deliver {} to {}: {e}",

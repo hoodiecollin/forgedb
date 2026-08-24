@@ -323,9 +323,14 @@ impl FfiGenerator {
                 static VERSION: OnceLock<CString> = OnceLock::new();
                 VERSION
                     .get_or_init(|| {
-                        CString::new(env!("CARGO_PKG_VERSION")).unwrap_or_else(|_| {
-                            CString::new("0.0.0").unwrap()
-                        })
+                        // `CString::default()`, not a `"0.0.0"` literal. The
+                        // branch is unreachable (a cargo version holds no NUL),
+                        // and a hardcoded version literal in generated code is
+                        // exactly the token the #337 guard scans for — an empty
+                        // string also reads as "unknown" rather than as a real
+                        // version that happens to be zero.
+                        CString::new(env!("CARGO_PKG_VERSION"))
+                            .unwrap_or_else(|_| CString::default())
                     })
                     .as_ptr()
             }
