@@ -312,24 +312,41 @@ impl SchemaChange {
     /// residue the differ genuinely cannot PROVE a value for is `Authored`.
     pub fn hop_body_class(&self) -> HopBodyClass {
         match self {
-            // Re-encoding a value from one type to another is semantic — the
-            // differ cannot know the mapping (e.g. `u32 -> string`, `string ->
-            // enum`), so the developer authors it.
-            SchemaChange::ChangeFieldType { .. } => HopBodyClass::Authored,
+            // Re-encoding a value from one type to another is semantic — UNLESS
+            // the change is a value-preserving widening, in which case every
+            // value maps to itself and there is nothing for a human to decide.
+            // `widens_to` is the one definition of that (#374 direction B); the
+            // fixture that motivated this issue demanded a hand-written Rust
+            // function for `u32 -> u64`.
+            SchemaChange::ChangeFieldType {
+                old_type, new_type, ..
+            } => {
+                if old_type.widens_to(new_type) {
+                    HopBodyClass::Auto
+                } else {
+                    HopBodyClass::Authored
+                }
+            }
             // Narrowing nullable -> NOT NULL needs a fill value for the existing
-            // `None`s; the differ has none to offer.
+            // `None`s; the differ has none to offer. The other direction (`T ->
+            // ?T`) is provable: every existing value is still itself, and the
+            // column simply gains a presence tag.
             SchemaChange::ChangeFieldNullability {
                 old_nullable: true,
                 new_nullable: false,
                 ..
             } => HopBodyClass::Authored,
-            // A newly-required field with no default has no value the differ can
-            // synthesize for existing rows.
+            SchemaChange::ChangeFieldNullability { .. } => HopBodyClass::Auto,
+            // A newly-required field has no value the differ can synthesize for
+            // existing rows — unless the destination schema declares one, in
+            // which case the answer is written down in the `.forge` and is the
+            // same value the generated reopen-backfill writes.
             SchemaChange::AddField {
                 nullable: false,
                 default_value: None,
                 ..
             } => HopBodyClass::Authored,
+            SchemaChange::AddField { .. } => HopBodyClass::Auto,
             // #438: positional, so the answer depends on WHICH way the list
             // moved. Delegated to the one classifier — never re-derived here.
             SchemaChange::ChangeEnumVariants {
@@ -342,10 +359,27 @@ impl SchemaChange {
                 new_fields,
                 ..
             } => Self::struct_verdict(old_fields, new_fields).1,
-            // Everything else is provable structural/constant: additive nullable/
-            // defaulted adds (backfill), removes (omit), renames (name map), and
-            // index/constraint changes (identity row body).
-            _ => HopBodyClass::Auto,
+            // The provable structural residue, named one variant at a time.
+            //
+            // This match has NO `_ =>` arm, and that is the point (#374 step 3).
+            // The catch-all here used to be `Auto`, so any variant added later —
+            // #438's `ChangeEnumVariants` among them, had it landed a week later
+            // — was silently provable, and a dropped enum variant would have
+            // become a hop no human ever looked at. Adding a variant must now be
+            // a compile error until someone decides what it means.
+            SchemaChange::AddModel { .. }
+            | SchemaChange::RemoveModel { .. }
+            | SchemaChange::RemoveField { .. }
+            | SchemaChange::RenameField { .. }
+            | SchemaChange::RenameModel { .. }
+            | SchemaChange::AddIndex { .. }
+            | SchemaChange::RemoveIndex { .. }
+            | SchemaChange::AddUniqueConstraint { .. }
+            | SchemaChange::RemoveUniqueConstraint { .. }
+            | SchemaChange::AddCompositeIndex { .. }
+            | SchemaChange::RemoveCompositeIndex { .. }
+            | SchemaChange::AddConstraint { .. }
+            | SchemaChange::RemoveConstraint { .. } => HopBodyClass::Auto,
         }
     }
 
@@ -387,6 +421,7 @@ impl SchemaChange {
                 new_nullable: false,
                 ..
             } => true,
+            SchemaChange::ChangeFieldNullability { .. } => false,
             // M4: Adding a NOT NULL column without a default to a populated table is
             // breaking — existing rows have no value to fill in.
             SchemaChange::AddField {
@@ -394,6 +429,15 @@ impl SchemaChange {
                 default_value: None,
                 ..
             } => true,
+            SchemaChange::AddField { .. } => false,
+            // A rename moves the bytes: the model's directory name and the
+            // column's file name are both derived from the declared name, so a
+            // renamed field's data does NOT follow the name across a reopen. It
+            // needs the offline transformer exactly as a drop does, and calling
+            // it non-breaking sent the operator down the "additive — just
+            // reopen" path, which silently empties the column.
+            SchemaChange::RenameField { .. } => true,
+            SchemaChange::RenameModel { .. } => true,
             SchemaChange::RemoveUniqueConstraint { .. } => false, // Safe to remove constraints
             SchemaChange::AddUniqueConstraint { .. } => true,     // May fail if duplicates exist
             // #438: an append is benign at rest; every other shape re-maps
@@ -408,7 +452,17 @@ impl SchemaChange {
                 new_fields,
                 ..
             } => Self::struct_verdict(old_fields, new_fields).0,
-            _ => false,
+            // Non-breaking at rest, named one variant at a time. Like
+            // `hop_body_class` above this match has NO `_ =>` arm, and for the
+            // sharper of the two reasons: its catch-all was `false`, so a
+            // variant added later was silently declared safe for data at rest.
+            SchemaChange::AddModel { .. }
+            | SchemaChange::AddIndex { .. }
+            | SchemaChange::RemoveIndex { .. }
+            | SchemaChange::AddCompositeIndex { .. }
+            | SchemaChange::RemoveCompositeIndex { .. }
+            | SchemaChange::AddConstraint { .. }
+            | SchemaChange::RemoveConstraint { .. } => false,
         }
     }
 

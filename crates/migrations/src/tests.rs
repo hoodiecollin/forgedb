@@ -484,3 +484,155 @@ fn scenario_2_widenings_are_provable_and_everything_else_is_not() {
     assert!(!S::Decimal.widens_to(&S::F64));
     assert!(!S::Enum("A".into()).widens_to(&S::Str));
 }
+
+// ---------------------------------------------------------------------------
+// #374 step 3 — the provable set, and the two matches that decide it
+// ---------------------------------------------------------------------------
+
+/// The body of a `fn` in this crate's `types.rs`, **with every comment
+/// stripped**, from its signature to its closing brace at the same indent.
+///
+/// Stripping is not tidiness. Both matches below are heavily commented, and the
+/// comments *explain the wildcard that is no longer there* — so a guard that
+/// greps the raw text is satisfied by the prose describing the invariant it is
+/// supposed to enforce, and a well-commented file makes that worse rather than
+/// better. What is asserted on is only the code.
+fn code_of(fn_signature: &str) -> String {
+    let src = include_str!("types.rs");
+    let start = src
+        .find(fn_signature)
+        .unwrap_or_else(|| panic!("`{fn_signature}` is not in types.rs — did it get renamed?"));
+    // The function ends at the first line that is exactly the 4-space-indented
+    // closing brace (these are inherent-impl methods).
+    let rest = &src[start..];
+    let end = rest
+        .find("\n    }\n")
+        .unwrap_or_else(|| panic!("no closing brace found for `{fn_signature}`"));
+    rest[..end]
+        .lines()
+        .map(|l| match l.find("//") {
+            Some(i) => &l[..i],
+            None => l,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Neither classifier may carry a catch-all arm (#374 step 3, scenario 3).
+///
+/// `hop_body_class`'s wildcard was `Auto` and `is_breaking`'s was `false` — so
+/// **any** variant added to `SchemaChange` later was silently declared both
+/// provable and safe for data at rest. Both are exactly the wrong default:
+/// #438's `ChangeEnumVariants` would have made a dropped enum variant a hop no
+/// human ever looked at.
+///
+/// A structural guard rather than a runtime one because the property is a
+/// compile-time one. Verified by mutation: re-adding `_ => HopBodyClass::Auto`
+/// to `hop_body_class` makes this test RED, and deleting a named arm instead
+/// makes `cargo check` fail — which is the property itself.
+#[test]
+fn scenario_3_neither_classifier_has_a_catch_all_arm() {
+    for sig in [
+        "pub fn hop_body_class(&self) -> HopBodyClass {",
+        "pub fn is_breaking(&self) -> bool {",
+    ] {
+        let code = code_of(sig);
+        assert!(
+            !code.contains("_ =>"),
+            "`{sig}` has a catch-all arm again. Every `SchemaChange` variant must \
+             be classified deliberately; a wildcard makes the next variant \
+             silently provable (or silently safe). Body:\n{code}"
+        );
+    }
+}
+
+/// Scenario 2, at the classifier rather than at `widens_to`.
+///
+/// `widens_to` being right is necessary and not sufficient — the arm has to
+/// *call* it. Mutating `widens_to` proves the predicate works; this asserts it
+/// is reached from `hop_body_class`.
+#[test]
+fn scenario_2_the_classifier_calls_the_widening_table() {
+    use crate::SimpleType as S;
+    let change = |old: S, new: S| SchemaChange::ChangeFieldType {
+        model_name: "Post".into(),
+        field_name: "views".into(),
+        old_type: old,
+        new_type: new,
+    };
+
+    for (old, new) in [
+        (S::U32, S::U64),
+        (S::I32, S::I64),
+        (S::U32, S::I64),
+        (S::StrN { chars: 4, exact: false }, S::StrN { chars: 8, exact: false }),
+        (S::Timestamp(0), S::Timestamp(2)),
+    ] {
+        let c = change(old.clone(), new.clone());
+        assert_eq!(
+            c.hop_body_class(),
+            HopBodyClass::Auto,
+            "{old} -> {new} is value-preserving and must need no author"
+        );
+        // Still breaking: the bytes at rest change width, so the offline
+        // transformer is still the route. Provable and breaking are independent
+        // axes and this pins that they stayed independent.
+        assert!(c.is_breaking(), "{old} -> {new} still rewrites data at rest");
+    }
+
+    for (old, new) in [
+        (S::U64, S::U32),
+        (S::I32, S::U32),
+        (S::U64, S::I64),
+        (S::U32, S::F64),
+        (S::StrN { chars: 8, exact: false }, S::StrN { chars: 4, exact: false }),
+        (S::Timestamp(2), S::Timestamp(0)),
+        (S::Str, S::U32),
+        (S::Opaque("U32".into()), S::Opaque("U64".into())),
+    ] {
+        assert_eq!(
+            change(old.clone(), new.clone()).hop_body_class(),
+            HopBodyClass::Authored,
+            "{old} -> {new} is NOT value-preserving and must reach a human"
+        );
+    }
+}
+
+/// `T -> ?T` needs no author; `?T -> T` does.
+#[test]
+fn scenario_3b_widening_nullability_is_provable_and_narrowing_is_not() {
+    let n = |old: bool, new: bool| SchemaChange::ChangeFieldNullability {
+        model_name: "Post".into(),
+        field_name: "views".into(),
+        old_nullable: old,
+        new_nullable: new,
+    };
+    assert_eq!(n(false, true).hop_body_class(), HopBodyClass::Auto);
+    assert!(!n(false, true).is_breaking());
+    assert_eq!(n(true, false).hop_body_class(), HopBodyClass::Authored);
+    assert!(n(true, false).is_breaking());
+}
+
+/// A rename rewrites data at rest.
+///
+/// The model's directory name and the column's file name are both derived from
+/// the declared name, so a renamed field's bytes do not follow it across a
+/// reopen. Reporting a rename as non-breaking routed the operator to the
+/// "additive — just reopen" message, which silently empties the column.
+#[test]
+fn a_rename_is_breaking_even_though_it_needs_no_author() {
+    let f = SchemaChange::RenameField {
+        model_name: "Post".into(),
+        old_name: "views".into(),
+        new_name: "hits".into(),
+    };
+    assert!(f.is_breaking(), "a rename needs the offline transformer");
+    assert_eq!(f.hop_body_class(), HopBodyClass::Auto, "…but no human");
+
+    let m = SchemaChange::RenameModel {
+        old_name: "Post".into(),
+        new_name: "Article".into(),
+    };
+    assert!(m.is_breaking());
+    assert_eq!(m.hop_body_class(), HopBodyClass::Auto);
+}
