@@ -745,6 +745,7 @@ fn run(cli: Cli) -> Result<()> {
                 from,
                 to,
                 cache_container: Some(reserved.container.clone()),
+                in_tree: governing.rust_package(),
             })?;
             sync_after_emission(&reserved, declared.as_deref())?;
             Ok(())
@@ -843,6 +844,7 @@ fn run(cli: Cli) -> Result<()> {
                 // loaded config — `build` must bake what `generate` would (#361).
                 gen_config,
                 cache_container: Some(container),
+                in_tree: governing.rust_package(),
                 cache_project: Some(project_root),
                 plan_only: plan,
                 report,
@@ -890,6 +892,7 @@ fn run(cli: Cli) -> Result<()> {
                     config_targets,
                     gen_config,
                     cache_container: Some(container),
+                    in_tree: governing.rust_package(),
                 },
                 debounce,
                 clear,

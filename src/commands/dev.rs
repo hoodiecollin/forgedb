@@ -42,6 +42,14 @@ pub struct DevGenerate {
     pub gen_config: forgedb_codegen::GenConfig,
     /// The app's container in the build cache, reserved by the caller.
     pub cache_container: Option<PathBuf>,
+    /// Where the in-tree Rust package goes (#338), or `None` when the knob is
+    /// absent.
+    ///
+    /// Without it a watch-driven regeneration would refresh the mirror and the
+    /// cache while leaving the in-tree package stale — one command silently
+    /// emitting a different project state than the others, which is the defect
+    /// class #364 was.
+    pub in_tree: Option<PathBuf>,
 }
 
 /// Re-derive the cache workspace root after an emission.
@@ -78,6 +86,7 @@ fn regenerate(opts: &DevGenerate) -> Result<()> {
         from: None,
         to: None,
         cache_container: opts.cache_container.clone(),
+        in_tree: opts.in_tree.clone(),
     })
 }
 

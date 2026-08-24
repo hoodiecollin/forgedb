@@ -8,6 +8,8 @@ use forgedb_parser::Parser;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod in_tree;
+
 /// The `--sdk`/`--runtime`/`--replica` mode axis (#122). Orthogonal to the
 /// runtime/language axis (`python`, `node`, `bun`, `browser`): a target names a
 /// runtime, a mode names *how* to bind it.
@@ -62,6 +64,12 @@ pub struct GenerateOptions {
     /// root AFTER this returns, because a root rendered before emission lists
     /// the previous run's packages.
     pub cache_container: Option<PathBuf>,
+    /// Where the in-tree Rust package goes (#338), already resolved against the
+    /// **schema's** directory by `Governing::rust_package`.
+    ///
+    /// `None` means `[placement].rust_package` is absent — which is the opt-out,
+    /// and the only opt-out there is. Nothing is emitted and nothing changes.
+    pub in_tree: Option<PathBuf>,
 }
 
 /// Every app-derived name one `generate` invocation builds under (#335 §2).
@@ -434,6 +442,23 @@ pub fn run(options: GenerateOptions) -> Result<()> {
     // generator invocation.
     if let Some(container) = &options.cache_container {
         emit_cache_packages(container, &naming, &ctx.gen_config, &cache)?;
+    }
+
+    // The in-tree placement (#338). A SECOND DESTINATION for the package the
+    // cache emitter just wrote, never a second generator: both read
+    // `CorePackage::files` over the same memoized `core_lib`, so the two copies
+    // are byte-identical by construction.
+    //
+    // Keyed on `options.in_tree` alone, independent of whether a cache container
+    // was reserved: the two placements answer different questions and a project
+    // may want either, both, or neither.
+    if let (Some(dir), Some(core_lib)) = (options.in_tree.as_deref(), cache.core_lib.as_deref()) {
+        in_tree::emit(
+            dir,
+            &naming.package(&crate::naming::PackageKind::Core),
+            &ctx.gen_config,
+            core_lib,
+        )?;
     }
 
     // Report results
