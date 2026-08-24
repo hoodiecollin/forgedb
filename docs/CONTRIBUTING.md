@@ -610,8 +610,9 @@ Closes #123
 | **`test suite`** — tier 1 (`make test`) | PRs into `develop`/`main`, and pushes to both | **Yes**, on PRs |
 | Cycle-scope gate | PRs into `develop` | Yes |
 | Substrate outside-repo reclose | `main` | Yes |
+| Reclose under a foreign cargo workspace root | `main` | Yes |
 | `migrate_tests` vs the published substrate | `main` | Yes |
-| Go reclose | PRs touching the Go/FFI generators | Yes |
+| Go reclose | `main` | Yes |
 | Nightly ignored suite — tier 2 | schedule, against `develop` | Files an issue |
 
 Run tier 1 yourself before opening a PR — it is the same command CI runs:

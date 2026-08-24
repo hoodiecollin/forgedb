@@ -39,9 +39,9 @@
 # Toolchain matrix mirrors pypi.yml's same-arch convention: Rust (pinned 1.96 via
 # rust-toolchain.toml) + Go + `CGO_ENABLED=1` + a C compiler, Unix-only (Windows
 # is excluded across every channel — storage-native positional I/O + coordinator
-# Unix sockets; tracked in #209). Triggers only on PRs that touch the Go/FFI
-# generators (or this file) + manual dispatch — the generated binding can only
-# drift when those change.
+# Unix sockets; tracked in #209). For the trigger, see the next section: #402 made
+# this `main`-only and dropped the paths filter, and this paragraph used to claim
+# otherwise twenty lines above the rule that contradicts it.
 name: Go reclose
 
 # WHY THIS IS `main`-ONLY, AND WHY IT WAS RED FOR TWO WEEKS BEFORE ANYONE NOTICED (#402)
