@@ -14,8 +14,8 @@
 //!
 //! * **The decision** — [`Askability`], a pure predicate over four booleans.
 //!   Its truth table is a unit test, not something only a terminal can run.
-//! * **The widget** — reached *only* through [`asker`], and only past
-//!   [`Askability::may_ask`].
+//! * **The widget** — [`TerminalAsk`], reached *only* through [`asker`], and
+//!   only past [`Askability::may_ask`].
 //!
 //! [`Asker`] sits between them.  That seam is why the interactive path has a
 //! test at all: the existing harness drives `forgedb` as a subprocess with
@@ -138,16 +138,16 @@ pub fn is_forbidden() -> bool {
 /// The asker for this invocation: a real prompt at a terminal, [`NeverAsk`]
 /// anywhere else.
 ///
-/// **The only constructor of the terminal widget** — a structural guard
-/// asserts that, so a future call site cannot reach it past the boundary.
+/// **The only constructor of [`TerminalAsk`]** — a structural guard asserts
+/// that, so a future call site cannot reach the widget past the boundary.
 pub fn asker() -> Box<dyn Asker> {
     let askability = Askability::detect();
     trace(askability.reason());
-    // The widget does not exist yet, so every invocation declines — which is
-    // exactly today's behaviour, and is why this step changes none of it. The
-    // boundary is already live and already traced, which is what lets the
-    // asking path be built and proven before a terminal is ever involved.
-    Box::new(NeverAsk)
+    if askability.may_ask() {
+        Box::new(TerminalAsk)
+    } else {
+        Box::new(NeverAsk)
+    }
 }
 
 /// Append one reason line to `$FORGEDB_ASK_TRACE`, when it is set.
@@ -200,4 +200,167 @@ impl Asker for CommandConsent {
     fn confirm_edit(&self, _path: &Path) -> Result<bool> {
         Ok(true)
     }
+}
+
+// ---------------------------------------------------------------------------
+// The widget
+// ---------------------------------------------------------------------------
+
+/// The terminal prompt. **Everything renders on stderr.**
+///
+/// Deliberately unlike [`crate::ui`], which writes to stdout by design (its
+/// warnings are part of `validate`'s report). A question is the same class of
+/// thing as an error: it must not enter a captured stdout, and
+/// `forgedb generate > build.log` must still put it in front of the person
+/// running it.
+///
+/// This type is reached only through [`asker`], and only past
+/// [`Askability::may_ask`] — so nothing here has to re-check whether asking is
+/// allowed, and nothing here may be constructed by a caller that skipped the
+/// check.
+pub struct TerminalAsk;
+
+/// A cancelled prompt is a **decline**, not a distinct outcome.
+///
+/// `ESC` returns `Ok(None)`; `^C` returns an `Interrupted` io error after
+/// dialoguer has restored the terminal. Both mean "no answer", which is the same
+/// path a pipe takes: the unchanged diagnostic and the unchanged exit status.
+/// A real I/O failure is not swallowed.
+fn cancelled<T>(r: std::result::Result<Option<T>, dialoguer::Error>) -> Result<Option<T>> {
+    match r {
+        Ok(v) => Ok(v),
+        Err(dialoguer::Error::IO(e)) if e.kind() == std::io::ErrorKind::Interrupted => Ok(None),
+        Err(dialoguer::Error::IO(e)) => Err(e.into()),
+    }
+}
+
+/// The trailing item on every select: type something that is not on the list.
+const OTHER: &str = "Enter a different name…";
+const CANCEL: &str = "Cancel (leave it unresolved)";
+
+impl Asker for TerminalAsk {
+    fn ask(&self, q: &Question) -> Result<Option<Answer>> {
+        let term = dialoguer::console::Term::stderr();
+        let theme = dialoguer::theme::ColorfulTheme::default();
+
+        match q {
+            Question::WhichName {
+                root, candidates, ..
+            } => {
+                // The computed facts go in FRONT of the question. Which manifest
+                // a name came from is the whole basis for choosing between them,
+                // and a bare list of names does not carry it.
+                let mut items: Vec<String> = candidates
+                    .iter()
+                    .map(|(manifest, name)| format!("{name}   (from {manifest})"))
+                    .collect();
+                items.push(OTHER.to_string());
+
+                let _ = term.write_line(&format!(
+                    "\n{} names this directory in {} ecosystem manifests, and they \
+                     disagree.\nPicking one silently would key a build cache on a \
+                     guess you never saw.",
+                    root.display(),
+                    candidates.len()
+                ));
+
+                let Some(picked) = cancelled(
+                    dialoguer::Select::with_theme(&theme)
+                        .with_prompt("Which name is this project's?")
+                        .items(&items)
+                        .default(0)
+                        .interact_on_opt(&term),
+                )?
+                else {
+                    return Ok(None);
+                };
+
+                let name = match candidates.get(picked) {
+                    Some((_, name)) => name.clone(),
+                    None => match free_text(&term, &theme)? {
+                        Some(n) => n,
+                        None => return Ok(None),
+                    },
+                };
+                Ok(Some(Answer::Name(name)))
+            }
+
+            Question::Collision {
+                id,
+                held_by,
+                holder_exists,
+                ..
+            } => {
+                let _ = term.write_line(&format!(
+                    "\nThe project id {id:?} is already claimed by {}.",
+                    held_by.display()
+                ));
+
+                // The offered ANSWERS differ by liveness, which is exactly why
+                // this decision cannot be a flag: whether the holding root still
+                // exists is a fact about the filesystem the user cannot know
+                // when they type the command.
+                let mut items = Vec::new();
+                if !*holder_exists {
+                    let _ = term.write_line(
+                        "That path no longer exists. Nothing removes a claim, so this                          is very likely this project colliding with its own record —                          but a missing path can also mean an unmounted volume, which                          is exactly when taking the id over would be wrong.",
+                    );
+                    items.push("Take over the claim (keep this project's name)".to_string());
+                } else {
+                    let _ = term.write_line(
+                        "That path still exists, so this is a real collision: two                          projects sharing an id would share one build cache, one                          lockfile and one target directory.",
+                    );
+                }
+                items.push(OTHER.to_string());
+                items.push(CANCEL.to_string());
+
+                let Some(picked) = cancelled(
+                    dialoguer::Select::with_theme(&theme)
+                        .with_prompt("How should this be resolved?")
+                        .items(&items)
+                        .default(0)
+                        .interact_on_opt(&term),
+                )?
+                else {
+                    return Ok(None);
+                };
+
+                match items[picked].as_str() {
+                    CANCEL => Ok(None),
+                    OTHER => Ok(free_text(&term, &theme)?.map(Answer::Name)),
+                    _ => Ok(Some(Answer::TakeOverClaim)),
+                }
+            }
+        }
+    }
+
+    fn confirm_edit(&self, path: &Path) -> Result<bool> {
+        let term = dialoguer::console::Term::stderr();
+        let theme = dialoguer::theme::ColorfulTheme::default();
+        let _ = term.write_line(&format!(
+            "\n{} already exists, and ForgeDB did not write it.",
+            path.display()
+        ));
+        // Defaulting to NO. A config in someone else's repository is not a file
+        // to edit on a keystroke that was aimed at the previous question.
+        Ok(cancelled(
+            dialoguer::Confirm::with_theme(&theme)
+                .with_prompt("Record `[project].name` there, preserving its formatting?")
+                .default(false)
+                .interact_on_opt(&term),
+        )?
+        .unwrap_or(false))
+    }
+}
+
+fn free_text(
+    term: &dialoguer::console::Term,
+    theme: &dialoguer::theme::ColorfulTheme,
+) -> Result<Option<String>> {
+    let typed: String = dialoguer::Input::with_theme(theme)
+        .with_prompt("Project name")
+        .interact_text_on(term)
+        .unwrap_or_default();
+    let typed = typed.trim().to_string();
+    Ok((!typed.is_empty()).then_some(typed))
 }

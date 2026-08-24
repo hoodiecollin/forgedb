@@ -411,3 +411,141 @@ fn s5_the_language_server_cannot_reach_an_asker() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// S19 — the widget is constructed in exactly one place
+// ---------------------------------------------------------------------------
+
+/// The boundary is only worth anything if it cannot be walked around.
+///
+/// `ask::asker()` is the one function that constructs `TerminalAsk`, and it is
+/// the one that consults `may_ask()`. A second construction site anywhere would
+/// be a prompt with no boundary in front of it — and it would look completely
+/// ordinary at the call site, which is why this is a guard rather than a
+/// convention.
+///
+/// Anchored on the **constructor expression**, not on a comment or a binding
+/// name (#281): a guard that matches a label passes when the work it labels has
+/// moved somewhere else.
+#[test]
+fn s19_the_widget_is_constructed_in_exactly_one_place() {
+    let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders = Vec::new();
+    for file in rust_files(&src_dir) {
+        if file.file_name().and_then(|n| n.to_str()) == Some("ask.rs") {
+            continue;
+        }
+        if std::fs::read_to_string(&file)
+            .unwrap_or_default()
+            .contains("TerminalAsk")
+        {
+            offenders.push(file.display().to_string());
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "the prompt widget must be reachable only through `ask::asker()`, which \
+         is what checks whether asking is allowed at all:\n  {}",
+        offenders.join("\n  ")
+    );
+
+    let ask_rs = std::fs::read_to_string(src_dir.join("ask.rs")).unwrap();
+    assert_eq!(
+        ask_rs.matches("Box::new(TerminalAsk)").count(),
+        1,
+        "exactly one construction site"
+    );
+    // …and it is inside `asker()`, past `may_ask()`.
+    let asker_fn = ask_rs
+        .split("pub fn asker()")
+        .nth(1)
+        .expect("asker() exists");
+    let body = &asker_fn[..asker_fn.find("\n}\n").expect("a function body")];
+    assert!(
+        body.contains("may_ask()") && body.contains("Box::new(TerminalAsk)"),
+        "the construction is gated by the boundary in the same function: {body}"
+    );
+}
+
+/// `std::io::IsTerminal` has exactly one call site, for the same reason.
+///
+/// A second one would be a second definition of "is this interactive" — and the
+/// two would agree until the day one of them grew a clause.
+#[test]
+fn s19b_terminal_detection_has_one_definition() {
+    let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders = Vec::new();
+    for file in rust_files(&src_dir) {
+        if file.file_name().and_then(|n| n.to_str()) == Some("ask.rs") {
+            continue;
+        }
+        if std::fs::read_to_string(&file)
+            .unwrap_or_default()
+            .contains("is_terminal()")
+        {
+            offenders.push(file.display().to_string());
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "terminal detection belongs to `Askability::detect()` alone:\n  {}",
+        offenders.join("\n  ")
+    );
+}
+
+fn rust_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(rust_files(&path));
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// S20 — the widget itself
+// ---------------------------------------------------------------------------
+
+/// **Tier 2, and manual, because no harness in this repo can allocate a pty.**
+///
+/// That is a limit, not a hope — and S1 (the exhaustive truth table) and S13
+/// (the whole resolution, driven by a scripted `Asker`) are what make it a small
+/// one: everything except the rendering is covered without a terminal.
+///
+/// Run by hand from a real terminal:
+///
+/// ```text
+/// mkdir -p /tmp/s20 && cd /tmp/s20 && git init -q .
+/// printf '[package]\nname = "backend"\nversion = "0.1.0"\n' > Cargo.toml
+/// printf '{ "name": "storefront" }\n' > package.json
+/// printf 'Note {\n  id: +uuid\n  body: string\n}\n' > schema.forge
+/// FORGEDB_HOME=/tmp/s20/.home forgedb generate rust > /tmp/s20/out.log
+/// ```
+///
+/// What to check, none of which tier 1 can see:
+///
+/// 1. The select lists each `manifest → name` plus a free-text entry.
+/// 2. It renders on **stderr** — the redirect above captures stdout, and the
+///    question must still be visible.
+/// 3. `ESC` and `^C` both produce the unchanged diagnostic and the unchanged
+///    exit status, rather than a third outcome.
+/// 4. Answering writes `forgedb.toml`, and a second `forgedb generate` with the
+///    same command asks nothing.
+/// 5. `NO_COLOR=1` is honoured. `dialoguer` pulls `console`, which does its own
+///    terminal and `NO_COLOR`/`CLICOLOR` detection alongside `colored`'s. They
+///    can disagree — but only at a TTY, so tier 1 is blind to it by
+///    construction.
+#[test]
+#[ignore = "tier 2: needs a real pty; the procedure is in this test's doc comment"]
+fn s20_the_widget_renders_on_stderr_and_cancels_cleanly() {
+    // Deliberately empty. The value of this test is the recorded procedure
+    // above; an assertion here could only re-test what S1/S13/S19 already cover
+    // without a terminal, and would read as coverage it is not.
+}
