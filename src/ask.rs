@@ -303,12 +303,17 @@ impl Asker for TerminalAsk {
                 let mut items = Vec::new();
                 if !*holder_exists {
                     let _ = term.write_line(
-                        "That path no longer exists. Nothing removes a claim, so this                          is very likely this project colliding with its own record —                          but a missing path can also mean an unmounted volume, which                          is exactly when taking the id over would be wrong.",
+                        "That path no longer exists. Nothing removes a claim, so this \
+                         is very likely this project colliding with its own record — \
+                         but a missing path can also mean an unmounted volume, which \
+                         is exactly when taking the id over would be wrong.",
                     );
                     items.push("Take over the claim (keep this project's name)".to_string());
                 } else {
                     let _ = term.write_line(
-                        "That path still exists, so this is a real collision: two                          projects sharing an id would share one build cache, one                          lockfile and one target directory.",
+                        "That path still exists, so this is a real collision: two \
+                         projects sharing an id would share one build cache, one \
+                         lockfile and one target directory.",
                     );
                 }
                 items.push(OTHER.to_string());

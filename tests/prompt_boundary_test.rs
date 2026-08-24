@@ -623,6 +623,118 @@ fn s20_the_widget_renders_on_stderr_and_cancels_cleanly() {
     );
 }
 
+/// The other widget path: a dead claim, offered a take-over.
+///
+/// Tier 2 for the same reason as S20, and worth its own scenario because the
+/// *offered answers differ by holder liveness* — which is the sharpest statement
+/// of why this decision is not expressible as a flag, and is the branch a
+/// scripted `Asker` exercises without ever rendering.
+///
+/// It also asserts the rendered prose has no absurd whitespace run. That is not
+/// fussiness: these strings are the only user-facing text in the issue with no
+/// other assertion on their content, and a mangled multi-line literal renders
+/// perfectly plausibly to `cargo build` while reading as broken to a human.
+#[test]
+#[ignore = "tier 2: allocates a pty via script(1)"]
+fn s20b_a_dead_claim_is_offered_a_take_over_at_a_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let trace = tmp.path().join("ask.trace");
+    let base = tmp.path().canonicalize().unwrap();
+    let a = base.join("a");
+    std::fs::create_dir_all(a.join(".git")).unwrap();
+    write(&a.join("forgedb.toml"), "[project]\nname = \"moved\"\n");
+    write(&a.join("schema.forge"), SCHEMA);
+
+    let first = run_traced(
+        &a,
+        home.path(),
+        &trace,
+        &[
+            "generate",
+            "rust",
+            "--output",
+            base.join("gen1").to_str().unwrap(),
+        ],
+    );
+    assert!(first.status.success(), "{}", combined(&first));
+
+    // Move the project. Nothing tells the ledger.
+    let b = base.join("b");
+    std::fs::rename(&a, &b).unwrap();
+    std::fs::remove_file(&trace).unwrap();
+
+    let session = pty_run(
+        &b,
+        home.path(),
+        &trace,
+        "\n",
+        &format!(
+            "{BIN} generate rust --force --output {}",
+            base.join("gen2").display()
+        ),
+    );
+    assert_eq!(
+        trace_lines(&trace),
+        vec!["terminal".to_string()],
+        "no pty, no scenario:\n{session}"
+    );
+    assert!(
+        session.contains("no longer exists"),
+        "the terminal path says the holding root is gone:\n{session}"
+    );
+    assert!(
+        session.contains("Take over the claim"),
+        "…and offers the take-over, which a LIVE holder is never offered:\n{session}"
+    );
+    assert!(
+        session.contains("unmounted"),
+        "…carrying the caveat that made automatic reaping wrong:\n{session}"
+    );
+
+    // Rendered prose, not source shape: a collapsed multi-line literal compiles
+    // and renders as a wall of spaces.
+    for line in strip_ansi(&session).lines() {
+        assert!(
+            !line.trim_end().contains("        "),
+            "a rendered prompt line carries a whitespace run, which means a \
+             multi-line string literal lost its continuations: {line:?}"
+        );
+    }
+
+    // Accepting wrote the LEDGER and left the config alone.
+    assert_eq!(
+        std::fs::read_to_string(b.join("forgedb.toml")).unwrap(),
+        "[project]\nname = \"moved\"\n",
+        "a take-over never touches the project's config"
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.path().join("ledger/moved.claim"))
+            .unwrap()
+            .trim(),
+        b.to_string_lossy(),
+        "…and the ledger now points at us"
+    );
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // CSI and friends: skip until a final byte in @..~
+            for n in chars.by_ref() {
+                if ('@'..='~').contains(&n) {
+                    break;
+                }
+            }
+        } else if c != '\r' {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Run a shell command inside a real pty, feeding `input` to it.
 ///
 /// `script(1)` is the portable-enough way to get one: BSD/macOS takes the
