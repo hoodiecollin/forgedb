@@ -94,9 +94,27 @@ pub struct ModelOp {
     pub field_renames: Vec<(String, String)>,
     /// Removed field names (the key is dropped from the row).
     pub field_removes: Vec<String>,
-    /// `(field_name, json_default_literal)` additive fields — the default is a
-    /// JSON literal string the CLI computed from the dest field's type.
+    /// `(field_name, json_literal)` additive fields — the literal is the ONE
+    /// lowering `forgedb_codegen::default_fill` produced from the destination
+    /// field's `@default`, or the lowering of a recorded
+    /// `Answer::Constant` (#374).
+    ///
+    /// A required field with **neither** contributes NO entry, on purpose: the
+    /// key is then absent from the row and the destination decode fails with
+    /// `missing field`, naming it. Emitting a type-zero here instead is what
+    /// made an unanswered hop write `""` and exit 0.
     pub field_adds: Vec<(String, String)>,
+    /// `(source_field, destination_field)` per-row copies — the lowering of a
+    /// recorded `Answer::CopyField` (#374).
+    ///
+    /// A copy, not a constant: the value is read from **this row**, which is
+    /// what makes `slug = title` mean each row's own title rather than the
+    /// first one's.
+    pub field_copies: Vec<(String, String)>,
+    /// `(field_name, json_literal)` fills for a field narrowing to NOT NULL
+    /// (#374). Written over the key **only when it is null**, because the rows
+    /// that already have a value keep it.
+    pub field_null_fills: Vec<(String, String)>,
 }
 
 /// Whether a model participates in the copy loop: it must be id-bearing (its rows
@@ -297,9 +315,36 @@ impl TransformGenerator {
                         }
                     });
                 }
+                // Copies run BEFORE removes and adds: the source is named as
+                // it exists in the row after any rename, and may itself be a
+                // field this hop is dropping.
+                for (from, to) in &op.field_copies {
+                    ops.push(quote! {
+                        if let Some(__obj) = __j.as_object_mut() {
+                            if let Some(__v) = __obj.get(#from).cloned() {
+                                __obj.insert(#to.to_string(), __v);
+                            }
+                        }
+                    });
+                }
                 for f in &op.field_removes {
                     ops.push(quote! {
                         if let Some(__obj) = __j.as_object_mut() { __obj.remove(#f); }
+                    });
+                }
+                // A narrowing to NOT NULL replaces only the nulls; a row that
+                // already had a value keeps it, which a plain insert would
+                // overwrite.
+                for (name, json) in &op.field_null_fills {
+                    ops.push(quote! {
+                        if let Some(__obj) = __j.as_object_mut() {
+                            if __obj.get(#name).map(|v| v.is_null()).unwrap_or(true) {
+                                __obj.insert(
+                                    #name.to_string(),
+                                    serde_json::from_str(#json).unwrap(),
+                                );
+                            }
+                        }
                     });
                 }
                 for (name, json) in &op.field_adds {

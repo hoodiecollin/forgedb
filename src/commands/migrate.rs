@@ -922,6 +922,50 @@ pub fn emit_transform(from: u32, to: u32, _output: &Path, _force: bool) -> Resul
     )))
 }
 
+/// Refuse to build any hop in the range that has no answer (#374 step 6).
+///
+/// The classification and the file-level checks are
+/// `forgedb_migrations::hop_answer_status`; this is the CLI's half — the
+/// diagnostic, and the decision to check the whole range up front.
+///
+/// It runs before `emit_transform_crate` parses a schema, so a refused range
+/// leaves **nothing** in the cache member and never invokes cargo.
+fn refuse_unanswered_hops(
+    migrations_dir: &Path,
+    hops: &[forgedb_migrations::Migration],
+) -> Result<()> {
+    let mut lines = Vec::new();
+    for m in hops {
+        // A pre-#374 record is admitted by the legacy rule inside
+        // `hop_answer_status`; say so once, here, rather than letting the
+        // operator discover the format bump from a diff.
+        if m.record_version == 0 && !m.authored_changes().is_empty() {
+            ui::warning(&format!(
+                "Migration {} predates the answer format; its transform is read from \
+                 disk with no recorded answer to check it against. The next \
+                 `forgedb migrate create` records answers for the hops it detects.",
+                m.id
+            ));
+        }
+        if let Err(problems) = forgedb_migrations::hop_answer_status(migrations_dir, m) {
+            for p in problems {
+                lines.push(format!("  • [{} v{}→v{}] {p}", m.id, m.from_version, m.to_version));
+            }
+        }
+    }
+    if lines.is_empty() {
+        return Ok(());
+    }
+    Err(CliError::Migration(format!(
+        "this range cannot be built — {} change(s) in it have no answer:\n{}\n\n\
+         An answer is recorded at `migrate create` time, when you have the change in \
+         your head; it is not something `migrate build` can infer. Nothing was written \
+         to the build cache.",
+        lines.len(),
+        lines.join("\n"),
+    )))
+}
+
 /// Generate the transformer crate for a version range and write it into the
 /// app's cache container as `transform-<from>-<to>/` (#74 Phase 3, #335 §9).
 ///
@@ -953,6 +997,14 @@ fn emit_transform_crate(app: &ResolvedApp, kind: &PackageKind) -> Result<()> {
             "empty migration range (v{from} → v{to}): nothing to transform"
         )));
     }
+
+    // #374 step 6 — REFUSE an unanswered hop, over the WHOLE range, before a
+    // line is generated and before cargo is ever invoked.
+    //
+    // Range-wide rather than per-hop: a range containing one unanswered hop
+    // cannot produce a correct migration, so failing at the first one after
+    // emitting the others would leave a half-written member in the cache.
+    refuse_unanswered_hops(&migrations_dir, &hop_migrations)?;
 
     // Parse each version's committed full schema (from..=to).  These own the
     // parsed ASTs the plan borrows, so they must outlive the plan.
@@ -1030,6 +1082,8 @@ fn build_model_ops(
         renames: Vec<(String, String)>,
         removes: Vec<String>,
         adds: Vec<(String, String)>,
+        copies: Vec<(String, String)>,
+        null_fills: Vec<(String, String)>,
     }
     let mut acc: BTreeMap<String, Acc> = BTreeMap::new();
 
@@ -1063,19 +1117,37 @@ fn build_model_ops(
                 field_name,
                 nullable,
                 default_json,
+                answer,
                 ..
             } => {
-                let json = add_field_json(
-                    dest_schema,
-                    model_name,
-                    field_name,
-                    *nullable,
-                    default_json.as_deref(),
-                );
-                acc.entry(model_name.clone())
-                    .or_default()
-                    .adds
-                    .push((field_name.clone(), json));
+                let entry = acc.entry(model_name.clone()).or_default();
+                match lower_fill(*nullable, default_json.as_deref(), answer.as_ref()) {
+                    Some(Fill::Json(json)) => entry.adds.push((field_name.clone(), json)),
+                    Some(Fill::Copy(from)) => entry.copies.push((from, field_name.clone())),
+                    // Nothing to emit: an unanswered required add. The key is
+                    // absent, so the destination decode fails NAMING the field
+                    // rather than accepting a substituted zero. Reachable only
+                    // if the refusal above was bypassed.
+                    None => {}
+                }
+            }
+            // A narrowing to NOT NULL: the answer is the fill for the existing
+            // `None`s, written over the key only when it is null.
+            SchemaChange::ChangeFieldNullability {
+                model_name,
+                field_name,
+                old_nullable: true,
+                new_nullable: false,
+                answer,
+            } => {
+                let entry = acc.entry(model_name.clone()).or_default();
+                match lower_fill(false, None, answer.as_ref()) {
+                    Some(Fill::Json(json)) => {
+                        entry.null_fills.push((field_name.clone(), json))
+                    }
+                    Some(Fill::Copy(from)) => entry.copies.push((from, field_name.clone())),
+                    None => {}
+                }
             }
             // #438 — named explicitly rather than absorbed by the catch-all
             // below, because "a new variant silently swallowed by `_ => {}`" is
@@ -1107,41 +1179,52 @@ fn build_model_ops(
             field_renames: a.renames,
             field_removes: a.removes,
             field_adds: a.adds,
+            field_copies: a.copies,
+            field_null_fills: a.null_fills,
         })
         .collect()
 }
 
-/// The JSON literal the transformer's hop inserts for an additive field
-/// (#74 Phase 3).
+/// What a hop emits for one field's value.
+enum Fill {
+    /// A JSON literal inserted verbatim.
+    Json(String),
+    /// A per-row copy of another field of the same model.
+    Copy(String),
+}
+
+/// Lower the ONE source of a field's value into what the hop emits (#374).
 ///
-/// Three cases, and the third is the interesting one:
+/// The precedence is not arbitrary and there is deliberately no merging:
 ///
-/// 1. the change records a resolved `@default` — used **verbatim**, because it
-///    is already the one lowering `forgedb_codegen::default_fill` produced and
-///    the reopen backfill writes the matching bytes from the same value;
-/// 2. a nullable add — `null`;
-/// 3. a required add with no default. There is nothing here to emit. It is
-///    `Authored` residue whose value comes from the recorded answer, and
-///    `emit_transform_crate` refuses to generate a hop that has none.
-fn add_field_json(
-    dest_schema: &forgedb_parser::Schema,
-    model_name: &str,
-    field_name: &str,
+/// 1. the schema's `@default`, already lowered by
+///    `forgedb_codegen::default_fill` and recorded as a JSON literal;
+/// 2. the operator's recorded answer;
+/// 3. `null` for a nullable add — the only value a nullable field can be given
+///    without asking;
+/// 4. nothing. A required add with no default and no answer contributes no op,
+///    so the key is ABSENT and the destination decode fails with `missing
+///    field`. Reachable only if `refuse_unanswered_hops` was bypassed, which is
+///    exactly what scenario 15 does on purpose.
+///
+/// `Answer::Escape` returns `None` here too: an escape's value comes from the
+/// author's own transform, which runs after these structural ops.
+fn lower_fill(
     nullable: bool,
     default_json: Option<&str>,
-) -> String {
+    answer: Option<&forgedb_migrations::Answer>,
+) -> Option<Fill> {
+    use forgedb_migrations::Answer;
     if let Some(j) = default_json {
-        return j.to_string();
+        return Some(Fill::Json(j.to_string()));
     }
-    if nullable {
-        return "null".to_string();
+    match answer {
+        Some(Answer::Constant { json }) => return Some(Fill::Json(json.clone())),
+        Some(Answer::CopyField { field }) => return Some(Fill::Copy(field.clone())),
+        Some(Answer::Escape { .. }) => return None,
+        None => {}
     }
-    // Case 3. Reached only if the answer resolution above it let an unanswered
-    // required add through; the emitted `null` then fails the destination
-    // decode by NAME, which is the whole point (#374 decision 5) — an empty
-    // string would have been accepted and exit 0.
-    let _ = (dest_schema, model_name, field_name);
-    "null".to_string()
+    nullable.then(|| Fill::Json("null".to_string()))
 }
 
 /// Path of the recorded schema snapshot (the last schema a migration was created

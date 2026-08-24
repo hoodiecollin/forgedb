@@ -300,3 +300,114 @@ fn scenario_4_one_default_two_routes_identical_rows() {
 
     let _ = fs::remove_dir_all(&shared);
 }
+
+// ---------------------------------------------------------------------------
+// Scenario 11 — an unanswered hop cannot be built
+// ---------------------------------------------------------------------------
+
+/// The app's container in the build cache, or `None` if none was reserved.
+fn container(dir: &Path) -> Option<PathBuf> {
+    let apps = home(dir).join("projects").join("migrate-answers").join("apps");
+    let mut found: Vec<PathBuf> = fs::read_dir(&apps)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    found.sort();
+    found.pop()
+}
+
+/// `migrate build` refuses a hop whose required add has no answer — **naming the
+/// change**, writing nothing into the cache member, and never invoking cargo.
+///
+/// The last two are the load-bearing assertions. A refusal that happens after
+/// emission leaves a half-written member behind, and a refusal that happens
+/// after cargo starts costs a compile to learn something the record already
+/// said.
+///
+/// # Mutation (scenario 14)
+///
+/// Verified by deleting the `refuse_unanswered_hops(...)` **call site** in
+/// `emit_transform_crate` — not the function. This test then goes RED, because
+/// the build proceeds. Mutating the function proves the check works; only
+/// mutating the call site proves it is reached.
+#[test]
+fn test_scenario_11_an_unanswered_hop_cannot_be_built() {
+    let temp = TempDir::new().unwrap();
+    let dir = temp.path();
+    fixture(dir, "Post {\n  id: +uuid\n  title: string\n}\n");
+
+    // A required add with no default: unprovable, and nothing has answered it.
+    fs::write(
+        dir.join("schema.forge"),
+        "Post {\n  id: +uuid\n  title: string\n  slug: string\n}\n",
+    )
+    .unwrap();
+    let out = create(dir, "add slug", &[]);
+    assert!(out.status.success(), "create failed:\n{}", combined(&out));
+
+    // Strip the answer, if create recorded one, so this test is about `build`.
+    strip_answers(dir);
+
+    let out = forgedb(dir)
+        .args([
+            "migrate", "build", "--schema", "schema.forge", "--from", "1", "--to", "2",
+        ])
+        .output()
+        .expect("run migrate build");
+    let log = combined(&out);
+
+    assert!(!out.status.success(), "the build must refuse:\n{log}");
+    assert!(
+        log.contains("Post") && log.contains("slug"),
+        "the refusal must name the change:\n{log}"
+    );
+    assert!(
+        !log.contains("Compiling") && !log.contains("Finished `dev`"),
+        "cargo must never be invoked for a range that cannot be built:\n{log}"
+    );
+    if let Some(c) = container(dir) {
+        let member = c.join("transform-1-2");
+        assert!(
+            !member.exists(),
+            "nothing may be written into the cache member for a refused range: {}",
+            member.display()
+        );
+    }
+}
+
+/// Remove every `answer` from every recorded change, rewriting the checksum so
+/// the record still loads.
+///
+/// A hand-stripped record is the fixture scenario 11 asks for: it is what a
+/// lineage looks like when a change was detected and never answered.
+fn strip_answers(dir: &Path) {
+    for path in fs::read_dir(migrations_dir(dir))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+    {
+        let mut rec: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let mut touched = false;
+        for change in rec["changes"].as_array_mut().unwrap() {
+            for (_, body) in change.as_object_mut().unwrap().iter_mut() {
+                if let Some(o) = body.as_object_mut() {
+                    touched |= o.remove("answer").is_some();
+                }
+            }
+        }
+        if !touched {
+            continue;
+        }
+        // Re-checksum, exactly as `Migration::calculate_checksum` does.
+        rec["checksum"] = serde_json::Value::String(String::new());
+        let body = serde_json::to_string(&rec).unwrap();
+        rec["checksum"] = serde_json::Value::String(forgedb_migrations::checksum::compute(
+            body.as_bytes(),
+        ));
+        fs::write(&path, serde_json::to_string(&rec).unwrap()).unwrap();
+    }
+}

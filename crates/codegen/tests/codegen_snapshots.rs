@@ -7002,6 +7002,8 @@ fn sample_transform_crate() -> (String, forgedb_codegen::TransformCrate) {
                     field_renames: vec![],
                     field_removes: vec![],
                     field_adds: vec![("bio".to_string(), "null".to_string())],
+                    field_copies: vec![],
+                    field_null_fills: vec![],
                 }],
                 authored_src: None,
             },
