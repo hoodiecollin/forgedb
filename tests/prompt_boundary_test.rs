@@ -1,0 +1,413 @@
+//! May ForgeDB ask? — the #367 boundary scenarios (gate #371, S1–S5).
+//!
+//! **The non-interactive path is the feature here, not an edge case.** Every
+//! decision point has defined behaviour with no terminal, because the contexts
+//! that have none are the ones ForgeDB itself ships: the `Dockerfile` `init`
+//! scaffolds, `docker build`, the reclose workflows, `dev`'s watch loop,
+//! `build --print-artifact` inside a `$(…)` capture, and the language server.
+//! A prompt that can hang in any of those is a defect, not a rough edge.
+//!
+//! The subprocess scenarios below inherit that property by construction —
+//! `std::process::Command` pipes stdio, so they *always* take the
+//! non-interactive branch. That is exactly why `FORGEDB_ASK_TRACE` is shipped
+//! code rather than a test fixture: without it, "did not ask because forbidden"
+//! and "did not ask because piped" are indistinguishable from outside, and a
+//! test asserting the first passes when only the second is true.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use forgedb::ask::Askability;
+
+const BIN: &str = env!("CARGO_BIN_EXE_forgedb");
+
+const SCHEMA: &str = "Note {\n  id: +uuid\n  body: string\n}\n";
+
+fn write(path: &Path, contents: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, contents).unwrap();
+}
+
+fn repo_root(dir: &tempfile::TempDir) -> PathBuf {
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    root
+}
+
+/// A root two ecosystem manifests name, with a schema and **no** `forgedb.toml`
+/// — the shape that makes `identify` ambiguous. An adopted repository carrying
+/// both a `Cargo.toml` and a `package.json` is ordinary, which is why this path
+/// is routinely reached.
+fn ambiguous_root(dir: &tempfile::TempDir) -> PathBuf {
+    let root = repo_root(dir);
+    write(
+        &root.join("Cargo.toml"),
+        "[package]\nname = \"backend\"\nversion = \"0.1.0\"\n",
+    );
+    write(
+        &root.join("package.json"),
+        "{ \"name\": \"storefront\", \"version\": \"1.0.0\" }",
+    );
+    write(&root.join("schema.forge"), SCHEMA);
+    root
+}
+
+/// Run the CLI with an isolated cache home and a trace file, from an explicit
+/// directory.
+fn run_traced(cwd: &Path, home: &Path, trace: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(BIN)
+        .args(args)
+        .current_dir(cwd)
+        .env("FORGEDB_HOME", home)
+        .env("FORGEDB_ASK_TRACE", trace)
+        .output()
+        .expect("forgedb binary runs")
+}
+
+fn trace_lines(trace: &Path) -> Vec<String> {
+    std::fs::read_to_string(trace)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+fn combined(out: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+// ---------------------------------------------------------------------------
+// S1 — the boundary is a pure predicate
+// ---------------------------------------------------------------------------
+
+/// All sixteen combinations, exhaustively.
+///
+/// This is the **only** place the interactive condition is exercised over its
+/// whole domain, and it can be because the predicate takes four booleans rather
+/// than calling `IsTerminal` itself. A boundary fused to the terminal would
+/// have exactly one testable row here: the one the harness happens to be in.
+#[test]
+fn s1_the_boundary_is_a_pure_predicate_over_four_booleans() {
+    let mut permitted = Vec::new();
+    for bits in 0u8..16 {
+        let a = Askability {
+            stdin_tty: bits & 1 != 0,
+            stderr_tty: bits & 2 != 0,
+            quiet: bits & 4 != 0,
+            forbidden: bits & 8 != 0,
+        };
+        if a.may_ask() {
+            permitted.push(a);
+        }
+
+        // `reason()` names the FIRST failing clause in a fixed order, so a
+        // trace line is a stable, greppable fact rather than "whichever check
+        // the compiler got to first".
+        let expected = if a.forbidden {
+            "forbidden"
+        } else if a.quiet {
+            "quiet"
+        } else if !a.stdin_tty {
+            "no-stdin-tty"
+        } else if !a.stderr_tty {
+            "no-stderr-tty"
+        } else {
+            "terminal"
+        };
+        assert_eq!(a.reason(), expected, "{a:?}");
+        assert_eq!(
+            a.may_ask(),
+            a.reason() == "terminal",
+            "`terminal` and `may_ask` must never disagree: {a:?}"
+        );
+    }
+
+    assert_eq!(
+        permitted,
+        vec![Askability {
+            stdin_tty: true,
+            stderr_tty: true,
+            quiet: false,
+            forbidden: false,
+        }],
+        "exactly one of sixteen rows may ask"
+    );
+}
+
+/// Each clause is an independent veto.
+///
+/// Asserted separately from the truth table because the four exist for four
+/// different reasons and a later simplification must not collapse them:
+/// `stdin` is what stops a `docker build` blocking forever (a prompt *reads*
+/// stdin), `stderr` is about the question being visible at all, `quiet` is the
+/// user asking for silence, and `forbidden` is ForgeDB knowing its own stdout.
+#[test]
+fn s1b_each_clause_vetoes_on_its_own() {
+    let open = Askability {
+        stdin_tty: true,
+        stderr_tty: true,
+        quiet: false,
+        forbidden: false,
+    };
+    assert!(open.may_ask());
+
+    assert!(!Askability { stdin_tty: false, ..open }.may_ask());
+    assert!(!Askability { stderr_tty: false, ..open }.may_ask());
+    assert!(!Askability { quiet: true, ..open }.may_ask());
+    assert!(!Askability { forbidden: true, ..open }.may_ask());
+}
+
+// ---------------------------------------------------------------------------
+// S2 — a piped invocation never asks, and says so
+// ---------------------------------------------------------------------------
+
+/// The contract for every scripted invocation: identical diagnostic, identical
+/// non-zero exit, and — the only change — a **command** that records the answer.
+#[test]
+fn s2_a_piped_invocation_never_asks_and_names_a_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let trace = tmp.path().join("ask.trace");
+    let root = ambiguous_root(&tmp);
+
+    let out = run_traced(
+        &root,
+        home.path(),
+        &trace,
+        &[
+            "generate",
+            "rust",
+            "--output",
+            root.join("generated").to_str().unwrap(),
+        ],
+    );
+
+    assert!(!out.status.success(), "ambiguity is still refused");
+    let msg = combined(&out);
+    // Today's diagnostic, unchanged.
+    assert!(msg.contains("cannot pick a project name"), "{msg}");
+    assert!(msg.contains("backend") && msg.contains("storefront"), "{msg}");
+    assert!(msg.contains("[project].name"), "{msg}");
+    // …plus the persisting act, carrying the schema the failing invocation
+    // resolved. Without `--schema` the same command run from another directory
+    // in a monorepo resolves a DIFFERENT project — copy-pasteable and wrong.
+    assert!(msg.contains("forgedb project name"), "{msg}");
+    assert!(msg.contains("--schema"), "names the resolved schema: {msg}");
+
+    assert_eq!(
+        trace_lines(&trace),
+        vec!["no-stdin-tty".to_string()],
+        "a piped invocation decided ONCE, and decided it could not ask"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S3 — machine-readable stdout is *forbidden*, not merely piped
+// ---------------------------------------------------------------------------
+
+/// The trap this scenario exists for: the `Build` arm already calls
+/// `ui::set_verbosity(false, true)` in these modes, which *incidentally*
+/// satisfies the quiet clause. A plain "did not prompt" assertion therefore
+/// passes with the `ask::forbid()` call **deleted**, and would keep passing
+/// until someone changed how `--quiet` interacts with prompts — at which point
+/// `docker build` would hang on a line the scaffolded `Dockerfile` runs.
+///
+/// So this asserts the *reason*, not the outcome. Mutation-checked both ways:
+/// deleting `ask::forbid()` makes it RED; deleting the `set_verbosity` line
+/// leaves it GREEN.
+#[test]
+fn s3_machine_readable_stdout_forbids_rather_than_merely_silencing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let trace = tmp.path().join("ask.trace");
+    let root = repo_root(&tmp);
+    write(&root.join("forgedb.toml"), "[project]\nname = \"clean\"\n");
+    write(&root.join("schema.forge"), SCHEMA);
+
+    // `--plan` keeps this cheap. It conflicts with `--print-artifact` and the
+    // command exits non-zero because of it — deliberately: the conflict is
+    // checked inside `build::run`, which is reached only AFTER the arm has
+    // forbidden asking and resolved the identity, so the trace is already
+    // written. Dropping `--plan` would compile the whole generated app to
+    // assert one line of a trace file.
+    let out = run_traced(
+        &root,
+        home.path(),
+        &trace,
+        &["build", "--plan", "--print-artifact", "server"],
+    );
+    let msg = combined(&out);
+
+    let lines = trace_lines(&trace);
+    assert!(
+        lines.contains(&"forbid".to_string()),
+        "the forbid() CALL SITE must run, not merely exist: {lines:?}\n{msg}"
+    );
+    assert!(
+        lines.contains(&"forbidden".to_string()),
+        "…and the latch must be what decided it — `quiet` here would mean the \
+         explicit forbid is doing nothing and a `--quiet` change could \
+         reintroduce the hang: {lines:?}\n{msg}"
+    );
+    assert!(
+        !lines.contains(&"terminal".to_string()),
+        "a machine-readable stdout may never ask: {lines:?}"
+    );
+}
+
+/// The same arm without a machine-readable flag does **not** forbid.
+///
+/// Without this, `s3` would still pass if `forbid()` were called
+/// unconditionally at the top of `main` — which would silently make every
+/// future prompt unreachable.
+#[test]
+fn s3b_a_plain_build_does_not_forbid() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let trace = tmp.path().join("ask.trace");
+    let root = repo_root(&tmp);
+    write(&root.join("forgedb.toml"), "[project]\nname = \"clean\"\n");
+    write(&root.join("schema.forge"), SCHEMA);
+
+    run_traced(&root, home.path(), &trace, &["build", "--plan"]);
+
+    let lines = trace_lines(&trace);
+    assert!(
+        !lines.contains(&"forbid".to_string()),
+        "forbidding is per-mode, not global: {lines:?}"
+    );
+    assert_eq!(
+        lines,
+        vec!["no-stdin-tty".to_string()],
+        "piped, and that is the only reason it did not ask: {lines:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S4 — `dev` forbids before entering the watch loop
+// ---------------------------------------------------------------------------
+
+/// Structural: the `forbid()` call precedes the `auto_watch(` **call token**.
+///
+/// Anchored on the call, never on a comment or a binding name (#281): a guard
+/// that matches a label passes when the work it labels has moved.
+#[test]
+fn s4_dev_forbids_before_the_watch_loop() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/commands/dev.rs"))
+        .expect("dev.rs is readable");
+
+    let forbid = src
+        .find("ask::forbid()")
+        .expect("dev.rs calls ask::forbid()");
+    let watch = src
+        .find("auto_watch(")
+        .expect("dev.rs calls auto_watch()");
+    assert!(
+        forbid < watch,
+        "a prompt raised by a save-triggered regeneration is a hang with no \
+         visible cause — the terminal is showing watch output, not a question"
+    );
+}
+
+/// Runtime: a real `dev` process regenerates at least once, and asking stays
+/// forbidden for the whole of it.
+///
+/// Tier 2 (`#[ignore]`) because it spawns a watcher and waits on the
+/// filesystem. Its tier-1 sibling above is structural, which is what makes this
+/// one's cost optional rather than load-bearing.
+#[test]
+#[ignore = "tier 2: spawns `forgedb dev` and waits on the watcher"]
+fn s4b_dev_stays_forbidden_across_a_regeneration() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let trace = tmp.path().join("ask.trace");
+    let root = repo_root(&tmp);
+    write(&root.join("forgedb.toml"), "[project]\nname = \"watched\"\n");
+    write(&root.join("schema.forge"), SCHEMA);
+
+    let mut child = Command::new(BIN)
+        .args([
+            "dev",
+            "--debounce",
+            "50",
+            "--output",
+            root.join("generated").to_str().unwrap(),
+        ])
+        .current_dir(&root)
+        .env("FORGEDB_HOME", home.path())
+        .env("FORGEDB_ASK_TRACE", &trace)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("dev starts");
+
+    // Wait for the loop to be up, then trigger a save.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    write(
+        &root.join("schema.forge"),
+        "Note {\n  id: +uuid\n  body: string\n  title: string\n}\n",
+    );
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let lines = trace_lines(&trace);
+    assert!(
+        lines.contains(&"forbid".to_string()),
+        "the loop is entered with asking latched off: {lines:?}"
+    );
+    assert!(
+        !lines.contains(&"terminal".to_string()),
+        "nothing in a watch loop may ask: {lines:?}"
+    );
+    assert!(
+        root.join("generated").exists(),
+        "the watcher actually regenerated — otherwise this asserts nothing"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S5 — the language server can never reach an asker
+// ---------------------------------------------------------------------------
+
+/// `crates/lsp-server` owns stdin as its JSON-RPC channel: reading one byte
+/// from it corrupts the protocol, and a prompt there would deadlock an editor
+/// with no output anywhere.
+///
+/// This is satisfied *today* by construction — the LSP crate does not depend on
+/// the root crate, and `forgedb lsp` hands the process over before resolving
+/// anything. Which is precisely why it needs a guard: nothing currently stops
+/// that changing, and the failure would be invisible until an editor hung.
+#[test]
+fn s5_the_language_server_cannot_reach_an_asker() {
+    let manifest = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/crates/lsp-server/Cargo.toml"
+    ))
+    .expect("the LSP crate's manifest is readable");
+    for line in manifest.lines() {
+        let line = line.trim();
+        assert!(
+            !line.starts_with("forgedb ") && !line.starts_with("forgedb="),
+            "the language server must not depend on the root crate, whose \
+             identity resolution can ask questions: {line}"
+        );
+    }
+
+    let launcher = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/commands/lsp.rs"
+    ))
+    .expect("lsp.rs is readable");
+    for needle in ["govern", "identify", "ask::"] {
+        assert!(
+            !launcher.contains(needle),
+            "`forgedb lsp` must hand the process over before resolving a \
+             project — it found `{needle}`"
+        );
+    }
+}

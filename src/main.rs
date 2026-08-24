@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 // library's consumers use — the tests, and #335's callers — read as dead code in
 // the binary, which is a warning that can only be silenced by an `#[allow]` that
 // then outlives its reason and hides a real hole.
-use forgedb::{cache, commands, error, naming, project, targets, ui};
+use forgedb::{ask, cache, commands, error, naming, project, targets, ui};
 
 use error::Result;
 
@@ -684,11 +684,11 @@ fn run(cli: Cli) -> Result<()> {
         } => {
             // The schema names itself; no config participates (#333 §10).
             let schema_path = project::find_schema(schema.as_deref())?;
-            let governing = project::govern(explicit_config, project::schema_dir(&schema_path))?;
+            let governing = project::govern_for_schema(explicit_config, &schema_path)?;
             // Resolved (and claimed) here rather than lazily: a project id is a
             // precondition of generating, so a collision must be refused before
             // any bytes are written, not after.
-            let project = governing.identify_reported()?;
+            let project = governing.identify_reported(&*ask::asker())?;
             // Reserve BEFORE emission (it needs the path); re-derive the
             // workspace root AFTER, once this app's packages exist (#335 §3).
             let reserved = reserve_in_cache(&project, &schema_path, governing.symbol_naming())?;
@@ -798,13 +798,23 @@ fn run(cli: Cli) -> Result<()> {
                 report.as_deref(),
             ) {
                 ui::set_verbosity(false, true);
+                // …and a question is forbidden OUTRIGHT here, not merely
+                // silenced (#367). `set_verbosity(false, true)` above already
+                // satisfies the quiet clause, so this line looks redundant and
+                // is not: it is the difference between "did not ask because the
+                // output level happens to be quiet" and "did not ask because
+                // this stdout belongs to a `$(…)` capture". The first is a
+                // coincidence a future `--quiet`-handling change can undo; the
+                // second is the reason. `FORGEDB_ASK_TRACE` is what lets a test
+                // tell them apart, and therefore what proves THIS call runs.
+                ask::forbid();
             }
             // Resolved exactly as `Commands::Generate` does, from the same walk —
             // `build` must compile in the same place `generate` emitted into, and
             // must bake what `generate` would (#361, extended to identity by #333).
             let schema_path = project::find_schema(schema.as_deref())?;
-            let governing = project::govern(explicit_config, project::schema_dir(&schema_path))?;
-            let project = governing.identify_reported()?;
+            let governing = project::govern_for_schema(explicit_config, &schema_path)?;
+            let project = governing.identify_reported(&*ask::asker())?;
             let reserved = reserve_in_cache(&project, &schema_path, governing.symbol_naming())?;
             let forge_config = governing.config();
             let resolved_output = Some(governing.output(output.as_deref()));
@@ -865,8 +875,12 @@ fn run(cli: Cli) -> Result<()> {
             // config at all: every save rewrote `database.rs` with
             // `GenConfig::DEFAULT` and `schema_version = 1`.
             let schema_path = project::find_schema(schema.as_deref())?;
-            let governing = project::govern(explicit_config, project::schema_dir(&schema_path))?;
-            let project = governing.identify_reported()?;
+            let governing = project::govern_for_schema(explicit_config, &schema_path)?;
+            // The STARTUP resolution may ask — it is before the loop, the
+            // terminal is not yet showing watch output, and a `dev` that cannot
+            // name its project has nothing to watch for. `dev::run` forbids
+            // immediately before entering the loop (#367).
+            let project = governing.identify_reported(&*ask::asker())?;
             let reserved = reserve_in_cache(&project, &schema_path, governing.symbol_naming())?;
             let forge_config = governing.config();
             let resolved_output = governing.output(output.as_deref());

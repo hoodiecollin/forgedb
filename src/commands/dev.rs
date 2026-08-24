@@ -130,6 +130,16 @@ pub fn run(options: DevOptions) -> Result<()> {
         println!();
     });
 
+    // NOTHING BEYOND THIS POINT MAY ASK A QUESTION (#367).
+    //
+    // A prompt raised by a save-triggered regeneration is a hang with no visible
+    // cause: the terminal is at that moment showing watch output, not a
+    // question, and the user is not sitting at a prompt waiting to answer one.
+    // This is unconditional on how `dev` was started — the startup resolution
+    // above already ran, and it is the only place in `dev` where asking is ever
+    // right.
+    crate::ask::forbid();
+
     // Run watcher (blocks until Ctrl+C). `output` still rides along because the
     // published `auto_watch` signature takes it; nothing in the watcher writes
     // there any more.

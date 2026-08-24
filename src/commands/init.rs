@@ -192,13 +192,13 @@ fn refuse_a_taken_name(project_name: &str, isolated: bool) -> Result<()> {
     if !isolated {
         return Ok(());
     }
-    if let Some(held_by) = project::held_by(project_name)? {
+    if let Some(holder) = project::held_by(project_name)? {
         return Err(CliError::Config(format!(
             "Project name {project_name:?} is already claimed by {}.\n\n\
              Two projects sharing an id would share one build cache, one lockfile \
              and one target directory. Pick a different name, or pass \
              --no-isolated to join an enclosing project instead.",
-            held_by.display()
+            holder.path.display()
         )));
     }
     Ok(())
