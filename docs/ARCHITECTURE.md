@@ -338,12 +338,81 @@ Two rules keep that honest:
   the schema. Instead the file's contents are replaced by a `compile_error!` naming what happened,
   idempotently, leaving the user-editable scaffolds beside it untouched.
 
-**Go links the FFI engine statically**, and that is the one delivery carve-out (#337 owns
-delivery in general): `ffi/` emits `cdylib + rlib + staticlib`, and the `.a` is delivered into
-`output/go/` beside the header the Go source already imports. Dynamic delivery was measured and
-rejected — rustc stamps an **absolute** `LC_ID_DYLIB`, so a consumer records the cache path and
-dangles the moment the cache is GC'd, which the C8 contract permits at any time and which CI
-cannot see because the cache still exists while it runs.
+### What it delivers, and what makes a stale artifact loud (#337)
+
+`src/commands/build/deliver.rs` · `src/fingerprint.rs`
+
+Building an artifact nobody can reach is the same as not building it. **Delivery is a
+projection of the build report**: for every reported artifact whose package kind has a
+destination, the file is copied out of the cache and into that app's `output`, beside the
+generated text that describes it, and every delivered path is printed (C7).
+
+| Package | Artifact | Destination | Delivered name |
+|---|---|---|---|
+| `napi` | cdylib | `<output>/napi/` | `forgedb.node` |
+| `pyo3` | cdylib | `<output>/pyo3/` | `_forgedb_native.abi3.so` |
+| `ffi` | **staticlib** | `<output>/ffi/` | `libforgedb.a` |
+| `ffi` (again) | staticlib | `<output>/go/` | `libforgedb.a` |
+| `core` `server` `wasm` `transform-*` `engine-*` | — | none | — |
+
+- **The match over `PackageKind` is total, with no wildcard arm**, so adding a kind is a
+  compile error rather than a silent non-delivery. The undelivered kinds are listed
+  explicitly: an absent arm and an empty arm read alike and mean opposite things.
+- **Delivery joins no path.** Every one of them is read from the report, which was built
+  from cargo's own JSON stream — #292's defect class, one layer down.
+- **The delivered name is always a rename.** Cargo writes `lib<pkg>.dylib`; CPython will not
+  import a `.dylib` and Node requires a `.node`. The pyo3 name is *composed* from
+  `PyO3Generator::EXTENSION_STEM`, because CPython resolves `PyInit_<stem>` from the
+  delivered filename — the name and the `#[pymodule]` function are one decision, and a
+  second spelling is how they come apart.
+- **`ffi` delivers the archive, not the cdylib**, and Go's row is the same archive at a
+  second destination. Dynamic delivery was measured and rejected: rustc stamps an
+  **absolute** `LC_ID_DYLIB`, so a consumer that *links* a copied dylib records the cache
+  path and dangles the moment the cache is GC'd — which C8 permits at any time and which CI
+  cannot see, because the cache still exists while it runs. Node and CPython are unaffected:
+  they `dlopen` their extension by path and record no dependency on it, verified with
+  `otool -L`/`ldd` rather than assumed.
+
+**Both halves carry a fingerprint of the source they were generated from**, so a consumer
+that loads an artifact built from different source than the code beside it gets a named
+error instead of a method set that silently no longer matches.
+
+- **It is over generated SOURCE, never the CLI version.** An upgrade that changes nothing
+  about the output must invalidate nothing, or the error trains people to ignore it.
+- **One per (app, package)**: the app's `core` plus that package's own directory, manifests
+  included, since a substrate pin change alters the compiled artifact while leaving every
+  `.rs` byte identical. Per-app would couple targets that have nothing to do with each other,
+  and would let a `migrate build` invalidate every binding in the app.
+- **The value is computed from what the run is about to emit, before any of it reaches
+  disk** — not by scanning the container afterwards, which describes the *previous* run.
+- **The constant lives in each wrapper, never in `core`.** `core/src/lib.rs` is the exact
+  `String` also written to `<output>/database.rs` as the mirror, and a `mod fingerprint;`
+  line there would name a file that does not exist beside it.
+- **Where each half checks the other:** Node's `index.js` and Python's `forgedb.py` compare
+  at `require`/`import` and throw with the remedy; Go compares in package `init()`; C gets
+  the value as a macro plus an inline check that is **advisory — ForgeDB generates no C that
+  executes, so nothing can force it to run.**
+
+What Go's `init()` buys over the linker is narrower than "load-time verification" suggests:
+a schema change that removes a symbol already fails to link. It adds a readable message, and
+the cases the linker cannot see at all — a `[storage]`/`[runtime]` knob that changes
+durability semantics without changing one symbol name.
+
+**Generated text is committed; compiled output is ignored**, by a `.gitignore` ForgeDB
+writes *inside* the directory it owns. Extensions only — never a directory, never `*.rs`,
+never a manifest — because #338 writes a ForgeDB-owned cargo package into the consumer's
+tree and that package is committed source. It re-includes `*.js` and `*.d.ts`, without which
+the shims are uncommittable: the scaffolded root `.gitignore` ignores both project-wide.
+
+**Limits, stated so they are not discovered.** The fingerprint proves *source* identity, not
+artifact identity: it does not cover `Cargo.lock` (project-wide, and a `= "0.3"` pin that
+resolved 0.3.1 and 0.3.2 fingerprints alike), the compiler, the profile or the target triple.
+It is not provenance — anything that can write the artifact can write the constant. Only one
+platform's artifact can occupy a directory at a time, which is the direct consequence of
+ignoring compiled output: **CI needs the Rust toolchain for any in-process consumer.** And
+`forgedb dev` will fail the check continuously for such a consumer, because the watcher
+regenerates and never compiles — the report is honest, and #335's choice to keep cargo out of
+the watcher stands.
 
 **`migrate` joined the cache with everything else**, so it is no longer CWD-relative: every
 subcommand takes a required `--schema`, the transformer and engine hops are range-stamped members

@@ -170,11 +170,25 @@ pub fn member_hash(rel_schema: &Path) -> String {
 /// project-path fallback id, so there is a single place a drift would show up
 /// and a single set of golden vectors pinning it.
 pub fn path_hash(input: &str) -> String {
+    fnv1a_hex(input.as_bytes())
+}
+
+/// FNV-1a (64-bit) over arbitrary bytes, rendered as 16 lowercase hex digits.
+///
+/// The one implementation. [`path_hash`] is this function over a string's bytes,
+/// and #337's source fingerprint is this function over a framed entry list — so
+/// the golden vectors that pin `path_hash` and `member_hash` pin the digest
+/// itself, not merely one caller's use of it.
+///
+/// Specified here rather than taken from a dependency so that it cannot move
+/// underneath a released cache or a committed shim. The threat model is an
+/// accidental collision, not an adversary choosing the input.
+pub fn fnv1a_hex(bytes: &[u8]) -> String {
     const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x100_0000_01b3;
 
     let mut hash = FNV_OFFSET_BASIS;
-    for byte in input.as_bytes() {
+    for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(FNV_PRIME);
     }
