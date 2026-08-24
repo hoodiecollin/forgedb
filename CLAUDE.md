@@ -173,6 +173,28 @@ built-in `generated` default included** (`Governing::output` owns all three case
 `output` is a per-app pattern; the CWD-relative reading had every app in a project
 overwriting its siblings.
 
+**`forgedb build` DELIVERS the compiled half (#337)** — `src/commands/build/deliver.rs` is the ONE
+table, a **total match over `PackageKind` with no wildcard arm** (a new kind is a compile error, never
+a silent non-delivery), and every path is read from the build report, never joined (#292's class).
+`napi` → `<output>/napi/forgedb.node`, `pyo3` → `<output>/pyo3/_forgedb_native.abi3.so` (the name is
+COMPOSED from `PyO3Generator::EXTENSION_STEM`, because CPython resolves `PyInit_<stem>` from the
+delivered filename — the stem and the `#[pymodule]` name are one decision), `ffi` → the **staticlib**
+into `<output>/ffi/` *and* `<output>/go/` (a copied cdylib inherits the cache's absolute
+`LC_ID_DYLIB`; Node/CPython `dlopen` by path and are unaffected, verified with `otool -L`, not
+assumed). `core`/`server`/`wasm`/`transform-*`/`engine-*` deliver nothing.
+
+**Both halves carry a SOURCE fingerprint (`src/fingerprint.rs`)** — FNV-1a (the same `cache::fnv1a_hex`
+the member hash uses) over the app's `core` package plus that package's own directory, manifests
+included, `src/fingerprint.rs` excluded from its own input by name. **Per (app, package)**, never
+per-app and never the CLI version. Computed from what the run is about to emit, before any of it
+reaches disk. The constant lives in each wrapper, NEVER in `core` (`core/src/lib.rs` is the exact
+`String` the `<output>/database.rs` mirror gets, and a `mod fingerprint;` there names a file that is
+not beside it). Node's `index.js` and Python's `forgedb.py` compare at load and throw; Go compares in
+`init()`; C gets a macro plus an **advisory** inline check (ForgeDB generates no C that runs).
+`generate` writes `<output>/.gitignore` — **extensions only**, never a directory / `*.rs` /
+`Cargo.toml`, because #338's in-tree package is committed source — and the artifact patterns came OUT
+of `init`'s root `.gitignore`.
+
 **A THIRD destination is opt-in: `[placement].rust_package` (#338).** A Rust consumer who builds
 with cargo can have the generated database emitted into their own tree as a ForgeDB-owned cargo
 package — `Cargo.toml` + `src/lib.rs`, **never** an `api.rs`/`main.rs`/`[[bin]]`, whatever
@@ -328,6 +350,8 @@ schema.forge → parser (lexer→AST) → validation → codegen
   ├─ TypeScriptGenerator → types.ts
   ├─ ApiGenerator        → api.rs
   ├─ StubGenerator       → placeholder stubs README (no UI/component codegen today)
+  ├─ FfiGenerator        → ffi/src/lib.rs + <output>/ffi/forgedb.h (the header MOVED here
+  │                        from GoGenerator in #337 — it declares symbols ffi.rs defines)
   ├─ OpenApiGenerator    → openapi.json (offline OpenAPI 3.1)
   ├─ WasmGenerator       → replica/* (browser read-replica; opt-in)
   ├─ RustSdkGenerator    → rust-sdk/*   (reqwest REST client crate; `rust --sdk`, opt-in)

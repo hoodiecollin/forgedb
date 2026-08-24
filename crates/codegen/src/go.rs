@@ -50,19 +50,19 @@ use std::collections::{HashMap, HashSet};
 pub struct GoGenerator;
 
 /// One id-bearing model exposed over the Go binding (CRUD + snapshot reads).
-struct GoModel {
+pub(crate) struct GoModel {
     /// PascalCase model name (also the Go struct name).
-    name: String,
+    pub(crate) name: String,
     /// snake_case name — the `<prefix><snake>_<op>` C-symbol infix.
-    snake: String,
+    pub(crate) snake: String,
     /// Go type of the model's identity field (`string` for uuid PKs).
-    id_go: String,
+    pub(crate) id_go: String,
 }
 
 /// A relation-traversal C entry point mirrored one-for-one from the FFI
 /// generator (`generate_relation_ops`). `sym` is the C-symbol suffix (without
 /// the app's prefix); `method` is its PascalCase Go method name.
-enum GoRelOp {
+pub(crate) enum GoRelOp {
     /// Forward FK: resolve `*Target`/`?Target` by the source id → `*Target`.
     ForwardFk {
         sym: String,
@@ -104,19 +104,24 @@ enum GoRelOp {
 
 /// One Arrow-exportable column: the `Export<Model><Field>Arrow` Go method and its
 /// `<snake>_<field>_export_arrow` C symbol suffix (below the app's prefix).
-struct ArrowCol {
-    sym: String,
-    method: String,
+pub(crate) struct ArrowCol {
+    pub(crate) sym: String,
+    pub(crate) method: String,
 }
 
 impl GoGenerator {
     /// Generate the `forgedb.go` package for a schema.
-    pub fn generate(schema: &Schema, symbol_prefix: &str) -> Result<GeneratedCode> {
+    pub fn generate(
+        schema: &Schema,
+        symbol_prefix: &str,
+        fingerprint: &str,
+    ) -> Result<GeneratedCode> {
         let models = Self::crud_models(schema);
         let rel_ops = Self::relation_ops(schema);
 
         let mut code = String::new();
         code.push_str(&subst(FILE_HEADER, symbol_prefix));
+        code.push_str(&Self::fingerprint_check(symbol_prefix, fingerprint));
         code.push_str(&subst(SPINE, symbol_prefix));
         code.push_str(&subst(ASYNC_SPINE, symbol_prefix));
 
@@ -154,87 +159,10 @@ impl GoGenerator {
         })
     }
 
-    /// Generate the `forgedb.h` C header declaring every prototype the Go
-    /// package binds (the schema-invariant spine + the per-model + relation
-    /// symbols). cgo `#include`s it; the symbols are defined by the `ffi`
-    /// package this links against.
-    ///
-    /// `symbol_prefix` MUST be the same value handed to `FfiGenerator::generate`
-    /// for this app. A mismatch is not a compile error on either side — it is an
-    /// undefined-symbol error at link time.
-    pub fn generate_header(schema: &Schema, symbol_prefix: &str) -> Result<GeneratedCode> {
-        let pfx = symbol_prefix;
-        let models = Self::crud_models(schema);
-        let rel_ops = Self::relation_ops(schema);
-
-        let mut h = String::new();
-        h.push_str(&subst(HEADER_PREAMBLE, pfx));
-
-        for m in &models {
-            let s = &m.snake;
-            h.push_str(&format!(
-                "\n/* --- {name} --- */\n\
-                 bool {pfx}{s}_insert(Db* db, const uint8_t* record, size_t record_len, uint8_t** id_out, size_t* id_len_out, ForgeError** err_out);\n\
-                 bool {pfx}{s}_get(Db* db, const uint8_t* id, size_t id_len, uint8_t** out, size_t* out_len, ForgeError** err_out);\n\
-                 int64_t {pfx}{s}_count(Db* db, ForgeError** err_out);\n\
-                 bool {pfx}{s}_all(Db* db, uint8_t** out, size_t* out_len, ForgeError** err_out);\n\
-                 int32_t {pfx}{s}_update(Db* db, const uint8_t* id, size_t id_len, const uint8_t* record, size_t record_len, ForgeError** err_out);\n\
-                 int32_t {pfx}{s}_delete(Db* db, const uint8_t* id, size_t id_len, ForgeError** err_out);\n\
-                 bool {pfx}{s}_get_at(Db* db, const Snapshot* snap, const uint8_t* id, size_t id_len, uint8_t** out, size_t* out_len, ForgeError** err_out);\n\
-                 bool {pfx}{s}_all_at(Db* db, const Snapshot* snap, uint8_t** out, size_t* out_len, ForgeError** err_out);\n\
-                 void {pfx}{s}_insert_async(Db* db, const uint8_t* record, size_t record_len, uint64_t token);\n\
-                 void {pfx}{s}_get_async(Db* db, const uint8_t* id, size_t id_len, uint64_t token);\n\
-                 void {pfx}{s}_count_async(Db* db, uint64_t token);\n\
-                 void {pfx}{s}_all_async(Db* db, uint64_t token);\n\
-                 void {pfx}{s}_update_async(Db* db, const uint8_t* id, size_t id_len, const uint8_t* record, size_t record_len, uint64_t token);\n\
-                 void {pfx}{s}_delete_async(Db* db, const uint8_t* id, size_t id_len, uint64_t token);\n",
-                name = m.name,
-                s = s,
-            ));
-        }
-
-        if !rel_ops.is_empty() {
-            h.push_str("\n/* --- relations --- */\n");
-            for op in &rel_ops {
-                h.push_str(&match op {
-                    GoRelOp::ForwardFk { sym, .. } | GoRelOp::Vec { sym, .. } => format!(
-                        "bool {pfx}{sym}(Db* db, const uint8_t* id, size_t id_len, uint8_t** out, size_t* out_len, ForgeError** err_out);\n"
-                    ),
-                    GoRelOp::VecAt { sym, .. } => format!(
-                        "bool {pfx}{sym}(Db* db, const Snapshot* snap, const uint8_t* id, size_t id_len, uint8_t** out, size_t* out_len, ForgeError** err_out);\n"
-                    ),
-                    GoRelOp::Link { sym, .. } => format!(
-                        "bool {pfx}{sym}(Db* db, const uint8_t* left, size_t left_len, const uint8_t* right, size_t right_len, ForgeError** err_out);\n"
-                    ),
-                    GoRelOp::Unlink { sym, .. } => format!(
-                        "int32_t {pfx}{sym}(Db* db, const uint8_t* left, size_t left_len, const uint8_t* right, size_t right_len, ForgeError** err_out);\n"
-                    ),
-                });
-            }
-        }
-
-        let arrow = Self::arrow_columns(schema);
-        if !arrow.is_empty() {
-            h.push_str("\n/* --- Arrow columnar export --- */\n");
-            for c in &arrow {
-                h.push_str(&format!(
-                    "bool {}{}(Db* db, struct ArrowSchema* out_schema, struct ArrowArray* out_array, ForgeError** err_out);\n",
-                    pfx, c.sym
-                ));
-            }
-        }
-
-        h.push_str("\n#endif /* FORGEDB_H */\n");
-        Ok(GeneratedCode {
-            description: format!("Go binding C header ({} models)", models.len()),
-            code: h,
-        })
-    }
-
     /// The Arrow-exportable columns (same filter as the FFI Arrow ops): each
     /// id-bearing model's non-null fixed-width primitive / uuid / required-FK
     /// columns.
-    fn arrow_columns(schema: &Schema) -> Vec<ArrowCol> {
+    pub(crate) fn arrow_columns(schema: &Schema) -> Vec<ArrowCol> {
         let mut cols = Vec::new();
         for model in schema
             .models
@@ -256,6 +184,47 @@ impl GoGenerator {
             }
         }
         cols
+    }
+
+    /// The package-`init()` fingerprint check.
+    ///
+    /// **The fingerprint compared here is the `ffi` package's, not this
+    /// directory's.** `<output>/go/` is not a cache package and is not hashed;
+    /// the archive this links IS the `ffi` package's artifact, so the `ffi`
+    /// package's value is the only one that can agree with what the archive
+    /// exports. A later reader will want to "fix" this into a per-directory
+    /// hash; that breaks the comparison.
+    ///
+    /// What this buys over the linker is narrower than "load-time verification"
+    /// suggests, and the narrow version is the honest one: a schema change that
+    /// removes an exported symbol ALREADY fails to link. This adds (a) a readable
+    /// message where the linker's names a mangled C symbol, and (b) the cases the
+    /// linker cannot see at all — a `[storage]`/`[runtime]` knob that changes
+    /// durability semantics without changing one symbol name.
+    fn fingerprint_check(symbol_prefix: &str, fingerprint: &str) -> String {
+        format!(
+            r#"
+// forgedbFingerprint is the fingerprint of the generated source THIS file was
+// written from. The linked archive exposes the same value; `init` below refuses
+// to let the package load when they disagree.
+//
+// It is NOT a version: a ForgeDB upgrade that changes nothing about the emitted
+// source leaves it untouched.
+const forgedbFingerprint = "{fingerprint}"
+
+func init() {{
+	built := C.GoString(C.{pfx}fingerprint())
+	if built != forgedbFingerprint {{
+		panic("forgedb: libforgedb.a was built from a different schema than the Go package beside it" +
+			"\n  this package expects: " + forgedbFingerprint +
+			"\n  the archive reports:  " + built +
+			"\nRun `forgedb build` to recompile it.")
+	}}
+}}
+"#,
+            pfx = symbol_prefix,
+            fingerprint = fingerprint,
+        )
     }
 
     /// Generate the `forgedb_arrow.go` companion (only when the schema has
@@ -341,7 +310,7 @@ func (db *DB) {method}() (arrow.Array, error) {{
     // --- Derivation (shared by `generate` and `generate_header`) --------------
 
     /// The id-bearing models (same filter as the FFI per-model ops).
-    fn crud_models(schema: &Schema) -> Vec<GoModel> {
+    pub(crate) fn crud_models(schema: &Schema) -> Vec<GoModel> {
         schema
             .models
             .iter()
@@ -361,7 +330,7 @@ func (db *DB) {method}() (arrow.Array, error) {{
     /// M2M snapshot `_at` getter is intentionally not surfaced in this first cut,
     /// but its name is still reserved in `seen` so later families collide
     /// identically to the FFI derivation.
-    fn relation_ops(schema: &Schema) -> Vec<GoRelOp> {
+    pub(crate) fn relation_ops(schema: &Schema) -> Vec<GoRelOp> {
         let mut ops = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
 
@@ -1065,7 +1034,7 @@ const SYM_PLACEHOLDER: &str = "%SYM%";
 /// The prefix comes from `forgedb::naming::symbol_prefix` — the ONE definition —
 /// and is threaded in from the caller. `go.rs` never derives it, and neither
 /// does `ffi.rs`, which emits the symbols this file calls.
-fn subst(template: &str, symbol_prefix: &str) -> String {
+pub(crate) fn subst(template: &str, symbol_prefix: &str) -> String {
     template.replace(SYM_PLACEHOLDER, symbol_prefix)
 }
 
@@ -1287,6 +1256,14 @@ CGO_ENABLED=1 go build ./...
 Re-run `forgedb build` after every `.forge` schema change — the C ABI is tailored
 per schema, and the archive is linked into your binary at `go build` time.
 
+If you forget, the package refuses to load. Both halves carry a fingerprint of
+the generated source they came from, and `init()` compares them, so a stale
+archive is a panic naming the mismatch rather than a method set that no longer
+matches your schema. Most schema changes already fail at link time; this also
+covers the ones that do not — a `[storage]` or `[runtime]` setting changes what
+the engine does without changing a single exported symbol, and the linker cannot
+see that at all.
+
 ForgeDB compiles the engine inside its own build cache, and that cache is a
 cache: it can be cleared at any time. Static linking is what makes your binary
 survive that. Do not point cgo at a `.dylib`/`.so` in the cache instead — rustc
@@ -1453,7 +1430,7 @@ func erroredResult[T any](err error) <-chan Result[T] {
 
 /// The `forgedb.h` fixed preamble: guard, includes, opaque handle typedefs, and
 /// the schema-invariant spine prototypes.
-const HEADER_PREAMBLE: &str = r#"/* Code generated by ForgeDB. DO NOT EDIT. */
+pub(crate) const HEADER_PREAMBLE: &str = r#"/* Code generated by ForgeDB. DO NOT EDIT. */
 #ifndef FORGEDB_H
 #define FORGEDB_H
 

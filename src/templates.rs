@@ -259,14 +259,16 @@ enabled = false
 pub fn default_gitignore() -> &'static str {
     r#"# ForgeDB generated code is COMMITTED, not ignored.
 #
-# `generated/` holds source you review and ship — database.rs, api.rs, types.ts,
-# openapi.json, the client SDKs and go/. ForgeDB compiles the Rust in its own
-# build cache under $FORGEDB_HOME, so none of this is build output. Commit it.
+# Your output directory holds source you review and ship — database.rs, api.rs,
+# types.ts, openapi.json, the client SDKs, go/ and the binding shims. ForgeDB
+# compiles the Rust in its own build cache under $FORGEDB_HOME, so none of this
+# is build output. Commit it.
 #
-# The one COMPILED artifact ForgeDB delivers into the tree is the static library
-# the Go binding links against, and that is ignored:
-/generated/**/*.a
-/generated/**/*.lib
+# The COMPILED artifacts `forgedb build` delivers are ignored by a .gitignore
+# ForgeDB writes INSIDE that directory, not here (#337). This file cannot do it:
+# the patterns would have to name the output directory, and `output` is a
+# per-app setting (#333) — the literal `generated/` that used to be here was
+# already wrong for every project that configures one.
 
 # Database Files
 /data/

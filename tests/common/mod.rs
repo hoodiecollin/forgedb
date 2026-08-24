@@ -1,3 +1,9 @@
+#![allow(dead_code)]
+//
+// A shared harness: each test binary that says `mod common;` compiles the WHOLE
+// file and uses a subset of it, so an unused helper here is the normal case
+// rather than dead code.
+
 //! Shared harness for the tests that prove things about **generated code by
 //! running it** — generate a schema, compile the emitted crate against the
 //! in-tree substrate, and execute a driver binary that exercises it.
@@ -185,3 +191,90 @@ pub fn assert_driver_ok(out: &Output, proj: &Path, what: &str) {
     assert!(out.status.success(), "{what}:\n{stdout}\n{stderr}");
     let _ = std::fs::remove_dir_all(proj);
 }
+
+// ---------------------------------------------------------------------------
+// Load-command inspection (#409, shared with #337's delivery cases)
+// ---------------------------------------------------------------------------
+//
+// Lifted out of `placement_flip_test` when #337 needed the same normalisation for
+// the delivered `.node` and Python extension. A second copy would have been a
+// second parser of two tools that disagree in two silent ways, which is the
+// defect #409 fixed.
+
+/// `otool -L` on macOS, `ldd` elsewhere.
+pub fn load_commands(bin: &Path) -> String {
+    let tool = if cfg!(target_os = "macos") { "otool" } else { "ldd" };
+    let mut cmd = Command::new(tool);
+    if cfg!(target_os = "macos") {
+        cmd.arg("-L");
+    }
+    let out = cmd.arg(bin).output().expect("inspect load commands");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The libraries `bin` loads, normalised to one shape across the two tools.
+///
+/// `load_commands` already picks the right tool per platform, and the caller used to parse
+/// the result as though both spoke the same language. They do not, and BOTH differences
+/// are silent — the check kept running and kept looking thorough (#409):
+///
+/// ```text
+/// otool -L                          ldd
+/// ────────────────────────────      ────────────────────────────────────────────────
+/// /path/to/bin:              <- header    (no header line at all)
+///     /usr/lib/libSystem.B.dylib (…)      linux-vdso.so.1 (0x…)
+///                                         libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x…)
+///                                         /lib64/ld-linux-x86-64.so.2 (0x…)
+/// ```
+///
+/// 1. **The header.** The old code did `.skip(1)`, which drops `otool`'s `path:` line — and
+///    on Linux drops the first *real* library instead, unchecked. The set it examined was
+///    quietly one short.
+/// 2. **The first token.** With `otool` it is the library path. With `ldd` it is the SONAME,
+///    and the path is on the far side of `=>`. So every `ldd` line of that form was tested
+///    as `libc.so.6` rather than `/lib/x86_64-linux-gnu/libc.so.6`, matched no prefix in the
+///    allow-list, and failed — correctly rejecting a library that is as system as they come.
+///
+/// Both are the same mistake as the assertion they serve: a rule written against the output
+/// of one host, on a test that only ever ran on that host. Normalising here means the
+/// allow-list has exactly one format to reason about.
+pub fn linked_libraries(bin: &Path) -> Vec<String> {
+    parse_linked_libraries(&load_commands(bin))
+}
+
+/// The parsing half, split out so it can be tested WITHOUT the host it parses.
+///
+/// This matters more than it looks. The bug being fixed is Linux-only, `scenario_31` runs
+/// only in the nightly, and the person fixing it was on macOS — so the fix would otherwise
+/// have been verified on the one platform where the bug does not occur. That is the same
+/// shape as the defect itself. A pure function over captured tool output is checkable
+/// anywhere, on every PR, by `parses_both_tools_output` below.
+pub fn parse_linked_libraries(output: &str) -> Vec<String> {
+    output
+        .lines()
+        // `otool` prints `<binary>:` first; `ldd` prints no header. Drop the header by what
+        // it IS, not by position — position is what got this wrong.
+        .filter(|l| !l.trim_end().ends_with(':'))
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            // `ldd`'s resolved form: `soname => /abs/path (0xaddr)`. The path is what the
+            // allow-list is about; the SONAME carries no location at all.
+            let token = match line.split(" => ").nth(1) {
+                Some(rhs) => rhs.split_whitespace().next()?,
+                // Either an `otool` entry, an absolute-path `ldd` entry (the loader), or a
+                // pseudo-library with no path (`linux-vdso.so.1`).
+                None => line.split_whitespace().next()?,
+            };
+            // `ldd` renders an unresolvable dependency as `name => not found`; `nth(1)` then
+            // yields "not". Keep the SONAME so the failure names the missing library.
+            if token == "not" {
+                return line.split_whitespace().next().map(str::to_string);
+            }
+            Some(token.to_string())
+        })
+        .collect()
+}
+

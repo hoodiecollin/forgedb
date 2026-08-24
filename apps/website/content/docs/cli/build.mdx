@@ -65,13 +65,51 @@ forgedb build --report artifacts.json      # the whole report, for a Dockerfile
 The `deploy/` files `init` writes use `--print-artifact` rather than copying from a
 hard-coded path.
 
-<Callout type="note" title="One delivery, and only one">
-`build` copies nothing out of the cache except the FFI **static archive**, which it
-places beside the generated Go package as `generated/go/libforgedb.a`. Go is the one
-target whose source cannot be generated correctly without knowing where its library
-will be — the emitted cgo preamble links `-L${SRCDIR} -lforgedb`. It is the archive
-rather than the shared object on purpose: a shared object records an absolute path into
-the cache, and the cache is a cache.
+## What it delivers
+
+For every native target your project declares, `build` copies the compiled artifact out of
+the cache and into that app's output directory, beside the generated text that describes it,
+and prints where each one landed.
+
+| Target | Delivered to | As |
+|---|---|---|
+| `node-runtime` / `bun-runtime` | `<output>/napi/` | `forgedb.node` |
+| `python-runtime` | `<output>/pyo3/` | `_forgedb_native.abi3.so` |
+| `ffi` | `<output>/ffi/` | `libforgedb.a` |
+| `go-runtime` | `<output>/go/` | `libforgedb.a` |
+
+Nothing else is copied. The server binary is *reported* rather than delivered — the
+`deploy/` files read its path from `--print-artifact` in the same invocation that produced
+it — and the browser replica's `.wasm` is out of scope.
+
+<Callout type="note" title="Why C and Go get an archive and not a shared library">
+A shared library records an **absolute** path to where it was built, and copying it does not
+rewrite that path. A consumer that linked one would record a path into the ForgeDB build
+cache — and the cache is a cache, deletable at any time. An archive's contents are linked
+into your binary, so there is nothing left to dangle.
+
+Node and Python are unaffected: both load their extension by path at runtime and record no
+dependency on it.
+</Callout>
+
+<Callout type="warning" title="A stale artifact fails loudly">
+Generated code and the artifact built from it each carry a fingerprint of the source they
+came from. Change your schema, run `generate` but not `build`, and `require`/`import` throws
+— or a Go binary panics at start — naming the mismatch and telling you to run `forgedb
+build`. It is not a version: upgrading ForgeDB without changing your generated output
+invalidates nothing.
+
+For C the check is **advisory** — ForgeDB generates no C that runs, so `forgedb.h` offers
+`forgedb_fingerprint_ok()` and nothing can force you to call it.
+
+`forgedb dev` regenerates and never compiles, so an in-process Node or Python consumer will
+fail this check continuously during a watch session. The report is honest — the artifact
+really is stale — but you will want `forgedb build` in that loop.
+</Callout>
+
+<Callout type="note" title="CI needs a Rust toolchain">
+Compiled artifacts are ignored by git, so each machine builds its own from your schema. A CI
+job that tests an in-process binding has to run `forgedb build` first.
 </Callout>
 
 ## Examples

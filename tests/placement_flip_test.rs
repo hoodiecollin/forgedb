@@ -18,6 +18,9 @@
 //! half of the same property — what the emitted cgo preamble actually says —
 //! runs every time, because that is where the dylib mistake would reappear.
 
+mod common;
+
+use common::{linked_libraries, load_commands, parse_linked_libraries};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -182,8 +185,15 @@ fn scenario_29_exactly_one_rust_generator_invocation_exists() {
     );
 }
 
-/// The four packages `output` has stopped receiving are actually gone from it,
+/// The four **crates** `output` has stopped receiving are actually gone from it,
 /// and the two things that stayed are still there.
+///
+/// #337 narrowed this from "the directory is absent" to "the CRATE is absent".
+/// Those directories now receive the consumer-facing half of each binding — a
+/// header, an entry module, a Python module — which is generated text the user
+/// commits, not a cargo package. Asserting the whole directory away would refuse
+/// the delivery destination the epic exists to create, so the assertion is on the
+/// two files that make a directory a crate.
 #[test]
 fn the_output_directory_no_longer_receives_the_four_moved_packages() {
     let dir = project(
@@ -194,12 +204,22 @@ fn the_output_directory_no_longer_receives_the_four_moved_packages() {
 
     let outdir = dir.join("generated");
     for moved in ["ffi", "napi", "pyo3"] {
-        assert!(
-            !outdir.join(moved).exists(),
-            "{} still receives `{moved}/`",
-            outdir.display()
-        );
+        for crate_file in ["Cargo.toml", "src/lib.rs", "src/database.rs"] {
+            assert!(
+                !outdir.join(moved).join(crate_file).exists(),
+                "{} still receives `{moved}/{crate_file}`",
+                outdir.display()
+            );
+        }
     }
+
+    // …and each of them DOES receive its consumer-facing half (#337), which is
+    // the other half of the same property: the crate moved, the shim arrived.
+    assert!(outdir.join("ffi/forgedb.h").is_file(), "no C header in generated/ffi/");
+    assert!(outdir.join("napi/index.js").is_file(), "no entry module in generated/napi/");
+    assert!(outdir.join("napi/index.d.ts").is_file(), "no declarations in generated/napi/");
+    assert!(outdir.join("pyo3/forgedb.py").is_file(), "no Python module in generated/pyo3/");
+    assert!(outdir.join("pyo3/forgedb.pyi").is_file(), "no Python stub in generated/pyo3/");
     // `replica/`'s CRATE moved; its browser assets did not — they are files the
     // user's page serves, and a content-hashed cache directory is unservable.
     assert!(!outdir.join("replica/src").exists(), "replica/src/ was not moved");
@@ -437,13 +457,17 @@ fn scenario_31_a_go_binary_survives_deletion_of_the_cargo_target_directory() {
         staticlib.display()
     );
 
-    // Deliver it beside the Go package. This is the copy `forgedb build` owes
-    // the Go binding — see `forgedb::commands::generate::deliver_go_staticlib`.
+    // The delivery `forgedb build` already performed (#337 folded the Go
+    // carve-out into the general table). Asserted rather than re-run: a test
+    // that delivers for itself proves the copy works and says nothing about
+    // whether `build` runs it.
     let go_dir = dir.join("generated/go");
-    let delivered =
-        forgedb::commands::generate::deliver_go_staticlib(&dir.join("generated"), &staticlib)
-            .expect("deliver the staticlib");
-    assert_eq!(delivered, go_dir.join("libforgedb.a"));
+    let delivered = go_dir.join("libforgedb.a");
+    assert!(
+        delivered.is_file(),
+        "`forgedb build` did not deliver the archive to {}",
+        delivered.display()
+    );
 
     // The Arrow file pulls an external Go module; drop it so this case needs no
     // network. It is orthogonal to what is being asserted (how the engine links).
@@ -503,83 +527,6 @@ fn scenario_31_a_go_binary_survives_deletion_of_the_cargo_target_directory() {
             load_commands(&bin)
         );
     }
-}
-
-/// `otool -L` on macOS, `ldd` elsewhere.
-fn load_commands(bin: &Path) -> String {
-    let tool = if cfg!(target_os = "macos") { "otool" } else { "ldd" };
-    let mut cmd = Command::new(tool);
-    if cfg!(target_os = "macos") {
-        cmd.arg("-L");
-    }
-    let out = cmd.arg(bin).output().expect("inspect load commands");
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
-
-/// The libraries `bin` loads, normalised to one shape across the two tools.
-///
-/// `load_commands` already picks the right tool per platform, and the caller used to parse
-/// the result as though both spoke the same language. They do not, and BOTH differences
-/// are silent — the check kept running and kept looking thorough (#409):
-///
-/// ```text
-/// otool -L                          ldd
-/// ────────────────────────────      ────────────────────────────────────────────────
-/// /path/to/bin:              <- header    (no header line at all)
-///     /usr/lib/libSystem.B.dylib (…)      linux-vdso.so.1 (0x…)
-///                                         libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x…)
-///                                         /lib64/ld-linux-x86-64.so.2 (0x…)
-/// ```
-///
-/// 1. **The header.** The old code did `.skip(1)`, which drops `otool`'s `path:` line — and
-///    on Linux drops the first *real* library instead, unchecked. The set it examined was
-///    quietly one short.
-/// 2. **The first token.** With `otool` it is the library path. With `ldd` it is the SONAME,
-///    and the path is on the far side of `=>`. So every `ldd` line of that form was tested
-///    as `libc.so.6` rather than `/lib/x86_64-linux-gnu/libc.so.6`, matched no prefix in the
-///    allow-list, and failed — correctly rejecting a library that is as system as they come.
-///
-/// Both are the same mistake as the assertion they serve: a rule written against the output
-/// of one host, on a test that only ever ran on that host. Normalising here means the
-/// allow-list has exactly one format to reason about.
-fn linked_libraries(bin: &Path) -> Vec<String> {
-    parse_linked_libraries(&load_commands(bin))
-}
-
-/// The parsing half, split out so it can be tested WITHOUT the host it parses.
-///
-/// This matters more than it looks. The bug being fixed is Linux-only, `scenario_31` runs
-/// only in the nightly, and the person fixing it was on macOS — so the fix would otherwise
-/// have been verified on the one platform where the bug does not occur. That is the same
-/// shape as the defect itself. A pure function over captured tool output is checkable
-/// anywhere, on every PR, by `parses_both_tools_output` below.
-fn parse_linked_libraries(output: &str) -> Vec<String> {
-    output
-        .lines()
-        // `otool` prints `<binary>:` first; `ldd` prints no header. Drop the header by what
-        // it IS, not by position — position is what got this wrong.
-        .filter(|l| !l.trim_end().ends_with(':'))
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() {
-                return None;
-            }
-            // `ldd`'s resolved form: `soname => /abs/path (0xaddr)`. The path is what the
-            // allow-list is about; the SONAME carries no location at all.
-            let token = match line.split(" => ").nth(1) {
-                Some(rhs) => rhs.split_whitespace().next()?,
-                // Either an `otool` entry, an absolute-path `ldd` entry (the loader), or a
-                // pseudo-library with no path (`linux-vdso.so.1`).
-                None => line.split_whitespace().next()?,
-            };
-            // `ldd` renders an unresolvable dependency as `name => not found`; `nth(1)` then
-            // yields "not". Keep the SONAME so the failure names the missing library.
-            if token == "not" {
-                return line.split_whitespace().next().map(str::to_string);
-            }
-            Some(token.to_string())
-        })
-        .collect()
 }
 
 /// Fixtures captured from the real tools, including the exact `ldd` output that failed in

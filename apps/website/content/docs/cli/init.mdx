@@ -67,9 +67,10 @@ of yours, because there is no crate of yours.
 <Callout type="note" title="generated/ is committed">
 The scaffolded `.gitignore` no longer ignores `/generated/` wholesale. That directory is
 source you review and ship — `database.rs`, `api.rs`, `types.ts`, `openapi.json`, the
-client SDKs, the Go package. The one compiled artifact ForgeDB delivers into the tree is
-the static archive the Go binding links, and that is ignored by extension
-(`/generated/**/*.a`).
+client SDKs, the Go package, and the binding shims. The compiled artifacts `forgedb build`
+delivers are ignored by a `.gitignore` ForgeDB writes **inside** the output directory, not
+by this one: the patterns would have to name that directory, and `output` is a per-app
+setting.
 </Callout>
 
 ## Examples

@@ -293,3 +293,29 @@ jobs:
               ! ldd generated/smoke/smoke 2>/dev/null | grep -q 'not found'
               ! ldd generated/smoke/smoke 2>/dev/null | grep -q "$FORGEDB_HOME";;
           esac
+
+          # 8. THE init() GUARD (#337). Steps 6 and 7 prove a MATCHING pair runs;
+          #    they say nothing about whether the check that catches a mismatched
+          #    pair ever executes. This is the call-site half.
+          #
+          #    A `[storage]` knob changes durability semantics and NOT ONE
+          #    exported symbol, so `go build` still succeeds — which is precisely
+          #    the case the linker's undefined-symbol error cannot reach, and the
+          #    honest description of what the init() check adds over it.
+          cat >> forgedb.toml <<'CFG'
+
+          [storage]
+          fsync = "always"
+          CFG
+          "$FORGEDB" generate go --runtime --force
+          # Rebuild the Go package ONLY. `forgedb build` is deliberately NOT run:
+          # the point is a stale archive beside fresh source.
+          (cd generated/smoke && CGO_ENABLED=1 go build -o smoke .)
+          if (cd generated/smoke && ./smoke); then
+            echo "FAIL: the Go binary ran against an archive built from different source." >&2
+            echo "The init() fingerprint check did not execute." >&2
+            exit 1
+          fi
+          (cd generated/smoke && ./smoke 2>&1 || true) | tee init-check.log
+          grep -q 'different schema' init-check.log
+          grep -q 'forgedb build' init-check.log
