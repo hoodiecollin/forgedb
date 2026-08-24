@@ -43,6 +43,7 @@ fn test_init_command_creates_project_structure() {
     let project_path = temp_dir.path().join(project_name);
 
     let options = InitOptions {
+        project_name_override: None,
         project_name: project_path.to_string_lossy().to_string(),
         template: None,
         // Both are TOMBSTONES (#335 §15): they still exist so that setting one
@@ -93,6 +94,7 @@ fn test_init_with_blog_template() {
     let project_path = temp_dir.path().join(project_name);
 
     let options = InitOptions {
+        project_name_override: None,
         project_name: project_path.to_string_lossy().to_string(),
         template: Some("blog".to_string()),
         // Both are TOMBSTONES (#335 §15): they still exist so that setting one
@@ -129,6 +131,7 @@ fn test_init_emits_onhost_systemd_deploy() {
     let project_path = temp_dir.path().join(project_name);
 
     let options = InitOptions {
+        project_name_override: None,
         project_name: project_path.to_string_lossy().to_string(),
         template: None,
         // Both are TOMBSTONES (#335 §15): they still exist so that setting one

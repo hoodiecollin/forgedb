@@ -26,12 +26,12 @@ fn level() -> u8 {
     LEVEL.load(Ordering::Relaxed)
 }
 
-/// Is output suppressed? (`--quiet`.)
+/// Is output suppressed to errors only?
 ///
-/// Read by [`crate::prompt::askable`]: under `--quiet` a question would be a
-/// prompt nobody can see, so the interactive path is refused rather than
-/// entered. Exposed here rather than re-derived, so there is one definition of
-/// what quiet means.
+/// Exposed for [`crate::ask`], which needs the *level* rather than a printer:
+/// `--quiet` plus a missing answer takes the error path, because a question
+/// printed by a process the user asked to be silent is one they will not be
+/// looking for. This is the only reason the level is readable at all.
 pub fn is_quiet() -> bool {
     level() == QUIET
 }

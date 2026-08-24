@@ -74,7 +74,7 @@ pub use config::{FsyncMode, GenConfig};
 pub use default_fill::{FillValue, default_fill, fill_from_param};
 pub use escape::{python_host, python_types, typescript_host, typescript_types};
 pub use core_pkg::CorePackage;
-pub use server_pkg::{ServerLayout, ServerPackage};
+pub use server_pkg::ServerPackage;
 pub use ffi::FfiGenerator;
 pub use go::GoGenerator;
 pub use go_sdk::GoSdkGenerator;

@@ -12,7 +12,7 @@
 
 use forgedb::commands::migrate::answers::resolve_answers;
 use forgedb::commands::migrate::escape::language_for;
-use forgedb::prompt::Scripted;
+use forgedb::ask::ScriptedPrompt as Scripted;
 use forgedb_migrations::{
     Answer, EscapeLanguage, Migration, SchemaChange, SimpleType, hop_answer_status,
 };

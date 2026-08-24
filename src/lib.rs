@@ -1,3 +1,4 @@
+pub mod ask;
 pub mod cache;
 pub mod commands;
 pub mod config;
@@ -5,7 +6,6 @@ pub mod diagnostics;
 pub mod error;
 pub mod naming;
 pub mod project;
-pub mod prompt;
 pub mod targets;
 pub mod toolchain;
 pub mod templates;

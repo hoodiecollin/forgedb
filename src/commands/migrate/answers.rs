@@ -23,7 +23,7 @@
 //!    computed — otherwise the checksum does not cover the answer, and the
 //!    answer can be edited afterwards with the record still reading as intact.
 
-use crate::prompt::{Ask, Choice};
+use crate::ask::{Choice, Prompt};
 use crate::{Result, error::CliError};
 use forgedb_migrations::{Answer, EscapeLanguage, HopBodyClass, RenameProposal, SchemaChange};
 use std::path::Path;
@@ -67,7 +67,7 @@ pub fn resolve_answers(
     escape: EscapeLanguage,
     migrations_dir: &Path,
     migration_id: &str,
-    ask: Option<&mut dyn Ask>,
+    ask: Option<&mut (dyn Prompt + '_)>,
     non_interactive_reason: &str,
     // The hop's `(from, to)` schema serials — the two typed modules an escape
     // transform reads from and writes to.
@@ -228,13 +228,11 @@ fn copy_candidates(
 /// Ask one question. `Ok(None)` means "the operator chose the escape hatch",
 /// which the caller resolves once, for all of them, after every prompt.
 fn ask_one(
-    ask: &mut dyn Ask,
+    ask: &mut dyn Prompt,
     q: &Question<'_>,
     dest_schema: &forgedb_parser::Schema,
     escape: EscapeLanguage,
 ) -> Result<Option<Answer>> {
-    let io = |e: std::io::Error| CliError::Migration(format!("could not ask: {e}"));
-
     // The menu is built from what is actually possible for THIS change, so an
     // option that cannot work is never offered. A "copy another field" row on a
     // model with no field of the same type is an invitation to an answer the
@@ -271,7 +269,7 @@ fn ask_one(
     );
 
     loop {
-        let choice = ask.select(&question, &options, None).map_err(io)?;
+        let choice = ask.select(&question, &options, None)?;
         let Choice::Index(i) = choice else {
             // The menu offers no free-text escape, so `Ask` cannot return one.
             unreachable!("select without a free-text hint returns an index");
@@ -285,7 +283,7 @@ fn ask_one(
                         &q.copy_candidates,
                         None,
                     )
-                    .map_err(io)?;
+                    ?;
                 let Choice::Index(j) = picked else {
                     unreachable!("select without a free-text hint returns an index")
                 };
@@ -300,7 +298,7 @@ fn ask_one(
                         &[],
                         Some("the value"),
                     )
-                    .map_err(io)?;
+                    ?;
                 let Choice::Free(text) = typed else {
                     unreachable!("a menu with no options and a free hint returns free text")
                 };
@@ -361,7 +359,7 @@ fn language_label(l: EscapeLanguage) -> &'static str {
 pub fn resolve_rename_proposals(
     proposals: &[RenameProposal],
     changes: &mut Vec<SchemaChange>,
-    mut ask: Option<&mut dyn Ask>,
+    mut ask: Option<&mut (dyn Prompt + '_)>,
 ) -> Result<()> {
     for proposal in proposals {
         let (question, accepted_change, drops_and_adds): (String, SchemaChange, Vec<SchemaChange>) =
@@ -420,9 +418,7 @@ pub fn resolve_rename_proposals(
             };
 
         let accepted = match ask.as_deref_mut() {
-            Some(a) => a
-                .confirm(&question)
-                .map_err(|e| CliError::Migration(format!("could not ask: {e}")))?,
+            Some(a) => a.confirm(&question)?,
             // Declined. A drop+add is what the schema literally says.
             None => false,
         };

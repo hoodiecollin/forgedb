@@ -162,9 +162,8 @@ fn resolve_app(app: &AppRef) -> Result<ResolvedApp> {
         )));
     }
 
-    let governing_chain =
-        crate::project::govern(app.config.as_deref(), crate::project::schema_dir(schema))?;
-    let project = governing_chain.identify_reported()?;
+    let governing_chain = crate::project::govern_for_schema(app.config.as_deref(), schema)?;
+    let project = governing_chain.identify_reported(&*crate::ask::asker())?;
     let symbol_naming = governing_chain.symbol_naming();
     // Taken by value: `migrate build` reads `[toolchain]` much later, and
     // re-walking the chain there could answer a different question than the one
@@ -345,22 +344,29 @@ pub fn create(opts: MigrateCreateOptions) -> Result<()> {
     // record, then the snapshot, then the versioned schema; prompting in the
     // middle would add a window in which the operator answers, hits Ctrl-C, and
     // leaves a partial lineage behind.
-    let askable = crate::prompt::askable();
-    let mut tty = crate::prompt::Tty;
-    let interactive = !opts.no_auto && askable.is_yes();
+    // The SAME boundary `forgedb project` asks past (#367): `ask::prompt()`
+    // returns `None` unless stdin and stderr are both terminals, output is not
+    // suppressed, and nothing has forbidden asking. `--no-auto` is #374's own
+    // veto on top of it.
+    let mut widget = if opts.no_auto {
+        None
+    } else {
+        crate::ask::prompt()
+    };
     let reason = if opts.no_auto {
         "--no-auto"
     } else {
-        askable.reason()
+        crate::ask::Askability::detect().reason()
     };
-    let ask_for_renames: Option<&mut dyn crate::prompt::Ask> =
-        if interactive { Some(&mut tty) } else { None };
+    answers::resolve_rename_proposals(
+        &rename_proposals,
+        &mut changes,
+        widget.as_deref_mut(),
+    )?;
     // A rename is PROPOSED by the differ and decided here (#374 decision 10).
     // Resolved before the answers, because accepting one REPLACES a drop+add
     // pair — and the add in that pair is itself unprovable, so asking about it
     // first would ask a question the rename makes disappear.
-    answers::resolve_rename_proposals(&rename_proposals, &mut changes, ask_for_renames)?;
-
     ui::info(&format!("Detected {} change(s)", changes.len()));
     for change in &changes {
         let marker = if change.hop_body_class() == HopBodyClass::Authored {
@@ -371,15 +377,13 @@ pub fn create(opts: MigrateCreateOptions) -> Result<()> {
         println!("  • {}{}", change.description(), marker);
     }
 
-    let ask: Option<&mut dyn crate::prompt::Ask> =
-        if interactive { Some(&mut tty) } else { None };
     let scaffold = answers::resolve_answers(
         &mut changes,
         &dest_schema,
         escape_language,
         &migrations_dir,
         &migration_id,
-        ask,
+        widget.as_deref_mut(),
         reason,
         (from_version, to_version),
     )?;
