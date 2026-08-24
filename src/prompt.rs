@@ -148,10 +148,10 @@ impl Ask for Tty {
                 writeln!(err, "  (or type {hint})")?;
             }
             let answer = Self::ask_line("> ")?;
-            if let Ok(n) = answer.parse::<usize>() {
-                if n >= 1 && n <= options.len() {
-                    return Ok(Choice::Index(n - 1));
-                }
+            if let Ok(n) = answer.parse::<usize>()
+                && (1..=options.len()).contains(&n)
+            {
+                return Ok(Choice::Index(n - 1));
             }
             if free.is_some() && !answer.is_empty() {
                 return Ok(Choice::Free(answer));
@@ -223,10 +223,10 @@ impl Ask for Scripted {
     ) -> std::io::Result<Choice> {
         self.asked.push(question.to_string());
         let answer = self.next(question)?;
-        if let Ok(n) = answer.parse::<usize>() {
-            if n >= 1 && n <= options.len() {
-                return Ok(Choice::Index(n - 1));
-            }
+        if let Ok(n) = answer.parse::<usize>()
+            && (1..=options.len()).contains(&n)
+        {
+            return Ok(Choice::Index(n - 1));
         }
         if free.is_some() {
             return Ok(Choice::Free(answer));

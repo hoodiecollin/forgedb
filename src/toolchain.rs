@@ -179,9 +179,9 @@ pub fn version_at_least(reported: &str, min: &str) -> bool {
     };
     let got = nums(reported);
     let want = nums(min);
-    for i in 0..want.len() {
+    for (i, w) in want.iter().enumerate() {
         let g = got.get(i).copied().unwrap_or(0);
-        match g.cmp(&want[i]) {
+        match g.cmp(w) {
             std::cmp::Ordering::Greater => return true,
             std::cmp::Ordering::Less => return false,
             std::cmp::Ordering::Equal => {}

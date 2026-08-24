@@ -56,13 +56,18 @@ struct Question<'a> {
 /// loop.)
 ///
 /// Returns the [`EscapeLanguage`] scaffold that was written, if any.
+///
+/// The argument list is long because every one of them is a distinct fact this
+/// function needs and none is derivable from the others; bundling them into a
+/// struct would move the same eight values one line up, at one call site.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_answers(
     changes: &mut [SchemaChange],
     dest_schema: &forgedb_parser::Schema,
     escape: EscapeLanguage,
     migrations_dir: &Path,
     migration_id: &str,
-    mut ask: Option<&mut dyn Ask>,
+    ask: Option<&mut dyn Ask>,
     non_interactive_reason: &str,
     // The hop's `(from, to)` schema serials — the two typed modules an escape
     // transform reads from and writes to.
@@ -73,7 +78,7 @@ pub fn resolve_answers(
         return Ok(None);
     }
 
-    let Some(ask) = ask.as_deref_mut() else {
+    let Some(ask) = ask else {
         // The FIRST one, named. The rest are deliberately not mentioned.
         let q = &questions[0];
         return Err(CliError::Migration(format!(
