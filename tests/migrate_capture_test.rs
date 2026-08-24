@@ -584,3 +584,150 @@ fn decision_5_a_required_add_with_no_answer_lowers_to_nothing() {
          an unanswered hop write \"\" and exit 0."
     );
 }
+
+// ---------------------------------------------------------------------------
+// Scenario 20, tier 1 — the emitted modules are real types
+// ---------------------------------------------------------------------------
+
+use forgedb::commands::migrate::escape::write_support_files;
+
+const TYPED: &str = "enum Status { Draft, Published }\n\n\
+                     struct Point {\n  x: u32\n  y: u32\n}\n\n\
+                     Author {\n  id: +uuid\n  name: string\n}\n\n\
+                     Post {\n  id: +uuid\n  title: string(24)\n  views: u32?\n  \
+                     at: timestamp(us)\n  price: decimal\n  meta: json\n  \
+                     state: Status\n  origin: Point\n  tags: [u32; 3]\n  \
+                     author: *Author\n  editor: ?Author\n  raw: bytes(8)\n}\n";
+
+/// `migrate create` writes ForgeDB's own files beside the author's transform,
+/// and they are ALWAYS rewritten — so a CLI upgrade reaches them and any drift
+/// lands in the author's own `git diff` rather than as a type error in a file
+/// nobody edited.
+#[test]
+fn the_support_files_are_forgedbs_and_are_always_rewritten() {
+    let t = TempDir::new().unwrap();
+    let schema = parse(TYPED);
+    let versions = [(1u32, &schema), (2u32, &schema)];
+
+    let written =
+        write_support_files(t.path(), "20260808000000", EscapeLanguage::TypeScript, &versions)
+            .unwrap();
+    let names: Vec<String> = written
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(names, vec!["host.ts", "v1.ts", "v2.ts"]);
+
+    // Rewritten, not preserved — unlike the author's transform.
+    std::fs::write(&written[1], "// stale\n").unwrap();
+    write_support_files(t.path(), "20260808000000", EscapeLanguage::TypeScript, &versions).unwrap();
+    assert!(
+        !std::fs::read_to_string(&written[1]).unwrap().contains("stale"),
+        "ForgeDB's own modules are regenerated every time"
+    );
+
+    // A Rust escape is compiled INTO the hop, so there is nothing to emit here.
+    assert!(
+        write_support_files(t.path(), "20260808000001", EscapeLanguage::Rust, &versions)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// The TypeScript module types every field on the transformer's wire — and its
+/// wire is the `serde` form of the generated `vN` Rust struct, not the REST
+/// SDK's.
+///
+/// Tier 1 and structural. The **Python** pair is compiled for real by
+/// `tests/migrate_escape_test.rs` scenario 20 (`python -m compileall`, stdlib).
+/// TypeScript has no equivalent that needs nothing installed — `tsc` is not on
+/// any runner and a test that installs it fails on a network blip — so what is
+/// asserted here is the mapping, one row at a time.
+#[test]
+fn the_typescript_module_types_every_wire_shape() {
+    let schema = parse(TYPED);
+    let (name, src) = forgedb_codegen::typescript_types(&schema, 2);
+    assert_eq!(name, "v2.ts");
+
+    for expected in [
+        "export type Status = \"Draft\" | \"Published\";",
+        "export interface Point {",
+        "export interface Post {",
+        // #238: an inline `string(N)` is a string on the wire — the fixed slot
+        // is a storage fact JSON cannot observe.
+        "  title: string;",
+        "  views: number | null;",
+        // #254: an instant crosses JSON as an RFC 3339 string, never a number.
+        "  at: string;",
+        // decimal serializes as a string so precision survives.
+        "  price: string;",
+        "  meta: unknown;",
+        "  state: Status;",
+        "  origin: Point;",
+        "  tags: number[];",
+        // #266: an FK carries the TARGET's identity value, which is not always
+        // a uuid — here `Author.id` is one, so `string`.
+        "  author: string;",
+        "  editor: string | null;",
+        "  raw: number[];",
+    ] {
+        assert!(
+            src.contains(expected),
+            "the emitted v2.ts is missing {expected:?}:\n{src}"
+        );
+    }
+    assert!(
+        !src.contains(": any"),
+        "`any` in a module whose whole purpose is to type the author's transform \
+         is a type that checks nothing:\n{src}"
+    );
+    assert!(src.contains("DO NOT EDIT"), "it is ForgeDB's file:\n{src}");
+}
+
+/// The Python module maps the same wire to Python's names.
+#[test]
+fn the_python_module_types_every_wire_shape() {
+    let schema = parse(TYPED);
+    let (name, src) = forgedb_codegen::python_types(&schema, 1);
+    assert_eq!(name, "v1.py");
+    for expected in [
+        "Status = Literal[\"Draft\", \"Published\"]",
+        "class Point(TypedDict):",
+        "class Post(TypedDict):",
+        "    title: str",
+        "    views: Optional[int]",
+        "    at: str",
+        "    price: str",
+        "    meta: Any",
+        "    state: Status",
+        "    origin: Point",
+        "    tags: List[int]",
+        "    author: str",
+        "    editor: Optional[str]",
+        "    raw: List[int]",
+    ] {
+        assert!(
+            src.contains(expected),
+            "the emitted v1.py is missing {expected:?}:\n{src}"
+        );
+    }
+}
+
+/// A pure collection relation is **not on the row's wire at all** — it is stored
+/// as junction pairs the transformer copies separately — so it must not appear
+/// in either module.
+///
+/// A field typed `never` / `Any` here would be a lie the author would then try
+/// to return.
+#[test]
+fn a_collection_relation_is_absent_from_both_modules() {
+    let schema = parse(
+        "Author {\n  id: +uuid\n  name: string\n  posts: [Post]\n}\n\n\
+         Post {\n  id: +uuid\n  author: *Author\n}\n",
+    );
+    let (_, ts) = forgedb_codegen::typescript_types(&schema, 1);
+    let (_, py) = forgedb_codegen::python_types(&schema, 1);
+    assert!(!ts.contains("posts"), "{ts}");
+    assert!(!py.contains("posts"), "{py}");
+    assert!(!ts.contains("never"), "and no placeholder stands in for it:\n{ts}");
+}

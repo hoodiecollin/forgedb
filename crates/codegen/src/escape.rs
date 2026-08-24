@@ -170,13 +170,14 @@ fn ts_type(schema: &Schema, ty: &FieldType) -> String {
         FieldType::Nullable(inner) => format!("{} | null", ts_type(schema, inner)),
         // #266: an FK carries the TARGET's identity value on the wire, which is
         // not always a uuid.
-        FieldType::Relation(RelationType::RequiredReference(_)) => {
-            ts_type(schema, &crate::rust::RustGenerator::resolved_type(schema, ty))
-        }
-        FieldType::Relation(RelationType::OptionalReference(_)) => format!(
-            "{} | null",
-            ts_type(schema, &crate::rust::RustGenerator::resolved_type(schema, ty))
-        ),
+        //
+        // Both kinds delegate WITHOUT adding a nullability suffix:
+        // `resolved_type` already wraps an optional reference in `Nullable`, so
+        // adding one here produced `string | null | null`. Optionality has one
+        // source, and for a relation it is the resolution.
+        FieldType::Relation(
+            RelationType::RequiredReference(_) | RelationType::OptionalReference(_),
+        ) => ts_type(schema, &crate::rust::RustGenerator::resolved_type(schema, ty)),
         // Filtered out by `on_the_wire` before they reach here; kept so this
         // match is total rather than needing a catch-all.
         FieldType::Relation(RelationType::OneToMany(_) | RelationType::ManyToMany(_))
@@ -200,13 +201,11 @@ fn py_type(schema: &Schema, ty: &FieldType) -> String {
         FieldType::Bytes(_) => "List[int]".into(),
         FieldType::FixedArray(inner, _) => format!("List[{}]", py_type(schema, inner)),
         FieldType::Nullable(inner) => format!("Optional[{}]", py_type(schema, inner)),
-        FieldType::Relation(RelationType::RequiredReference(_)) => {
-            py_type(schema, &crate::rust::RustGenerator::resolved_type(schema, ty))
-        }
-        FieldType::Relation(RelationType::OptionalReference(_)) => format!(
-            "Optional[{}]",
-            py_type(schema, &crate::rust::RustGenerator::resolved_type(schema, ty))
-        ),
+        // See `ts_type`: `resolved_type` already wraps an optional reference in
+        // `Nullable`, so both kinds delegate without adding a second one.
+        FieldType::Relation(
+            RelationType::RequiredReference(_) | RelationType::OptionalReference(_),
+        ) => py_type(schema, &crate::rust::RustGenerator::resolved_type(schema, ty)),
         FieldType::Relation(RelationType::OneToMany(_) | RelationType::ManyToMany(_))
         | FieldType::Component(_) => "Any".into(),
     }
