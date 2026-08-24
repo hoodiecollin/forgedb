@@ -735,27 +735,103 @@ pub fn identify_and_claim(chain: &Chain) -> Result<ProjectId> {
 /// exactly the errors [`identify_and_claim`] produces.  A prompt only ever fills
 /// an answer that is otherwise absent.
 pub fn identify_and_claim_with(chain: &Chain, asker: &dyn Asker) -> Result<ProjectId> {
-    // Step 5 of #367 consults `asker` here, once there is an act to perform with
-    // the answer (`record_name` lands in step 2, `take_over_claim` in step 3).
-    // Threaded now so the boundary, the vocabulary and the call sites land as
-    // one reviewable change that alters no behaviour.
-    let _ = asker;
-    let id = identify(chain)?;
-    if let Claim::Conflict {
+    let schema_hint = chain.schema().map(Path::to_path_buf);
+
+    // Decision 1 — two manifests name the root and nothing chooses between them.
+    //
+    // `Chain` is deliberately not `Clone` (it owns parsed configs), so the
+    // post-write walk is held beside the borrow rather than replacing it.
+    let mut after_write: Option<Chain> = None;
+    let id = match identify_or_ask(chain)? {
+        Identified::Resolved(id) => id,
+        Identified::Ambiguous { root, candidates } => {
+            let question = Question::WhichName {
+                root: root.clone(),
+                candidates: candidates.clone(),
+                schema_hint: schema_hint.clone(),
+            };
+            // `TakeOverClaim` is not an answer to "which of these names";
+            // treating it as a decline keeps every unanswered shape on one path.
+            let Some(Answer::Name(name)) = asker.ask(&question)? else {
+                return Err(ambiguity_error(&root, &candidates, schema_hint.as_deref()));
+            };
+            record_name(chain, &name, false, asker)?;
+            // The chain is STALE the instant a config is written: in the create
+            // case the link does not exist in it at all, and a patched chain
+            // differs from a re-walked one in `name_pos`. Re-walk; never patch.
+            let rewalked = rewalk(chain)?;
+            let id = identify(&rewalked)?;
+            after_write = Some(rewalked);
+            id
+        }
+    };
+    let chain: &Chain = after_write.as_ref().unwrap_or(chain);
+
+    // Decision 2 — the resolved id is already claimed.
+    let Claim::Conflict {
         held_by,
         holder_exists,
     } = claim(&id)?
-    {
-        return Err(collision_error(
-            &id,
-            &Holder {
-                path: held_by,
-                exists: holder_exists,
-            },
-            chain.schema(),
-        ));
+    else {
+        return Ok(id);
+    };
+    let holder = Holder {
+        path: held_by,
+        exists: holder_exists,
+    };
+    let question = Question::Collision {
+        id: id.name.clone(),
+        root: id.root.clone(),
+        held_by: holder.path.clone(),
+        holder_exists: holder.exists,
+        schema_hint: schema_hint.clone(),
+    };
+
+    match asker.ask(&question)? {
+        // The LEDGER, and nothing else — the project keeps its name. This is the
+        // common instance of the decision, because nothing removes a claim.
+        Some(Answer::TakeOverClaim) => {
+            take_over_claim(&id, false)?;
+            Ok(id)
+        }
+        // A real collision: the answer is a new name in THIS project's own
+        // config, which is what makes the resolution survive a cache wipe.
+        // `overwrite` is true here and false above because the name being
+        // replaced is the one the user was just shown colliding — being shown it
+        // and answering with a replacement IS the in-session confirmation.
+        // `record_name` still gates the file write on `confirm_edit`.
+        Some(Answer::Name(name)) => {
+            record_name(chain, &name, true, asker)?;
+            let rewalked = rewalk(chain)?;
+            let id = identify(&rewalked)?;
+            // Claimed once, not recursively: an asker that keeps answering with
+            // a colliding name would otherwise loop forever, and a bounded
+            // retry that ends in the unchanged diagnostic is the honest shape.
+            match claim(&id)? {
+                Claim::Conflict {
+                    held_by,
+                    holder_exists,
+                } => Err(collision_error(
+                    &id,
+                    &Holder {
+                        path: held_by,
+                        exists: holder_exists,
+                    },
+                    schema_hint.as_deref(),
+                )),
+                _ => Ok(id),
+            }
+        }
+        None => Err(collision_error(&id, &holder, schema_hint.as_deref())),
     }
-    Ok(id)
+}
+
+/// Walk the same starting point again, after a config was written.
+fn rewalk(chain: &Chain) -> Result<Chain> {
+    match chain.schema() {
+        Some(schema) => Chain::walk_from_schema(schema),
+        None => Chain::walk(&chain.start),
+    }
 }
 
 /// The collision diagnostic — **two messages, because there are two remedies.**
