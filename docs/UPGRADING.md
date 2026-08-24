@@ -272,6 +272,46 @@ exported symbols. `uniform` narrows renames to schemas you actually move. Declar
 The cache's own member directories are unaffected: they are still keyed by the path hash, so no
 data directory and no cache layout needs migrating.
 
+### 9. The Node binding's `main` moved, and compiled artifacts are ignored elsewhere
+
+Two changes, both mechanical, both loud if you skip them.
+
+**`generated/napi/package.json` now names `index.js`, not `forgedb.node`.** `forgedb build`
+still delivers the addon as `forgedb.node`; what changed is that a generated entry module
+loads it and refuses to hand it back if it was built from different generated source than
+the code beside it. If `main` still points at the addon, `require()` resolves it directly
+and that check never runs — present, correct, and never executed.
+
+`forgedb generate` **repoints an existing `main`/`types` for you** and prints what it
+changed; every other key in the file is preserved. If you had replaced `main` with something
+of your own, ForgeDB leaves it alone — point it at `./index.js` yourself, or the check is
+inert.
+
+**The Python extension is delivered under a private name.** `generated/pyo3/` now holds a
+generated `forgedb.py` beside `_forgedb_native.abi3.so`. `import forgedb` is unchanged; what
+changed is that the name resolves to the generated module, which imports the extension and
+checks the fingerprint first. Put `generated/pyo3` on `sys.path` exactly as before.
+
+**The artifact ignore patterns moved out of the root `.gitignore`.** `forgedb init` used to
+write `/generated/**/*.a` and `/generated/**/*.lib` there. Those hardcoded the literal
+`generated/`, so they were already wrong for any project that configures `[generate].output`
+— and `output` is a per-app setting. `forgedb generate` now writes a `.gitignore` **inside**
+the output directory instead.
+
+Nothing forces you to delete the two old lines from your root `.gitignore`; they are
+redundant, not harmful. **Do commit the new `<output>/.gitignore`**, and do commit the shims
+beside it (`index.js`, `index.d.ts`, `forgedb.py`, `forgedb.pyi`, `ffi/forgedb.h`) — they are
+generated text like `types.ts`, they are covered by `generate --check`, and the load check
+does not work without them.
+
+One consequence worth knowing: the scaffolded root `.gitignore` ignores `*.js` and `*.d.ts`
+project-wide, and the new subtree file re-includes them. That also un-ignores
+`generated/replica/client/replica-worker.js`, generated text that has never been committable.
+
+**CI needs the Rust toolchain for any in-process consumer.** Compiled artifacts are ignored,
+so each machine builds its own with `forgedb build`. A CI job that only ran `npm test` or
+`pytest` against a committed `.node` no longer has one to run against.
+
 ### What is new rather than broken
 
 `[project]` is now read rather than ignored. `[project].name` is your project's id, and

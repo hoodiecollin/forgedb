@@ -166,12 +166,128 @@ struct CacheEmission {
     core_lib: Option<String>,
     /// `server/src/api.rs`, and the `<output>/api.rs` mirror.
     api: Option<String>,
-    /// Each wrapper's `src/lib.rs`. `None` means this invocation did not emit
-    /// that package, and the cache writer skips it.
-    ffi: Option<String>,
-    napi: Option<String>,
-    pyo3: Option<String>,
-    wasm: Option<String>,
+    /// The `core` package as it will be written — manifest included.
+    core: Option<PackagePlan>,
+    /// The `server` package as it will be written.
+    server: Option<PackagePlan>,
+    /// Each wrapper package this invocation planned. An absent kind means this
+    /// invocation did not emit it, and the cache writer skips it.
+    wrappers: Vec<PackagePlan>,
+    /// Memoized fingerprints, keyed by package directory. **One derivation**:
+    /// the Go arm needs the `ffi` value mid-emission and the shim pass needs it
+    /// again afterwards, and a second computation is a second thing that can
+    /// disagree.
+    fingerprints: std::collections::BTreeMap<String, String>,
+    /// Was `ffi` DECLARED, or merely pulled in by the `go` arm?
+    ///
+    /// The two are different projects: a Go-only project has no `<output>/ffi/`
+    /// and must not grow one, because a directory that exists is a directory
+    /// delivery delivers into.
+    ffi_declared: bool,
+}
+
+/// One cache package as it will be written: package-relative path -> contents.
+///
+/// **Rendered before anything is written**, which is the whole reason this type
+/// exists. The fingerprint has to cover the exact bytes that land — manifests
+/// included, since a substrate pin change alters the compiled artifact while
+/// leaving every `.rs` byte identical — and the shims that carry the value are
+/// written into `output` during the same invocation. Hashing a directory scan
+/// afterwards is the ordering trap #335 hit once already (`place()` had to split
+/// into `reserve` + `sync_root` because rendering from a scan described the
+/// PREVIOUS run).
+struct PackagePlan {
+    kind: crate::naming::PackageKind,
+    files: Vec<(String, String)>,
+}
+
+impl PackagePlan {
+    fn new(kind: crate::naming::PackageKind, files: Vec<(String, String)>) -> PackagePlan {
+        PackagePlan { kind, files }
+    }
+
+    /// This package's hash entries, namespaced by its directory.
+    ///
+    /// The prefix is what keeps `core/src/lib.rs` and `napi/src/lib.rs` distinct
+    /// in an input that holds both.
+    fn entries(&self) -> Vec<crate::fingerprint::Entry<'_>> {
+        let dir = self.kind.dir();
+        self.files
+            .iter()
+            .map(|(rel, body)| crate::fingerprint::Entry {
+                path: format!("{dir}/{rel}"),
+                bytes: body.as_str(),
+            })
+            .collect()
+    }
+
+    fn push(&mut self, rel: &str, body: String) {
+        self.files.push((rel.to_string(), body));
+    }
+}
+
+/// Why the FFI engine is being emitted.
+///
+/// A plain `bool` here would be a parameter a call site can compute a second,
+/// divergent condition into — the shape #445 deleted from `CorePackage::cargo_toml`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FfiReason {
+    /// `generate ffi`, or `ffi` in `[generate].targets`. The user asked for a C
+    /// binding, so `<output>/ffi/` gets a header.
+    Declared,
+    /// The `go` arm needs the same engine package. Nothing lands in
+    /// `<output>/ffi/`.
+    ForGo,
+}
+
+impl CacheEmission {
+    fn wrapper(&self, kind: &crate::naming::PackageKind) -> Option<&PackagePlan> {
+        self.wrappers.iter().find(|p| &p.kind == kind)
+    }
+
+    fn wrapper_mut(&mut self, kind: &crate::naming::PackageKind) -> Option<&mut PackagePlan> {
+        self.wrappers.iter_mut().find(|p| &p.kind == kind)
+    }
+
+    /// Plan one binding wrapper: manifest, `src/lib.rs`, and whatever build-time
+    /// files that wrapper needs beside them.
+    fn plan_wrapper(
+        &mut self,
+        kind: crate::naming::PackageKind,
+        manifest: String,
+        lib_rs: String,
+        extra: &[(&str, String)],
+    ) {
+        let mut files = vec![
+            ("Cargo.toml".to_string(), manifest),
+            ("src/lib.rs".to_string(), lib_rs),
+        ];
+        for (name, body) in extra {
+            files.push(((*name).to_string(), body.clone()));
+        }
+        self.wrappers.push(PackagePlan::new(kind, files));
+    }
+
+    /// The fingerprint of one wrapper package: the app's `core` plus that
+    /// package's own directory, `src/fingerprint.rs` excluded by name.
+    ///
+    /// `None` when either half has not been planned — a `--sdk`-only run emits
+    /// no `core`, and there is then nothing to fingerprint.
+    fn fingerprint(&mut self, kind: &crate::naming::PackageKind) -> Option<String> {
+        let dir = kind.dir();
+        if let Some(value) = self.fingerprints.get(&dir) {
+            return Some(value.clone());
+        }
+        let value = {
+            let core = self.core.as_ref()?;
+            let pkg = self.wrapper(kind)?;
+            let mut entries = core.entries();
+            entries.extend(pkg.entries());
+            crate::fingerprint::compute(&entries)
+        };
+        self.fingerprints.insert(dir, value.clone());
+        Some(value)
+    }
 }
 
 pub fn run(options: GenerateOptions) -> Result<()> {
@@ -355,7 +471,7 @@ pub fn run(options: GenerateOptions) -> Result<()> {
             generate_wasm_replica(&ctx, &mut cache, &mut generated_files)?;
         }
         "ffi" => {
-            generate_ffi_engine(&ctx, &mut cache, &mut generated_files)?;
+            generate_ffi_engine(&ctx, &mut cache, &mut generated_files, FfiReason::Declared)?;
         }
         // Per-runtime ergonomic wrappers (#51/#52/#117). Resolved here from
         // `python --runtime` / `node|bun --runtime`; the generators land in their
@@ -391,6 +507,18 @@ pub fn run(options: GenerateOptions) -> Result<()> {
             )));
         }
     }
+
+    // The consumer-facing half of every delivered target (#337), as a POST-PASS.
+    //
+    // It has to run after every arm, not inside one: a shim carries the
+    // fingerprint of its package, the fingerprint covers the rendered manifest,
+    // and a manifest is not rendered until the arm that plans the package has
+    // run. Writing a shim from inside an arm would hash a package that is not
+    // finished being planned.
+    //
+    // It runs BEFORE the check-mode comparison below, so `generate --check`
+    // covers the shims — they are committed generated text like `types.ts`.
+    emit_consumer_shims(&ctx, &mut cache, &mut generated_files)?;
 
     // Check mode: compare each freshly generated artifact against what's
     // committed, then remove the scratch dir. Only generated artifacts are
@@ -467,7 +595,7 @@ pub fn run(options: GenerateOptions) -> Result<()> {
     // `<output>/database.rs` got — one value, two writes — never a second
     // generator invocation.
     if let Some(container) = &options.cache_container {
-        emit_cache_packages(container, &naming, &ctx.gen_config, &cache)?;
+        emit_cache_packages(container, &cache)?;
     }
 
     // The in-tree placement (#338). A SECOND DESTINATION for the package the
@@ -570,7 +698,7 @@ fn generate_all(
     // The native FFI engine (the Layer-0 C-ABI spine every language binding
     // hangs off, and the `staticlib` the Go binding links).
     if opt_in("ffi") {
-        generate_ffi_engine(ctx, cache, files)?;
+        generate_ffi_engine(ctx, cache, files, FfiReason::Declared)?;
     }
 
     // REST client SDKs (#118/#205/#206). Each emits a portable network client,
@@ -647,6 +775,21 @@ fn ensure_database(
             description: result.description,
         },
     ));
+    // The `core` package as it will be written, manifest included — rendered
+    // HERE so the fingerprint sees the bytes that land. The manifest comes from
+    // the SAME `GenConfig` that rendered `core_lib` (#445), so its `utoipa` pin
+    // and the source's `use utoipa::ToSchema;` cannot disagree.
+    cache.core = Some(PackagePlan::new(
+        crate::naming::PackageKind::Core,
+        forgedb_codegen::CorePackage::files(
+            &ctx.naming.package(&crate::naming::PackageKind::Core),
+            &ctx.gen_config,
+            &core_lib,
+        )
+        .into_iter()
+        .map(|(rel, body)| (rel.to_string(), body))
+        .collect(),
+    ));
     cache.core_lib = Some(core_lib);
     Ok(())
 }
@@ -665,6 +808,24 @@ fn emit_api(
         .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
     let path = ctx.output.join("api.rs");
     write_file(&path, &result.code, ctx.force)?;
+    let core_pkg = ctx.naming.package(&crate::naming::PackageKind::Core);
+    let server_pkg = ctx.naming.package(&crate::naming::PackageKind::Server);
+    cache.server = Some(PackagePlan::new(
+        crate::naming::PackageKind::Server,
+        vec![
+            (
+                "Cargo.toml".to_string(),
+                forgedb_codegen::ServerPackage::cargo_toml(&server_pkg, &core_pkg),
+            ),
+            // `api.rs` needs no generator change: it opens with `use super::*;`,
+            // so a `main.rs` that globs `forgedb_core` compiles it verbatim.
+            ("src/api.rs".to_string(), result.code.clone()),
+            (
+                "src/main.rs".to_string(),
+                forgedb_codegen::ServerPackage::main_rs(),
+            ),
+        ],
+    ));
     cache.api = Some(result.code.clone());
     files.push((path, result));
     Ok(())
@@ -680,14 +841,29 @@ fn generate_ffi_engine(
     ctx: &Emit<'_>,
     cache: &mut CacheEmission,
     files: &mut Vec<(PathBuf, forgedb_codegen::GeneratedCode)>,
+    reason: FfiReason,
 ) -> Result<()> {
-    if cache.ffi.is_some() {
+    // Set BEFORE the memo check: `targets = ["go", "ffi"]` reaches this twice,
+    // and a flag set after an early return records whichever call happened to be
+    // first.
+    if reason == FfiReason::Declared {
+        cache.ffi_declared = true;
+    }
+    if cache.wrapper(&crate::naming::PackageKind::Ffi).is_some() {
         return Ok(());
     }
     ensure_database(ctx, cache, files)?;
     let ffi_result = FfiGenerator::generate(ctx.schema, &ctx.naming.symbol_prefix)
         .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
-    cache.ffi = Some(ffi_result.code);
+    cache.plan_wrapper(
+        crate::naming::PackageKind::Ffi,
+        FfiGenerator::cargo_toml(
+            &ctx.naming.package(&crate::naming::PackageKind::Ffi),
+            &ctx.naming.package(&crate::naming::PackageKind::Core),
+        ),
+        ffi_result.code,
+        &[],
+    );
     Ok(())
 }
 
@@ -702,13 +878,25 @@ fn generate_pyo3_binding(
     cache: &mut CacheEmission,
     files: &mut Vec<(PathBuf, forgedb_codegen::GeneratedCode)>,
 ) -> Result<()> {
-    if cache.pyo3.is_some() {
+    if cache.wrapper(&crate::naming::PackageKind::Pyo3).is_some() {
         return Ok(());
     }
     ensure_database(ctx, cache, files)?;
     let py_result = PyO3Generator::generate(ctx.schema)
         .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
-    cache.pyo3 = Some(py_result.code);
+    cache.plan_wrapper(
+        crate::naming::PackageKind::Pyo3,
+        PyO3Generator::cargo_toml(
+            &ctx.naming.package(&crate::naming::PackageKind::Pyo3),
+            &ctx.naming.package(&crate::naming::PackageKind::Core),
+        ),
+        py_result.code,
+        // The `build.rs` is not optional packaging: without
+        // `pyo3_build_config::add_extension_module_link_args()` a plain
+        // `cargo build` of an extension module fails at LINK time on macOS
+        // (undefined `_PyExc_*`), which a `cargo check` never reaches.
+        &[("build.rs", PyO3Generator::build_rs_scaffold().to_string())],
+    );
     Ok(())
 }
 
@@ -719,13 +907,23 @@ fn generate_napi_binding(
     cache: &mut CacheEmission,
     files: &mut Vec<(PathBuf, forgedb_codegen::GeneratedCode)>,
 ) -> Result<()> {
-    if cache.napi.is_some() {
+    if cache.wrapper(&crate::naming::PackageKind::Napi).is_some() {
         return Ok(());
     }
     ensure_database(ctx, cache, files)?;
     let napi_result = NapiGenerator::generate(ctx.schema)
         .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
-    cache.napi = Some(napi_result.code);
+    cache.plan_wrapper(
+        crate::naming::PackageKind::Napi,
+        NapiGenerator::cargo_toml(
+            &ctx.naming.package(&crate::naming::PackageKind::Napi),
+            &ctx.naming.package(&crate::naming::PackageKind::Core),
+        ),
+        napi_result.code,
+        // The `package.json` no longer lives here: it is the CONSUMER's file and
+        // moved to `<output>/napi/` with the entry module it names (#337).
+        &[("build.rs", NapiGenerator::build_rs_scaffold().to_string())],
+    );
     Ok(())
 }
 
@@ -742,7 +940,7 @@ fn generate_wasm_replica(
     cache: &mut CacheEmission,
     files: &mut Vec<(PathBuf, forgedb_codegen::GeneratedCode)>,
 ) -> Result<()> {
-    if cache.wasm.is_some() {
+    if cache.wrapper(&crate::naming::PackageKind::Wasm).is_some() {
         return Ok(());
     }
     ensure_database(ctx, cache, files)?;
@@ -750,7 +948,15 @@ fn generate_wasm_replica(
     // The wasm-bindgen transport glue — a cache package.
     let wasm_result =
         WasmGenerator::generate(ctx.schema).map_err(|e| CliError::CodeGeneration(e.to_string()))?;
-    cache.wasm = Some(wasm_result.code);
+    cache.plan_wrapper(
+        crate::naming::PackageKind::Wasm,
+        WasmGenerator::cargo_toml(
+            &ctx.naming.package(&crate::naming::PackageKind::Wasm),
+            &ctx.naming.package(&crate::naming::PackageKind::Core),
+        ),
+        wasm_result.code,
+        &[],
+    );
 
     // The main-thread async client (#110 #2): a per-schema TS `ReplicaClient`
     // that RPCs into the Worker running the engine — mirrors the transport's read
@@ -786,7 +992,7 @@ fn generate_wasm_replica(
 /// **`go/` stays in `output`** (#335 §6): it is Go source the user's program
 /// imports, and a hashed cache directory is unimportable. The engine it links is
 /// the cache's FFI package, delivered here as `libforgedb.a` by `forgedb build`
-/// — see [`deliver_go_staticlib`].
+/// — see [`crate::commands::build::deliver`].
 fn generate_go_binding(
     ctx: &Emit<'_>,
     cache: &mut CacheEmission,
@@ -795,13 +1001,28 @@ fn generate_go_binding(
     // The FFI engine package the Go binding links against — reused verbatim, so
     // Go requires no new C symbol. Idempotent, so `targets = ["ffi", "go"]`
     // emits one engine rather than racing two arms to write the same files.
-    generate_ffi_engine(ctx, cache, files)?;
+    generate_ffi_engine(ctx, cache, files, FfiReason::ForGo)?;
 
     let go_dir = ctx.output.join("go");
     fs::create_dir_all(&go_dir)?;
 
+    // **The `ffi` package's fingerprint, not this directory's.** `<output>/go/`
+    // is not a cache package and is not hashed; the archive `forgedb build`
+    // delivers here IS the `ffi` package's artifact, so the `ffi` value is the
+    // only one that can agree with what the archive exports. A per-directory
+    // reading of the same granularity rule breaks the comparison.
+    let fingerprint = cache
+        .fingerprint(&crate::naming::PackageKind::Ffi)
+        .ok_or_else(|| {
+            CliError::CodeGeneration(
+                "the Go binding needs the FFI package's source fingerprint, and no FFI \
+                 package was planned. This is a ForgeDB bug; please report it."
+                    .to_string(),
+            )
+        })?;
+
     // The generated Go cgo package.
-    let go_result = GoGenerator::generate(ctx.schema, &ctx.naming.symbol_prefix)
+    let go_result = GoGenerator::generate(ctx.schema, &ctx.naming.symbol_prefix, &fingerprint)
         .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
     let go_path = go_dir.join("forgedb.go");
     write_file(&go_path, &go_result.code, ctx.force)?;
@@ -828,8 +1049,10 @@ fn generate_go_binding(
     }
 
     // The C header cgo `#include`s (declares the app's prefixed prototypes).
-    let header_result = GoGenerator::generate_header(ctx.schema, &ctx.naming.symbol_prefix)
-        .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+    // Emitted by `FfiGenerator` — the symbols it declares are DEFINED there.
+    let header_result =
+        FfiGenerator::generate_header(ctx.schema, &ctx.naming.symbol_prefix, &fingerprint)
+            .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
     let header_path = go_dir.join("forgedb.h");
     write_file(&header_path, &header_result.code, ctx.force)?;
     files.push((header_path, header_result));
@@ -1175,10 +1398,10 @@ pub use forgedb_types;\n";
 /// (#338) — is **ForgeDB's file**, rewritten in full on every generate. That is
 /// what makes a CLI upgrade's substrate pin reach an existing project instead of
 /// freezing at whatever the first run wrote (#290's floor problem).
-fn write_core_package(dir: &Path, files: &[(&'static str, String)]) -> Result<Vec<PathBuf>> {
+fn write_core_package<P: AsRef<Path>>(dir: &Path, files: &[(P, String)]) -> Result<Vec<PathBuf>> {
     let mut written = Vec::with_capacity(files.len());
     for (rel, body) in files {
-        let path = dir.join(rel);
+        let path = dir.join(rel.as_ref());
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -1188,150 +1411,262 @@ fn write_core_package(dir: &Path, files: &[(&'static str, String)]) -> Result<Ve
     Ok(written)
 }
 
-fn emit_cache_packages(
-    container: &Path,
-    naming: &AppNaming,
-    gen_config: &forgedb_codegen::GenConfig,
-    cache: &CacheEmission,
-) -> Result<()> {
-    let Some(core_lib) = cache.core_lib.as_deref() else {
+/// Write every planned cache package.
+///
+/// **It writes plans, and renders nothing.** Every byte here was rendered during
+/// the emitting arms, which is what lets the fingerprint cover the exact bytes
+/// that land and lets the shims carrying that value be written in the same
+/// invocation. Rendering here again would be a second derivation of one artifact.
+///
+/// Everything is rewritten in full on every generate. There is no
+/// write-only-when-absent branch **on purpose**: the output directory's
+/// scaffolds are the user's and are preserved, but a stale manifest in a
+/// directory the user never opens is how a CLI upgrade that bumps a substrate
+/// pin fails to reach an existing project.
+fn emit_cache_packages(container: &Path, cache: &CacheEmission) -> Result<()> {
+    let Some(core) = cache.core.as_ref() else {
         // No Rust database was emitted in this invocation (a `--sdk`-only or
         // stubs-only run), so there is no `core` to write and nothing that
         // depends on one.
         return Ok(());
     };
 
-    let core_pkg = naming.package(&crate::naming::PackageKind::Core);
-    let core_dir = container.join(crate::naming::PackageKind::Core.dir());
-    // Rendered by `CorePackage::files` — the ONE definition of what a `core`
-    // package is, shared with the in-tree emitter and `--check`'s comparer
-    // (#338). Two destinations, one renderer; a second enumeration here is how
-    // an in-tree package would come to hold a different file set than a cache
-    // one while both looked right.
-    //
-    // The manifest is rendered from THE SAME `GenConfig` that rendered
-    // `core_lib` (#445). `utoipa` is pinned iff `GenConfig::needs_utoipa` — the
-    // one condition — and that is also what put `use utoipa::ToSchema;` and the
-    // derives into the source this manifest compiles.
-    //
-    // It used to read `cache.api.is_some()`: "did the command I just ran emit an
-    // api". That is a DIFFERENT condition, and it disagrees for exactly the
-    // invocations that narrow — `generate rust` under `targets = ["all"]`, and
-    // `build --no-api` — emitting a `core` whose source names a crate its own
-    // manifest does not pin (`error[E0432]: unresolved import 'utoipa'`).
-    //
-    // The parameter that carried the divergent condition is gone: `cargo_toml`
-    // takes the config, so there is nothing here left to compute.
-    write_core_package(
-        &core_dir,
-        &forgedb_codegen::CorePackage::files(&core_pkg, gen_config, core_lib),
-    )?;
-    ui::detail(&format!("  ✓ {} (cache package)", core_dir.display()));
+    // `write_core_package` is the ONE writer, shared with #338's in-tree
+    // placement. Two destinations, one writer; a second copy of "create the
+    // parent, write the bytes" is where the two would start disagreeing about,
+    // say, whether a stale file is removed first.
+    write_plan(container, core)?;
 
-    if let Some(api) = cache.api.as_deref() {
-        let server_pkg = naming.package(&crate::naming::PackageKind::Server);
-        let server_dir = container.join(crate::naming::PackageKind::Server.dir());
-        fs::create_dir_all(server_dir.join("src"))?;
-        fs::write(
-            server_dir.join("Cargo.toml"),
-            forgedb_codegen::ServerPackage::cargo_toml(&server_pkg, &core_pkg),
-        )?;
-        // `api.rs` needs no generator change: it opens with `use super::*;`, so a
-        // `main.rs` that globs `forgedb_core` compiles it verbatim.
-        fs::write(server_dir.join("src/api.rs"), api)?;
-        fs::write(
-            server_dir.join("src/main.rs"),
-            forgedb_codegen::ServerPackage::main_rs(),
-        )?;
-        ui::detail(&format!("  ✓ {} (cache package)", server_dir.display()));
+    if let Some(server) = cache.server.as_ref() {
+        write_plan(container, server)?;
     }
 
-    // --- The four binding wrappers (#335 §1, steps 5b + 7) -------------------
+    // --- The binding wrappers (#335 §1, steps 5b + 7) ------------------------
     //
     // Each manifest pins ZERO substrate, reaching all of it through `core`. That
     // is what makes their substrate types UNIFY with `core`'s: before this,
     // every wrapper carried its own pin list beside its own copy of
-    // `database.rs`, and the four copies agreed only because one lockfile
-    // resolved four independently-authored lists the same way.
+    // `database.rs`, and the copies agreed only because one lockfile resolved
+    // several independently-authored lists the same way.
     //
-    // A wrapper arm cannot fire without `core`: every emitter that sets one of
-    // these fields calls `ensure_database` first, and this function returns
-    // early when that produced nothing.
-    use crate::naming::PackageKind;
-
-    if let Some(napi) = cache.napi.as_deref() {
-        write_wrapper_package(
-            container,
-            &PackageKind::Napi,
-            NapiGenerator::cargo_toml(&naming.package(&PackageKind::Napi), &core_pkg),
-            napi,
-            &[
-                ("build.rs", NapiGenerator::build_rs_scaffold()),
-                ("package.json", NapiGenerator::package_json_scaffold()),
-            ],
-        )?;
-    }
-
-    if let Some(pyo3) = cache.pyo3.as_deref() {
-        // The `build.rs` is not optional packaging: without
-        // `pyo3_build_config::add_extension_module_link_args()` a plain
-        // `cargo build` of an extension module fails at LINK time on macOS
-        // (undefined `_PyExc_*`), which a `cargo check` never reaches.
-        write_wrapper_package(
-            container,
-            &PackageKind::Pyo3,
-            PyO3Generator::cargo_toml(&naming.package(&PackageKind::Pyo3), &core_pkg),
-            pyo3,
-            &[("build.rs", PyO3Generator::build_rs_scaffold())],
-        )?;
-    }
-
-    if let Some(ffi) = cache.ffi.as_deref() {
-        write_wrapper_package(
-            container,
-            &PackageKind::Ffi,
-            FfiGenerator::cargo_toml(&naming.package(&PackageKind::Ffi), &core_pkg),
-            ffi,
-            &[],
-        )?;
-    }
-
-    if let Some(wasm) = cache.wasm.as_deref() {
-        write_wrapper_package(
-            container,
-            &PackageKind::Wasm,
-            WasmGenerator::cargo_toml(&naming.package(&PackageKind::Wasm), &core_pkg),
-            wasm,
-            &[],
-        )?;
+    // A wrapper arm cannot fire without `core`: every emitter that plans one
+    // calls `ensure_database` first, and this function returns early when that
+    // produced nothing.
+    for wrapper in &cache.wrappers {
+        write_plan(container, wrapper)?;
     }
 
     Ok(())
 }
 
-/// Write one binding wrapper as a cache package: manifest, `src/lib.rs`, and
-/// whatever build-time files that wrapper needs beside them.
-///
-/// Everything here is rewritten in full on every generate, like every other file
-/// in the cache. There is no write-only-when-absent branch **on purpose**: the
-/// output directory's scaffolds are the user's and are preserved, but a stale
-/// manifest in a directory the user never opens is how a CLI upgrade that bumps
-/// a substrate pin fails to reach an existing project.
-fn write_wrapper_package(
-    container: &Path,
-    kind: &crate::naming::PackageKind,
-    manifest: String,
-    lib_rs: &str,
-    extra: &[(&str, &str)],
-) -> Result<()> {
-    let dir = container.join(kind.dir());
-    fs::create_dir_all(dir.join("src"))?;
-    fs::write(dir.join("Cargo.toml"), manifest)?;
-    fs::write(dir.join("src").join("lib.rs"), lib_rs)?;
-    for (name, content) in extra {
-        fs::write(dir.join(name), content)?;
-    }
+/// Write one planned package into `container`.
+fn write_plan(container: &Path, plan: &PackagePlan) -> Result<()> {
+    let dir = container.join(plan.kind.dir());
+    write_core_package(&dir, &plan.files)?;
     ui::detail(&format!("  ✓ {} (cache package)", dir.display()));
+    Ok(())
+}
+
+// ===========================================================================
+// The consumer-facing half (#337)
+// ===========================================================================
+
+/// What `<output>/.gitignore` says.
+///
+/// **Extensions only.** Never a directory, never `*.rs`, never `Cargo.toml`:
+/// #338 writes a ForgeDB-owned cargo package into the consumer's tree and that
+/// package is committed source, so a pattern here that swallowed a directory or
+/// a Rust file would silently un-commit it.
+///
+/// The re-includes are not optional. `forgedb init`'s root `.gitignore` ignores
+/// `*.js` and `*.d.ts` project-wide (they are build output for a TypeScript
+/// project), and a deeper `.gitignore` is the only thing that can override that
+/// for this subtree — otherwise the shims this whole mechanism exists to commit
+/// are uncommittable. A free consequence: `replica/client/replica-worker.js`,
+/// generated text that has never been committable, becomes so.
+pub const OUTPUT_GITIGNORE: &str = "\
+# Generated by ForgeDB. Rewritten on every generate.
+#
+# Everything ForgeDB generates here is TEXT you commit: database.rs, api.rs,
+# types.ts, openapi.json, the client SDKs, the Go package, the shims. The only
+# things ignored are the COMPILED artifacts `forgedb build` delivers beside
+# them — each machine builds its own, from your schema, with your toolchain.
+#
+# Patterns are extensions only, deliberately: a directory pattern here would
+# also swallow generated source, and ForgeDB owns this directory but does not
+# own your judgement about what belongs in it.
+*.a
+*.lib
+*.node
+*.so
+*.dylib
+
+# ForgeDB's own shims. The project root .gitignore ignores these two extensions
+# project-wide (they are build output for a TypeScript project); this subtree is
+# the exception, and a deeper .gitignore is the only thing that can say so.
+!*.js
+!*.d.ts
+";
+
+/// Write the consumer-facing half of every delivered target: the shims that
+/// carry the fingerprint, and the `.gitignore` that keeps the compiled halves
+/// out of the repository.
+///
+/// Each shim is generated text like `types.ts` — committed, reviewable, and
+/// covered by `generate --check`.
+fn emit_consumer_shims(
+    ctx: &Emit<'_>,
+    cache: &mut CacheEmission,
+    files: &mut Vec<(PathBuf, forgedb_codegen::GeneratedCode)>,
+) -> Result<()> {
+    use crate::naming::PackageKind;
+
+    // `fs::write`, not `write_file`: this is ForgeDB's statement about what
+    // ForgeDB delivers, so it is rewritten on every generate rather than frozen
+    // at whatever the project's first run wrote. A project that predates a newly
+    // delivered name would otherwise commit a binary silently.
+    let gitignore = ctx.output.join(".gitignore");
+    fs::write(&gitignore, OUTPUT_GITIGNORE)?;
+    files.push((
+        gitignore,
+        forgedb_codegen::GeneratedCode {
+            code: OUTPUT_GITIGNORE.to_string(),
+            description: "ignore rules for the delivered artifacts".to_string(),
+        },
+    ));
+
+    // --- Node / Bun ---------------------------------------------------------
+    if let Some(fp) = plan_fingerprint(cache, &PackageKind::Napi) {
+        let dir = ctx.output.join(PackageKind::Napi.dir());
+        fs::create_dir_all(&dir)?;
+
+        let entry = NapiGenerator::entry_module(&fp);
+        let entry_path = dir.join("index.js");
+        write_file(&entry_path, &entry.code, ctx.force)?;
+        files.push((entry_path, entry));
+
+        let dts = NapiGenerator::type_declarations(ctx.schema)
+            .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+        let dts_path = dir.join("index.d.ts");
+        write_file(&dts_path, &dts.code, ctx.force)?;
+        files.push((dts_path, dts));
+
+        reconcile_napi_package_json(&dir)?;
+    }
+
+    // --- Python -------------------------------------------------------------
+    if let Some(fp) = plan_fingerprint(cache, &PackageKind::Pyo3) {
+        let dir = ctx.output.join(PackageKind::Pyo3.dir());
+        fs::create_dir_all(&dir)?;
+
+        let module = PyO3Generator::python_module(ctx.schema, &fp)
+            .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+        let module_path = dir.join("forgedb.py");
+        write_file(&module_path, &module.code, ctx.force)?;
+        files.push((module_path, module));
+
+        let stub = PyO3Generator::type_stub(ctx.schema)
+            .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+        let stub_path = dir.join("forgedb.pyi");
+        write_file(&stub_path, &stub.code, ctx.force)?;
+        files.push((stub_path, stub));
+    }
+
+    // --- C ------------------------------------------------------------------
+    //
+    // Keyed on `ffi_declared`, not on the package's existence: the `go` arm
+    // plans the same package, and a Go-only project must not grow an
+    // `<output>/ffi/` directory — a directory that exists is a directory
+    // delivery delivers into.
+    let ffi_fp = plan_fingerprint(cache, &PackageKind::Ffi);
+    if cache.ffi_declared && let Some(fp) = ffi_fp {
+        let dir = ctx.output.join(PackageKind::Ffi.dir());
+        fs::create_dir_all(&dir)?;
+        let header = FfiGenerator::generate_header(ctx.schema, &ctx.naming.symbol_prefix, &fp)
+            .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+        let header_path = dir.join("forgedb.h");
+        write_file(&header_path, &header.code, ctx.force)?;
+        files.push((header_path, header));
+    }
+
+    Ok(())
+}
+
+/// Compute a wrapper's fingerprint and put the emitted constant file into its
+/// plan, so the cache package carries the value the shim was written with.
+///
+/// The two acts are one function because they must not be separable: a shim
+/// written from a value the package never receives is a load check guaranteed to
+/// fail, and a package carrying a value no shim compares is one guaranteed never
+/// to run.
+fn plan_fingerprint(
+    cache: &mut CacheEmission,
+    kind: &crate::naming::PackageKind,
+) -> Option<String> {
+    let value = cache.fingerprint(kind)?;
+    let plan = cache.wrapper_mut(kind)?;
+    // Idempotent: the `ffi` plan is reached twice when a project declares both
+    // `ffi` and `go`.
+    if !plan.files.iter().any(|(rel, _)| rel == crate::fingerprint::FINGERPRINT_FILE) {
+        plan.push(
+            crate::fingerprint::FINGERPRINT_FILE,
+            crate::fingerprint::fingerprint_rs(&value),
+        );
+    }
+    Some(value)
+}
+
+/// Write `<output>/napi/package.json`, or repoint a pre-#337 one.
+///
+/// It is the consumer's file — written only when absent, like every other
+/// scaffold in the output directory. The reconciliation is the exception, and it
+/// is narrow: `main`/`types` are rewritten ONLY when they still carry the
+/// pre-#337 values, and every other key is preserved.
+///
+/// Without it a pre-#337 project's `main` still names `forgedb.node`, `require`
+/// resolves the addon directly, and `index.js` **never executes** — a load check
+/// that is present, correct, and never run. That is worse than an absent one,
+/// because it reads as coverage.
+fn reconcile_napi_package_json(dir: &Path) -> Result<()> {
+    let path = dir.join("package.json");
+    let Ok(existing) = fs::read_to_string(&path) else {
+        fs::write(&path, NapiGenerator::package_json_scaffold())?;
+        ui::info(&format!("  ✓ {} (npm binding scaffold)", path.display()));
+        return Ok(());
+    };
+
+    let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&existing) else {
+        // Not ours to repair. A `package.json` we cannot parse is one a human
+        // has to look at, and rewriting it would destroy what they wrote.
+        ui::warning(&format!(
+            "{} is not valid JSON — leaving it alone. If `main` still names \
+             `forgedb.node`, the generated `index.js` load check never runs.",
+            path.display()
+        ));
+        return Ok(());
+    };
+
+    let mut changed = Vec::new();
+    if doc.get("main").and_then(|v| v.as_str()) == Some(NapiGenerator::LEGACY_MAIN) {
+        doc["main"] = serde_json::Value::String("index.js".to_string());
+        changed.push("main");
+    }
+    if doc.get("types").is_none() {
+        doc["types"] = serde_json::Value::String("index.d.ts".to_string());
+        changed.push("types");
+    }
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let rendered = serde_json::to_string_pretty(&doc)
+        .map_err(|e| CliError::Other(format!("could not render {}: {e}", path.display())))?;
+    fs::write(&path, format!("{rendered}\n"))?;
+    ui::warning(&format!(
+        "repointed {} ({}) — `main` named the addon directly, so the generated \
+         `index.js` load check would never have run",
+        path.display(),
+        changed.join(", ")
+    ));
     Ok(())
 }
 
@@ -1414,49 +1749,4 @@ fn supersede_moved_packages(output_dir: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-// ===========================================================================
-// Go static-library delivery (#335 §6, the one carve-out from "no delivery")
-// ===========================================================================
-
-/// The delivered name of the Go binding's static archive.
-///
-/// It is a FIXED name, not the derived package name, because the cgo preamble
-/// `crates/codegen/src/go.rs` emits is a `const &str` that must name the library
-/// it links: `-L${SRCDIR} -lforgedb`. Deriving it would mean threading the app's
-/// hash into a static template for no benefit — the archive already sits in a
-/// per-app directory.
-pub const GO_STATICLIB: &str = "libforgedb.a";
-
-/// Deliver the app's FFI **staticlib** beside its generated Go package.
-///
-/// This is the single carve-out from #335's "no delivery" non-goal, and it is
-/// forced: the Go binding is the one target whose *source* cannot be generated
-/// correctly without knowing where its library will be. `#337` generalizes the
-/// mechanism; it does not change this destination.
-///
-/// It must be the `staticlib`, never the `cdylib`. rustc stamps an **absolute**
-/// `LC_ID_DYLIB` into a cdylib, so a Go binary that linked one records the
-/// absolute cache path — and the cache is a cache, deletable at any time (C8),
-/// after which the binary dies `dyld: Library not loaded`. A copied archive's
-/// *contents* are linked in, so there is nothing left to dangle.
-pub fn deliver_go_staticlib(output_dir: &Path, staticlib: &Path) -> Result<PathBuf> {
-    let go_dir = output_dir.join("go");
-    if !go_dir.is_dir() {
-        return Err(CliError::Other(format!(
-            "cannot deliver {} — {} does not exist. Run `forgedb generate go --runtime` first.",
-            GO_STATICLIB,
-            go_dir.display()
-        )));
-    }
-    let dest = go_dir.join(GO_STATICLIB);
-    fs::copy(staticlib, &dest).map_err(|e| {
-        CliError::Other(format!(
-            "failed to deliver {} to {}: {e}",
-            staticlib.display(),
-            dest.display()
-        ))
-    })?;
-    Ok(dest)
 }

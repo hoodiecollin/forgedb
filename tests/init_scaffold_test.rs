@@ -229,12 +229,23 @@ fn the_gitignore_no_longer_ignores_generated_wholesale() {
         ".gitignore still ignores generated code wholesale ({wholesale:?}):\n{gitignore}"
     );
 
-    // ...and it still ignores the one compiled artifact delivered into the tree
-    // (design #335 §6: the Go binding links `output/go/libforgedb.a`).
-    assert!(
-        gitignore.contains("/generated/**/*.a"),
-        ".gitignore does not ignore the delivered static library:\n{gitignore}"
-    );
+    // ...and the artifact patterns are GONE from here (#337 decision 4). They
+    // hardcoded the literal `generated/`, which #333 made a per-app setting, so
+    // this file was already wrong for every project that configures `output`.
+    // Ignoring the delivered artifacts is `<output>/.gitignore`'s job now, and
+    // two files listing the same patterns is a drift source.
+    //
+    // Asserted as an ABSENCE of the pattern anywhere in the file, comments
+    // included: the old text explained the pattern in the words the pattern is
+    // written in, so a substring check that tolerated comments would pass on a
+    // file that still carried it.
+    for stale in ["/generated/**/*.a", "/generated/**/*.lib"] {
+        assert!(
+            !gitignore.contains(stale),
+            "the root .gitignore still carries {stale}; it moved into \
+             <output>/.gitignore (#337):\n{gitignore}"
+        );
+    }
 
     // Data is still ignored — this is not "ignore nothing".
     assert!(

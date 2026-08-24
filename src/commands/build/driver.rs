@@ -793,6 +793,24 @@ pub struct ReportedArtifact {
     pub triple: String,
 }
 
+/// One artifact `forgedb build` copied out of the cache and into the app's
+/// `output` (#337).
+///
+/// **Additive under `version: 1`.** A consumer that does not know the key
+/// ignores it; one that does can copy delivered files as well as built ones,
+/// which is what the deploy path (#335 §15) needs.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeliveredArtifact {
+    /// `PackageKind::dir()` of the package that PRODUCED the file — `ffi` for
+    /// the archive delivered into `go/`, because that is what it is.
+    pub kind: String,
+    pub target_kind: TargetKind,
+    /// Where it came from, in the cache. Read from the report, never joined.
+    pub from: PathBuf,
+    /// Where it landed, under the app's `output`.
+    pub to: PathBuf,
+}
+
 /// The machine-readable result of one `forgedb build` (#335 §14).
 ///
 /// Serialized by `--report`; `--print-artifact` is a projection of the same
@@ -813,6 +831,10 @@ pub struct BuildReport {
     pub profile: Profile,
     /// One entry per emitted artifact FILE.  Empty is legal; absent is not.
     pub artifacts: Vec<ReportedArtifact>,
+    /// One entry per artifact copied into the app's `output` (#337).  Empty is
+    /// legal — a project with no class-B target delivers nothing.
+    #[serde(default)]
+    pub delivered: Vec<DeliveredArtifact>,
 }
 
 /// The format version `--report` writes.
@@ -884,7 +906,7 @@ impl BuildReport {
         }
     }
 
-    fn render_inventory(&self) -> String {
+    pub(crate) fn render_inventory(&self) -> String {
         if self.artifacts.is_empty() {
             return "  (nothing)".to_string();
         }
