@@ -716,3 +716,134 @@ fn run_block_panics_on_a_missing_step_rather_than_widening() {
 fn run_block_refuses_a_single_line_step_rather_than_taking_its_neighbours() {
     let _ = run_block("substrate-reclose.yml", "Build the forgedb CLI");
 }
+
+// ---------------------------------------------------------------------------
+// S339-8 — every reclose job sets FORGEDB_HOME outside the checkout, and says so
+//          in an assertion rather than a comment.
+// ---------------------------------------------------------------------------
+
+/// The build cache is where every generated package compiles now, so "outside
+/// the checkout" attaches to the CACHE, not to the app directory.
+///
+/// The repo root `Cargo.toml` has `members` and no `exclude`, so a cache under
+/// `${{ github.workspace }}` is swallowed by this repo's own workspace: the
+/// generated packages inherit the 1.96 pin and resolve `forgedb-*` BY PATH. The
+/// reclose then measures the checkout instead of the registry — silently, and
+/// while passing, which is the one failure mode it cannot survive.
+///
+/// Both halves are required. The export alone is a value someone can change; the
+/// refusal is what makes a wrong value loud.
+#[test]
+fn every_reclose_job_sets_forgedb_home_outside_the_checkout() {
+    for (file, step) in [
+        (
+            "substrate-reclose.yml",
+            "Scaffold a project outside the checkout",
+        ),
+        ("go-reclose.yml", "Reclose — generate, build, link, run"),
+    ] {
+        let body = run_block(file, step);
+        assert!(
+            body.contains("export FORGEDB_HOME="),
+            "{file} / {step:?} no longer exports FORGEDB_HOME, so the cache lands \
+             in `~/.forgedb` — warm across runs, and a warm cache resolves nothing \
+             from the registry:\n{body}"
+        );
+        assert!(
+            body.contains("case \"$FORGEDB_HOME\" in") && body.contains("${GITHUB_WORKSPACE}"),
+            "{file} / {step:?} dropped the refusal that FORGEDB_HOME is not inside \
+             the checkout. Without it a cache under the workspace resolves \
+             `forgedb-*` by path and this job measures the checkout while \
+             passing:\n{body}"
+        );
+    }
+}
+
+/// The cold-cache pair, in the job that owns it.
+///
+/// Anchored on the `test ! -e` invocations, never on the comment above them:
+/// this file's header explains at length why the cache must be cold, in the same
+/// words a file-wide search would find. `run_block` strips comments for exactly
+/// this reason.
+#[test]
+fn the_bare_reclose_proves_its_cache_was_cold() {
+    let scaffold = run_block(
+        "substrate-reclose.yml",
+        "Scaffold a project outside the checkout",
+    );
+    for needle in [
+        "test ! -e \"$HOME/.forgedb\"",
+        "test ! -e \"$FORGEDB_HOME\"",
+        "test ! -e \"$FORGEDB_HOME/projects\"",
+    ] {
+        assert!(
+            scaffold.contains(needle),
+            "the reclose no longer asserts `{needle}` before generating. A warm \
+             cache masks a publish gap outright — the substrate is already \
+             resolved, so a version that no longer exists on crates.io is never \
+             looked up and the job goes green on an uninstallable \
+             branch:\n{scaffold}"
+        );
+    }
+
+    // …and at the far end, where a leak into the default home would otherwise
+    // only be discovered by the NEXT run finding it warm.
+    let last = run_block(
+        "substrate-reclose.yml",
+        "6/6 transform — migrate build over a real lineage",
+    );
+    assert!(
+        last.contains("test ! -e \"$HOME/.forgedb\""),
+        "the reclose's last arm no longer asserts the default cache home is still \
+         absent. Something writing there makes the next run warm, and the check \
+         then measures its own leftovers:\n{last}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S339-9 — no cache action may name the ForgeDB home.
+// ---------------------------------------------------------------------------
+
+/// The single edit that makes this job fast AND makes it prove nothing.
+///
+/// Caching `~/.forgedb` (or `$FORGEDB_HOME`, or handing it to rust-cache as a
+/// `cache-directories` entry) restores a resolved lockfile and a compiled
+/// substrate from a previous run. Every registry lookup this job exists to
+/// perform then does not happen, and the publish gap — the ONE thing it detects
+/// — becomes invisible while the job reports green and finishes in a third of
+/// the time. It is attractive precisely because it is the obvious optimization.
+#[test]
+fn no_cache_action_names_the_forgedb_home() {
+    for file in ["substrate-reclose.yml", "go-reclose.yml"] {
+        let wf = workflow(file);
+
+        assert!(
+            !wf.contains("uses: actions/cache"),
+            "{file} uses `actions/cache`. This job's entire value is that it \
+             resolves from crates.io on every run; a restored cache is how it \
+             goes green while the branch is uninstallable."
+        );
+
+        // rust-cache is allowed — it caches the CHECKOUT's target dir, which this
+        // job builds the CLI in. What it must never be handed is the ForgeDB home.
+        for (idx, _) in wf.match_indices("uses: Swatinem/rust-cache") {
+            // Scoped to that step's own `with:` block: the next `- ` at the step's
+            // depth ends it. Matching file-wide would let an unrelated mention of
+            // `.forgedb` anywhere satisfy — or break — this.
+            let tail = &wf[idx..];
+            let step = tail
+                .find("\n      - ")
+                .map(|e| &tail[..e])
+                .unwrap_or(tail);
+            for needle in [".forgedb", "FORGEDB_HOME", "forgedb-home", "cache-directories"] {
+                assert!(
+                    !step.contains(needle),
+                    "{file} hands `{needle}` to rust-cache. Restoring the ForgeDB \
+                     home makes the substrate resolve from a previous run rather \
+                     than from the registry, and the publish gap this job exists \
+                     to detect becomes invisible:\n{step}"
+                );
+            }
+        }
+    }
+}

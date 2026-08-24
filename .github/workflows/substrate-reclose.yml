@@ -121,6 +121,21 @@ jobs:
           WORK="$(mktemp -d "${RUNNER_TEMP}/substrate-reclose.XXXXXX")"
           cd "$WORK"
 
+          # THE CACHE IS COLD, AND THAT IS ASSERTED (#339).
+          #
+          # A warm cache masks a publish gap outright: the substrate is already
+          # compiled and already in the lockfile, so a version that no longer
+          # exists on crates.io is never looked up and the job goes green on a
+          # branch nobody could install. The default home is `~/.forgedb`, which
+          # every step below deliberately steers away from — so the property to
+          # hold is that nothing has been left there, at EITHER end of the run.
+          #
+          # The start-of-run half is not redundant with the end-of-run one. A
+          # runner image that shipped a `~/.forgedb`, or a caching action someone
+          # adds later, would make the end assertion pass vacuously — it would be
+          # observing a directory this job never created and never read.
+          test ! -e "$HOME/.forgedb"
+
           # FORGEDB_HOME IS AN ASSERTION, NOT A CONVENIENCE.
           #
           # The build cache is where every generated package is compiled now, so
@@ -142,6 +157,10 @@ jobs:
               echo "forgedb-* by path, so the reclose would prove nothing." >&2
               exit 1;;
           esac
+
+          # Before `init`, because `init` consults the claim ledger under the
+          # home and so is itself a reason the directory could exist.
+          test ! -e "$FORGEDB_HOME"
 
           "$FORGEDB" init app
           cd app
@@ -185,6 +204,13 @@ jobs:
           SCHEMA
 
           "$FORGEDB" validate
+
+          # Nothing has reserved a build container yet: `init` and `validate`
+          # write no cache package, so the first `generate` starts from nothing.
+          # This is the assertion the *arms* depend on — a `projects/` left over
+          # from anywhere would make every compile below incremental against
+          # substrate that was resolved by some earlier run.
+          test ! -e "$FORGEDB_HOME/projects"
 
           # Hand the paths to every step below. CARGO_TARGET_DIR is shared so the
           # substrate compiles once per triple; it deliberately does NOT point at
@@ -549,6 +575,13 @@ jobs:
           test ! -e migrations/transform
           test -z "$(find "$APP" -name target -type d | head -1)"
           test ! -e Cargo.toml
+
+          # The other half of the cold-cache pair (#339). Every step above steered
+          # the cache to $FORGEDB_HOME under $WORK; if anything reached the
+          # default home instead, this run compiled somewhere the next run would
+          # find WARM — and the whole check would then be measuring its own
+          # leftovers rather than crates.io.
+          test ! -e "$HOME/.forgedb"
 
       - name: Report open release gates
         # Informational: names anything still blocking the next tag. Never fails
