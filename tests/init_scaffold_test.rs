@@ -242,3 +242,120 @@ fn the_gitignore_no_longer_ignores_generated_wholesale() {
         ".gitignore stopped ignoring the data directory:\n{gitignore}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// S17 (#367) — `init --project-name`
+// ---------------------------------------------------------------------------
+
+/// A project id and a directory are different things.
+///
+/// Conflating them is what made a taken id an unfixable `init`: the only way to
+/// change the project's name was to change the directory's. This flag exists so
+/// the scriptable path gets the same answer the terminal path gets — and so CI,
+/// which cannot answer a question, never needs the prompt at all.
+#[test]
+fn s17_init_project_name_names_the_project_not_the_directory() {
+    let tmp = TempDir::new().expect("tempdir");
+    let out = forgedb(
+        tmp.path(),
+        &["init", "apps/api", "--project-name", "storefront"],
+    );
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let project = tmp.path().join("apps/api");
+    let config = fs::read_to_string(project.join("forgedb.toml")).expect("forgedb.toml");
+    assert!(
+        config.contains("name = \"storefront\""),
+        "the project is named by the flag: {config}"
+    );
+
+    // …and the DIRECTORY keeps the name the user typed, everywhere it is
+    // derived from. A docker tag, a compose service name and a systemd unit
+    // name cannot contain a `/`, which is why they were path-derived in the
+    // first place — that derivation is untouched by this flag and must stay
+    // untouched.
+    let compose = fs::read_to_string(project.join("docker-compose.yml")).expect("compose");
+    assert!(
+        compose.contains("api"),
+        "the compose service is still the directory's name: {compose}"
+    );
+    assert!(
+        !compose.contains("storefront"),
+        "a project id is not a compose service name: {compose}"
+    );
+    assert!(
+        project.join("deploy/api.service").is_file(),
+        "the systemd unit is still named for the directory"
+    );
+    assert!(
+        !project.join("deploy/storefront.service").exists(),
+        "a project id is not a systemd unit name"
+    );
+    let dockerfile = fs::read_to_string(project.join("Dockerfile")).expect("Dockerfile");
+    assert!(
+        !dockerfile.contains("storefront"),
+        "nor a docker identifier: {dockerfile}"
+    );
+}
+
+/// The flag reaches C12's refusal exactly as the positional does.
+///
+/// Otherwise `--project-name` would be a way to *bypass* the collision check
+/// rather than a way to answer it — the id would be claimed by two roots and
+/// they would share one build cache, one lockfile and one target directory.
+#[test]
+fn s17b_init_project_name_is_refused_when_the_id_is_taken() {
+    let tmp = TempDir::new().expect("tempdir");
+    // Claim `taken` by generating from a scaffold of that name.
+    let first = forgedb(tmp.path(), &["init", "taken"]);
+    assert!(first.status.success());
+    let generated = Command::new(env!("CARGO_BIN_EXE_forgedb"))
+        .current_dir(tmp.path().join("taken"))
+        .env("FORGEDB_HOME", tmp.path().join(".forgedb-home"))
+        .args(["generate", "rust"])
+        .output()
+        .expect("run forgedb");
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+
+    let refused = forgedb(tmp.path(), &["init", "other", "--project-name", "taken"]);
+    assert!(
+        !refused.status.success(),
+        "a taken id must be refused however it was supplied"
+    );
+    let msg = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(msg.contains("already claimed"), "{msg}");
+    assert!(
+        msg.contains("--project-name"),
+        "…and the refusal names the flag that answers it: {msg}"
+    );
+    assert!(
+        !tmp.path().join("other").exists(),
+        "the refusal happens BEFORE anything is scaffolded — C12's point is that \
+         a user should not end up with a tree whose name they now have to change"
+    );
+}
+
+/// A project id is a directory name under `~/.forgedb/projects/`, so a path
+/// there would escape the cache rather than key it.
+#[test]
+fn s17c_init_refuses_a_path_like_project_name() {
+    let tmp = TempDir::new().expect("tempdir");
+    let out = forgedb(tmp.path(), &["init", "app", "--project-name", "a/b"]);
+    assert!(!out.status.success());
+    let msg = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(msg.contains("path separator"), "{msg}");
+    assert!(!tmp.path().join("app").exists(), "nothing was scaffolded");
+}

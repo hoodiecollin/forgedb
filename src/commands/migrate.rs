@@ -138,8 +138,8 @@ fn resolve_app(app: &AppRef) -> Result<ResolvedApp> {
         )));
     }
 
-    let governing = crate::project::govern(app.config.as_deref(), crate::project::schema_dir(schema))?;
-    let project = governing.identify_reported()?;
+    let governing = crate::project::govern_for_schema(app.config.as_deref(), schema)?;
+    let project = governing.identify_reported(&*crate::ask::asker())?;
     let reserved =
         crate::cache::reserve(&project.name, &project.root, schema, governing.symbol_naming())?;
     // C7: every command that writes into the cache prints where it wrote.
