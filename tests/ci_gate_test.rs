@@ -127,6 +127,38 @@ fn workflow(name: &str) -> String {
         .join("\n")
 }
 
+/// A workflow's `on:` block, comments stripped.
+///
+/// Scoped to the trigger rather than matched file-wide for the usual reason: the
+/// word `main` appears in nearly every one of these files, in prose explaining
+/// exactly why the trigger says `main` — so a file-wide assertion is satisfied by
+/// its own rationale.
+///
+/// Panics if the block is absent. A workflow with no `on:` never runs, and a
+/// helper that returned `""` there would make every assertion below pass on it.
+fn trigger_block(workflow_file: &str) -> String {
+    let src = workflow(workflow_file);
+    let start = src.find("\non:\n").unwrap_or_else(|| {
+        panic!(
+            "{workflow_file} has no top-level `on:` block — it can never run, and \
+             every guard keyed to its triggers would pass vacuously"
+        )
+    }) + "\non:\n".len();
+    let mut out = String::new();
+    for line in src[start..].lines() {
+        if !line.trim().is_empty() && !line.starts_with(char::is_whitespace) {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    assert!(
+        !out.trim().is_empty(),
+        "{workflow_file}'s `on:` block is empty"
+    );
+    out
+}
+
 /// The shell command of the single-line `run:` step with the given `name:`.
 ///
 /// Scoped to one step on purpose: asserting against the whole workflow means any other
@@ -164,8 +196,24 @@ fn run_block(workflow_file: &str, step_name: &str) -> String {
     let start = src.find(&needle).unwrap_or_else(|| {
         panic!("{workflow_file} has no step named {step_name:?} — the guard keyed to it is now vacuous")
     });
+    // The step's own indent, and the slice that belongs to THIS step: up to the
+    // next `- name:` at the same depth. Bounding first is load-bearing — an
+    // unbounded `find("run: |")` on a step whose `run:` is single-line silently
+    // returns the NEXT step's script, so the guard stays live and aimed at the
+    // wrong subject. That is the widening class this repo has already paid for,
+    // and it is why the miss below panics.
+    let indent = src[..start]
+        .rfind('\n')
+        .map(|nl| start - nl - 1)
+        .unwrap_or(0);
+    let step_marker = format!("\n{}- name: ", " ".repeat(indent));
     let rest = &src[start..];
-    let run = rest.find("\n").map(|_| ()).and(rest.find("run: |")).unwrap_or_else(|| {
+    let rest = match rest[1..].find(&step_marker) {
+        Some(next) => &rest[..next + 1],
+        None => rest,
+    };
+
+    let run = rest.find("run: |").unwrap_or_else(|| {
         panic!(
             "step {step_name:?} in {workflow_file} has no block-scalar `run: |`. \
              If it became a single-line `run:`, use `run_command` — this helper \
@@ -176,10 +224,6 @@ fn run_block(workflow_file: &str, step_name: &str) -> String {
 
     // A block scalar runs to the first line that is neither blank nor indented
     // deeper than the step's own `- name:` key.
-    let indent = src[..start]
-        .rfind('\n')
-        .map(|nl| start - nl - 1)
-        .unwrap_or(0);
     let mut out = String::new();
     for line in body.lines() {
         if line.trim().is_empty() {
@@ -547,4 +591,128 @@ fn the_workflows_this_file_guards_still_exist() {
              deleting it removes the gate and nothing else will report that."
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// S339-7 — every registry-resolving job is `main`-only.
+// ---------------------------------------------------------------------------
+
+/// #402's lesson, one issue old, turned into a test that runs on every branch.
+///
+/// A job that scaffolds outside the checkout resolves every `forgedb-*` from
+/// crates.io. `develop` is *allowed* to carry a publish gap — that is the entire
+/// point of holding the gap off the default branch — so such a job run there
+/// fails BY DESIGN for most of every cycle. #402 measured the cost of getting it
+/// wrong: nine runs, nine failures, six branches, and nobody read it, because
+/// everyone who saw it red saw it red on a branch that had not caused it.
+///
+/// A permanently-red job is not a control. This guard runs in tier 1, on every
+/// branch, so a re-widened trigger is caught a cycle before a `main`-only job
+/// could report it — which is the one thing a `main`-only job cannot do for
+/// itself.
+#[test]
+fn every_registry_resolving_job_runs_on_main_only() {
+    for file in ["substrate-reclose.yml", "go-reclose.yml"] {
+        let on = trigger_block(file);
+
+        for event in ["push:", "pull_request:"] {
+            assert!(
+                on.contains(event),
+                "{file}'s `on:` block no longer declares `{event}`. Got:\n{on}"
+            );
+        }
+
+        // Anchored on the FILTER, never on the event name: a `push:` with no
+        // `branches:` under it runs on every branch, and reads identically.
+        let filters: Vec<&str> = on
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("branches:"))
+            .collect();
+        assert_eq!(
+            filters.len(),
+            2,
+            "{file} must filter BOTH `push` and `pull_request` to a branch list; \
+             found {} `branches:` line(s). An event with no filter runs on every \
+             branch, including `develop`, where this job is red by design. Got:\n{on}",
+            filters.len(),
+        );
+        for f in &filters {
+            assert_eq!(
+                *f, "branches: [main]",
+                "{file} restricts a trigger to `{f}` rather than `branches: [main]`. \
+                 Any other branch here puts a registry-resolving job on a surface \
+                 that carries the publish gap. Got:\n{on}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S339-11 — `run_block` cannot pass vacuously.
+// ---------------------------------------------------------------------------
+
+/// The helper every guard below leans on, tested directly.
+///
+/// `run_command` reads to the end of the `run:` line, so on a block scalar it
+/// returns the literal `run: |` — one token, containing none of the script. Every
+/// `!contains` assertion built on that passes having examined nothing. This is
+/// the guard on the guard: if `run_block` ever degrades to that shape, the
+/// failure lands here rather than as six silently-vacuous assertions.
+#[test]
+fn run_block_returns_the_whole_script_not_the_scalar_header() {
+    // A multi-line step: both the first command and the LAST line must be there.
+    // Truncating to the first line is the plausible regression, and it would
+    // leave every guard passing on a prefix.
+    let ffi = run_block(
+        "substrate-reclose.yml",
+        "2/6 ffi — generate ffi, then forgedb build",
+    );
+    assert!(
+        ffi.lines().filter(|l| !l.trim().is_empty()).count() > 1,
+        "run_block returned a single line for a block-scalar step — it has \
+         degraded to `run_command`'s behaviour and every guard keyed on it is now \
+         vacuous. Got:\n{ffi}"
+    );
+    assert!(
+        ffi.contains("set -euxo pipefail"),
+        "run_block dropped the first line of the script:\n{ffi}"
+    );
+    assert!(
+        ffi.contains("./csmoke"),
+        "run_block dropped the LAST line of the script — a guard keyed on a \
+         trailing command would pass vacuously:\n{ffi}"
+    );
+
+    // Comments are stripped, so a needle's own rationale cannot satisfy it.
+    assert!(
+        !ffi.contains("#337: the delivered half"),
+        "run_block no longer strips comments; a guard can now be satisfied by the \
+         prose explaining it:\n{ffi}"
+    );
+}
+
+/// A step name that does not exist must PANIC naming the step, never degrade to
+/// a wider slice.
+///
+/// `find(..).unwrap_or(0)` widens to the whole file: the assertion stays live,
+/// aimed at the wrong subject, and gets *easier* to satisfy as it becomes
+/// meaningless. That is the failure mode this repo has already paid for.
+#[test]
+#[should_panic(expected = "no step named \"a step that does not exist\"")]
+fn run_block_panics_on_a_missing_step_rather_than_widening() {
+    let _ = run_block("substrate-reclose.yml", "a step that does not exist");
+}
+
+/// A step whose `run:` is SINGLE-LINE must panic too, rather than silently
+/// returning the next step's script.
+///
+/// `Build the forgedb CLI` is single-line and is followed by a block-scalar
+/// step, so an unbounded search for `run: |` finds the neighbour's body and
+/// returns it — a guard keyed to the first step would then be asserting
+/// properties of the second, live and wrong.
+#[test]
+#[should_panic(expected = "has no block-scalar `run: |`")]
+fn run_block_refuses_a_single_line_step_rather_than_taking_its_neighbours() {
+    let _ = run_block("substrate-reclose.yml", "Build the forgedb CLI");
 }
