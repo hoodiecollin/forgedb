@@ -87,6 +87,149 @@ pub enum SchemaChange {
         field_name: String,
         constraint_name: String,
     },
+    /// The variant list of an `enum` a stored field uses changed (#438).
+    ///
+    /// **Field-scoped on purpose.** The definition is schema-level, but the
+    /// *data* it endangers is a column, so the change is reported once per
+    /// storing field. That keeps [`target_model`](SchemaChange::target_model)
+    /// returning `&str` and keeps the authored scaffold's per-model grouping
+    /// working with no surface change.
+    ///
+    /// Carries the two **ordered lists**, never a pre-baked verdict: the
+    /// classification is derived by [`classify_positional`] and so re-derives
+    /// identically forever, which is what `HopBodyClass`'s frozen-at-`migrate
+    /// create` contract requires.
+    ChangeEnumVariants {
+        model_name: String,
+        field_name: String,
+        enum_name: String,
+        old_variants: Vec<String>,
+        new_variants: Vec<String>,
+    },
+    /// The layout of an inline `struct` a stored field uses changed (#438).
+    ///
+    /// `#[repr(C)]`, whole value transmuted into a `size_of::<T>()` slot — so
+    /// field order AND per-field width are both on disk. Carries `(name, type)`
+    /// in declaration order for the same reason as above.
+    ChangeStructLayout {
+        model_name: String,
+        field_name: String,
+        struct_name: String,
+        old_fields: Vec<(String, String)>,
+        new_fields: Vec<(String, String)>,
+    },
+}
+
+/// What happened to an **ordered, position-keyed** list of names (#438).
+///
+/// One classifier for both enum variants and struct field names, because both
+/// are stored positionally and the question "did the byte→meaning mapping move?"
+/// has exactly one right answer for either. `is_breaking`, `hop_body_class` and
+/// `description` all read this; none of them re-derives it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PositionalDelta {
+    /// The lists are identical.
+    Unchanged,
+    /// Names were added and **nothing else moved or went away**, so every added
+    /// name necessarily landed at an index `>= old.len()`. Every existing byte
+    /// still decodes to what it did. The one safe edit an enum has.
+    Appended { added: Vec<String> },
+    /// Exactly one name dropped and one added **at the same index**, nothing
+    /// moved. Mirrors the differ's existing single-unambiguous-rename heuristic
+    /// for fields. The slot is unchanged, but the *name* is what crosses the
+    /// transformer's JSON boundary — so this is not benign.
+    Renamed { old_name: String, new_name: String },
+    /// A name that exists on both sides changed index. Every stored byte at or
+    /// past the first moved position now decodes as some other name, with no
+    /// byte out of range and therefore no failure mode at all.
+    Reordered { moved: Vec<String> },
+    /// A name went away. The mapping moved *and* some stored byte may now be out
+    /// of range entirely.
+    Dropped { dropped: Vec<String> },
+}
+
+/// Classify what moved in an ordered list of names (#438).
+///
+/// Precedence is deliberate and runs strictest-first once `Renamed` (a *narrower*
+/// reading of a drop+add pair) has had its chance: a removal in the middle both
+/// drops a name and moves its successors, and `Dropped` is the answer that costs
+/// the operator an authored body rather than silently promising them an automatic
+/// one.
+pub fn classify_positional(old: &[String], new: &[String]) -> PositionalDelta {
+    if old == new {
+        return PositionalDelta::Unchanged;
+    }
+
+    let index_in = |list: &[String], name: &str| list.iter().position(|n| n == name);
+
+    let dropped: Vec<String> = old.iter().filter(|n| !new.contains(n)).cloned().collect();
+    let added: Vec<String> = new.iter().filter(|n| !old.contains(n)).cloned().collect();
+    let moved: Vec<String> = old
+        .iter()
+        .filter(|n| match (index_in(old, n), index_in(new, n)) {
+            (Some(a), Some(b)) => a != b,
+            _ => false,
+        })
+        .cloned()
+        .collect();
+
+    if moved.is_empty() && dropped.len() == 1 && added.len() == 1 {
+        let old_name = &dropped[0];
+        let new_name = &added[0];
+        if index_in(old, old_name) == index_in(new, new_name) {
+            return PositionalDelta::Renamed {
+                old_name: old_name.clone(),
+                new_name: new_name.clone(),
+            };
+        }
+    }
+    if !dropped.is_empty() {
+        return PositionalDelta::Dropped { dropped };
+    }
+    if !moved.is_empty() {
+        return PositionalDelta::Reordered { moved };
+    }
+    if !added.is_empty() {
+        return PositionalDelta::Appended { added };
+    }
+    PositionalDelta::Unchanged
+}
+
+/// What happened to an inline `struct`'s layout (#438).
+///
+/// A superset of [`PositionalDelta`]: a struct has one failure mode an enum does
+/// not, because its fields carry a *width* as well as a position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LayoutDelta {
+    /// A field kept its name and position but changed type. Same-width retypes
+    /// (`i32` → `u32`) are the silent ones; different-width retypes re-frame the
+    /// column.
+    Retyped { fields: Vec<String> },
+    /// Nothing was retyped; the field *names* moved (or did not).
+    Names(PositionalDelta),
+}
+
+/// Classify an inline struct's layout change (#438).
+///
+/// A retype outranks a name move: it is the case the differ can prove least
+/// about, and every struct edit except a pure reorder is `Authored` anyway.
+pub fn classify_layout(old: &[(String, String)], new: &[(String, String)]) -> LayoutDelta {
+    let retyped: Vec<String> = old
+        .iter()
+        .filter_map(|(name, old_ty)| {
+            new.iter()
+                .find(|(n, _)| n == name)
+                .filter(|(_, new_ty)| new_ty != old_ty)
+                .map(|_| name.clone())
+        })
+        .collect();
+    if !retyped.is_empty() {
+        return LayoutDelta::Retyped { fields: retyped };
+    }
+    let names = |list: &[(String, String)]| -> Vec<String> {
+        list.iter().map(|(n, _)| n.clone()).collect()
+    };
+    LayoutDelta::Names(classify_positional(&names(old), &names(new)))
 }
 
 /// How the transformer generator (#74 Phase 3) will produce the new-row body for
@@ -112,6 +255,49 @@ pub enum HopBodyClass {
 }
 
 impl SchemaChange {
+    /// The verdict table for an enum variant-list change (#438).
+    ///
+    /// **The one place** `ChangeEnumVariants`'s severity and hop class are
+    /// decided; `is_breaking`, `hop_body_class` and `description` all call it.
+    ///
+    /// | delta | breaking | class | why |
+    /// |---|---|---|---|
+    /// | `Appended` | no | `Auto` | every existing byte still decodes to itself; recorded only so the version moves and an older binary is told to migrate rather than panicking on an unknown byte |
+    /// | `Reordered` | **yes** | `Auto` | every stored row silently re-maps — but an enum crosses the transformer's JSON boundary as its **name**, so the existing identity hop body re-encodes it with no authoring |
+    /// | `Dropped` | **yes** | `Authored` | a row carrying the retired name has nothing to deserialize into |
+    /// | `Renamed` | **yes** | `Authored` | same reason: the old name does not deserialize |
+    fn enum_verdict(old: &[String], new: &[String]) -> (bool, HopBodyClass) {
+        match classify_positional(old, new) {
+            PositionalDelta::Unchanged => (false, HopBodyClass::Auto),
+            PositionalDelta::Appended { .. } => (false, HopBodyClass::Auto),
+            PositionalDelta::Reordered { .. } => (true, HopBodyClass::Auto),
+            PositionalDelta::Dropped { .. } | PositionalDelta::Renamed { .. } => {
+                (true, HopBodyClass::Authored)
+            }
+        }
+    }
+
+    /// The verdict table for an inline-struct layout change (#438).
+    ///
+    /// **There is no additive case for a struct.** Unlike an enum, every field's
+    /// offset is a function of the whole declaration, so the enum's one safe
+    /// edit has no struct analogue — `Appended` is breaking here.
+    ///
+    /// | delta | breaking | class |
+    /// |---|---|---|
+    /// | `Names(Reordered)` | **yes** | `Auto` (JSON transport is by field name) |
+    /// | `Retyped` / `Names(Appended)` / `Names(Dropped)` / `Names(Renamed)` | **yes** | `Authored` |
+    fn struct_verdict(old: &[(String, String)], new: &[(String, String)]) -> (bool, HopBodyClass) {
+        match classify_layout(old, new) {
+            LayoutDelta::Names(PositionalDelta::Unchanged) => (false, HopBodyClass::Auto),
+            LayoutDelta::Names(PositionalDelta::Reordered { .. }) => (true, HopBodyClass::Auto),
+            // Retyped, added, dropped, renamed: the width or the JSON key moved
+            // and the differ can prove no value for the result. Matches how
+            // `ChangeFieldType` and a required `AddField` are already classified.
+            _ => (true, HopBodyClass::Authored),
+        }
+    }
+
     /// Classify how this hop's new-row body is produced (#74 Phase 2, C8/C9).
     ///
     /// This is deliberately **distinct from [`is_breaking`](Self::is_breaking)**:
@@ -140,6 +326,18 @@ impl SchemaChange {
                 default_value: None,
                 ..
             } => HopBodyClass::Authored,
+            // #438: positional, so the answer depends on WHICH way the list
+            // moved. Delegated to the one classifier — never re-derived here.
+            SchemaChange::ChangeEnumVariants {
+                old_variants,
+                new_variants,
+                ..
+            } => Self::enum_verdict(old_variants, new_variants).1,
+            SchemaChange::ChangeStructLayout {
+                old_fields,
+                new_fields,
+                ..
+            } => Self::struct_verdict(old_fields, new_fields).1,
             // Everything else is provable structural/constant: additive nullable/
             // defaulted adds (backfill), removes (omit), renames (name map), and
             // index/constraint changes (identity row body).
@@ -167,7 +365,9 @@ impl SchemaChange {
             | SchemaChange::AddCompositeIndex { model_name, .. }
             | SchemaChange::RemoveCompositeIndex { model_name, .. }
             | SchemaChange::AddConstraint { model_name, .. }
-            | SchemaChange::RemoveConstraint { model_name, .. } => model_name,
+            | SchemaChange::RemoveConstraint { model_name, .. }
+            | SchemaChange::ChangeEnumVariants { model_name, .. }
+            | SchemaChange::ChangeStructLayout { model_name, .. } => model_name,
             SchemaChange::RenameModel { new_name, .. } => new_name,
         }
     }
@@ -192,6 +392,18 @@ impl SchemaChange {
             } => true,
             SchemaChange::RemoveUniqueConstraint { .. } => false, // Safe to remove constraints
             SchemaChange::AddUniqueConstraint { .. } => true,     // May fail if duplicates exist
+            // #438: an append is benign at rest; every other shape re-maps
+            // stored bytes. Same classifier as `hop_body_class`.
+            SchemaChange::ChangeEnumVariants {
+                old_variants,
+                new_variants,
+                ..
+            } => Self::enum_verdict(old_variants, new_variants).0,
+            SchemaChange::ChangeStructLayout {
+                old_fields,
+                new_fields,
+                ..
+            } => Self::struct_verdict(old_fields, new_fields).0,
             _ => false,
         }
     }
@@ -341,7 +553,85 @@ impl SchemaChange {
                     constraint_name, model_name, field_name
                 )
             }
+            // #438. The description names the *stored* consequence, not the
+            // edit: "reorder" reads as a formatting change, and the operator's
+            // whole decision hangs on knowing that every already-written row
+            // re-maps.
+            SchemaChange::ChangeEnumVariants {
+                model_name,
+                field_name,
+                enum_name,
+                old_variants,
+                new_variants,
+            } => {
+                let breaking =
+                    Self::breaking_marker(Self::enum_verdict(old_variants, new_variants).0);
+                let what = match classify_positional(old_variants, new_variants) {
+                    PositionalDelta::Unchanged => "unchanged".to_string(),
+                    PositionalDelta::Appended { added } => {
+                        format!("append {}", added.join(", "))
+                    }
+                    PositionalDelta::Renamed { old_name, new_name } => format!(
+                        "RENAME '{}' to '{}' — rows holding the old name have nothing to decode into",
+                        old_name, new_name
+                    ),
+                    PositionalDelta::Reordered { moved } => format!(
+                        "REORDER {} — every stored discriminant re-maps",
+                        moved.join(", ")
+                    ),
+                    PositionalDelta::Dropped { dropped } => format!(
+                        "REMOVE {} — stored discriminants re-map and some fall out of range",
+                        dropped.join(", ")
+                    ),
+                };
+                format!(
+                    "Enum '{}' behind '{}.{}': {}{}",
+                    enum_name, model_name, field_name, what, breaking
+                )
+            }
+            SchemaChange::ChangeStructLayout {
+                model_name,
+                field_name,
+                struct_name,
+                old_fields,
+                new_fields,
+            } => {
+                let breaking =
+                    Self::breaking_marker(Self::struct_verdict(old_fields, new_fields).0);
+                let what = match classify_layout(old_fields, new_fields) {
+                    LayoutDelta::Retyped { fields } => format!(
+                        "RETYPE {} — the stored bytes are reinterpreted",
+                        fields.join(", ")
+                    ),
+                    LayoutDelta::Names(PositionalDelta::Unchanged) => "unchanged".to_string(),
+                    LayoutDelta::Names(PositionalDelta::Appended { added }) => format!(
+                        "ADD {} — the row width changes, so every stored row re-frames",
+                        added.join(", ")
+                    ),
+                    LayoutDelta::Names(PositionalDelta::Renamed { old_name, new_name }) => format!(
+                        "RENAME '{}' to '{}' — the old JSON key no longer decodes",
+                        old_name, new_name
+                    ),
+                    LayoutDelta::Names(PositionalDelta::Reordered { moved }) => format!(
+                        "REORDER {} — every field reads its neighbour's bytes",
+                        moved.join(", ")
+                    ),
+                    LayoutDelta::Names(PositionalDelta::Dropped { dropped }) => format!(
+                        "REMOVE {} — the row width shrinks, so every stored row re-frames",
+                        dropped.join(", ")
+                    ),
+                };
+                format!(
+                    "Struct '{}' behind '{}.{}': {}{}",
+                    struct_name, model_name, field_name, what, breaking
+                )
+            }
         }
+    }
+
+    /// The shared breaking marker the descriptions above append.
+    fn breaking_marker(breaking: bool) -> &'static str {
+        if breaking { " (⚠️  BREAKING)" } else { "" }
     }
 }
 

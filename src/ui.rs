@@ -26,6 +26,16 @@ fn level() -> u8 {
     LEVEL.load(Ordering::Relaxed)
 }
 
+/// Is output suppressed to errors only?
+///
+/// Exposed for [`crate::ask`], which needs the *level* rather than a printer:
+/// `--quiet` plus a missing answer takes the error path, because a question
+/// printed by a process the user asked to be silent is one they will not be
+/// looking for. This is the only reason the level is readable at all.
+pub fn is_quiet() -> bool {
+    level() == QUIET
+}
+
 /// Print a success message with checkmark (suppressed by `--quiet`).
 pub fn success(msg: &str) {
     if level() >= NORMAL {

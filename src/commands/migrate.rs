@@ -84,23 +84,6 @@ pub struct MigrateEngineOptions {
     pub removed_output: Option<PathBuf>,
 }
 
-/// The directory a schema's governing config is walked up from, and the
-/// directory its `migrations/` sits beside.
-///
-/// A bare `schema.forge` has no parent component, and walking from `""` would
-/// resolve against the filesystem **root** rather than the CWD — the difference
-/// between "the config beside my schema" and "any config on the machine".
-///
-/// `main.rs` carries the same five lines for the same reason. They are not
-/// shared because that one lives in the **binary** crate and this in the
-/// library, so there is no path from here to it.
-fn schema_dir(schema: &Path) -> &Path {
-    match schema.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    }
-}
-
 /// One `migrate` invocation's app, resolved: which project governs it, which
 /// container in the build cache is its, and every name it builds under.
 struct ResolvedApp {
@@ -155,8 +138,8 @@ fn resolve_app(app: &AppRef) -> Result<ResolvedApp> {
         )));
     }
 
-    let governing = crate::project::govern(app.config.as_deref(), schema_dir(schema))?;
-    let project = governing.identify_reported()?;
+    let governing = crate::project::govern_for_schema(app.config.as_deref(), schema)?;
+    let project = governing.identify_reported(&*crate::ask::asker())?;
     let reserved =
         crate::cache::reserve(&project.name, &project.root, schema, governing.symbol_naming())?;
     // C7: every command that writes into the cache prints where it wrote.
@@ -167,7 +150,7 @@ fn resolve_app(app: &AppRef) -> Result<ResolvedApp> {
 
     Ok(ResolvedApp {
         schema: schema.clone(),
-        migrations_dir: schema_dir(schema).join("migrations"),
+        migrations_dir: crate::project::migrations_dir(schema),
         app_name: reserved.app_name.clone(),
         reserved,
     })
@@ -1094,6 +1077,22 @@ fn build_model_ops(
                     .adds
                     .push((field_name.clone(), json));
             }
+            // #438 — named explicitly rather than absorbed by the catch-all
+            // below, because "a new variant silently swallowed by `_ => {}`" is
+            // exactly the silent-capability-hole shape: a skipped branch reads
+            // as a missing feature rather than as an error.
+            //
+            // They need NO structural op, and that is a positive fact, not a
+            // gap. The transformer's hop reads every row through the `v_from`
+            // typed structs, serializes to JSON, and decodes into `v_to`
+            // (`crates/codegen/src/transform.rs`) — and an enum crosses that
+            // boundary as its variant **name**, a struct as its field
+            // **names**. So the re-encode to the new discriminant / the new
+            // offsets is performed by the identity body already. Emitting a
+            // rename/remove/add op here would be re-implementing a path that
+            // works.
+            SchemaChange::ChangeEnumVariants { .. }
+            | SchemaChange::ChangeStructLayout { .. } => {}
             // Structural no-ops for the row body (index/constraint/type changes):
             // index & constraint changes leave the row bytes identical; a type
             // change / nullable-narrowing is Authored residue carried separately.
@@ -1222,13 +1221,104 @@ fn save_schema_snapshot(migrations_dir: &std::path::Path, schema_src: &str) -> R
     Ok(())
 }
 
-/// Parse a `.forge` source and project it onto the migration differ's
-/// `SimpleSchema`.  Only **storage-backed** fields are included — pure collection
-/// relations (`[Model]` one-to-many / many-to-many) carry no column, so adding or
-/// removing one is not a data migration and must not register as a field change.
-/// FK scalars (`*Model` / `?Model`) DO carry a `Uuid` column, so they are kept.
-fn to_simple_schema(schema: &forgedb_parser::Schema) -> forgedb_migrations::SimpleSchema {
+/// True for a field that occupies a column on disk.
+///
+/// Pure collection relations (`[Model]` one-to-many / many-to-many) carry no
+/// column, so adding or removing one is not a data migration and must not
+/// register as a field change.  FK scalars (`*Model` / `?Model`) DO carry a
+/// `Uuid` column, so they are kept.
+fn is_storage_backed(field: &forgedb_parser::Field) -> bool {
     use forgedb_parser::{FieldType, RelationType};
+    !matches!(
+        &field.field_type,
+        FieldType::Relation(RelationType::OneToMany(_))
+            | FieldType::Relation(RelationType::ManyToMany(_))
+    )
+}
+
+/// Every `enum` / `struct` name this type reaches, **transitively** (#438).
+///
+/// The walk descends `Nullable`, `FixedArray`, `StructType`/`OptionalStructType`
+/// and `Enum`, carrying a visited set so a struct that (illegally) recurses
+/// cannot spin.
+///
+/// Depth is the trap and the reason this is a walk rather than a match. An enum
+/// is `is_fixed_size`, so it may sit inside an inline struct, and a struct may
+/// contain a struct. When the innermost enum changes, the *outer* field's own
+/// declaration text does not move at all — so a dependency list that stops at
+/// depth one is the same blindness #438 is about, one level down.
+fn type_dependencies(
+    schema: &forgedb_parser::Schema,
+    ty: &forgedb_parser::FieldType,
+    seen: &mut std::collections::HashSet<String>,
+    out: &mut Vec<String>,
+) {
+    use forgedb_parser::FieldType;
+    match ty {
+        FieldType::Nullable(inner) => type_dependencies(schema, inner, seen, out),
+        FieldType::FixedArray(inner, _) => type_dependencies(schema, inner, seen, out),
+        FieldType::Enum(name) => {
+            if seen.insert(name.clone()) {
+                out.push(name.clone());
+            }
+        }
+        FieldType::StructType(name) | FieldType::OptionalStructType(name) => {
+            if seen.insert(name.clone()) {
+                out.push(name.clone());
+                if let Some(def) = schema.find_struct(name) {
+                    for f in &def.fields {
+                        type_dependencies(schema, &f.field_type, seen, out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Project one AST field onto the differ's `SimpleField`, resolving its
+/// transitive enum/struct dependencies against `schema`.
+fn to_simple_field(
+    schema: &forgedb_parser::Schema,
+    f: &forgedb_parser::Field,
+) -> forgedb_migrations::SimpleField {
+    let mut seen = std::collections::HashSet::new();
+    let mut depends_on = Vec::new();
+    type_dependencies(schema, &f.field_type, &mut seen, &mut depends_on);
+    forgedb_migrations::SimpleField {
+        name: f.name.clone(),
+        // Debug repr is a stable, consistent stringification for both
+        // sides of the diff — equality is all the differ needs.
+        //
+        // For an enum/struct field it carries only the NAME
+        // (`Enum("Status")`), which is exactly why `depends_on` below has
+        // to exist: the definition changing does not move this string.
+        field_type: format!("{:?}", f.field_type),
+        nullable: f.is_nullable(),
+        unique: f.unique,
+        indexed: f.indexed,
+        index_type: format!("{:?}", f.index_type),
+        constraints: f
+            .constraints
+            .iter()
+            .map(|c| forgedb_migrations::SimpleConstraint {
+                name: c.name.clone(),
+                params: c.params.iter().map(|p| format!("{:?}", p)).collect(),
+            })
+            .collect(),
+        depends_on,
+    }
+}
+
+/// Parse a `.forge` source and project it onto the migration differ's
+/// `SimpleSchema`.  Only **storage-backed** fields are included (see
+/// [`is_storage_backed`]).
+///
+/// The `enums` / `structs` projections (#438) are what let the differ see a
+/// definition change at all: a field's type string names the enum/struct but
+/// carries none of its contents, so two schemas differing only in `Status`'s
+/// variant order project onto models that compare **equal**.
+fn to_simple_schema(schema: &forgedb_parser::Schema) -> forgedb_migrations::SimpleSchema {
     let models = schema
         .models
         .iter()
@@ -1237,31 +1327,8 @@ fn to_simple_schema(schema: &forgedb_parser::Schema) -> forgedb_migrations::Simp
             fields: m
                 .fields
                 .iter()
-                .filter(|f| {
-                    !matches!(
-                        &f.field_type,
-                        FieldType::Relation(RelationType::OneToMany(_))
-                            | FieldType::Relation(RelationType::ManyToMany(_))
-                    )
-                })
-                .map(|f| forgedb_migrations::SimpleField {
-                    name: f.name.clone(),
-                    // Debug repr is a stable, consistent stringification for both
-                    // sides of the diff — equality is all the differ needs.
-                    field_type: format!("{:?}", f.field_type),
-                    nullable: f.is_nullable(),
-                    unique: f.unique,
-                    indexed: f.indexed,
-                    index_type: format!("{:?}", f.index_type),
-                    constraints: f
-                        .constraints
-                        .iter()
-                        .map(|c| forgedb_migrations::SimpleConstraint {
-                            name: c.name.clone(),
-                            params: c.params.iter().map(|p| format!("{:?}", p)).collect(),
-                        })
-                        .collect(),
-                })
+                .filter(|f| is_storage_backed(f))
+                .map(|f| to_simple_field(schema, f))
                 .collect(),
             composite_indexes: m
                 .composite_indexes
@@ -1270,7 +1337,34 @@ fn to_simple_schema(schema: &forgedb_parser::Schema) -> forgedb_migrations::Simp
                 .collect(),
         })
         .collect();
-    forgedb_migrations::SimpleSchema { models }
+    let enums = schema
+        .enums
+        .iter()
+        .map(|e| forgedb_migrations::SimpleEnum {
+            name: e.name.clone(),
+            // Declaration order, verbatim — it IS the stored discriminant map.
+            variants: e.variants.clone(),
+        })
+        .collect();
+    let structs = schema
+        .structs
+        .iter()
+        .map(|s| forgedb_migrations::SimpleStruct {
+            name: s.name.clone(),
+            // Declaration order, verbatim — it IS the `#[repr(C)]` layout.
+            fields: s
+                .fields
+                .iter()
+                .filter(|f| is_storage_backed(f))
+                .map(|f| to_simple_field(schema, f))
+                .collect(),
+        })
+        .collect();
+    forgedb_migrations::SimpleSchema {
+        models,
+        enums,
+        structs,
+    }
 }
 
 /// Print the offline data-migration next steps for a recorded hop that rewrites

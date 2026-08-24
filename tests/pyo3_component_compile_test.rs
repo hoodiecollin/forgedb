@@ -126,7 +126,15 @@ fn scenario_23_a_component_ref_schema_emits_pyo3_that_builds() {
         "the fixture schema has no component ref"
     );
 
-    let database = forgedb_codegen::RustGenerator::generate(&schema).unwrap().code;
+    // The ONE config both halves of `core` are rendered from (#445): the
+    // database source below and the manifest that compiles it.
+    // `RustGenerator::generate` is `GenConfig::DEFAULT`, so naming it here is
+    // what keeps the `ToSchema` derives and the `utoipa` pin from being decided
+    // twice.
+    let config = forgedb_codegen::GenConfig::DEFAULT;
+    let database = forgedb_codegen::RustGenerator::generate_with_config(&schema, 1, config)
+        .unwrap()
+        .code;
     let wrapper = forgedb_codegen::PyO3Generator::generate(&schema).unwrap().code;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -141,12 +149,13 @@ fn scenario_23_a_component_ref_schema_emits_pyo3_that_builds() {
     );
 
     // `core` — the generated database as a library, plus the substrate
-    // re-exports its dependents reach the substrate through. `web` is on by
-    // default in `GenConfig`, so the emission carries `ToSchema` derives and the
-    // manifest has to pin utoipa for them.
+    // re-exports its dependents reach the substrate through. The manifest reads
+    // the SAME `config` the source above was emitted from, so the `utoipa` pin
+    // and the `ToSchema` derives cannot disagree — this used to pass a hardcoded
+    // `true` beside a generation whose config it merely assumed.
     write(
         &root.join("core/Cargo.toml"),
-        &forgedb_codegen::CorePackage::cargo_toml(CORE_PKG, true),
+        &forgedb_codegen::CorePackage::cargo_toml(CORE_PKG, &config),
     );
     write(
         &root.join("core/src/lib.rs"),

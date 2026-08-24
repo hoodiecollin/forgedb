@@ -2,10 +2,33 @@ use crate::types::SchemaChange;
 use std::collections::{HashMap, HashSet};
 use std::collections::BTreeMap;
 
-/// Simple schema representation for diffing
+/// Simple schema representation for diffing.
+///
+/// # Why `enums` and `structs` are here and not only `models` (#438)
+///
+/// A field's *type* is compared as a string, and for an `enum`/`struct` field
+/// that string carries only the **name** (`Enum("Status")`) — the definition
+/// lives beside the models, not inside the reference. So a schema that reorders
+/// `Status`'s variants produces two `SimpleSchema` values whose models compare
+/// **equal**, and the differ, handed two equal values, correctly reports
+/// nothing.
+///
+/// That silence is not cosmetic. An enum is stored as a **positional 1-byte
+/// discriminant** (variants map to `0..N` in declaration order), so a reorder
+/// re-maps every already-written row to a different variant with no byte on
+/// disk changing and no version moving; an inline `struct` is `#[repr(C)]` and
+/// every field's offset is a function of the whole declaration. Carrying the
+/// ordered definitions here is what lets the differ *see* those edits, record a
+/// hop, and bump the schema version that arms the generated open guard.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SimpleSchema {
     pub models: Vec<SimpleModel>,
+    /// Every declared `enum`, with its variants in **declaration order**. The
+    /// order is the payload: it is the byte→meaning map.
+    pub enums: Vec<SimpleEnum>,
+    /// Every declared inline `struct`, with its fields in **declaration
+    /// order**. Order and per-field width are both load-bearing on disk.
+    pub structs: Vec<SimpleStruct>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -13,6 +36,22 @@ pub struct SimpleModel {
     pub name: String,
     pub fields: Vec<SimpleField>,
     pub composite_indexes: Vec<Vec<String>>,
+}
+
+/// A declared `enum`, projected for diffing (#438).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SimpleEnum {
+    pub name: String,
+    /// Declaration order — this IS the stored discriminant mapping.
+    pub variants: Vec<String>,
+}
+
+/// A declared inline `struct`, projected for diffing (#438).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SimpleStruct {
+    pub name: String,
+    /// Declaration order — this IS the `#[repr(C)]` field layout.
+    pub fields: Vec<SimpleField>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,6 +63,21 @@ pub struct SimpleField {
     pub indexed: bool,
     pub index_type: String,
     pub constraints: Vec<SimpleConstraint>,
+    /// The names of every `enum` / `struct` this field's type reaches
+    /// **transitively** (#438).
+    ///
+    /// This is how a definition change is projected back onto the model fields
+    /// that store it. Transitivity is the whole point and is easy to get wrong:
+    /// an enum can sit inside an inline struct, and a struct inside a struct
+    /// (`[Point; 4]` inside `Shape`, `Color` inside `Point`). When `Color`
+    /// changes, the outer field's own declaration text does not — so a
+    /// dependency list that stops at depth one is the same blindness wearing a
+    /// smaller hat.
+    ///
+    /// Populated where the full AST is (the CLI's `to_simple_schema`), so this
+    /// crate stays a pure comparison over its own value types with no parser
+    /// dependency.
+    pub depends_on: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -118,7 +172,149 @@ impl SchemaDiffer {
             }
         }
 
+        // #438: the definitions themselves. A field's type string carries only
+        // the enum/struct NAME, so these edits are invisible to `diff_fields`
+        // above by construction — nothing there is wrong, it is comparing two
+        // values that are equal.
+        changes.extend(Self::diff_enums(old_schema, new_schema));
+        changes.extend(Self::diff_structs(old_schema, new_schema));
+
         changes
+    }
+
+    /// Diff the declared `enum`s and project each change onto the model fields
+    /// that store it (#438).
+    ///
+    /// Only an enum present on **both** sides is diffed. A newly-declared enum
+    /// has no stored rows, and a removed one is already reported through the
+    /// referencing field (which must itself have changed type or gone away).
+    fn diff_enums(old_schema: &SimpleSchema, new_schema: &SimpleSchema) -> Vec<SchemaChange> {
+        let mut changes = Vec::new();
+
+        let old_enums: BTreeMap<_, _> = old_schema
+            .enums
+            .iter()
+            .map(|e| (e.name.clone(), e))
+            .collect();
+        let new_enums: BTreeMap<_, _> = new_schema
+            .enums
+            .iter()
+            .map(|e| (e.name.clone(), e))
+            .collect();
+
+        for (name, new_enum) in new_enums.iter() {
+            let Some(old_enum) = old_enums.get(name) else {
+                continue;
+            };
+            if old_enum.variants == new_enum.variants {
+                continue;
+            }
+            for (model_name, field_name) in Self::dependent_fields(old_schema, new_schema, name) {
+                changes.push(SchemaChange::ChangeEnumVariants {
+                    model_name,
+                    field_name,
+                    enum_name: name.clone(),
+                    old_variants: old_enum.variants.clone(),
+                    new_variants: new_enum.variants.clone(),
+                });
+            }
+        }
+
+        changes
+    }
+
+    /// Diff the declared inline `struct`s and project each change onto the model
+    /// fields that store one (#438).
+    ///
+    /// A struct's layout is `(name, type)` per field, in declaration order —
+    /// both halves are load-bearing on disk, so both are carried.
+    fn diff_structs(old_schema: &SimpleSchema, new_schema: &SimpleSchema) -> Vec<SchemaChange> {
+        let mut changes = Vec::new();
+
+        let old_structs: BTreeMap<_, _> = old_schema
+            .structs
+            .iter()
+            .map(|s| (s.name.clone(), s))
+            .collect();
+        let new_structs: BTreeMap<_, _> = new_schema
+            .structs
+            .iter()
+            .map(|s| (s.name.clone(), s))
+            .collect();
+
+        for (name, new_struct) in new_structs.iter() {
+            let Some(old_struct) = old_structs.get(name) else {
+                continue;
+            };
+            let old_fields = Self::layout(&old_struct.fields);
+            let new_fields = Self::layout(&new_struct.fields);
+            if old_fields == new_fields {
+                continue;
+            }
+            for (model_name, field_name) in Self::dependent_fields(old_schema, new_schema, name) {
+                changes.push(SchemaChange::ChangeStructLayout {
+                    model_name,
+                    field_name,
+                    struct_name: name.clone(),
+                    old_fields: old_fields.clone(),
+                    new_fields: new_fields.clone(),
+                });
+            }
+        }
+
+        changes
+    }
+
+    /// A struct's on-disk layout as `(field name, field type)` in declaration order.
+    fn layout(fields: &[SimpleField]) -> Vec<(String, String)> {
+        fields
+            .iter()
+            .map(|f| (f.name.clone(), f.field_type.clone()))
+            .collect()
+    }
+
+    /// Every `(model, field)` that stores a value reaching `type_name`, in a
+    /// deterministic order (#438).
+    ///
+    /// Restricted to models AND fields present on **both** sides: a newly-added
+    /// model or field has no rows written under the old mapping, so there is
+    /// nothing about it to migrate, and a removed one is already reported as its
+    /// own change.
+    fn dependent_fields(
+        old_schema: &SimpleSchema,
+        new_schema: &SimpleSchema,
+        type_name: &str,
+    ) -> Vec<(String, String)> {
+        let old_models: BTreeMap<_, _> = old_schema
+            .models
+            .iter()
+            .map(|m| (m.name.clone(), m))
+            .collect();
+        let new_models: BTreeMap<_, _> = new_schema
+            .models
+            .iter()
+            .map(|m| (m.name.clone(), m))
+            .collect();
+
+        let mut out = Vec::new();
+        for (model_name, new_model) in new_models.iter() {
+            let Some(old_model) = old_models.get(model_name) else {
+                continue;
+            };
+            let old_field_names: HashSet<&String> =
+                old_model.fields.iter().map(|f| &f.name).collect();
+            let mut fields: Vec<&SimpleField> = new_model
+                .fields
+                .iter()
+                .filter(|f| old_field_names.contains(&f.name))
+                .filter(|f| f.depends_on.iter().any(|d| d == type_name))
+                .collect();
+            fields.sort_by(|a, b| a.name.cmp(&b.name));
+            for f in fields {
+                out.push((model_name.clone(), f.name.clone()));
+            }
+        }
+        out
     }
 
     /// Return true when two models have the same set of field names and matching types.

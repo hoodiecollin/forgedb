@@ -70,7 +70,7 @@ pub mod go;
 pub use api::ApiGenerator;
 pub use config::{FsyncMode, GenConfig};
 pub use core_pkg::CorePackage;
-pub use server_pkg::{ServerLayout, ServerPackage};
+pub use server_pkg::ServerPackage;
 pub use ffi::FfiGenerator;
 pub use go::GoGenerator;
 pub use go_sdk::GoSdkGenerator;

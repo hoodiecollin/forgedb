@@ -225,7 +225,7 @@ impl RustGenerator {
     /// `cannot find attribute 'schema' in this scope`, not a harmless no-op.
     /// Every production of one routes through here so the two cannot disagree.
     fn schema_attr(attr: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
-        if Self::active_cfg().web {
+        if Self::active_cfg().needs_utoipa() {
             attr
         } else {
             quote! {}
@@ -233,6 +233,11 @@ impl RustGenerator {
     }
 
     /// The `, ToSchema` fragment of a derive list, or nothing (#335 §10).
+    ///
+    /// Reads [`crate::GenConfig::needs_utoipa`] — the ONE condition (#445). The
+    /// `utoipa` pin in `core/Cargo.toml` reads that same one, and it has to:
+    /// this derive is what makes the pin necessary, and a manifest deciding it
+    /// separately is `error[E0432]: unresolved import 'utoipa'`.
     ///
     /// Gated on the app declaring a web surface, because once `database.rs` and
     /// `api.rs` are separate crates the derive lands in `core` while its
@@ -243,7 +248,7 @@ impl RustGenerator {
     /// Emitted as a leading-comma fragment so the derive lists it joins stay
     /// readable at their call sites.
     fn to_schema_derive() -> proc_macro2::TokenStream {
-        if Self::active_cfg().web {
+        if Self::active_cfg().needs_utoipa() {
             quote! { , ToSchema }
         } else {
             quote! {}
@@ -401,12 +406,15 @@ impl RustGenerator {
 
         // Attributes and imports
         let inline_str_import = Self::inline_str_import(schema);
-        // #335 §10: the utoipa import and every `ToSchema` derive are gated on
-        // the app declaring a web surface. Once `database.rs` and `api.rs` are
-        // separate crates the derive and its consumer are in different crates and
-        // the ORPHAN RULE blocks supplying the impl from `server`, so this cannot
-        // be decided later. Default is ON, so existing output is byte-identical.
-        let utoipa_import = if Self::active_cfg().web {
+        // #335 §10 / #445: the utoipa import and every `ToSchema` derive read
+        // `GenConfig::needs_utoipa` — the same one condition
+        // `CorePackage::cargo_toml` reads for the pin, because this import is
+        // precisely what makes that pin necessary. Once `database.rs` and
+        // `api.rs` are separate crates the derive and its consumer are in
+        // different crates and the ORPHAN RULE blocks supplying the impl from
+        // `server`, so this cannot be decided later. Default is ON, so existing
+        // output is byte-identical.
+        let utoipa_import = if Self::active_cfg().needs_utoipa() {
             quote! { use utoipa::ToSchema; }
         } else {
             quote! {}
