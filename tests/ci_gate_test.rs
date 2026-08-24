@@ -889,3 +889,75 @@ fn the_bare_job_asserts_an_exact_manifest_set() {
          nothing:\n{body}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// S339-1/2/10 — the parent-workspace job's steps still do their work.
+// ---------------------------------------------------------------------------
+
+/// The step NAMES are the stable interface every guard here keys on; the
+/// assertions are keyed to the COMMAND inside each, never to the name and never
+/// to the comment above it.
+///
+/// This job is green on day one by design — it is a regression and coverage
+/// guard, not a bug-finder — which is exactly the condition under which a step
+/// can be quietly gutted and nobody notices: it was passing before and it is
+/// passing after.
+#[test]
+fn the_parent_workspace_job_still_does_its_work() {
+    // The foreign root itself. Without a `[workspace]` table above the app this
+    // job is a slower copy of the one beside it.
+    let setup = run_block(
+        "substrate-reclose.yml",
+        "Scaffold a foreign workspace root, and an app beneath it",
+    );
+    for needle in ["[workspace]", "members = [\"consumer\"]", "sha256sum Cargo.toml"] {
+        assert!(
+            setup.contains(needle),
+            "the parent-workspace job no longer builds a foreign cargo workspace \
+             root (`{needle}` is gone). Without one it tests the same bare \
+             `mktemp -d` shape the job beside it already covers, and #330 case A \
+             is invisible again:\n{setup}"
+        );
+    }
+
+    // P1 — the cache resolves ITSELF, under a foreign root.
+    let p1 = run_block("substrate-reclose.yml", "P1 foreign root — the cache is immune");
+    for needle in [
+        "cargo locate-project --workspace",
+        "--manifest-path $ROOT/Cargo.toml",
+        "test -f \"$ROOT/Cargo.lock\"",
+        "test -d \"$ROOT/target\"",
+    ] {
+        assert!(
+            p1.contains(needle),
+            "P1 no longer proves the cache is immune to the foreign root \
+             (`{needle}` is gone). That immunity is the epic's central claim — it \
+             is why the cache directory makes #328 mostly dissolve — and this is \
+             the only place it is checked against a real nested \
+             workspace:\n{p1}"
+        );
+    }
+
+    // P2 — the checksum comparison, and the `members` line by name.
+    let p2 = run_block(
+        "substrate-reclose.yml",
+        "P2 foreign root — ForgeDB writes nothing it does not own",
+    );
+    assert!(
+        p2.contains("sha256sum Cargo.toml") && p2.contains("$ROOT_SHA"),
+        "P2 no longer COMPARES the foreign root's checksum against the one taken \
+         before `init`. A `test -f` or a `grep` here would pass on a file ForgeDB \
+         had rewritten:\n{p2}"
+    );
+    // Matched on the grep INVOCATION rather than on a literal spelling of the
+    // pattern: the pattern is shell-escaped in the workflow and a switch to
+    // `grep -F` would legitimately unescape it, which is not a regression.
+    assert!(
+        p2.lines().any(|l| {
+            l.starts_with("grep ") && l.contains("members") && l.contains("consumer")
+        }),
+        "P2 no longer greps the foreign root for its `members` array. It is the \
+         specific edit #338 refuses to make, and a checksum failure alone does not \
+         say which line moved:\n{p2}"
+    );
+}

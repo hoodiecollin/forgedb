@@ -655,3 +655,217 @@ jobs:
         # --ignored is load-bearing: without it libtest FILTERS THE TEST OUT and the step
         # passes having run nothing at all.
         run: cargo test --test migrate_tests -- --ignored --nocapture
+
+  # ---------------------------------------------------------------------------
+  # parent-workspace — the reclose under a FOREIGN cargo workspace root (#339).
+  # ---------------------------------------------------------------------------
+  #
+  # The job above scaffolds into a bare `mktemp -d` with no parent workspace root.
+  # That is not what a real consumer's tree looks like, and it is exactly why #330
+  # case A — a scaffold that could not build inside a workspace — was invisible to
+  # CI through the whole of v0.4.0. This job supplies the shape the other one
+  # cannot: a `[workspace]` root the consumer owns, one member they own, the app
+  # and the build cache beneath it.
+  #
+  # THIS JOB IS EXPECTED TO BE GREEN ON DAY ONE, AND THAT IS NOT REDUNDANCY.
+  #
+  # It is a REGRESSION AND COVERAGE guard, not a bug-finder. Every property below
+  # was measured green before the job was written — the cache resolves its own
+  # workspace root under a foreign one, ForgeDB leaves the foreign root
+  # byte-identical, and the generated Rust SDK compiles against real reqwest. A
+  # green first run must not be read as evidence there was nothing to check: what
+  # these steps hold is that the epic's central claim — the cache directory is why
+  # #328 mostly dissolves — stays true, and that three surfaces nothing else
+  # compiles keep compiling.
+  #
+  # WHY THE SDK IS BUILT BY ADOPTION AND NOT IN PLACE
+  #
+  # An earlier design ran `cargo build` inside `generated/rust-sdk`, expected it to
+  # fail with cargo's "current package believes it's in a workspace when it's not",
+  # and fixed that by emitting a `[workspace]` table into the generated package.
+  # That remedy is withdrawn (#430, closed as not-a-defect): a nested package
+  # carrying `[workspace]` that any member path-depends on makes cargo fail the
+  # ENTIRE workspace, so it is buildable only while nothing depends on it. With the
+  # fix gone, an in-place build under a foreign root has no green state at all.
+  #
+  # The shape that does is the one #338 already prescribes: the consumer ADOPTS the
+  # crate with one path dep from a crate they own, and cargo makes it an implicit
+  # member. The step deliberately does NOT assert the pre-adoption failure —
+  # encoding cargo's error text as a required property would make a future cargo
+  # relaxation read as a ForgeDB regression, and the property worth holding is "a
+  # consumer in a workspace can build what we wrote", not "cargo still refuses".
+  #
+  # WHY UBUNTU ONLY, AND WHY THE TARGETS ARE NARROWED
+  #
+  # Cost. The matrix on the job above exists to catch host-specific LINK problems
+  # (the macOS-only pyo3 `-undefined dynamic_lookup` failure); nothing here probes
+  # one. `[generate].targets` is narrowed to rust + api + rust-sdk for the same
+  # reason: the wrappers pin zero substrate and are already covered arm by arm
+  # above, so compiling them again under a foreign root buys nothing.
+  #
+  # WHY IN-TREE IS `P4` HERE AND NOT `7/7` ABOVE
+  #
+  # The property in-tree placement measures — a ForgeDB-owned package joining a
+  # foreign cargo workspace and resolving its substrate pins in the CONSUMER's
+  # lockfile — only exists under a foreign root. In the bare job it would test a
+  # shape no consumer has. And renumbering `0/6 … 6/6` would break every tier-1
+  # guard keyed to those step names, loudly but pointlessly.
+  #
+  # NO CARGO_TARGET_DIR HERE, deliberately: "the cache has its own target/" is one
+  # of the properties P1 asserts, and a shared redirect would make it unobservable.
+  parent-workspace:
+    name: reclose under a foreign cargo workspace root
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the forgedb CLI
+        run: cargo build --release --bin forgedb
+
+      - name: Scaffold a foreign workspace root, and an app beneath it
+        shell: bash
+        env:
+          FORGEDB: ${{ github.workspace }}/target/release/forgedb
+        run: |
+          set -euxo pipefail
+          test ! -e "$HOME/.forgedb"
+
+          # `pwd -P` because every path comparison below is a string compare
+          # against what cargo reports, and cargo canonicalizes.
+          WORK="$(cd "$(mktemp -d "${RUNNER_TEMP}/parent-workspace.XXXXXX")" && pwd -P)"
+          cd "$WORK"
+
+          export FORGEDB_HOME="$WORK/forgedb-home"
+          case "$FORGEDB_HOME" in
+            "${GITHUB_WORKSPACE}"*)
+              echo "FAIL: FORGEDB_HOME ($FORGEDB_HOME) is inside the checkout" >&2
+              exit 1;;
+          esac
+          test ! -e "$FORGEDB_HOME"
+
+          # The foreign root. `resolver = "2"`, not "3", deliberately: it is the
+          # commoner consumer shape and the more adversarial one, since ForgeDB's
+          # own cache root pins "3".
+          mkdir -p consumer/src
+          cat > Cargo.toml <<'ROOT'
+          [workspace]
+          members = ["consumer"]
+          resolver = "2"
+          ROOT
+          cat > consumer/Cargo.toml <<'MEMBER'
+          [package]
+          name = "consumer"
+          version = "0.0.0"
+          edition = "2021"
+
+          [dependencies]
+          MEMBER
+          echo 'fn main() {}' > consumer/src/main.rs
+
+          # Captured BEFORE `init`, compared after `build`. This file is the one
+          # thing above the app that ForgeDB must never touch.
+          ROOT_SHA="$(sha256sum Cargo.toml | cut -d' ' -f1)"
+
+          "$FORGEDB" init app
+          cd app
+          test ! -e Cargo.toml
+          test ! -e "$FORGEDB_HOME/projects"
+
+          # The same schema shape the bare job uses — relations, an enum, an
+          # index, a projection, json/decimal/optional columns — because `api.rs`
+          # names `rust_decimal::Decimal` absolutely only when a model declares
+          # one, and the SDK's generated types follow the same surface.
+          cat > schema.forge <<'SCHEMA'
+          enum Status { Draft, Published, Archived }
+
+          Author {
+            id: +uuid
+            email: &string
+            name: ^string
+            posts: [Post]
+          }
+
+          Post {
+            @projection(card: title, status)
+            id: +uuid
+            title: ^string
+            body: string
+            summary: string?
+            views: u32
+            price: decimal
+            status: ^Status
+            meta: json
+            author: *Author
+            editor: ?Author
+          }
+          SCHEMA
+
+          # Narrowed to the three surfaces this job is about. The four wrappers
+          # pin zero substrate and are covered arm by arm in the job above.
+          sed -i 's/^targets = \["all"\]$/targets = ["rust", "api", "rust-sdk"]/' forgedb.toml
+          grep -q 'targets = \["rust", "api", "rust-sdk"\]' forgedb.toml
+
+          "$FORGEDB" validate
+
+          echo "FORGEDB_HOME=$FORGEDB_HOME" >> "$GITHUB_ENV"
+          echo "WORK=$WORK" >> "$GITHUB_ENV"
+          echo "APP=$WORK/app" >> "$GITHUB_ENV"
+          echo "ROOT_SHA=$ROOT_SHA" >> "$GITHUB_ENV"
+
+      - name: P1 foreign root — the cache is immune
+        shell: bash
+        env:
+          FORGEDB: ${{ github.workspace }}/target/release/forgedb
+        run: |
+          set -euxo pipefail
+          cd "$APP"
+          "$FORGEDB" generate all
+
+          ROOT="$(find "$FORGEDB_HOME/projects" -mindepth 1 -maxdepth 1 -type d)"
+          test -n "$ROOT"
+          test "$(printf '%s\n' "$ROOT" | wc -l)" -eq 1
+          echo "CACHE_ROOT=$ROOT" >> "$GITHUB_ENV"
+
+          # The epic's central claim, as a check: a cargo workspace nested inside
+          # another one is NOT swallowed — cargo resolves the innermost root that
+          # declares `[workspace]`, and the cache declares one. Ask cargo, at the
+          # cache, rather than reasoning about it.
+          test "$(cd "$ROOT" && cargo locate-project --workspace --message-format plain)" \
+             = "$ROOT/Cargo.toml"
+
+          # And the driver agrees: the invocation ForgeDB is about to make names
+          # the CACHE manifest, never the foreign one it is sitting under.
+          "$FORGEDB" build --plan | tee plan.log
+          grep -q -- "--manifest-path $ROOT/Cargo.toml" plan.log
+          ! grep -q -- "--manifest-path $WORK/Cargo.toml" plan.log
+
+          "$FORGEDB" build
+
+          # Its own lockfile and its own target dir — the two things a swallowed
+          # workspace would NOT have, because it would share the parent's.
+          test -f "$ROOT/Cargo.lock"
+          test -d "$ROOT/target"
+          # …and the foreign root has neither yet: nothing ForgeDB did resolved
+          # anything on the consumer's behalf.
+          test ! -e "$WORK/Cargo.lock"
+
+      - name: P2 foreign root — ForgeDB writes nothing it does not own
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$WORK"
+          # sha256 captured before `init`, compared after `build`. #338's own arm
+          # inverts this assertion for its mode, which is why the two live in
+          # different steps rather than being reconciled into one.
+          AFTER_SHA="$(sha256sum Cargo.toml | cut -d' ' -f1)"
+          if [ "$ROOT_SHA" != "$AFTER_SHA" ]; then
+            echo "FAIL: ForgeDB modified the foreign workspace root it does not own." >&2
+            cat Cargo.toml >&2
+            exit 1
+          fi
+          # Named separately from the checksum: `members` is the specific edit
+          # that would be tempting (and that #338 explicitly refuses), and a
+          # checksum failure alone would not say which line moved.
+          grep -q 'members = \["consumer"\]' Cargo.toml
