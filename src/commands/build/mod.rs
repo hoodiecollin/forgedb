@@ -15,6 +15,7 @@
 //! to build and turns the result into the two machine-readable surfaces
 //! (`--report`, `--print-artifact`) that #335 §14/§15 owes the deploy path.
 
+pub mod deliver;
 pub mod driver;
 
 use crate::naming::PackageKind;
@@ -254,22 +255,20 @@ pub fn run(options: BuildOptions) -> Result<()> {
         ));
     }
 
-    // The one delivery `forgedb build` performs, and it is forced rather than
-    // chosen (#335 §6): the generated cgo preamble says
-    // `#cgo LDFLAGS: -L${SRCDIR} -lforgedb`, so the Go package's *source* is
-    // already written against a library sitting beside it. Go is the single
-    // target whose source cannot be generated correctly without knowing where
-    // its library will be, which is why C8's "no delivery" non-goal carves it
-    // out. #337 generalizes the mechanism; it does not move this destination.
+    // Delivery (#337). Every class-B target's compiled half is copied out of the
+    // cache and into the app's `output`, beside the generated text that
+    // describes it, and every delivered path is printed (C7).
     //
-    // It is the **staticlib**, never the cdylib — see `deliver_go_staticlib`:
-    // rustc stamps an absolute `LC_ID_DYLIB`, so a Go binary that linked the
-    // cdylib records the cache path and dies `dyld: Library not loaded` the
-    // first time the cache is collected.
+    // Go used to be the ONE carve-out from #335's "no delivery" non-goal,
+    // because the generated cgo preamble says `#cgo LDFLAGS: -L${SRCDIR}
+    // -lforgedb` — the Go package's *source* is already written against a
+    // library sitting beside it. That row is now one row of the table, and its
+    // destination is unchanged.
     //
-    // Silently skipped when the app emitted no `go/`, because then there is
-    // nothing to deliver *to* — not because the delivery is optional.
-    deliver_go_staticlib_if_generated(&options, &report)?;
+    // It runs BEFORE the report is written, so `--report` names what was
+    // delivered rather than describing a delivery that had not happened yet.
+    let mut report = report;
+    report.delivered = deliver::run_if_output(options.output.as_deref(), &report)?;
 
     // Both machine surfaces are projections of the SAME value, written only
     // after every path in it has been existence-checked by `driver::execute`.
@@ -280,52 +279,6 @@ pub fn run(options: BuildOptions) -> Result<()> {
         println!("{}", report.print_artifact(kind)?.display());
     }
 
-    Ok(())
-}
-
-/// Copy the app's FFI **staticlib** beside its generated Go package, when there
-/// is one.
-///
-/// Two conditions, and both are "is there anything to do" rather than policy:
-/// the app emitted a `go/` directory, and its `ffi` package produced a
-/// staticlib. Neither is configurable — a project that declares the Go runtime
-/// declares the ffi package with it.
-///
-/// The artifact is taken from the **report**, so the file has already been
-/// existence-checked against what cargo said it wrote (`driver::execute`). A
-/// path joined from the target directory would be #292 again, one layer down.
-fn deliver_go_staticlib_if_generated(
-    options: &BuildOptions,
-    report: &driver::BuildReport,
-) -> Result<()> {
-    let Some(output) = options.output.as_deref() else {
-        return Ok(());
-    };
-    let output = PathBuf::from(output);
-    if !output.join("go").is_dir() {
-        return Ok(());
-    }
-
-    let Some(staticlib) = report
-        .artifacts
-        .iter()
-        .find(|a| a.kind == "ffi" && a.target_kind == driver::TargetKind::Staticlib)
-    else {
-        return Err(CliError::Build(format!(
-            "{} exists but this build produced no `ffi` staticlib to link it against. \
-             The generated cgo preamble is `-L${{SRCDIR}} -lforgedb`, so `go build` would \
-             fail at the link step with an error naming neither cause. This is a ForgeDB \
-             bug; please report it.",
-            output.join("go").display()
-        )));
-    };
-
-    let delivered =
-        crate::commands::generate::deliver_go_staticlib(&output, &staticlib.path)?;
-    ui::info(&format!(
-        "go (staticlib): {} — linked into the Go binary, so it survives a cache GC",
-        delivered.display()
-    ));
     Ok(())
 }
 
@@ -524,6 +477,10 @@ fn build_report(
             Profile::Debug
         },
         artifacts: reported,
+        // Filled by `deliver::run` after the compile; empty here because nothing
+        // has been delivered yet, and a report that claimed otherwise would be
+        // describing the future.
+        delivered: Vec::new(),
     })
 }
 
