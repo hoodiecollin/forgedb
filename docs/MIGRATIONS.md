@@ -4,12 +4,19 @@ ForgeDB is a **code generator**, so schema evolution follows the generate-then-c
 model: you edit `schema.forge`, regenerate, and recompile your app. What happens to the
 *data on disk* depends on the change:
 
-- **Additive** changes (a new model, a new nullable field) are preserved automatically — the
-  regenerated app backfills them on reopen. No data step.
-- **Everything else** (a type change, a column/model drop, a nullable→NOT-NULL narrowing, a
-  `&unique` add, a required field with no default) rewrites data-at-rest. ForgeDB generates a
-  per-version **offline transformer bin** that does the rewrite, driven end-to-end by
-  `forgedb migrate`.
+- **Provable** changes need no input from you: a new model, a new nullable field, a drop, a
+  rename you confirm, a value-preserving widening, or an add whose field carries a `@default`.
+- **Everything else** (a type re-encode that is not a widening, a nullable→NOT-NULL narrowing, a
+  required field with no default, a removed enum variant) needs a decision ForgeDB cannot make —
+  and it **asks you at `migrate create` time**, when you have the change in your head, recording
+  your answer as data in the migration record.
+
+Either way the data-at-rest rewrite is done by a per-version **offline transformer bin** ForgeDB
+generates, driven end-to-end by `forgedb migrate`.
+
+**Writing Rust is the advanced escape hatch, not the default path.** When a transform genuinely
+needs code, you write it in the language your project already generates for — TypeScript or
+Python — against the generated types, and ForgeDB runs it on the interpreter you already have.
 
 The invariant (the generator-identity red line): the schema is never a runtime input to a
 generic engine. The transformer is **generated code** — one straight-line typed replay per
@@ -36,41 +43,83 @@ next two sections is about the app's serial.
 
 ---
 
-## Additive changes — automatic, data-preserving
+## Additive changes — nothing to answer
 
 An additive change is one existing rows can satisfy without a value being invented for them:
 **a new model**, or **a new nullable field** (`field: T?`, read as `None` by existing rows).
+ForgeDB proves the value, so it asks you nothing.
 
 ```bash
 # 1. Edit schema.forge — add the new nullable field AT THE END of the model.
 # 2. Record the change (baselines the lineage on first run):
-forgedb migrate create "add note field" --auto --schema schema.forge
+forgedb migrate create "add note field" --schema schema.forge
 # 3. Regenerate and rebuild your app:
 forgedb generate all --schema schema.forge
 forgedb build --schema schema.forge
-# 4. Restart. Existing rows are backfilled with defaults on first open.
+# 4. Point the regenerated app at a dir the transformer produced (see below).
 ```
 
 On reopen, generated recovery **anchors on the tombstone row count** (the authoritative
 committed count) and **backfills any column shorter than the anchor** — the new field — with
-its default. Existing rows are never touched.
+its `@default` when the schema declares a resolvable one, and its type zero otherwise. Existing
+rows are never touched.
+
+> **The reopen backfill is not a substitute for the transformer, and never was.** Every recorded
+> migration bumps the schema serial, `generate` bakes the new value into the app, and the
+> generated open guard **panics** on a mismatch. So the moment `migrate create` records a hop —
+> which it does for *any* non-empty diff, additive included — the "just restart the app" path is
+> closed. The backfill is what keeps a column well-formed *within* a version; the offline
+> transformer is what carries a data dir *across* one. Earlier revisions of this page said
+> otherwise.
 
 **Constraints:** append new fields at the **end** of the model (columns are position-addressed);
-new non-null fields backfill to the type zero, not `@default` (prefer nullable when the zero is
-not meaningful); let the old binary checkpoint its WAL before migrating.
+let the old binary checkpoint its WAL before migrating.
 
 ---
 
 ## Data-rewriting changes — the transformer bin
 
-For anything the reopen backfill cannot do, `forgedb migrate create --auto` still **records**
-the change as a versioned hop and classifies it:
+`forgedb migrate create` **records** every detected change as a versioned hop and classifies it:
 
-- **`Auto`** — the differ can prove the new-row body (drop a field/model, rename, add a
-  `&unique`). No authoring needed.
-- **`Authored`** — the differ cannot know the value (a type re-encode, a nullable→NOT-NULL
-  fill, a required-add-without-default, a removed or renamed enum variant). `migrate create`
-  writes a scaffold at `migrations/<id>/transform.rs` for you to fill in and freeze.
+- **`Auto`** — ForgeDB can prove the new-row body, so nothing is asked. Drop a field or model,
+  rename, add a `&unique`, `T` → `T?`, a value-preserving widening (`u32`→`u64`, `i32`→`i64`,
+  `u32`→`i64`, `string(N)`→`string(M)` for `M > N`, `timestamp(s)`→`timestamp(us)`), or an add
+  whose field carries a resolvable `@default`.
+- **`Authored`** — ForgeDB cannot derive the value (a type re-encode that is not a widening, a
+  nullable→NOT-NULL fill, a required add with no default, a removed or renamed enum variant).
+  **It asks you, at `create` time**, and records your answer as data in the migration record.
+
+### What it asks, and what it records
+
+```
+Post.slug — ForgeDB cannot derive a value for the rows that already exist.
+What should existing rows get?
+  1) a constant value
+  2) copy another field           title, summary
+  3) leave it — I'll write the transform in TypeScript   (advanced)
+```
+
+Option 2 is offered only when the model actually has a field of the same type; an option that
+cannot work is an invitation to an answer the build would then refuse.
+
+Your answer is recorded **as data** in `migrations/<id>_*.json`, beside the change it answers, and
+the record's checksum covers it. `migrate build` *lowers* it into the emitted transformer — the
+answer is a compile-time input to code generation, never something the transformer matches on at
+run time.
+
+**In a session with no terminal — a CI run, a pipe, or `--no-auto` — the FIRST change needing an
+answer is a hard error naming it, and nothing is written.** `--no-auto` suppresses the *prompt*,
+not detection: a migration whose every change is provable succeeds identically with and without
+it.
+
+**A rename is proposed, never assumed.** One field dropped and one added of the same type is
+usually a rename, and the two readings produce opposite data — a rename carries every stored
+value across, a drop+add empties the column. So ForgeDB asks. With nobody to ask it records the
+drop+add, which is what the schema literally says.
+
+**`migrate build` refuses a hop whose answer is missing**, before it generates a line and before
+cargo is invoked. The check is against the record and the recorded scaffold hash — never a grep
+for `TODO`, which you can delete without answering anything.
 
 Changes to an `enum`'s variants or an inline `struct`'s layout are diffed too, and most of them
 are breaking — see [below](#enum-and-struct-definitions-are-part-of-the-diff).
@@ -78,15 +127,17 @@ are breaking — see [below](#enum-and-struct-definitions-are-part-of-the-diff).
 ### Lifecycle
 
 ```bash
-# 1. Edit schema.forge, then record + classify the change:
-forgedb migrate create "qty to string" --auto --schema schema.forge
-#    → records migrations/<id>_*.json (from_version -> to_version)
+# 1. Edit schema.forge, then record + classify the change. It ASKS about
+#    anything it cannot prove:
+forgedb migrate create "qty to string" --schema schema.forge
+#    → records migrations/<id>_*.json (from_version -> to_version, + your answers)
 #    → snapshots migrations/schemas/v<n>.forge
-#    → for Authored residue, scaffolds migrations/<id>/transform.rs
+#    → if you chose "I'll write the transform", scaffolds
+#      migrations/<id>/transform.{ts,py,rs} plus ForgeDB's own host.* and v<n>.*
 
-# 2. If an authored body was scaffolded, edit it. `authored_transform(model, row)`
-#    receives each row as JSON AFTER the automatic (rename/drop/additive) ops and
-#    returns it reshaped for the next version. Fill in every TODO.
+# 2. If you chose the transform option, write it. `transform(model, row)` receives
+#    each row AFTER the automatic (rename/drop/additive) ops and returns it
+#    reshaped for the next version. It is typed against the generated v<n> module.
 
 # 3. Regenerate your app (its EXPECTED_SCHEMA_VERSION advances to the new version):
 forgedb generate all --schema schema.forge
@@ -107,7 +158,7 @@ Neither carries a name on disk. So an edit to a *definition* moves what the alre
 bytes MEAN, while changing no byte and no field's declared type — and the reference that names
 it (`status: Status`) does not move either.
 
-`migrate create --auto` compares the definitions themselves, and reports the change against
+`migrate create` compares the definitions themselves, and reports the change against
 every field that stores one:
 
 ```
@@ -261,24 +312,90 @@ upgrade steps live in [UPGRADING.md](UPGRADING.md).
 
 | Command | Purpose |
 |---|---|
-| `forgedb migrate create <desc> --auto --schema <file>` | Diff against the snapshot; record + classify the change; scaffold any authored body. |
-| `forgedb migrate create <desc> --schema <file>` | Create an empty manual migration template. |
+| `forgedb migrate create <desc> --schema <file>` | Diff against the snapshot; record + classify the change; ask about anything it cannot prove. |
+| `forgedb migrate create <desc> --no-auto --schema <file>` | The same, but never ask: the first unprovable change is a hard error naming it. |
 | `forgedb migrate status --schema <file>` | Show applied / pending migrations. |
 | `forgedb migrate build --from F --to T --schema <file>` | Generate + compile the transformer for one range. |
 | `forgedb migrate run --from F --to T --src <data> --dest <migrated> --schema <file>` | Run the transformer built for that range. |
-| `forgedb generate transform --from F --to T --schema <file>` | (Lower-level) emit the transformer source without compiling. |
 | `forgedb migrate engine --src <data> --dest <new-dir> --schema <file>` | Carry a dir across a ForgeDB **engine** byte-format generation (orthogonal to the schema serial). |
 
-`--schema` is required on every row above. Two flags that used to appear here are **gone, and
+`--schema` is required on every row above. Three flags that used to appear here are **gone, and
 error rather than no-op**: `migrate build -o/--output` and `migrate run --bin-dir` both named a
-directory for a crate ForgeDB now places itself. `forgedb migrate up` is gone with them — its
-one-command wrapper is the two rows above it, and its per-tenant sweep is **#373**.
+directory for a crate ForgeDB now places itself, and `migrate create --auto` named a mode that is
+now simply what the command does. `forgedb migrate up` and `forgedb generate transform` are gone
+with them — the first's one-command wrapper is the two `migrate build`/`migrate run` rows and its
+per-tenant sweep is **#373**; the second's job is `migrate build`.
+
+There is deliberately **no way to create a migration ForgeDB did not detect.** The old
+`--auto`-less branch wrote an empty record with `changes: []` for you to hand-edit; a record's
+`changes` array is derived from a schema diff, so it cannot disagree with
+`migrations/schemas/vN.forge`.
+
+---
+
+## Writing the transform in your own language
+
+Rust authoring is the **advanced** escape hatch, not the default path. When you choose "I'll
+write the transform", the language is **derived from `[generate].targets`** — a project that
+generates a TypeScript SDK writes its transforms in TypeScript — and ForgeDB scaffolds:
+
+```
+migrations/<id>/
+  transform.ts     ← YOURS. ForgeDB never rewrites it once it exists.
+  host.ts          ← ForgeDB's. The stdin/stdout loop. Rewritten every build.
+  v1.ts  v2.ts     ← ForgeDB's, from migrations/schemas/v{1,2}.forge. Rewritten every build.
+```
+
+```ts
+import { runTransform, type Row } from "./host";
+import type * as From from "./v1";
+import type * as To from "./v2";
+
+export function transform(model: string, row: Row): Row {
+  switch (model) {
+    case "Post": {
+      const from = row as unknown as From.Post;
+      const to: To.Post = { ...from, views: String(from.views) };
+      return to as unknown as Row;
+    }
+    default:
+      return row;
+  }
+}
+
+runTransform(transform);
+```
+
+**ForgeDB embeds no interpreter.** No QuickJS, no CPython, no bundled runtime — the transformer
+links the runtime *you already have*, so where it lives is a config concern:
+
+```toml
+[toolchain]
+bun    = { path = "/opt/homebrew/bin/bun", min_version = "1.1" }
+node   = { path = "/usr/local/bin/node",   min_version = "20" }
+python = { path = ".venv/bin/python",      min_version = "3.11" }
+```
+
+Location and version only — the language is never declared here. A relative `path` resolves
+against the **project root**, not your working directory; an absent one means "resolve the bare
+name on `PATH`". A missing or too-old interpreter is a clear error naming what was expected and
+what was found, raised **before** any code is generated.
+
+`migrate build` verifies your transform against the recorded scaffold hash, copies it into the
+build cache, and bakes the interpreter's absolute path into the transformer — so `migrate run`
+executes exactly what `migrate build` checked. The two processes speak one JSON object per line,
+strictly in order, one child per hop. A non-zero exit, a malformed reply, or an early exit each
+fail the whole hop and reproduce the child's own output; the destination is not published and the
+source dir is your rollback.
+
+**Go-target projects get the Rust escape.** Go is compiled, so "run the author's own runtime out
+of process" would mean invoking a toolchain and linking generated packages — materially more than
+a line-oriented host loop.
 
 ---
 
 ## Deferred
 
-- Honoring `@default` (not just the type zero) on additive backfill.
 - `compaction_epoch` verification before apply (the format-version guard is the interlock
   today; an in-process `compact()` renumbers rows within an epoch).
 - Cheap in-place byte-op hops (drop/rename without an O(rows) typed rewrite) — a perf

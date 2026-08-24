@@ -148,6 +148,15 @@ impl Chain {
         self.links.first()
     }
 
+    /// [`Chain::nearest`]'s config, taken by value.
+    pub fn into_nearest_config(mut self) -> Option<ForgeConfig> {
+        if self.links.is_empty() {
+            None
+        } else {
+            Some(self.links.remove(0).config)
+        }
+    }
+
     /// The config that decides identity: the nearest `isolated` one, else the
     /// outermost.  Frequently a different directory from [`Chain::nearest`].
     pub fn project_root(&self) -> Option<&Link> {
@@ -1023,6 +1032,24 @@ impl Governing {
             .as_ref()
             .or_else(|| self.chain.nearest().map(|l| &l.config))
             .unwrap_or(&self.fallback)
+    }
+
+    /// Take the governing config by value.
+    ///
+    /// `config()` borrows from `self`, so a caller that wants to keep the knobs
+    /// past the chain's lifetime has to clone the chain. This hands over the one
+    /// `ForgeConfig` that applies, so a later step reads the same answer rather
+    /// than re-walking and possibly getting a different one.
+    pub fn into_config(self) -> ForgeConfig {
+        let Governing {
+            chain,
+            explicit,
+            fallback,
+            ..
+        } = self;
+        explicit
+            .or_else(|| chain.into_nearest_config())
+            .unwrap_or(fallback)
     }
 
     /// How this project derives its app names — read from the **project root**

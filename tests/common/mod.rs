@@ -75,6 +75,19 @@ fn cargo_toml(name: &str) -> String {
     s
 }
 
+/// The generated project's `Cargo.toml`, for a caller assembling a crate itself
+/// rather than through [`generate_compile_run_in`] (#374).
+///
+/// The transformer's sources come from `TransformGenerator`, not from `forgedb
+/// generate`, so its project cannot go through the helper above — but it links
+/// the same substrate closure and must link it by PATH for the same reason: a
+/// test that resolved these from crates.io would be red for the whole of any
+/// cycle carrying a publish gap, which is why exactly one ignored test is
+/// allowed to do that and `tests/ci_gate_test.rs` guards the count.
+pub fn path_dep_cargo_toml(name: &str) -> String {
+    cargo_toml(name)
+}
+
 /// Generate `schema`, mount `driver` as the crate root exactly as the `forgedb
 /// init` scaffold does, compile, and run it with the data dir as `argv[1]`.
 ///

@@ -8,6 +8,7 @@ pub mod fingerprint;
 pub mod naming;
 pub mod project;
 pub mod targets;
+pub mod toolchain;
 pub mod templates;
 pub mod ui;
 

@@ -48,7 +48,9 @@
 //! ## Detecting Schema Changes
 //!
 //! ```rust
-//! use forgedb_migrations::{SchemaDiffer, SimpleSchema, SimpleModel, SimpleField, SimpleConstraint};
+//! use forgedb_migrations::{
+//!     SchemaDiffer, SimpleSchema, SimpleModel, SimpleField, SimpleConstraint, SimpleType,
+//! };
 //!
 //! // Create schemas directly (no file loading at the diff level)
 //! let old_schema = SimpleSchema {
@@ -58,7 +60,7 @@
 //!             fields: vec![
 //!                 SimpleField {
 //!                     name: "id".to_string(),
-//!                     field_type: "uuid".to_string(),
+//!                     ty: SimpleType::Uuid,
 //!                     nullable: false,
 //!                     unique: false,
 //!                     indexed: false,
@@ -81,7 +83,7 @@
 //!             fields: vec![
 //!                 SimpleField {
 //!                     name: "id".to_string(),
-//!                     field_type: "uuid".to_string(),
+//!                     ty: SimpleType::Uuid,
 //!                     nullable: false,
 //!                     unique: false,
 //!                     indexed: false,
@@ -91,7 +93,7 @@
 //!                 },
 //!                 SimpleField {
 //!                     name: "email".to_string(),
-//!                     field_type: "string".to_string(),
+//!                     ty: SimpleType::Str,
 //!                     nullable: false,
 //!                     unique: false,
 //!                     indexed: false,
@@ -108,9 +110,9 @@
 //! };
 //!
 //! // SchemaDiffer is a unit struct; call diff() as a static method
-//! let changes = SchemaDiffer::diff(&old_schema, &new_schema);
-//! println!("Detected {} changes", changes.len());
-//! assert_eq!(changes.len(), 1);
+//! let diff = SchemaDiffer::diff(&old_schema, &new_schema);
+//! println!("Detected {} changes", diff.changes.len());
+//! assert_eq!(diff.changes.len(), 1);
 //! ```
 //!
 //! ## Applying Migrations
@@ -191,7 +193,7 @@
 //!   "changes": [
 //!     { "AddField": { "model_name": "User", "field_name": "email",
 //!                     "field_type": "string", "nullable": true,
-//!                     "default_value": null } }
+//!                     "default_json": null } }
 //!   ],
 //!   "from_version": 1,
 //!   "to_version": 2
@@ -232,14 +234,15 @@ mod tracker;
 mod types;
 
 pub use diff::{
-    SchemaDiffer, SimpleConstraint, SimpleEnum, SimpleField, SimpleModel, SimpleSchema,
-    SimpleStruct,
+    DiffResult, RenameProposal, SchemaDiffer, SimpleConstraint, SimpleEnum, SimpleField,
+    SimpleModel, SimpleSchema, SimpleStruct, SimpleType,
 };
 pub use generator::MigrationGenerator;
 pub use lineage::{
-    BASELINE_SCHEMA_VERSION, MigrationLineage, authored_body_path, current_schema_version,
-    load_versioned_schema, migration_body_dir, save_versioned_schema, scaffold_authored_body,
-    versioned_schema_dir, versioned_schema_path,
+    BASELINE_SCHEMA_VERSION, MigrationLineage, Unanswered, authored_body_path,
+    current_schema_version, escape_body_path, hop_answer_status, load_versioned_schema,
+    migration_body_dir, save_versioned_schema, scaffold_authored_body, versioned_schema_dir,
+    versioned_schema_path,
 };
 pub use tracker::MigrationTracker;
 pub use types::*;

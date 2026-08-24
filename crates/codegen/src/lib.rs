@@ -48,6 +48,8 @@
 //! ```
 
 pub mod config;
+pub mod default_fill;
+pub mod escape;
 pub mod core_pkg;
 pub mod server_pkg;
 pub mod go_sdk;
@@ -69,6 +71,8 @@ pub mod go;
 // Re-export generators for convenience
 pub use api::ApiGenerator;
 pub use config::{FsyncMode, GenConfig};
+pub use default_fill::{FillValue, default_fill, fill_from_param};
+pub use escape::{python_host, python_types, typescript_host, typescript_types};
 pub use core_pkg::CorePackage;
 pub use server_pkg::ServerPackage;
 pub use ffi::FfiGenerator;
@@ -82,7 +86,9 @@ pub use rust::RustGenerator;
 pub use rust_sdk::RustSdkGenerator;
 pub use stubs::StubGenerator;
 pub use engine::{EngineHopPlan, EngineMigrationGenerator};
-pub use transform::{HopPlan, ModelOp, TransformCrate, TransformGenerator, TransformPlan, VersionSchema};
+pub use transform::{
+    EscapeBridge, HopPlan, ModelOp, TransformCrate, TransformGenerator, TransformPlan, VersionSchema,
+};
 pub use typescript::TypeScriptGenerator;
 pub use wasm::WasmGenerator;
 

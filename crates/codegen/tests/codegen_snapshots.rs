@@ -7037,8 +7037,11 @@ fn sample_transform_crate() -> (String, forgedb_codegen::TransformCrate) {
                     field_renames: vec![],
                     field_removes: vec![],
                     field_adds: vec![("bio".to_string(), "null".to_string())],
+                    field_copies: vec![],
+                    field_null_fills: vec![],
                 }],
                 authored_src: None,
+                escape: None,
             },
             HopPlan {
                 from_version: 2,
@@ -7052,6 +7055,7 @@ fn sample_transform_crate() -> (String, forgedb_codegen::TransformCrate) {
                      serde_json::Value::String(v.to_string());\n        }\n    }\n    row\n}\n"
                         .to_string(),
                 ),
+                escape: None,
             },
         ],
     };
@@ -11307,5 +11311,219 @@ Note {
     assert!(
         on.contains("#[schema("),
         "this schema no longer exercises #[schema(..)], so the OFF assertion above is vacuous"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #374 — the answer decides what is EMITTED, never what is TAKEN
+// ---------------------------------------------------------------------------
+
+/// A lineage whose one hop carries an answer of every kind plus an escape
+/// bridge — the shape the identity guards below are written against.
+fn answered_transform_crate() -> (String, forgedb_codegen::TransformCrate) {
+    let v1 = parse_forge("Post {\n  id: +uuid\n  title: string\n  views: u32\n}\n");
+    let v2 = parse_forge(
+        "Post {\n  id: +uuid\n  title: string\n  views: string\n  slug: string\n  \
+         summary: string\n}\n",
+    );
+    let v1: &'static Schema = Box::leak(Box::new(v1));
+    let v2: &'static Schema = Box::leak(Box::new(v2));
+
+    let plan = TransformPlan {
+        versions: vec![
+            VersionSchema { version: 1, schema: v1 },
+            VersionSchema { version: 2, schema: v2 },
+        ],
+        hops: vec![HopPlan {
+            from_version: 1,
+            to_version: 2,
+            migration_id: "m1".to_string(),
+            model_ops: vec![ModelOp {
+                model: "Post".to_string(),
+                source_model: "Post".to_string(),
+                field_renames: vec![],
+                field_removes: vec![],
+                // `Answer::Constant`, lowered.
+                field_adds: vec![("slug".to_string(), "\"untitled\"".to_string())],
+                // `Answer::CopyField`, lowered.
+                field_copies: vec![("title".to_string(), "summary".to_string())],
+                field_null_fills: vec![],
+            }],
+            authored_src: None,
+            // `Answer::Escape`, lowered.
+            escape: Some(forgedb_codegen::EscapeBridge {
+                program: "/usr/bin/bun".to_string(),
+                args: vec!["/cache/escape/m1/transform.ts".to_string()],
+            }),
+        }],
+    };
+    let crate_out = TransformGenerator::generate(&plan, "forgedb-transform").unwrap();
+    let main = crate_out
+        .sources
+        .iter()
+        .find(|(p, _)| p == "src/main.rs")
+        .map(|(_, c)| c.clone())
+        .expect("main.rs emitted");
+    (main, crate_out)
+}
+
+/// The generated main.rs with comments and doc comments stripped.
+///
+/// A guard must not be satisfiable by the prose explaining it, and this file's
+/// output carries generated doc comments describing exactly the invariants
+/// below.
+fn code_only(main: &str) -> String {
+    main.lines()
+        .map(|l| {
+            let l = match l.find("///") {
+                Some(i) => &l[..i],
+                None => l,
+            };
+            match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Scenario 23 — an `Answer` decides **what is emitted**, never what is taken.
+///
+/// `Answer` is `Serialize` and `serde_json` is already a dependency of the
+/// emitted crate, so embedding the answer as a JSON constant and matching on it
+/// inside the hop would compile immediately and look tidy. It is the exact
+/// inversion of the generator identity: *which branch is taken* instead of
+/// *which code is emitted*. Hence the identifier's absence is asserted for
+/// identity, not for style.
+///
+/// Anchored on the tokens that represent the WORK — the emitted ops and the
+/// call site — never on a binding name.
+#[test]
+fn test_transform_generation_answers_are_lowered() {
+    let (main, _) = answered_transform_crate();
+    let code = code_only(&main);
+    // `prettyplease` wraps a method chain across lines, so the assertions about
+    // a CALL are made on a whitespace-free form: what is under test is the call,
+    // not how it was formatted.
+    let dense: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // The three answers are present as EMITTED CODE.
+    assert!(
+        dense.contains(r#"serde_json::from_str("\"untitled\"").unwrap()"#),
+        "a Constant is baked as a JSON literal at its own call site:\n{code}"
+    );
+    assert!(
+        dense.contains(r#"__obj.get("title")"#) && dense.contains(r#"__obj.insert("summary""#),
+        "a CopyField is a per-row read of one named field into another:\n{code}"
+    );
+    assert!(
+        dense.contains(r#"__escape.row("Post",__j)"#),
+        "an Escape is a call with the MODEL NAME as a literal at the call site — \
+         the same shape `authored_transform` already has:\n{code}"
+    );
+
+    // And the answer itself appears nowhere.
+    for forbidden in [
+        "Answer",
+        "CopyField",
+        "Constant {",
+        "scaffold_checksum",
+        "EscapeLanguage",
+        "hop_body_class",
+    ] {
+        assert!(
+            !code.contains(forbidden),
+            "`{forbidden}` reached the emitted crate. The answer is a COMPILE-TIME \
+             input that is lowered; carrying it as data and matching on it is the \
+             inversion this guard exists for:\n{code}"
+        );
+    }
+
+    // No descriptor loop — the temptation gate 1 named specifically. A model
+    // list or a per-field op table handed to the bridge would let ONE loop drive
+    // every model, which is the schema, at run time, in a generic evaluator.
+    for forbidden in [
+        "Vec<Step",
+        "for __model in",
+        "for model in",
+        "&[\"Post\"",
+        "MODELS",
+        "descriptor",
+    ] {
+        assert!(
+            !code.contains(forbidden),
+            "the bridge must never be given a model list or an op table (found \
+             {forbidden:?}):\n{code}"
+        );
+    }
+}
+
+/// Scenario 24 — the escape bridge adds no dependency, and the emitted crate
+/// still parses no schema.
+#[test]
+fn test_transform_escape_bridge_adds_no_dependency() {
+    let (main, crate_out) = answered_transform_crate();
+    let toml = &crate_out.cargo_toml;
+    assert!(
+        !toml.contains("forgedb-migrations =") && !toml.contains("forgedb-parser ="),
+        "the escape bridge must not drag in the parser or the migration crate"
+    );
+    // The bridge is std only: `Command`, pipes, a thread. Nothing new is linked,
+    // so #374 opens NO publish gap.
+    assert!(
+        main.contains("std::process::Command"),
+        "the bridge spawns the author's runtime through std"
+    );
+    assert!(
+        !toml.contains("tokio") && !toml.contains("interprocess") && !toml.contains("quickjs"),
+        "ForgeDB embeds no interpreter and takes no new dep to talk to one:\n{toml}"
+    );
+    assert!(
+        !main.contains("forgedb_parser") && !main.contains("schema.forge"),
+        "the emitted crate still reads no schema"
+    );
+}
+
+/// A hop with no escape emits none of the bridge — so a project that never uses
+/// one pays nothing, and the guard above cannot pass vacuously.
+#[test]
+fn test_a_hop_without_an_escape_emits_no_bridge() {
+    let (main, _) = sample_transform_crate();
+    assert!(
+        !main.contains("__Escape"),
+        "the bridge is emitted only when a hop needs it:\n{main}"
+    );
+    let (with, _) = answered_transform_crate();
+    assert!(
+        with.contains("__Escape"),
+        "…and IS emitted when one does — otherwise the assertion above is vacuous"
+    );
+}
+
+/// A Rust escape and a non-Rust one are mutually exclusive: one is compiled INTO
+/// the hop, the other runs out of process.
+#[test]
+fn test_a_rust_escape_is_embedded_and_a_typescript_one_is_spawned() {
+    let (rust_hop, crate_out) = sample_transform_crate();
+    assert!(
+        crate_out.sources.iter().any(|(p, _)| p == "src/authored_m2.rs"),
+        "a Rust escape is embedded verbatim as a module (C13)"
+    );
+    assert!(!rust_hop.contains("__Escape::spawn"));
+
+    let (ts_hop, crate_out) = answered_transform_crate();
+    assert!(
+        !crate_out
+            .sources
+            .iter()
+            .any(|(p, _)| p.starts_with("src/authored_")),
+        "a TypeScript escape embeds no Rust module"
+    );
+    let dense: String = ts_hop.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        dense.contains(r#"__Escape::spawn("/usr/bin/bun",&["/cache/escape/m1/transform.ts"],)"#),
+        "both the interpreter and the script path are BAKED, not discovered at run \
+         time:\n{ts_hop}"
     );
 }

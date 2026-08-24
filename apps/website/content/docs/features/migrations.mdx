@@ -1,6 +1,6 @@
 ---
 title: "Migrations"
-description: "Schema evolution the generator way — a version interlock, automatic additive backfill, Auto/Authored hop classification, and an offline transformer bin driven by forgedb migrate create → build → run."
+description: "Schema evolution the generator way — a version interlock, additive backfill, Auto/Authored hop classification with the answer captured at create time, and an offline transformer bin driven by forgedb migrate create → build → run."
 purpose: "orientation"
 ---
 
@@ -43,10 +43,10 @@ restart, and the app backfills the new column on reopen. Existing rows are never
 ```bash
 # 1. Edit schema.forge — add the new nullable field AT THE END of the model.
 # 2. Record the change (baselines the lineage on first run):
-forgedb migrate create "add note field" --auto --schema schema.forge
+forgedb migrate create "add note field" --schema schema.forge
 # 3. Regenerate and rebuild:
 forgedb generate
-# 4. Restart. Existing rows are backfilled with defaults on first open.
+# 4. Build and run the transformer, then point the app at the migrated dir.
 ```
 
 Two constraints. Append new fields at the **end** of the model, because columns are addressed
@@ -65,31 +65,43 @@ anchored length.
 
 Every other change rewrites data at rest — a type change, a dropped column or model, a
 nullable→NOT-NULL narrowing, a `&unique` add, a required field with no default. Running
-`forgedb migrate create --auto` records the change as a versioned hop and classifies it.
-Structural changes it can rewrite on its own. For changes where it can't know the new value (a
-type re-encode, or filling a new required field), it scaffolds a `transform.rs` for you to
-complete.
+`forgedb migrate create` records the change as a versioned hop and classifies it.
+Structural changes it can rewrite on its own. For changes where it can't derive the new value (a
+type re-encode that isn't a widening, or filling a new required field), it **asks you, right
+then** — a constant, a copy of another field, or "I'll write the transform" — and records your
+answer as data in the migration record.
 
 <DiveDeeper summary="the two hop kinds, Auto and Authored">
-`migrate create --auto` labels each hop `Auto` or `Authored`. `Auto` is a change whose new-row
-body the differ can prove on its own: dropping a field or model, a rename, adding a `&unique`.
-`Authored` is one where the value can't be derived (a type re-encode, a nullable→NOT-NULL fill,
-a required-add-without-default), so `migrate create` scaffolds `migrations/<id>/transform.rs`.
-You fill in every TODO and freeze it. `authored_transform(model, row)` receives each row as
-JSON after the automatic ops and returns it reshaped for the next version.
+`migrate create` labels each hop `Auto` or `Authored`. `Auto` is a change whose new-row body
+ForgeDB can prove on its own: dropping a field or model, a rename you confirm, adding a
+`&unique`, `T` → `T?`, a value-preserving widening (`u32`→`u64`, `string(N)`→`string(M)` for
+`M > N`, `timestamp(s)`→`timestamp(us)`), or an add whose field carries a resolvable `@default`.
+
+`Authored` is one where the value can't be derived. ForgeDB asks about it at `create` time and
+records the answer beside the change; `migrate build` *lowers* that answer into the generated
+transformer, so it is a compile-time input to code generation and never something the
+transformer matches on at run time. In a session with no terminal — a CI run, a pipe, or
+`--no-auto` — the **first** such change is a hard error naming it, and nothing is written.
+
+If you choose to write the transform, it is scaffolded in the language your project already
+generates for (derived from `[generate].targets`), typed against the generated per-version
+models, and run on the interpreter you already have — ForgeDB embeds none. Rust is the advanced
+escape hatch, not the default path.
 </DiveDeeper>
 
 ## Lifecycle — `migrate create` → `build` → `run`
 
 ```bash
 # 1. Edit schema.forge, then record + classify the change:
-forgedb migrate create "qty to string" --auto --schema schema.forge
+forgedb migrate create "qty to string" --schema schema.forge
 #    → records migrations/<id>_*.json (from_version -> to_version)
 #    → snapshots migrations/schemas/v<n>.forge
-#    → for Authored residue, scaffolds migrations/<id>/transform.rs
+#    → asks about anything it can't prove, and records your answer
+#    → if you chose "I'll write the transform", scaffolds
+#      migrations/<id>/transform.{ts,py,rs} beside ForgeDB's typed v<n> modules
 
-# 2. If an authored body was scaffolded, fill in every TODO. authored_transform(model, row)
-#    receives each row as JSON AFTER the automatic ops, and returns it reshaped.
+# 2. If you chose the transform option, write it. transform(model, row) receives
+#    each row AFTER the automatic ops, and returns it reshaped for the next version.
 
 # 3. Regenerate your app (its EXPECTED_FORMAT_VERSION advances):
 forgedb generate
