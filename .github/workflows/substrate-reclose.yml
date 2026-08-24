@@ -121,6 +121,21 @@ jobs:
           WORK="$(mktemp -d "${RUNNER_TEMP}/substrate-reclose.XXXXXX")"
           cd "$WORK"
 
+          # THE CACHE IS COLD, AND THAT IS ASSERTED (#339).
+          #
+          # A warm cache masks a publish gap outright: the substrate is already
+          # compiled and already in the lockfile, so a version that no longer
+          # exists on crates.io is never looked up and the job goes green on a
+          # branch nobody could install. The default home is `~/.forgedb`, which
+          # every step below deliberately steers away from — so the property to
+          # hold is that nothing has been left there, at EITHER end of the run.
+          #
+          # The start-of-run half is not redundant with the end-of-run one. A
+          # runner image that shipped a `~/.forgedb`, or a caching action someone
+          # adds later, would make the end assertion pass vacuously — it would be
+          # observing a directory this job never created and never read.
+          test ! -e "$HOME/.forgedb"
+
           # FORGEDB_HOME IS AN ASSERTION, NOT A CONVENIENCE.
           #
           # The build cache is where every generated package is compiled now, so
@@ -142,6 +157,10 @@ jobs:
               echo "forgedb-* by path, so the reclose would prove nothing." >&2
               exit 1;;
           esac
+
+          # Before `init`, because `init` consults the claim ledger under the
+          # home and so is itself a reason the directory could exist.
+          test ! -e "$FORGEDB_HOME"
 
           "$FORGEDB" init app
           cd app
@@ -186,6 +205,13 @@ jobs:
 
           "$FORGEDB" validate
 
+          # Nothing has reserved a build container yet: `init` and `validate`
+          # write no cache package, so the first `generate` starts from nothing.
+          # This is the assertion the *arms* depend on — a `projects/` left over
+          # from anywhere would make every compile below incremental against
+          # substrate that was resolved by some earlier run.
+          test ! -e "$FORGEDB_HOME/projects"
+
           # Hand the paths to every step below. CARGO_TARGET_DIR is shared so the
           # substrate compiles once per triple; it deliberately does NOT point at
           # the checkout's `target/`, which rust-cache owns.
@@ -206,6 +232,27 @@ jobs:
           # at a directory that is not there. Hence this runs FIRST, and on its
           # own, so a failure here names generation rather than the build.
           "$FORGEDB" generate all
+
+          # EXACTLY WHICH MANIFESTS REACH THE USER'S TREE (#339).
+          #
+          # An EQUALITY, not a superset. A superset would pass through the exact
+          # change it exists to catch: `[placement].rust_package` defaulting on
+          # would add a second manifest and read as fine. So would any new
+          # emitter nobody told CI about.
+          #
+          # This is the checkable form of the property `forgedb init` states
+          # positively at scaffold time — ForgeDB owns the build, and the one
+          # cargo package it writes into the consumer's tree is the class-A REST
+          # client the user compiles themselves.
+          find "$APP" -name Cargo.toml | sed "s#^$APP/##" | LC_ALL=C sort \
+            > "$RUNNER_TEMP/manifests.actual"
+          printf '%s\n' 'generated/rust-sdk/Cargo.toml' > "$RUNNER_TEMP/manifests.expected"
+          if ! diff -u "$RUNNER_TEMP/manifests.expected" "$RUNNER_TEMP/manifests.actual"; then
+            echo "FAIL: the set of cargo manifests ForgeDB writes into the app has changed." >&2
+            echo "A new one means an emitter started writing into a tree ForgeDB does not" >&2
+            echo "own; a missing one means an arm above is no longer emitting what it claims." >&2
+            exit 1
+          fi
 
       - name: Locate the cache workspace
         shell: bash
@@ -509,10 +556,19 @@ jobs:
 
           # The transformer replays a RECORDED lineage and refuses a synthesized
           # jump, so a v1 -> v2 hop has to exist before it can be built.
-          "$FORGEDB" migrate create baseline --auto --schema schema.forge
+          #
+          # `--no-auto`, not `--auto`: #374 REMOVED `--auto` (detection is what
+          # `migrate create` does, so there is no flag for it) and gave the new
+          # spelling the opposite meaning — it opts out of the interactive
+          # PROMPT, not of detection. A session with no terminal already behaves
+          # as if it were passed, so this changes nothing about what runs; it
+          # makes the workflow SAY so rather than depend on tty detection, and a
+          # change ForgeDB cannot prove a value for then fails naming itself
+          # instead of hanging on a question nobody can answer.
+          "$FORGEDB" migrate create baseline --no-auto --schema schema.forge
           perl -pi -e 's/^  summary: string\?$/  summary: string?\n  subtitle: string?/' schema.forge
           grep -n 'subtitle' schema.forge
-          "$FORGEDB" migrate create add-subtitle --auto --schema schema.forge
+          "$FORGEDB" migrate create add-subtitle --no-auto --schema schema.forge
           "$FORGEDB" migrate status --schema schema.forge
 
           # `migrate build` emits `transform-1-2/` as a member of the SAME cache
@@ -549,6 +605,13 @@ jobs:
           test ! -e migrations/transform
           test -z "$(find "$APP" -name target -type d | head -1)"
           test ! -e Cargo.toml
+
+          # The other half of the cold-cache pair (#339). Every step above steered
+          # the cache to $FORGEDB_HOME under $WORK; if anything reached the
+          # default home instead, this run compiled somewhere the next run would
+          # find WARM — and the whole check would then be measuring its own
+          # leftovers rather than crates.io.
+          test ! -e "$HOME/.forgedb"
 
       - name: Report open release gates
         # Informational: names anything still blocking the next tag. Never fails
@@ -601,3 +664,406 @@ jobs:
         # --ignored is load-bearing: without it libtest FILTERS THE TEST OUT and the step
         # passes having run nothing at all.
         run: cargo test --test migrate_tests -- --ignored --nocapture
+
+  # ---------------------------------------------------------------------------
+  # parent-workspace — the reclose under a FOREIGN cargo workspace root (#339).
+  # ---------------------------------------------------------------------------
+  #
+  # The job above scaffolds into a bare `mktemp -d` with no parent workspace root.
+  # That is not what a real consumer's tree looks like, and it is exactly why #330
+  # case A — a scaffold that could not build inside a workspace — was invisible to
+  # CI through the whole of v0.4.0. This job supplies the shape the other one
+  # cannot: a `[workspace]` root the consumer owns, one member they own, the app
+  # and the build cache beneath it.
+  #
+  # THIS JOB IS EXPECTED TO BE GREEN ON DAY ONE, AND THAT IS NOT REDUNDANCY.
+  #
+  # It is a REGRESSION AND COVERAGE guard, not a bug-finder. Every property below
+  # was measured green before the job was written — the cache resolves its own
+  # workspace root under a foreign one, ForgeDB leaves the foreign root
+  # byte-identical, and the generated Rust SDK compiles against real reqwest. A
+  # green first run must not be read as evidence there was nothing to check: what
+  # these steps hold is that the epic's central claim — the cache directory is why
+  # #328 mostly dissolves — stays true, and that three surfaces nothing else
+  # compiles keep compiling.
+  #
+  # WHY THE SDK IS BUILT BY ADOPTION AND NOT IN PLACE
+  #
+  # An earlier design ran `cargo build` inside `generated/rust-sdk`, expected it to
+  # fail with cargo's "current package believes it's in a workspace when it's not",
+  # and fixed that by emitting a `[workspace]` table into the generated package.
+  # That remedy is withdrawn (#430, closed as not-a-defect): a nested package
+  # carrying `[workspace]` that any member path-depends on makes cargo fail the
+  # ENTIRE workspace, so it is buildable only while nothing depends on it. With the
+  # fix gone, an in-place build under a foreign root has no green state at all.
+  #
+  # The shape that does is the one #338 already prescribes: the consumer ADOPTS the
+  # crate with one path dep from a crate they own, and cargo makes it an implicit
+  # member. The step deliberately does NOT assert the pre-adoption failure —
+  # encoding cargo's error text as a required property would make a future cargo
+  # relaxation read as a ForgeDB regression, and the property worth holding is "a
+  # consumer in a workspace can build what we wrote", not "cargo still refuses".
+  #
+  # WHY UBUNTU ONLY, AND WHY THE TARGETS ARE NARROWED
+  #
+  # Cost. The matrix on the job above exists to catch host-specific LINK problems
+  # (the macOS-only pyo3 `-undefined dynamic_lookup` failure); nothing here probes
+  # one. `[generate].targets` is narrowed to rust + api + rust-sdk for the same
+  # reason: the wrappers pin zero substrate and are already covered arm by arm
+  # above, so compiling them again under a foreign root buys nothing.
+  #
+  # WHY IN-TREE IS `P4` HERE AND NOT `7/7` ABOVE
+  #
+  # The property in-tree placement measures — a ForgeDB-owned package joining a
+  # foreign cargo workspace and resolving its substrate pins in the CONSUMER's
+  # lockfile — only exists under a foreign root. In the bare job it would test a
+  # shape no consumer has. And renumbering `0/6 … 6/6` would break every tier-1
+  # guard keyed to those step names, loudly but pointlessly.
+  #
+  # NO CARGO_TARGET_DIR HERE, deliberately: "the cache has its own target/" is one
+  # of the properties P1 asserts, and a shared redirect would make it unobservable.
+  parent-workspace:
+    name: reclose under a foreign cargo workspace root
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the forgedb CLI
+        run: cargo build --release --bin forgedb
+
+      - name: Scaffold a foreign workspace root, and an app beneath it
+        shell: bash
+        env:
+          FORGEDB: ${{ github.workspace }}/target/release/forgedb
+        run: |
+          set -euxo pipefail
+          test ! -e "$HOME/.forgedb"
+
+          # `pwd -P` because every path comparison below is a string compare
+          # against what cargo reports, and cargo canonicalizes.
+          WORK="$(cd "$(mktemp -d "${RUNNER_TEMP}/parent-workspace.XXXXXX")" && pwd -P)"
+          cd "$WORK"
+
+          export FORGEDB_HOME="$WORK/forgedb-home"
+          case "$FORGEDB_HOME" in
+            "${GITHUB_WORKSPACE}"*)
+              echo "FAIL: FORGEDB_HOME ($FORGEDB_HOME) is inside the checkout" >&2
+              exit 1;;
+          esac
+          test ! -e "$FORGEDB_HOME"
+
+          # The foreign root. `resolver = "2"`, not "3", deliberately: it is the
+          # commoner consumer shape and the more adversarial one, since ForgeDB's
+          # own cache root pins "3".
+          mkdir -p consumer/src
+          cat > Cargo.toml <<'ROOT'
+          [workspace]
+          members = ["consumer"]
+          resolver = "2"
+          ROOT
+          cat > consumer/Cargo.toml <<'MEMBER'
+          [package]
+          name = "consumer"
+          version = "0.0.0"
+          edition = "2021"
+
+          [dependencies]
+          MEMBER
+          echo 'fn main() {}' > consumer/src/main.rs
+
+          # Captured BEFORE `init`, compared after `build`. This file is the one
+          # thing above the app that ForgeDB must never touch.
+          ROOT_SHA="$(sha256sum Cargo.toml | cut -d' ' -f1)"
+
+          "$FORGEDB" init app
+          cd app
+          test ! -e Cargo.toml
+          test ! -e "$FORGEDB_HOME/projects"
+
+          # The same schema shape the bare job uses — relations, an enum, an
+          # index, a projection, json/decimal/optional columns — because `api.rs`
+          # names `rust_decimal::Decimal` absolutely only when a model declares
+          # one, and the SDK's generated types follow the same surface.
+          cat > schema.forge <<'SCHEMA'
+          enum Status { Draft, Published, Archived }
+
+          Author {
+            id: +uuid
+            email: &string
+            name: ^string
+            posts: [Post]
+          }
+
+          Post {
+            @projection(card: title, status)
+            id: +uuid
+            title: ^string
+            body: string
+            summary: string?
+            views: u32
+            price: decimal
+            status: ^Status
+            meta: json
+            author: *Author
+            editor: ?Author
+          }
+          SCHEMA
+
+          # Narrowed to the three surfaces this job is about. The four wrappers
+          # pin zero substrate and are covered arm by arm in the job above.
+          sed -i 's/^targets = \["all"\]$/targets = ["rust", "api", "rust-sdk"]/' forgedb.toml
+          grep -q 'targets = \["rust", "api", "rust-sdk"\]' forgedb.toml
+
+          "$FORGEDB" validate
+
+          echo "FORGEDB_HOME=$FORGEDB_HOME" >> "$GITHUB_ENV"
+          echo "WORK=$WORK" >> "$GITHUB_ENV"
+          echo "APP=$WORK/app" >> "$GITHUB_ENV"
+          echo "ROOT_SHA=$ROOT_SHA" >> "$GITHUB_ENV"
+
+      - name: P1 foreign root — the cache is immune
+        shell: bash
+        env:
+          FORGEDB: ${{ github.workspace }}/target/release/forgedb
+        run: |
+          set -euxo pipefail
+          cd "$APP"
+          "$FORGEDB" generate all
+
+          ROOT="$(find "$FORGEDB_HOME/projects" -mindepth 1 -maxdepth 1 -type d)"
+          test -n "$ROOT"
+          test "$(printf '%s\n' "$ROOT" | wc -l)" -eq 1
+          echo "CACHE_ROOT=$ROOT" >> "$GITHUB_ENV"
+
+          # The epic's central claim, as a check: a cargo workspace nested inside
+          # another one is NOT swallowed — cargo resolves the innermost root that
+          # declares `[workspace]`, and the cache declares one. Ask cargo, at the
+          # cache, rather than reasoning about it.
+          test "$(cd "$ROOT" && cargo locate-project --workspace --message-format plain)" \
+             = "$ROOT/Cargo.toml"
+
+          # And the driver agrees: the invocation ForgeDB is about to make names
+          # the CACHE manifest, never the foreign one it is sitting under.
+          "$FORGEDB" build --plan | tee plan.log
+          grep -q -- "--manifest-path $ROOT/Cargo.toml" plan.log
+          ! grep -q -- "--manifest-path $WORK/Cargo.toml" plan.log
+
+          "$FORGEDB" build
+
+          # Its own lockfile and its own target dir — the two things a swallowed
+          # workspace would NOT have, because it would share the parent's.
+          test -f "$ROOT/Cargo.lock"
+          test -d "$ROOT/target"
+          # …and the foreign root has neither yet: nothing ForgeDB did resolved
+          # anything on the consumer's behalf.
+          test ! -e "$WORK/Cargo.lock"
+
+      - name: P2 foreign root — ForgeDB writes nothing it does not own
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$WORK"
+          # sha256 captured before `init`, compared after `build`. #338's own arm
+          # inverts this assertion for its mode, which is why the two live in
+          # different steps rather than being reconciled into one.
+          AFTER_SHA="$(sha256sum Cargo.toml | cut -d' ' -f1)"
+          if [ "$ROOT_SHA" != "$AFTER_SHA" ]; then
+            echo "FAIL: ForgeDB modified the foreign workspace root it does not own." >&2
+            cat Cargo.toml >&2
+            exit 1
+          fi
+          # Named separately from the checksum: `members` is the specific edit
+          # that would be tempting (and that #338 explicitly refuses), and a
+          # checksum failure alone would not say which line moved.
+          grep -q 'members = \["consumer"\]' Cargo.toml
+
+      - name: P3 class-A output — the generated Rust SDK, adopted and built
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # THE FIRST TIME ANYTHING ANYWHERE COMPILES THIS CRATE.
+          #
+          # `RustSdkGenerator` is covered by string snapshots and by a
+          # `syn::parse_file` at generation time. Parsing is not compiling: the
+          # emitted crate names `reqwest`, `serde` and `serde_json` types it has
+          # never been type-checked against, and a snapshot passes on code that
+          # does not build.
+          #
+          # ADOPTED, not built in place. Under a foreign root a `cargo build`
+          # inside the SDK directory fails — cargo's documented behaviour for a
+          # package under a workspace root that is not a member — and the fix that
+          # would make it pass, a `[workspace]` table in the generated package, is
+          # withdrawn (#430): a nested one that any member path-depends on fails
+          # the whole workspace. So the consumer adopts it with one path dep, the
+          # way #338's model already prescribes for the in-tree package, and cargo
+          # makes it an implicit member.
+          #
+          # The pre-adoption failure is deliberately NOT asserted. Encoding
+          # cargo's error text as a required property would make a future cargo
+          # relaxation read as a ForgeDB regression, and the property worth
+          # holding is "a consumer in a workspace can build what we wrote".
+          test -f "$APP/generated/rust-sdk/Cargo.toml"
+
+          cat >> "$WORK/consumer/Cargo.toml" <<'DEP'
+          forgedb-client = { path = "../app/generated/rust-sdk" }
+          DEP
+          # A `main` that CONSTRUCTS the client: a path dep alone would compile
+          # the crate but exercise none of its public surface, so a client whose
+          # constructor did not typecheck against the consumer's own edition and
+          # feature set would still pass.
+          cat > "$WORK/consumer/src/main.rs" <<'MAIN'
+          fn main() {
+              let _c = forgedb_client::ForgeDbClient::new("http://127.0.0.1:3000");
+          }
+          MAIN
+
+          cd "$WORK"
+          # From the workspace ROOT, not from the SDK directory — that is the
+          # whole point of the step.
+          cargo build -p consumer
+
+          # …and cargo agrees it is a member, rather than merely a directory that
+          # happened to compile. `--no-deps` lists exactly the workspace members.
+          cargo metadata --no-deps --format-version 1 > "$RUNNER_TEMP/meta.json"
+          python3 - "$RUNNER_TEMP/meta.json" "$FORGEDB_HOME" <<'PY'
+          import json, sys
+
+          meta = json.load(open(sys.argv[1]))
+          home = sys.argv[2]
+          members = {p["name"]: p["manifest_path"] for p in meta["packages"]}
+
+          if "forgedb-client" not in members:
+              print("FAIL: the SDK is not a workspace member. Members: %s" % sorted(members))
+              print("It compiled, but as something cargo does not consider part of this")
+              print("workspace — which is not the shape a consumer adopting it would get.")
+              sys.exit(1)
+          print("ok: forgedb-client is a member at %s" % members["forgedb-client"])
+
+          leaks = sorted(n for n, m in members.items() if m.startswith(home))
+          if leaks:
+              print("FAIL: the consumer's build graph reaches into ForgeDB's cache: %s" % leaks)
+              print("The cache is derived state and may be deleted at any time (C8); a")
+              print("consumer build that depends on it breaks the moment it is pruned.")
+              sys.exit(1)
+          print("ok: no member resolves under %s" % home)
+          PY
+
+          # `members` was never edited — adoption is a path dep from a crate the
+          # consumer owns, and cargo joins the package on its own.
+          test "$(sha256sum Cargo.toml | cut -d' ' -f1)" = "$ROOT_SHA"
+
+      - name: P4 in-tree — the consumer's own build graph resolves the substrate
+        shell: bash
+        env:
+          FORGEDB: ${{ github.workspace }}/target/release/forgedb
+        run: |
+          set -euxo pipefail
+          # THE SEVENTH RECLOSE SURFACE (#338, checklist item on #339).
+          #
+          # In-tree placement is the FIRST surface where ForgeDB's substrate pins
+          # land in the USER's own build graph — their lockfile, their feature
+          # unification, their toolchain — rather than in a directory ForgeDB
+          # owns. #338's own tier-2 coverage builds the consumer workspace through
+          # `[patch.crates-io]` pointing at the checkout, which proves the emitted
+          # package COMPILES and says nothing about registry resolution: a patch
+          # table is precisely the thing that makes a registry lookup not happen.
+          #
+          # There is no `[patch.crates-io]` anywhere in this job.
+          cd "$APP"
+          cat >> forgedb.toml <<'PLACE'
+
+          [placement]
+          rust_package = "forgedb-core"
+          PLACE
+          "$FORGEDB" generate all --force | tee intree.log
+
+          # THE DEP LINE IS EXTRACTED FROM THE CLI'S OWN OUTPUT, NOT SPELLED HERE.
+          #
+          # ForgeDB prints this line and never writes it — which of a consumer's
+          # crates should depend on the database is not knowable. The package name
+          # is derived (`<app>-core`), so a literal here would be wrong at the
+          # first rename, and the `package =` rename is not optional: cargo
+          # matches a path dep's KEY against the package's own name.
+          #
+          # `test -n` is not decoration. An empty extraction makes the append a
+          # no-op, `cargo build` then succeeds having compiled nothing new, and
+          # the step reports green having proved nothing. That is not
+          # hypothetical: it is how the first draft of this step behaved, because
+          # the CLI prefixes the line with an info glyph.
+          DEP_LINE="$(perl -pe 's/\e\[[0-9;]*m//g' intree.log \
+                      | perl -ne 'print "$1\n" if /(forgedb_core = \{[^}]*\})/' | head -1)"
+          test -n "$DEP_LINE"
+
+          # Re-based against the consumer crate's own directory, exactly as the
+          # CLI's message instructs: the printed `path` is relative to the
+          # directory `generate` ran in, and the consumer is a sibling of it.
+          REBASED="$(printf '%s\n' "$DEP_LINE" | perl -pe 's{path = "}{path = "../app/}')"
+          REL="$(printf '%s\n' "$REBASED" | perl -ne 'print $1 if /path = "([^"]+)"/')"
+          test -n "$REL"
+          # The re-base is checked before it is pasted, so a broken one fails as
+          # itself rather than as a cargo error about a missing manifest.
+          test -f "$WORK/consumer/$REL/Cargo.toml"
+          printf '%s\n' "$REBASED" >> "$WORK/consumer/Cargo.toml"
+
+          cd "$WORK"
+          cargo build -p consumer
+
+          # Every forgedb-* in the CONSUMER's lockfile carries the crates.io
+          # source. `forgedb-client` is excluded by name because it is the path
+          # dep P3 adopted — a local member, legitimately sourceless.
+          python3 - "$WORK/Cargo.lock" <<'PY'
+          import re, sys
+
+          lock = open(sys.argv[1]).read()
+          REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
+          LOCAL = {"forgedb-client"}
+
+          # Named rather than counted, so a missing one says WHICH. `server` is not
+          # emitted in-tree by design (class D is `core` only), so auth and
+          # query-params are not expected here; the storage facade's wasm side is
+          # pulled in by the manifest's own target table.
+          REQUIRED = {
+              "forgedb-changefeed", "forgedb-compaction", "forgedb-coordinator",
+              "forgedb-storage", "forgedb-storage-native", "forgedb-txn",
+              "forgedb-types", "forgedb-wal",
+          }
+
+          seen, bad = {}, []
+          for block in lock.split("[[package]]"):
+              m = re.search(r'^name = "(.+)"$', block, re.M)
+              if not m or not m.group(1).startswith("forgedb-") or m.group(1) in LOCAL:
+                  continue
+              name = m.group(1)
+              src = re.search(r'^source = "(.+)"$', block, re.M)
+              seen[name] = src.group(1) if src else None
+              if seen[name] != REGISTRY:
+                  bad.append((name, seen[name]))
+
+          for n in sorted(seen):
+              print("ok: %s <- %s" % (n, seen[n]))
+
+          fail = False
+          if bad:
+              fail = True
+              print("\nFAIL: these resolved from something other than crates.io:")
+              for n, s in bad:
+                  print("  %s: %r (a null source means a PATH dependency)" % (n, s))
+              print("This is the CONSUMER's lockfile. A path source here means the")
+              print("in-tree package reached something outside the registry, which an")
+              print("installed user's build cannot.")
+
+          missing = REQUIRED - set(seen)
+          if missing:
+              fail = True
+              print("\nFAIL: absent from the consumer's lockfile: %s" % sorted(missing))
+              print("Either the in-tree package stopped pinning it — in which case this")
+              print("check has silently lost coverage — or the required set is stale.")
+              print("Do not simply delete the row.")
+
+          sys.exit(1 if fail else 0)
+          PY
+
+          # Still untouched, after two adoptions.
+          test "$(sha256sum Cargo.toml | cut -d' ' -f1)" = "$ROOT_SHA"

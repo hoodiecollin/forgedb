@@ -15,9 +15,10 @@
 //! - `api_wire_test` — the REST response bytes of every read path.
 //! - `list_scan_test` — the ids and `total` the list path selects (#228).
 //!
-//! The dependency list below is the one thing worth sharing: it mirrors the
-//! `forgedb init` server scaffold, and a copy of it in each test file would drift
-//! the moment the scaffold gains a dep.
+//! The dependency list below is the one thing worth sharing: a copy of it in each
+//! test file would drift the moment the emitted manifests gain a dep. What it
+//! must track is [`SUBSTRATE_PINS`], and `tests/harness_pins_test.rs` asserts
+//! that relationship rather than a comment claiming it.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -27,9 +28,47 @@ pub fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// The substrate crates the driver harnesses pin BY PATH, to prove the working
+/// tree rather than the registry.
+///
+/// **Re-anchored (#339).** This list used to be described as "mirrors the
+/// `forgedb init` server scaffold". Since #335 there is no scaffold manifest at
+/// all — `init` writes no `Cargo.toml`, and the manifests that pin substrate are
+/// the GENERATED ones, `core/` and `server/`, rendered into ForgeDB's own build
+/// cache. What this list must track is the union of their `forgedb-*` keys, and
+/// `tests/harness_pins_test.rs` asserts that instead of saying it.
+///
+/// A **superset** is the right relation, not equality: a harness crate compiles
+/// one generated `database.rs` + `api.rs` into a single package, so it links
+/// what `core` and `server` link *together*, and may legitimately carry a pin
+/// neither of them needs on its own.
+///
+/// The crate directory is derived from the name rather than written beside it —
+/// every one of these lives at `crates/<name without the forgedb- prefix>`, so a
+/// second column would only be a second thing to get wrong.
+pub const SUBSTRATE_PINS: &[&str] = &[
+    "forgedb-storage",
+    "forgedb-types",
+    "forgedb-changefeed",
+    "forgedb-wal",
+    "forgedb-auth",
+    "forgedb-query-params",
+    "forgedb-compaction",
+    "forgedb-txn",
+    "forgedb-coordinator",
+];
+
 /// Path dep line for a workspace substrate crate.
-fn dep(name: &str, crate_dir: &str) -> String {
+fn dep(name: &str) -> String {
+    let crate_dir = name
+        .strip_prefix("forgedb-")
+        .unwrap_or_else(|| panic!("{name} is not a `forgedb-` substrate crate"));
     let path = repo_root().join("crates").join(crate_dir);
+    assert!(
+        path.join("Cargo.toml").is_file(),
+        "SUBSTRATE_PINS names {name}, but {} has no manifest",
+        path.display()
+    );
     format!("{name} = {{ path = {:?} }}\n", path.to_string_lossy())
 }
 
@@ -43,23 +82,13 @@ pub fn write(path: &Path, contents: &str) {
 /// The generated project's `Cargo.toml`: every substrate crate by path (so the
 /// test proves the *working tree*, not the registry — the outside-repo reclose in
 /// `.github/workflows/substrate-reclose.yml` is what proves the registry), plus
-/// the third-party deps the `forgedb init` scaffold pins.
+/// the third-party deps the generated `core` and `server` manifests pin.
 fn cargo_toml(name: &str) -> String {
     let mut s = format!(
         "[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\n"
     );
-    for (n, d) in [
-        ("forgedb-storage", "storage"),
-        ("forgedb-types", "types"),
-        ("forgedb-changefeed", "changefeed"),
-        ("forgedb-wal", "wal"),
-        ("forgedb-auth", "auth"),
-        ("forgedb-query-params", "query-params"),
-        ("forgedb-compaction", "compaction"),
-        ("forgedb-txn", "txn"),
-        ("forgedb-coordinator", "coordinator"),
-    ] {
-        s.push_str(&dep(n, d));
+    for n in SUBSTRATE_PINS {
+        s.push_str(&dep(n));
     }
     s.push_str("serde = { version = \"1\", features = [\"derive\"] }\n");
     s.push_str("serde_json = \"1\"\n");

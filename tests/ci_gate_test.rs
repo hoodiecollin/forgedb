@@ -127,6 +127,38 @@ fn workflow(name: &str) -> String {
         .join("\n")
 }
 
+/// A workflow's `on:` block, comments stripped.
+///
+/// Scoped to the trigger rather than matched file-wide for the usual reason: the
+/// word `main` appears in nearly every one of these files, in prose explaining
+/// exactly why the trigger says `main` — so a file-wide assertion is satisfied by
+/// its own rationale.
+///
+/// Panics if the block is absent. A workflow with no `on:` never runs, and a
+/// helper that returned `""` there would make every assertion below pass on it.
+fn trigger_block(workflow_file: &str) -> String {
+    let src = workflow(workflow_file);
+    let start = src.find("\non:\n").unwrap_or_else(|| {
+        panic!(
+            "{workflow_file} has no top-level `on:` block — it can never run, and \
+             every guard keyed to its triggers would pass vacuously"
+        )
+    }) + "\non:\n".len();
+    let mut out = String::new();
+    for line in src[start..].lines() {
+        if !line.trim().is_empty() && !line.starts_with(char::is_whitespace) {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    assert!(
+        !out.trim().is_empty(),
+        "{workflow_file}'s `on:` block is empty"
+    );
+    out
+}
+
 /// The shell command of the single-line `run:` step with the given `name:`.
 ///
 /// Scoped to one step on purpose: asserting against the whole workflow means any other
@@ -164,8 +196,24 @@ fn run_block(workflow_file: &str, step_name: &str) -> String {
     let start = src.find(&needle).unwrap_or_else(|| {
         panic!("{workflow_file} has no step named {step_name:?} — the guard keyed to it is now vacuous")
     });
+    // The step's own indent, and the slice that belongs to THIS step: up to the
+    // next `- name:` at the same depth. Bounding first is load-bearing — an
+    // unbounded `find("run: |")` on a step whose `run:` is single-line silently
+    // returns the NEXT step's script, so the guard stays live and aimed at the
+    // wrong subject. That is the widening class this repo has already paid for,
+    // and it is why the miss below panics.
+    let indent = src[..start]
+        .rfind('\n')
+        .map(|nl| start - nl - 1)
+        .unwrap_or(0);
+    let step_marker = format!("\n{}- name: ", " ".repeat(indent));
     let rest = &src[start..];
-    let run = rest.find("\n").map(|_| ()).and(rest.find("run: |")).unwrap_or_else(|| {
+    let rest = match rest[1..].find(&step_marker) {
+        Some(next) => &rest[..next + 1],
+        None => rest,
+    };
+
+    let run = rest.find("run: |").unwrap_or_else(|| {
         panic!(
             "step {step_name:?} in {workflow_file} has no block-scalar `run: |`. \
              If it became a single-line `run:`, use `run_command` — this helper \
@@ -176,10 +224,6 @@ fn run_block(workflow_file: &str, step_name: &str) -> String {
 
     // A block scalar runs to the first line that is neither blank nor indented
     // deeper than the step's own `- name:` key.
-    let indent = src[..start]
-        .rfind('\n')
-        .map(|nl| start - nl - 1)
-        .unwrap_or(0);
     let mut out = String::new();
     for line in body.lines() {
         if line.trim().is_empty() {
@@ -546,5 +590,563 @@ fn the_workflows_this_file_guards_still_exist() {
             "{f} is missing. #390 added it as the control that runs the test suite; \
              deleting it removes the gate and nothing else will report that."
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S339-7 — every registry-resolving job is `main`-only.
+// ---------------------------------------------------------------------------
+
+/// #402's lesson, one issue old, turned into a test that runs on every branch.
+///
+/// A job that scaffolds outside the checkout resolves every `forgedb-*` from
+/// crates.io. `develop` is *allowed* to carry a publish gap — that is the entire
+/// point of holding the gap off the default branch — so such a job run there
+/// fails BY DESIGN for most of every cycle. #402 measured the cost of getting it
+/// wrong: nine runs, nine failures, six branches, and nobody read it, because
+/// everyone who saw it red saw it red on a branch that had not caused it.
+///
+/// A permanently-red job is not a control. This guard runs in tier 1, on every
+/// branch, so a re-widened trigger is caught a cycle before a `main`-only job
+/// could report it — which is the one thing a `main`-only job cannot do for
+/// itself.
+#[test]
+fn every_registry_resolving_job_runs_on_main_only() {
+    for file in ["substrate-reclose.yml", "go-reclose.yml"] {
+        let on = trigger_block(file);
+
+        for event in ["push:", "pull_request:"] {
+            assert!(
+                on.contains(event),
+                "{file}'s `on:` block no longer declares `{event}`. Got:\n{on}"
+            );
+        }
+
+        // Anchored on the FILTER, never on the event name: a `push:` with no
+        // `branches:` under it runs on every branch, and reads identically.
+        let filters: Vec<&str> = on
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("branches:"))
+            .collect();
+        assert_eq!(
+            filters.len(),
+            2,
+            "{file} must filter BOTH `push` and `pull_request` to a branch list; \
+             found {} `branches:` line(s). An event with no filter runs on every \
+             branch, including `develop`, where this job is red by design. Got:\n{on}",
+            filters.len(),
+        );
+        for f in &filters {
+            assert_eq!(
+                *f, "branches: [main]",
+                "{file} restricts a trigger to `{f}` rather than `branches: [main]`. \
+                 Any other branch here puts a registry-resolving job on a surface \
+                 that carries the publish gap. Got:\n{on}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S339-11 — `run_block` cannot pass vacuously.
+// ---------------------------------------------------------------------------
+
+/// The helper every guard below leans on, tested directly.
+///
+/// `run_command` reads to the end of the `run:` line, so on a block scalar it
+/// returns the literal `run: |` — one token, containing none of the script. Every
+/// `!contains` assertion built on that passes having examined nothing. This is
+/// the guard on the guard: if `run_block` ever degrades to that shape, the
+/// failure lands here rather than as six silently-vacuous assertions.
+#[test]
+fn run_block_returns_the_whole_script_not_the_scalar_header() {
+    // A multi-line step: both the first command and the LAST line must be there.
+    // Truncating to the first line is the plausible regression, and it would
+    // leave every guard passing on a prefix.
+    let ffi = run_block(
+        "substrate-reclose.yml",
+        "2/6 ffi — generate ffi, then forgedb build",
+    );
+    assert!(
+        ffi.lines().filter(|l| !l.trim().is_empty()).count() > 1,
+        "run_block returned a single line for a block-scalar step — it has \
+         degraded to `run_command`'s behaviour and every guard keyed on it is now \
+         vacuous. Got:\n{ffi}"
+    );
+    assert!(
+        ffi.contains("set -euxo pipefail"),
+        "run_block dropped the first line of the script:\n{ffi}"
+    );
+    assert!(
+        ffi.contains("./csmoke"),
+        "run_block dropped the LAST line of the script — a guard keyed on a \
+         trailing command would pass vacuously:\n{ffi}"
+    );
+
+    // Comments are stripped, so a needle's own rationale cannot satisfy it.
+    assert!(
+        !ffi.contains("#337: the delivered half"),
+        "run_block no longer strips comments; a guard can now be satisfied by the \
+         prose explaining it:\n{ffi}"
+    );
+}
+
+/// A step name that does not exist must PANIC naming the step, never degrade to
+/// a wider slice.
+///
+/// `find(..).unwrap_or(0)` widens to the whole file: the assertion stays live,
+/// aimed at the wrong subject, and gets *easier* to satisfy as it becomes
+/// meaningless. That is the failure mode this repo has already paid for.
+#[test]
+#[should_panic(expected = "no step named \"a step that does not exist\"")]
+fn run_block_panics_on_a_missing_step_rather_than_widening() {
+    let _ = run_block("substrate-reclose.yml", "a step that does not exist");
+}
+
+/// A step whose `run:` is SINGLE-LINE must panic too, rather than silently
+/// returning the next step's script.
+///
+/// `Build the forgedb CLI` is single-line and is followed by a block-scalar
+/// step, so an unbounded search for `run: |` finds the neighbour's body and
+/// returns it — a guard keyed to the first step would then be asserting
+/// properties of the second, live and wrong.
+#[test]
+#[should_panic(expected = "has no block-scalar `run: |`")]
+fn run_block_refuses_a_single_line_step_rather_than_taking_its_neighbours() {
+    let _ = run_block("substrate-reclose.yml", "Build the forgedb CLI");
+}
+
+// ---------------------------------------------------------------------------
+// S339-8 — every reclose job sets FORGEDB_HOME outside the checkout, and says so
+//          in an assertion rather than a comment.
+// ---------------------------------------------------------------------------
+
+/// The build cache is where every generated package compiles now, so "outside
+/// the checkout" attaches to the CACHE, not to the app directory.
+///
+/// The repo root `Cargo.toml` has `members` and no `exclude`, so a cache under
+/// `${{ github.workspace }}` is swallowed by this repo's own workspace: the
+/// generated packages inherit the 1.96 pin and resolve `forgedb-*` BY PATH. The
+/// reclose then measures the checkout instead of the registry — silently, and
+/// while passing, which is the one failure mode it cannot survive.
+///
+/// Both halves are required. The export alone is a value someone can change; the
+/// refusal is what makes a wrong value loud.
+#[test]
+fn every_reclose_job_sets_forgedb_home_outside_the_checkout() {
+    for (file, step) in [
+        (
+            "substrate-reclose.yml",
+            "Scaffold a project outside the checkout",
+        ),
+        ("go-reclose.yml", "Reclose — generate, build, link, run"),
+    ] {
+        let body = run_block(file, step);
+        assert!(
+            body.contains("export FORGEDB_HOME="),
+            "{file} / {step:?} no longer exports FORGEDB_HOME, so the cache lands \
+             in `~/.forgedb` — warm across runs, and a warm cache resolves nothing \
+             from the registry:\n{body}"
+        );
+        assert!(
+            body.contains("case \"$FORGEDB_HOME\" in") && body.contains("${GITHUB_WORKSPACE}"),
+            "{file} / {step:?} dropped the refusal that FORGEDB_HOME is not inside \
+             the checkout. Without it a cache under the workspace resolves \
+             `forgedb-*` by path and this job measures the checkout while \
+             passing:\n{body}"
+        );
+    }
+}
+
+/// The cold-cache pair, in the job that owns it.
+///
+/// Anchored on the `test ! -e` invocations, never on the comment above them:
+/// this file's header explains at length why the cache must be cold, in the same
+/// words a file-wide search would find. `run_block` strips comments for exactly
+/// this reason.
+#[test]
+fn the_bare_reclose_proves_its_cache_was_cold() {
+    let scaffold = run_block(
+        "substrate-reclose.yml",
+        "Scaffold a project outside the checkout",
+    );
+    for needle in [
+        "test ! -e \"$HOME/.forgedb\"",
+        "test ! -e \"$FORGEDB_HOME\"",
+        "test ! -e \"$FORGEDB_HOME/projects\"",
+    ] {
+        assert!(
+            scaffold.contains(needle),
+            "the reclose no longer asserts `{needle}` before generating. A warm \
+             cache masks a publish gap outright — the substrate is already \
+             resolved, so a version that no longer exists on crates.io is never \
+             looked up and the job goes green on an uninstallable \
+             branch:\n{scaffold}"
+        );
+    }
+
+    // …and at the far end, where a leak into the default home would otherwise
+    // only be discovered by the NEXT run finding it warm.
+    let last = run_block(
+        "substrate-reclose.yml",
+        "6/6 transform — migrate build over a real lineage",
+    );
+    assert!(
+        last.contains("test ! -e \"$HOME/.forgedb\""),
+        "the reclose's last arm no longer asserts the default cache home is still \
+         absent. Something writing there makes the next run warm, and the check \
+         then measures its own leftovers:\n{last}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S339-9 — no cache action may name the ForgeDB home.
+// ---------------------------------------------------------------------------
+
+/// The single edit that makes this job fast AND makes it prove nothing.
+///
+/// Caching `~/.forgedb` (or `$FORGEDB_HOME`, or handing it to rust-cache as a
+/// `cache-directories` entry) restores a resolved lockfile and a compiled
+/// substrate from a previous run. Every registry lookup this job exists to
+/// perform then does not happen, and the publish gap — the ONE thing it detects
+/// — becomes invisible while the job reports green and finishes in a third of
+/// the time. It is attractive precisely because it is the obvious optimization.
+#[test]
+fn no_cache_action_names_the_forgedb_home() {
+    for file in ["substrate-reclose.yml", "go-reclose.yml"] {
+        let wf = workflow(file);
+
+        assert!(
+            !wf.contains("uses: actions/cache"),
+            "{file} uses `actions/cache`. This job's entire value is that it \
+             resolves from crates.io on every run; a restored cache is how it \
+             goes green while the branch is uninstallable."
+        );
+
+        // rust-cache is allowed — it caches the CHECKOUT's target dir, which this
+        // job builds the CLI in. What it must never be handed is the ForgeDB home.
+        for (idx, _) in wf.match_indices("uses: Swatinem/rust-cache") {
+            // Scoped to that step's own `with:` block: the next `- ` at the step's
+            // depth ends it. Matching file-wide would let an unrelated mention of
+            // `.forgedb` anywhere satisfy — or break — this.
+            let tail = &wf[idx..];
+            let step = tail
+                .find("\n      - ")
+                .map(|e| &tail[..e])
+                .unwrap_or(tail);
+            for needle in [".forgedb", "FORGEDB_HOME", "forgedb-home", "cache-directories"] {
+                assert!(
+                    !step.contains(needle),
+                    "{file} hands `{needle}` to rust-cache. Restoring the ForgeDB \
+                     home makes the substrate resolve from a previous run rather \
+                     than from the registry, and the publish gap this job exists \
+                     to detect becomes invisible:\n{step}"
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S339-6 — exactly one manifest reaches the consumer's tree.
+// ---------------------------------------------------------------------------
+
+/// An EQUALITY, not a superset — and that distinction is the whole guard.
+///
+/// A superset assertion passes through the exact change it exists to catch: an
+/// `[placement].rust_package` default flipping on adds a second manifest and
+/// reads as fine, and so does any new emitter that starts writing a cargo
+/// package into a tree ForgeDB does not own.
+///
+/// The plan for #339 originally pinned the placement MODE in the app's config
+/// instead. That is unimplementable — #338's surface is one optional key whose
+/// absence is the opt-out, and there is no affirmative "cache-only" spelling to
+/// write. Asserting the OUTCOME needs no spelling, catches strictly more, and
+/// fails with the diff.
+#[test]
+fn the_bare_job_asserts_an_exact_manifest_set() {
+    let body = run_block("substrate-reclose.yml", "0/6 generate all — emit every cache package");
+
+    assert!(
+        body.contains("find \"$APP\" -name Cargo.toml"),
+        "the reclose no longer enumerates the manifests under the app, so a \
+         second cargo package appearing in a user's tree would be \
+         invisible:\n{body}"
+    );
+    assert!(
+        body.contains("diff -u"),
+        "the manifest check no longer COMPARES the two sets. A `grep`/`test -f` \
+         form is a superset assertion, and a superset passes through the exact \
+         change this exists to catch — a placement default flipping on, or a new \
+         emitter nobody told CI about:\n{body}"
+    );
+    assert!(
+        body.contains("generated/rust-sdk/Cargo.toml"),
+        "the expected set no longer names the one manifest ForgeDB legitimately \
+         writes into the app (the class-A REST client crate). An empty expected \
+         set would fail always; a missing one would compare against \
+         nothing:\n{body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S339-1/2/10 — the parent-workspace job's steps still do their work.
+// ---------------------------------------------------------------------------
+
+/// The step NAMES are the stable interface every guard here keys on; the
+/// assertions are keyed to the COMMAND inside each, never to the name and never
+/// to the comment above it.
+///
+/// This job is green on day one by design — it is a regression and coverage
+/// guard, not a bug-finder — which is exactly the condition under which a step
+/// can be quietly gutted and nobody notices: it was passing before and it is
+/// passing after.
+#[test]
+fn the_parent_workspace_job_still_does_its_work() {
+    // The foreign root itself. Without a `[workspace]` table above the app this
+    // job is a slower copy of the one beside it.
+    let setup = run_block(
+        "substrate-reclose.yml",
+        "Scaffold a foreign workspace root, and an app beneath it",
+    );
+    for needle in ["[workspace]", "members = [\"consumer\"]", "sha256sum Cargo.toml"] {
+        assert!(
+            setup.contains(needle),
+            "the parent-workspace job no longer builds a foreign cargo workspace \
+             root (`{needle}` is gone). Without one it tests the same bare \
+             `mktemp -d` shape the job beside it already covers, and #330 case A \
+             is invisible again:\n{setup}"
+        );
+    }
+
+    // P1 — the cache resolves ITSELF, under a foreign root.
+    let p1 = run_block("substrate-reclose.yml", "P1 foreign root — the cache is immune");
+    for needle in [
+        "cargo locate-project --workspace",
+        "--manifest-path $ROOT/Cargo.toml",
+        "test -f \"$ROOT/Cargo.lock\"",
+        "test -d \"$ROOT/target\"",
+    ] {
+        assert!(
+            p1.contains(needle),
+            "P1 no longer proves the cache is immune to the foreign root \
+             (`{needle}` is gone). That immunity is the epic's central claim — it \
+             is why the cache directory makes #328 mostly dissolve — and this is \
+             the only place it is checked against a real nested \
+             workspace:\n{p1}"
+        );
+    }
+
+    // P2 — the checksum comparison, and the `members` line by name.
+    let p2 = run_block(
+        "substrate-reclose.yml",
+        "P2 foreign root — ForgeDB writes nothing it does not own",
+    );
+    assert!(
+        p2.contains("sha256sum Cargo.toml") && p2.contains("$ROOT_SHA"),
+        "P2 no longer COMPARES the foreign root's checksum against the one taken \
+         before `init`. A `test -f` or a `grep` here would pass on a file ForgeDB \
+         had rewritten:\n{p2}"
+    );
+    // Matched on the grep INVOCATION rather than on a literal spelling of the
+    // pattern: the pattern is shell-escaped in the workflow and a switch to
+    // `grep -F` would legitimately unescape it, which is not a regression.
+    assert!(
+        p2.lines().any(|l| {
+            l.starts_with("grep ") && l.contains("members") && l.contains("consumer")
+        }),
+        "P2 no longer greps the foreign root for its `members` array. It is the \
+         specific edit #338 refuses to make, and a checksum failure alone does not \
+         say which line moved:\n{p2}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S339-3 — the SDK arm BUILDS the crate; it does not grep it.
+// ---------------------------------------------------------------------------
+
+/// The generated Rust SDK is covered by string snapshots and by a
+/// `syn::parse_file` at generation time. Parsing is not compiling — the emitted
+/// crate names `reqwest`/`serde` types it has never been type-checked against —
+/// and this step is the only place anything compiles it.
+///
+/// The plausible regression is not deletion but softening: a `test -f` on the
+/// manifest, or a `grep` for a symbol, which look like coverage and are not. So
+/// the assertions anchor on the compile and on the membership query, and
+/// explicitly on `cargo build` running from the workspace ROOT rather than
+/// inside the SDK directory — building in place is the shape #430 withdrew and
+/// it has no green state under a foreign root.
+#[test]
+fn the_sdk_arm_builds_rather_than_greps() {
+    let body = run_block(
+        "substrate-reclose.yml",
+        "P3 class-A output — the generated Rust SDK, adopted and built",
+    );
+
+    for needle in [
+        // Adoption: one path dep from a crate the consumer owns.
+        "forgedb-client = { path = \"../app/generated/rust-sdk\" }",
+        // The compile, from the ROOT.
+        "cargo build -p consumer",
+        // Membership, asked of cargo rather than asserted about the filesystem.
+        "cargo metadata --no-deps",
+        // The client is CONSTRUCTED — a path dep alone exercises no public surface.
+        "ForgeDbClient::new(",
+        // The foreign root is still untouched after adoption.
+        "$ROOT_SHA",
+    ] {
+        assert!(
+            body.contains(needle),
+            "the SDK arm no longer runs `{needle}`. Without it the step reads as \
+             coverage of a crate nothing compiles — `RustSdkGenerator` has only \
+             string snapshots and a parse check behind it:\n{body}"
+        );
+    }
+
+    // Building INSIDE the SDK directory is the withdrawn shape (#430): it has no
+    // green state under a foreign root, and a step that reintroduced it would be
+    // red forever for a reason that is not ForgeDB's.
+    assert!(
+        !body.contains("cd \"$APP/generated/rust-sdk\""),
+        "the SDK arm builds in place rather than by adoption. A package under a \
+         foreign workspace root that is not a member cannot build, and the fix \
+         that would make it — a `[workspace]` table in the generated package — is \
+         withdrawn (#430), because a nested one that any member path-depends on \
+         fails the entire workspace:\n{body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S339-4 — the in-tree arm pastes a line it EXTRACTED.
+// ---------------------------------------------------------------------------
+
+/// In-tree placement is the first surface where ForgeDB's substrate pins land in
+/// the *user's own* build graph. #338's tier-2 coverage builds the consumer
+/// workspace through `[patch.crates-io]` pointing at the checkout — which proves
+/// the emitted package compiles and says nothing about registry resolution, a
+/// patch table being precisely the thing that makes a registry lookup not happen.
+///
+/// Two properties, and the second is the one that fails quietly. The line the
+/// consumer pastes must come out of the CLI's own output — the package name is
+/// derived, so a literal spelling here is wrong at the first rename — and the
+/// extraction must be asserted non-empty before use, because an empty one makes
+/// the append a no-op and `cargo build` then passes having compiled nothing new.
+/// That is not hypothetical: the first draft of the step extracted nothing,
+/// because the CLI prefixes the line with an info glyph.
+#[test]
+fn the_in_tree_arm_pastes_a_line_it_extracted() {
+    let body = run_block(
+        "substrate-reclose.yml",
+        "P4 in-tree — the consumer's own build graph resolves the substrate",
+    );
+
+    assert!(
+        body.contains("rust_package"),
+        "P4 no longer sets `[placement].rust_package`, so no in-tree package is \
+         emitted and the step measures the cache again:\n{body}"
+    );
+    // Scoped to the ASSIGNMENT, not to the step. A file-wide `contains` here
+    // survived a mutation that replaced the extraction with a hardcoded line:
+    // `intree.log` still appeared, on the `tee` a few lines above. Both bounds
+    // panic on a miss rather than widening to the rest of the step.
+    let assign = {
+        let after = body.split_once("DEP_LINE=").unwrap_or_else(|| {
+            panic!("P4 no longer assigns DEP_LINE at all:\n{body}")
+        }).1;
+        after
+            .split_once("\ntest -n")
+            .unwrap_or_else(|| {
+                panic!("P4's DEP_LINE assignment is no longer followed by its non-empty check:\n{body}")
+            })
+            .0
+    };
+    assert!(
+        assign.contains("intree.log"),
+        "P4's DEP_LINE is not derived from the CLI's output — the assignment reads \
+         `{assign}`. The package name is derived (`<app>-core`), so a literal \
+         spelling here is wrong at the first rename, and the `package =` key is not \
+         optional: cargo matches a path dep's KEY against the package's own name."
+    );
+    assert!(
+        body.contains("test -n \"$DEP_LINE\""),
+        "P4 pastes the extracted line without asserting it is non-empty. An empty \
+         extraction makes the append a no-op; `cargo build` then succeeds having \
+         compiled nothing new, and the step reports green having proved \
+         nothing:\n{body}"
+    );
+    assert!(
+        body.contains("cargo build -p consumer"),
+        "P4 no longer builds the consumer. Emitting the package proves it was \
+         written, not that a user can compile it:\n{body}"
+    );
+    assert!(
+        body.contains("$WORK/Cargo.lock") && body.contains("crates.io-index"),
+        "P4 no longer inspects the CONSUMER's lockfile for the registry source. \
+         That resolution is the entire property — the package compiling is \
+         already covered by #338's own tier-2 tests, through a `[patch.crates-io]` \
+         that makes the registry lookup not happen:\n{body}"
+    );
+
+    // The one thing that would make the whole step vacuous.
+    assert!(
+        !body.contains("patch.crates-io"),
+        "P4 introduces a `[patch.crates-io]`. A patch table is exactly what makes \
+         a registry lookup not happen, so the step would prove only what #338's \
+         tier-2 tests already prove:\n{body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S339 — no reclose passes a flag the CLI has tombstoned.
+// ---------------------------------------------------------------------------
+
+/// The failure this exists to prevent, found by running it (#339's own dispatch).
+///
+/// #374 removed `migrate create --auto` and left the reclose's `6/6` arm calling
+/// it. Nothing reported that, because the reclose runs on `main` and the removal
+/// landed on `develop` — so the break sat there until someone dispatched the
+/// workflow by hand, and its first real execution would otherwise have been the
+/// release merge, where it is a release blocker.
+///
+/// A tombstoned flag is exactly the shape that rots this way: `refuse_removed_flag`
+/// makes the CLI reject it with a good message, which means the workflow fails
+/// LOUDLY — but only when it runs, once a cycle, on a branch nobody is looking at.
+///
+/// The flag set is DERIVED from the tombstone call sites, not written out again.
+/// A second list here would drift from the first, which is the failure this
+/// repo's guards exist to refuse.
+#[test]
+fn no_reclose_workflow_passes_a_tombstoned_cli_flag() {
+    let src = read("src/commands/migrate/mod.rs");
+    let re = Regex::new(r#"refuse_removed_flag\(\s*"(--[a-z0-9-]+)""#).unwrap();
+    let tombstoned: BTreeSet<String> = re
+        .captures_iter(&src)
+        .map(|c| c[1].to_string())
+        .collect();
+
+    assert!(
+        !tombstoned.is_empty(),
+        "found no `refuse_removed_flag` call sites — the parser has drifted from \
+         src/commands/migrate/mod.rs and this guard would now pass vacuously"
+    );
+
+    for file in ["substrate-reclose.yml", "go-reclose.yml"] {
+        let wf = workflow(file);
+        for line in wf.lines().map(str::trim) {
+            if !line.contains("$FORGEDB") {
+                continue;
+            }
+            for flag in &tombstoned {
+                assert!(
+                    !line.split_whitespace().any(|w| w == flag),
+                    "{file} invokes the CLI with `{flag}`, which \
+                     `refuse_removed_flag` rejects — so this step fails at run time, \
+                     and it only runs on `main`, once a cycle. That is exactly how \
+                     #374's removal sat broken in this workflow until #339 \
+                     dispatched it by hand.\nOffending line: {line}"
+                );
+            }
+        }
     }
 }

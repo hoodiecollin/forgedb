@@ -1084,8 +1084,22 @@ fn generate_go_binding(
 /// Generate the Rust REST client SDK crate (#206): a `reqwest`-based async client
 /// (`rust-sdk/src/lib.rs`) over the generated REST API, plus a `Cargo.toml`
 /// scaffold written only when absent. A transport client — links none of the
-/// forgedb substrate crates, only `reqwest`/`serde`. Build with `cargo build` in
-/// `rust-sdk/`.
+/// forgedb substrate crates, only `reqwest`/`serde`.
+///
+/// **Adopt it; do not build it in place.** `cargo build` inside `rust-sdk/` works
+/// only when nothing above the output directory is a cargo workspace. In a
+/// consumer whose tree *is* one — the common case — cargo refuses with *"current
+/// package believes it's in a workspace when it's not"*, because the crate sits
+/// under a workspace root without being a member. Add a path dep on it from
+/// whichever crate should call the API and build from the workspace root; cargo
+/// makes a path dependency residing inside the workspace directory a member on
+/// its own.
+///
+/// Emitting a `[workspace]` table here would NOT fix that: a nested package
+/// carrying one that any member path-depends on makes cargo fail the entire
+/// workspace (#430, closed as not-a-defect — the same reason #338's in-tree
+/// package emits none). `parent-workspace` in `.github/workflows/substrate-reclose.yml`
+/// is what keeps this paragraph honest.
 fn generate_rust_sdk(
     ctx: &Emit<'_>,
     files: &mut Vec<(PathBuf, forgedb_codegen::GeneratedCode)>,
