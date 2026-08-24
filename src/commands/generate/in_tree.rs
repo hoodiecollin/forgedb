@@ -69,6 +69,14 @@ use crate::{error::Result, ui};
 /// changed. Printing on change is stateful, is untestable without a fixture that
 /// survives two runs, and goes quiet in exactly the case where the user has not
 /// pasted it yet.
+///
+/// **The `path` is written as ForgeDB resolved it — relative to the directory
+/// `generate` ran in.** A consumer crate in a subdirectory has to re-base it, and
+/// the printed message says so. The alternative, an absolute path, is correct on
+/// exactly one machine: this line lands in a *committed* manifest, so an absolute
+/// path breaks the repo for every other developer and for CI. ForgeDB cannot
+/// compute the right relative path itself, because it does not know — and by
+/// decision cannot know — which of the consumer's crates receives the line.
 pub(super) fn emit(
     dir: &Path,
     core_pkg: &str,
@@ -92,7 +100,8 @@ pub(super) fn emit(
         dir.display(),
         written.len()
     ));
-    ui::info("  Add this one line to the [dependencies] of whichever crate should use it:");
+    ui::info("  Add this one line to the [dependencies] of whichever crate should use it,");
+    ui::info("  with `path` re-based against THAT crate's directory:");
     ui::info(&format!("    {}", CorePackage::dep_line(core_pkg, dir)));
 
     Ok(written)

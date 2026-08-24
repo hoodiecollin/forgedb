@@ -696,3 +696,361 @@ fn scenario_12_a_placement_inside_the_cache_is_refused() {
          runs too late"
     );
 }
+
+// ===========================================================================
+// The halves that run real cargo (tier 2 — `make test-ignored`)
+// ===========================================================================
+//
+// These build a real consumer workspace against a `[patch.crates-io]` block
+// pointing at this checkout. That proves the emitted package **compiles**; it
+// proves nothing about **registry resolution**, because a patch table is
+// precisely the thing that makes a registry lookup not happen. See this file's
+// module doc.
+
+/// This checkout's root, from the test binary's own manifest dir.
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// The `[patch.crates-io]` block that points every substrate crate at this
+/// checkout. Kept in the same shape as `build_cache_compile_test::patch_substrate`
+/// — the list has to cover the transitive substrate (`storage` is a facade over
+/// `storage-native`/`storage-web`), not just what `core` names directly.
+fn patch_block() -> String {
+    let mut body = String::from("\n[patch.crates-io]\n");
+    for dir in [
+        "storage",
+        "storage-native",
+        "storage-web",
+        "types",
+        "changefeed",
+        "wal",
+        "compaction",
+        "txn",
+        "coordinator",
+        "auth",
+        "query-params",
+    ] {
+        let path = repo_root().join("crates").join(dir);
+        assert!(path.is_dir(), "no such substrate crate: {}", path.display());
+        body.push_str(&format!(
+            "forgedb-{dir} = {{ path = {:?} }}\n",
+            path.to_string_lossy()
+        ));
+    }
+    body
+}
+
+/// Run cargo in `dir` with an explicit `--target-dir` and `CARGO_TARGET_DIR`
+/// removed.
+///
+/// Both are required, not tidy: an ambient env var — **or** a `[build]
+/// target-dir` in `$CARGO_HOME/config.toml`, which is machine-wide and needs no
+/// env var at all (#292) — would redirect this into the directory the outer
+/// `cargo test` holds a lock on, and the test would hang rather than fail.
+fn cargo(dir: &Path, target_dir: &Path, args: &[&str]) -> Output {
+    let compiles = args
+        .first()
+        .is_some_and(|a| *a == "build" || *a == "check" || *a == "run");
+    let mut cmd = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    cmd.args(args);
+    if compiles {
+        cmd.arg("--target-dir").arg(target_dir);
+    }
+    cmd.current_dir(dir)
+        .env_remove("CARGO_TARGET_DIR")
+        .output()
+        .expect("cargo runs")
+}
+
+/// The `[package] name`s `cargo metadata --no-deps` reports as workspace
+/// members.
+///
+/// Read from cargo's own JSON, never scraped from a path string: a name matched
+/// as a substring of a directory goes silently wrong the moment the naming
+/// scheme changes (#386).
+fn metadata_members(dir: &Path, target_dir: &Path) -> Vec<String> {
+    let out = cargo(dir, target_dir, &["metadata", "--no-deps", "--format-version", "1"]);
+    assert!(
+        out.status.success(),
+        "`cargo metadata` rejects the consumer workspace:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("cargo metadata emits JSON");
+    let mut names: Vec<String> = json["packages"]
+        .as_array()
+        .expect("packages")
+        .iter()
+        .map(|p| p["name"].as_str().expect("name").to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 5 ★ — the printed line builds, and the database runs
+// ---------------------------------------------------------------------------
+
+/// **Scenario 5 (★).** In a real cargo workspace outside this checkout, pasting
+/// the printed dep line **verbatim** into a crate's `[dependencies]` makes the
+/// generated package a workspace member although `members` was never edited,
+/// `cargo build` succeeds, and a `main` that opens a `Database`, inserts a row
+/// and reads it back runs and exits 0.
+///
+/// This is the scenario the whole feature reduces to, and no string-level test
+/// can reach any part of it: the two halves this bug class produces — a manifest
+/// and a source file — are each individually well-formed and fail only when they
+/// disagree.
+///
+/// The consumer here is the workspace **root package**, with a second member
+/// beside it. That shape is deliberate and is the one place the printed line is
+/// paste-able unchanged: `path` is written relative to the directory `generate`
+/// ran in, so a consumer crate in a *subdirectory* must re-base it. The CLI says
+/// so when it prints the line.
+#[test]
+#[ignore = "compiles a real consumer workspace; run with --ignored"]
+fn scenario_5_the_printed_line_builds_and_the_database_runs() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ws = tmp.path();
+
+    write(
+        &ws.join("schema.forge"),
+        "Note {\n  id: +uuid\n  title: string\n}\n",
+    );
+    write(
+        &ws.join("forgedb.toml"),
+        "[project]\nname = \"s5\"\n\n[generate]\ntargets = [\"rust\"]\n[placement]\nrust_package = \"generated/core\"\n",
+    );
+
+    let out = ok(&forgedb(ws, &["generate", "all", "--force"]), "generate all");
+    let dep_line = printed_dep_line(&out);
+
+    // A workspace whose root is also a package, plus one unrelated member. The
+    // `members` array names only `helper` — the generated package joins because
+    // it is a path dependency inside the workspace directory, and that is the
+    // mechanism the whole design rests on.
+    write(
+        &ws.join("Cargo.toml"),
+        &format!(
+            "[workspace]\nmembers = [\"helper\"]\n\n\
+             [package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+             [dependencies]\n{dep_line}\n{}",
+            patch_block()
+        ),
+    );
+    write(
+        &ws.join("helper/Cargo.toml"),
+        "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n",
+    );
+    write(&ws.join("helper/src/lib.rs"), "pub fn helper() {}\n");
+    write(
+        &ws.join("src/main.rs"),
+        r#"
+use forgedb_core::forgedb_types::Uuid;
+use forgedb_core::{Database, Note};
+
+fn main() {
+    let dir = std::env::temp_dir().join(format!("forgedb-338-s5-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut db = Database::open_at(dir.clone());
+    let id = db
+        .create_note(Note { id: Uuid::nil(), title: "hello".to_string() })
+        .expect("insert");
+    db.commit().expect("commit");
+
+    let got = db.note.get(id).expect("the row reads back");
+    assert_eq!(got.title, "hello");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("forgedb-338-ok {id}");
+}
+"#,
+    );
+
+    let target_dir = tmp.path().join(".cargo-target");
+
+    // The generated package is a member although `members` names only `helper`.
+    let members = metadata_members(ws, &target_dir);
+    let core = package_name(&ws.join("generated/core/Cargo.toml"));
+    assert!(
+        members.contains(&core),
+        "the generated package did not join the workspace: {members:?} (wanted {core})"
+    );
+    assert!(members.contains(&"consumer".to_string()));
+    assert!(members.contains(&"helper".to_string()));
+    // Scoped to the `members` ARRAY, read back through TOML — the manifest DOES
+    // name the core package, in the dep line, and that is the point. A whole-file
+    // `contains` would be satisfied by the very thing under test.
+    let root_manifest: toml::Value =
+        toml::from_str(&read(&ws.join("Cargo.toml"))).expect("the consumer root parses");
+    let listed: Vec<&str> = root_manifest["workspace"]["members"]
+        .as_array()
+        .expect("members")
+        .iter()
+        .map(|m| m.as_str().expect("a member is a string"))
+        .collect();
+    assert_eq!(
+        listed,
+        vec!["helper"],
+        "the test edited `members` — the path-dep auto-join is what is under test"
+    );
+
+    let build = cargo(ws, &target_dir, &["build", "-p", "consumer"]);
+    assert!(
+        build.status.success(),
+        "the consumer workspace does not build:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    // `build`, then RUN. A crate that compiles and cannot open a database is
+    // exactly the failure a compile-only check reports as green.
+    let run = cargo(ws, &target_dir, &["run", "-p", "consumer"]);
+    assert!(
+        run.status.success(),
+        "the consumer binary did not run:\n{}\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("forgedb-338-ok"),
+        "the binary exited 0 without reaching its own sentinel:\n{}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 11c — the narrowing invocation's package compiles
+// ---------------------------------------------------------------------------
+
+/// **Scenario 11c.** The in-tree package produced by `generate rust --force`
+/// under `targets = ["all"]` **compiles**.
+///
+/// This is the invocation that narrows: it emits no `api.rs`, but the app
+/// declares `api`, so `GenConfig::web` is true and the source carries the
+/// `ToSchema` derives. A manifest computed from "did this command emit an api"
+/// would omit the utoipa pin and the crate would fail with
+/// `error[E0432]: unresolved import 'utoipa'` — in the user's own build.
+/// 11b asserts the pairing as strings; only this one compiles it.
+#[test]
+#[ignore = "compiles a generated package; run with --ignored"]
+fn scenario_11c_the_narrowing_invocations_package_compiles() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ws = tmp.path();
+
+    write(&ws.join("schema.forge"), SCHEMA);
+    write(
+        &ws.join("forgedb.toml"),
+        "[project]\nname = \"s11c\"\n\n[generate]\ntargets = [\"all\"]\n[placement]\nrust_package = \"generated/core\"\n",
+    );
+
+    let out = ok(&forgedb(ws, &["generate", "rust", "--force"]), "generate rust");
+    let dep_line = printed_dep_line(&out);
+
+    write(
+        &ws.join("Cargo.toml"),
+        &format!(
+            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+             [dependencies]\n{dep_line}\n{}",
+            patch_block()
+        ),
+    );
+    write(&ws.join("src/lib.rs"), "pub use forgedb_core::*;\n");
+
+    let target_dir = tmp.path().join(".cargo-target");
+    let build = cargo(ws, &target_dir, &["build"]);
+    assert!(
+        build.status.success(),
+        "the package a narrowing generate wrote does not compile:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scenario 16b — two apps, one consumer workspace
+// ---------------------------------------------------------------------------
+
+/// **Scenario 16b.** A real workspace depending on two ForgeDB apps: `cargo
+/// metadata` lists both generated packages as members and `cargo build`
+/// succeeds.
+///
+/// Each app is consumed by its own member crate. That is not incidental — the
+/// printed dep line uses the key `forgedb_core` for every app, so a **single**
+/// crate depending on two ForgeDB apps must rename one of the two keys itself.
+/// One member per app is the shape that needs no such edit.
+#[test]
+#[ignore = "compiles a real consumer workspace; run with --ignored"]
+fn scenario_16b_two_apps_build_in_one_workspace() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ws = tmp.path();
+
+    write(
+        &ws.join("forgedb.toml"),
+        "[project]\nname = \"s16b\"\n\n[generate]\ntargets = [\"rust\"]\n[placement]\nrust_package = \"core\"\n",
+    );
+
+    let mut dep_lines = Vec::new();
+    for app in ["blog", "shop"] {
+        write(
+            &ws.join(app).join("schema.forge"),
+            "Note {\n  id: +uuid\n  title: string\n}\n",
+        );
+        let out = ok(
+            &forgedb(
+                ws,
+                &["generate", "all", "--force", "--schema", &format!("{app}/schema.forge")],
+            ),
+            "generate",
+        );
+        dep_lines.push(printed_dep_line(&out));
+    }
+
+    write(
+        &ws.join("Cargo.toml"),
+        &format!(
+            "[workspace]\nmembers = [\"blog/app\", \"shop/app\"]\nresolver = \"3\"\n{}",
+            patch_block()
+        ),
+    );
+    for (app, line) in ["blog", "shop"].iter().zip(&dep_lines) {
+        // Each member sits one level below the directory `generate` ran in, so
+        // the printed path is re-based here — the same edit a real consumer
+        // makes, and the reason the CLI says what the path is relative to.
+        let rebased = line.replace(
+            &format!("path = \"{app}/core\""),
+            "path = \"../core\"",
+        );
+        assert_ne!(&rebased, line, "the printed path was not the one re-based: {line}");
+        write(
+            &ws.join(app).join("app/Cargo.toml"),
+            &format!(
+                "[package]\nname = \"{app}-app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+                 [dependencies]\n{rebased}\n"
+            ),
+        );
+        write(
+            &ws.join(app).join("app/src/lib.rs"),
+            "pub fn open(p: std::path::PathBuf) -> forgedb_core::Database {\n    \
+             forgedb_core::Database::open_at(p)\n}\n",
+        );
+    }
+
+    let target_dir = tmp.path().join(".cargo-target");
+    let members = metadata_members(ws, &target_dir);
+    for app in ["blog", "shop"] {
+        let core = package_name(&ws.join(app).join("core/Cargo.toml"));
+        assert!(
+            members.contains(&core),
+            "{app}'s generated package did not join the workspace: {members:?}"
+        );
+    }
+
+    let build = cargo(ws, &target_dir, &["build"]);
+    assert!(
+        build.status.success(),
+        "a workspace holding two ForgeDB apps does not build:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+}
