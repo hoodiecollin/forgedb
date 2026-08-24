@@ -183,3 +183,21 @@ impl Asker for NeverAsk {
         Ok(false)
     }
 }
+
+/// The asker for `forgedb project …`: still asks nothing, but **consents** to
+/// editing a config ForgeDB did not author.
+///
+/// Typing the command *is* the in-session confirmation the accepted design
+/// requires, which is why consent is a property of the asker rather than a flag:
+/// the same [`crate::project::record_name`] call is a refusal when a `generate`
+/// reaches it and an authorised edit when the user asked for it by name.
+pub struct CommandConsent;
+
+impl Asker for CommandConsent {
+    fn ask(&self, _q: &Question) -> Result<Option<Answer>> {
+        Ok(None)
+    }
+    fn confirm_edit(&self, _path: &Path) -> Result<bool> {
+        Ok(true)
+    }
+}

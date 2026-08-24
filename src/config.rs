@@ -596,6 +596,132 @@ pub fn load_config_file(path: &std::path::Path) -> Result<ForgeConfig> {
     parse_config(&content, path)
 }
 
+// ---------------------------------------------------------------------------
+// Writing a config (#367)
+// ---------------------------------------------------------------------------
+//
+// These are writes, and they live in the module that owns the READS on purpose.
+// #361's one-loader invariant is about config I/O, and splitting the writer into
+// its own module would make it two modules again — the same drift with a new
+// file name.  Both go through [`write_checked`], so a `forgedb.toml` that would
+// no longer parse is never applied and a half-written one can never exist in the
+// user's repository.
+
+/// The line ForgeDB leaves at the top of a `forgedb.toml` it created.
+///
+/// The difference between a mystery file appearing in `git status` and a legible
+/// one.  An adopted repository is exactly the kind of project that reaches these
+/// decisions, so this line is the first thing many users will read about
+/// ForgeDB's config.
+const PROVENANCE: &str = "\
+# Created by `forgedb project name`. ForgeDB keys this project's build cache,
+# lockfile and target directory on the id below; recording it HERE rather than in
+# the cache is what makes it survive `rm -rf ~/.forgedb`.
+";
+
+/// Create a minimal `forgedb.toml` at `root` declaring `name`.
+///
+/// **Deliberately minimal — no `[generate]` table.**  `parse_config` refuses a
+/// config whose `generate.targets` is `None`, which reads like "a `[project]`-only
+/// file will hard-error".  It will not: `ForgeConfig.generate` carries
+/// `#[serde(default)]` and `GenerateConfig::default()` states
+/// `targets = ["all"]`, so a file with no `[generate]` table takes the built-in
+/// and parses.  Writing `targets` "to be safe" would be identical today and is
+/// the wrong instinct when ForgeDB is authoring a file in someone else's repo.
+///
+/// `isolated` is likewise absent: it defaults to `true`, and a create is only
+/// ever reached when the chain holds no config at all, so there is nothing this
+/// file could regroup.
+pub fn create_project_config(root: &std::path::Path, name: &str) -> Result<std::path::PathBuf> {
+    let path = root.join(CONFIG_FILE);
+    if path.exists() {
+        return Err(CliError::Config(format!(
+            "{} already exists — this is an edit, not a create.",
+            path.display()
+        )));
+    }
+    write_checked(&path, &format!("{PROVENANCE}\n[project]\nname = {}\n", quoted(name)))?;
+    Ok(path)
+}
+
+/// Set `[project].name` in an existing config, **preserving its formatting**.
+///
+/// Comments, blank lines, key order and every other table survive: the user owns
+/// this file, and a round-trip through `toml` would silently rewrite all of it.
+/// An existing name is never replaced unless `overwrite`.
+pub fn set_project_name(path: &std::path::Path, name: &str, overwrite: bool) -> Result<()> {
+    let content = std::fs::read_to_string(path).map_err(|e| {
+        CliError::Config(format!("Cannot read config file '{}': {}", path.display(), e))
+    })?;
+    let mut doc = content.parse::<toml_edit::DocumentMut>().map_err(|e| {
+        CliError::ConfigDiagnostic(format!("{}:\n{}", path.display(), e))
+    })?;
+
+    if let Some(existing) = doc
+        .get("project")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        && !overwrite
+    {
+        return Err(CliError::ConfigDiagnostic(format!(
+            "{} already declares `[project].name = {}`.\n\n\
+             A project id keys its build cache directory, so changing it orphans \
+             the one the current id points at. Pass --force to change it anyway.",
+            path.display(),
+            quoted(existing),
+        )));
+    }
+
+    // `or_insert` on a missing `[project]` creates an implicit table, which
+    // renders as `[project]` in a document that has no other tables and inlines
+    // nowhere — the shape a hand-written config already has.
+    let project = doc
+        .entry("project")
+        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+    let table = project.as_table_mut().ok_or_else(|| {
+        CliError::ConfigDiagnostic(format!(
+            "{}: `project` is not a table, so `[project].name` cannot be recorded there.",
+            path.display()
+        ))
+    })?;
+    table["name"] = toml_edit::value(name);
+
+    write_checked(path, &doc.to_string())
+}
+
+/// Write a config through a sibling temp file, **re-parsing before the rename**.
+///
+/// Two hazards, one mechanism.  `deny_unknown_fields` means an edit that creates
+/// a key the parser rejects would corrupt a working config — so the result is
+/// parsed by [`parse_config`] (the same function every read uses, never a second
+/// one) and a document that no longer parses is simply not applied.  And the
+/// rename is atomic, so a half-written `forgedb.toml` can never be observed in
+/// the user's repository.
+fn write_checked(path: &std::path::Path, content: &str) -> Result<()> {
+    parse_config(content, path)?;
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let temp = dir.join(format!(
+        ".{}.forgedb-tmp",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("config")
+    ));
+    std::fs::write(&temp, content)?;
+    match std::fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(e.into())
+        }
+    }
+}
+
+/// A TOML basic string. Project names are validated before they reach here
+/// (no control characters, no separators), so this only has to handle the
+/// two characters TOML itself reserves.
+fn quoted(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

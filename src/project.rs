@@ -701,6 +701,82 @@ fn collision_error(id: &ProjectId, holder: &Holder, schema_hint: Option<&Path>) 
         ))
     }
 }
+/// Where a name was recorded, and whether the file had to be created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recorded {
+    /// The `forgedb.toml` that now declares the name.
+    pub path: PathBuf,
+    /// Whether ForgeDB created that file.
+    pub created: bool,
+}
+
+/// **THE PERSISTING ACT.**  Record `[project].name` for this chain's project.
+///
+/// Writes at [`Chain::root_dir`] — *never* at [`Chain::nearest`].  "One walk,
+/// two answers" means the knob config and the identity config are usually
+/// different directories in a monorepo, and recording a name at the nearest one
+/// produces [`identify`]'s "declared at a config that is not the project root"
+/// error on the very next run: a failure that appears one invocation later, in a
+/// different message, reading as a user mistake.
+///
+/// Two shapes, per the accepted split:
+///
+/// * **Create**, unconditionally, when the chain holds no config at all.  There
+///   is nothing to damage, nothing to preserve and no name to clobber — and this
+///   is the common instance, because a project ForgeDB scaffolded already has a
+///   name and never reaches either decision.
+/// * **Edit**, format-preserving, only with `asker.confirm_edit`.  Typing
+///   `forgedb project name` IS that consent
+///   ([`crate::ask::CommandConsent`]); a `generate` that merely wanted the answer
+///   is not ([`crate::ask::NeverAsk`]), and takes an error naming the file and
+///   the key instead.
+pub fn record_name(
+    chain: &Chain,
+    name: &str,
+    overwrite: bool,
+    asker: &dyn Asker,
+) -> Result<Recorded> {
+    validate_name(name, "the requested project name")?;
+    let root = chain.root_dir();
+
+    let Some(link) = chain.project_root() else {
+        // The premise that makes an unconditional create safe: with no config
+        // anywhere, `root_dir()` is the schema's own directory and `isolated`
+        // takes its `true` default, so the created file regroups nothing. If a
+        // config existed in the chain, `root_dir()` would BE that config's
+        // directory and this would be an edit.
+        debug_assert!(
+            chain.links().is_empty(),
+            "a chain with links always has a project root"
+        );
+        let path = config::create_project_config(&root, name)?;
+        return Ok(Recorded {
+            path,
+            created: true,
+        });
+    };
+
+    let path = link.path.clone();
+    if !asker.confirm_edit(&path)? {
+        return Err(CliError::ConfigDiagnostic(format!(
+            "{} already exists, and ForgeDB does not edit a config it did not \
+             author without being asked.\n\n\
+             Add this under `[project]`:\n  name = \"{name}\"\n\n\
+             Or let ForgeDB write it:\n  forgedb project name {name}{}",
+            path.display(),
+            chain
+                .schema()
+                .map(|s| format!(" --schema {}", s.display()))
+                .unwrap_or_default(),
+        )));
+    }
+    config::set_project_name(&path, name, overwrite)?;
+    Ok(Recorded {
+        path,
+        created: false,
+    })
+}
+
 /// The directory a schema's governing config is walked up from, and the directory its
 /// `migrations/` sits beside.
 ///

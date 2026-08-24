@@ -213,6 +213,27 @@ enum Commands {
     #[command(subcommand)]
     Tenant(TenantCommands),
 
+    /// Record this project's identity decisions (#367)
+    ///
+    /// Two identity decisions cannot be settled by a flag *and made to stick*:
+    /// which ecosystem manifest names an ambiguous project root, and what to do
+    /// when the resolved id is already claimed. A flag could express either —
+    /// but the id keys `~/.forgedb/projects/<id>/`, so an answer living in one
+    /// `argv` is a different project on the next invocation that omits it, and
+    /// the invocations that omit it are the ones ForgeDB scaffolds. This
+    /// subcommand persists the answer, and is the command the non-interactive
+    /// diagnostics name.
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommands,
+
+        /// Schema file path — the app this is about. Resolved exactly as
+        /// `generate`/`build` resolve it, because identity is keyed on the
+        /// schema's chain, not on the working directory.
+        #[arg(short, long, global = true)]
+        schema: Option<String>,
+    },
+
     /// Run the ForgeDB language server over stdio (used by editor extensions).
     ///
     /// Thin launcher for the sibling `forgedb-lsp` binary shipped alongside the
@@ -260,6 +281,25 @@ enum Commands {
         /// `FORGEDB_COORDINATOR_MAX_FRAME_MIB`.
         #[arg(long)]
         max_frame_mib: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProjectCommands {
+    /// Persist `[project].name` at this project's root
+    ///
+    /// Creates a `forgedb.toml` when the chain holds none; otherwise edits the
+    /// existing one, preserving its comments and formatting.
+    Name {
+        /// The project id to record
+        name: String,
+
+        /// Replace an existing `[project].name`
+        ///
+        /// A rename re-keys the build cache, so the directory the old id points
+        /// at is reported as orphaned rather than moved or deleted.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -970,6 +1010,17 @@ fn run(cli: Cli) -> Result<()> {
             // Swallowed args and all: the tombstone answers, not clap.
             MigrateCommands::Up { args: _ } => commands::migrate::up(),
         },
+
+        Commands::Project { command, schema } => {
+            commands::project::run(commands::project::ProjectOptions {
+                command: match command {
+                    ProjectCommands::Name { name, force } => {
+                        commands::project::ProjectCommand::Name { name, force }
+                    }
+                },
+                schema,
+            })
+        }
 
         Commands::Lsp { server_path, args } => {
             commands::lsp::run(commands::lsp::LspOptions { server_path, args })
