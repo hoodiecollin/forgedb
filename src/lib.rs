@@ -7,6 +7,7 @@ pub mod naming;
 pub mod project;
 pub mod prompt;
 pub mod targets;
+pub mod toolchain;
 pub mod templates;
 pub mod ui;
 
