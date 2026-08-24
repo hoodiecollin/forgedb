@@ -106,7 +106,11 @@ fn claim_cmd(chain: &Chain, take_over: bool, force: bool) -> Result<()> {
     match project::take_over_claim(&id, force)? {
         None => ui::info(&format!("Project {:?} was already ours.", id.name)),
         Some(previous) => {
-            ui::success(&format!("Project {:?} now points at {}", id.name, id.root.display()));
+            ui::success(&format!(
+                "Project {:?} now points at {}",
+                id.name,
+                id.root.display()
+            ));
             // Named rather than summarised: displacing a LIVE holder is a real
             // consequence, and "which root did I just displace" is not
             // recoverable afterwards — the ledger holds one path.
