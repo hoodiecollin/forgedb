@@ -556,10 +556,19 @@ jobs:
 
           # The transformer replays a RECORDED lineage and refuses a synthesized
           # jump, so a v1 -> v2 hop has to exist before it can be built.
-          "$FORGEDB" migrate create baseline --auto --schema schema.forge
+          #
+          # `--no-auto`, not `--auto`: #374 REMOVED `--auto` (detection is what
+          # `migrate create` does, so there is no flag for it) and gave the new
+          # spelling the opposite meaning — it opts out of the interactive
+          # PROMPT, not of detection. A session with no terminal already behaves
+          # as if it were passed, so this changes nothing about what runs; it
+          # makes the workflow SAY so rather than depend on tty detection, and a
+          # change ForgeDB cannot prove a value for then fails naming itself
+          # instead of hanging on a question nobody can answer.
+          "$FORGEDB" migrate create baseline --no-auto --schema schema.forge
           perl -pi -e 's/^  summary: string\?$/  summary: string?\n  subtitle: string?/' schema.forge
           grep -n 'subtitle' schema.forge
-          "$FORGEDB" migrate create add-subtitle --auto --schema schema.forge
+          "$FORGEDB" migrate create add-subtitle --no-auto --schema schema.forge
           "$FORGEDB" migrate status --schema schema.forge
 
           # `migrate build` emits `transform-1-2/` as a member of the SAME cache

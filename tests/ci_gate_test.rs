@@ -1096,3 +1096,57 @@ fn the_in_tree_arm_pastes_a_line_it_extracted() {
          tier-2 tests already prove:\n{body}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// S339 — no reclose passes a flag the CLI has tombstoned.
+// ---------------------------------------------------------------------------
+
+/// The failure this exists to prevent, found by running it (#339's own dispatch).
+///
+/// #374 removed `migrate create --auto` and left the reclose's `6/6` arm calling
+/// it. Nothing reported that, because the reclose runs on `main` and the removal
+/// landed on `develop` — so the break sat there until someone dispatched the
+/// workflow by hand, and its first real execution would otherwise have been the
+/// release merge, where it is a release blocker.
+///
+/// A tombstoned flag is exactly the shape that rots this way: `refuse_removed_flag`
+/// makes the CLI reject it with a good message, which means the workflow fails
+/// LOUDLY — but only when it runs, once a cycle, on a branch nobody is looking at.
+///
+/// The flag set is DERIVED from the tombstone call sites, not written out again.
+/// A second list here would drift from the first, which is the failure this
+/// repo's guards exist to refuse.
+#[test]
+fn no_reclose_workflow_passes_a_tombstoned_cli_flag() {
+    let src = read("src/commands/migrate/mod.rs");
+    let re = Regex::new(r#"refuse_removed_flag\(\s*"(--[a-z0-9-]+)""#).unwrap();
+    let tombstoned: BTreeSet<String> = re
+        .captures_iter(&src)
+        .map(|c| c[1].to_string())
+        .collect();
+
+    assert!(
+        !tombstoned.is_empty(),
+        "found no `refuse_removed_flag` call sites — the parser has drifted from \
+         src/commands/migrate/mod.rs and this guard would now pass vacuously"
+    );
+
+    for file in ["substrate-reclose.yml", "go-reclose.yml"] {
+        let wf = workflow(file);
+        for line in wf.lines().map(str::trim) {
+            if !line.contains("$FORGEDB") {
+                continue;
+            }
+            for flag in &tombstoned {
+                assert!(
+                    !line.split_whitespace().any(|w| w == flag),
+                    "{file} invokes the CLI with `{flag}`, which \
+                     `refuse_removed_flag` rejects — so this step fails at run time, \
+                     and it only runs on `main`, once a cycle. That is exactly how \
+                     #374's removal sat broken in this workflow until #339 \
+                     dispatched it by hand.\nOffending line: {line}"
+                );
+            }
+        }
+    }
+}
