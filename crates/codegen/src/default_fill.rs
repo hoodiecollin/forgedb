@@ -144,10 +144,25 @@ pub fn default_fill(schema: &Schema, field: &Field) -> Option<FillValue> {
     // A nullable field's zero is `None` — already meaningful, and such an add
     // is provable with no default at all. Honouring `@default` here would
     // change what an existing nullable add backfills, for no correctness gain.
+    //
+    // The guard lives HERE and not in `fill_from_param`, deliberately: the
+    // prompt path answers nullable fields too (`views: u32? -> string?` is a
+    // re-encode the operator must answer), and it is only the *directive* that
+    // is refused on one.
     if field.is_nullable() {
         return None;
     }
-    let param = default_param(field)?;
+    fill_from_param(schema, field, default_param(field)?)
+}
+
+/// Resolve one literal against a field's type — the ONE conversion from "what
+/// somebody typed" to "the value both routes write" (#374).
+///
+/// Two callers and no third: [`default_fill`] hands it the field's `@default`
+/// directive, and `migrate create`'s prompt hands it what the operator typed.
+/// A second conversion beside this one is how the answer an operator gave and
+/// the answer the schema declares would come to be encoded differently.
+pub fn fill_from_param(schema: &Schema, field: &Field, param: &ConstraintParam) -> Option<FillValue> {
     let ty = crate::rust::RustGenerator::resolved_type(schema, &field.field_type);
 
     match &ty {

@@ -70,7 +70,7 @@ pub mod go;
 // Re-export generators for convenience
 pub use api::ApiGenerator;
 pub use config::{FsyncMode, GenConfig};
-pub use default_fill::{FillValue, default_fill};
+pub use default_fill::{FillValue, default_fill, fill_from_param};
 pub use core_pkg::CorePackage;
 pub use server_pkg::{ServerLayout, ServerPackage};
 pub use ffi::FfiGenerator;

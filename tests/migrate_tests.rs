@@ -139,7 +139,6 @@ fn record_lineage(dir: &Path) {
                 "migrate",
                 "create",
                 name,
-                "--auto",
                 "--schema",
                 "schema.forge",
             ])
@@ -176,7 +175,7 @@ fn test_scenario_32_every_migrate_arm_requires_schema() {
     fs::write(dir.join("schema.forge"), V1).unwrap();
 
     let arms: [&[&str]; 5] = [
-        &["migrate", "create", "some-change", "--auto"],
+        &["migrate", "create", "some-change"],
         &["migrate", "status"],
         &["migrate", "build", "--from", "1", "--to", "2"],
         &[
@@ -659,7 +658,7 @@ fn strip_ansi(s: &str) -> String {
     out.trim().to_string()
 }
 
-/// **One driver, not two.** `src/commands/migrate.rs` spawns no cargo process of
+/// **One driver, not two.** `src/commands/migrate/mod.rs` spawns no cargo process of
 /// its own — every cargo interaction it needs (build, and the target-directory
 /// lookup `migrate run` uses) goes through
 /// `src/commands/build/driver.rs`.
@@ -675,7 +674,7 @@ fn strip_ansi(s: &str) -> String {
 /// directory in the first place (#292).
 #[test]
 fn test_migrate_spawns_no_cargo_of_its_own() {
-    let src = include_str!("../src/commands/migrate.rs");
+    let src = include_str!("../src/commands/migrate/mod.rs");
     let offenders: Vec<(usize, &str)> = src
         .lines()
         .enumerate()
@@ -746,7 +745,6 @@ fn test_an_enum_reorder_records_a_hop_and_leaves_v1_intact() {
             "migrate",
             "create",
             "baseline",
-            "--auto",
             "--schema",
             "schema.forge",
         ])
@@ -764,7 +762,6 @@ fn test_an_enum_reorder_records_a_hop_and_leaves_v1_intact() {
             "migrate",
             "create",
             "swap_status",
-            "--auto",
             "--schema",
             "schema.forge",
         ])
@@ -846,7 +843,6 @@ fn test_a_nested_enum_and_struct_change_reach_the_differ() {
                 "migrate",
                 "create",
                 desc,
-                "--auto",
                 "--schema",
                 "schema.forge",
             ])

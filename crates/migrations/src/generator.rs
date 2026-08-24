@@ -35,11 +35,29 @@ impl MigrationGenerator {
                 .map_err(|e| format!("Failed to create migrations directory: {}", e))?;
         }
 
-        // Create migration
-        let migration =
-            Migration::new_versioned(description, changes, from_version, to_version);
+        Self::write_migration(
+            migrations_dir,
+            Migration::new_versioned(description, changes, from_version, to_version),
+        )
+    }
 
-        // Write migration file
+    /// Persist an already-built migration (#374).
+    ///
+    /// Split out of [`generate_versioned`](Self::generate_versioned) because
+    /// the id, the answers and the checksum have to be settled BEFORE the
+    /// record is constructed: an `Answer::Escape` scaffold lives at
+    /// `migrations/<id>/` and its hash has to be inside the record that the
+    /// checksum then covers. A constructor that allocates its own id cannot
+    /// serve that order.
+    pub fn write_migration<P: AsRef<Path>>(
+        migrations_dir: P,
+        migration: Migration,
+    ) -> Result<Migration, String> {
+        let migrations_dir = migrations_dir.as_ref();
+        if !migrations_dir.exists() {
+            fs::create_dir_all(migrations_dir)
+                .map_err(|e| format!("Failed to create migrations directory: {}", e))?;
+        }
         let migration_path = migrations_dir.join(migration.filename());
         let json = serde_json::to_string_pretty(&migration)
             .map_err(|e| format!("Failed to serialize migration: {}", e))?;

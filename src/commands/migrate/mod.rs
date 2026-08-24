@@ -1,3 +1,6 @@
+pub mod answers;
+pub mod escape;
+
 use crate::naming::PackageKind;
 use crate::{error::CliError, ui, Result};
 use colored::Colorize;
@@ -34,7 +37,21 @@ pub struct AppRef {
 pub struct MigrateCreateOptions {
     pub app: AppRef,
     pub description: String,
-    pub auto: bool,
+    /// TOMBSTONE for the deleted `--auto` (#374 direction A).
+    ///
+    /// Detection is what `migrate create` **does** — there is no second mode to
+    /// choose, so there is no flag. It still parses so that passing it is an
+    /// error naming that fact, rather than clap's "unexpected argument", which
+    /// names nothing; six examples in `docs/MIGRATIONS.md` and any runbook
+    /// written against 0.4 pass it. Same shape as `migrate build -o`,
+    /// `migrate run --bin-dir` and `migrate up` (#335 §9).
+    pub removed_auto: bool,
+    /// Opt out of the **prompt**, not of detection (#374 direction A).
+    ///
+    /// A migration whose every change is provable succeeds identically with and
+    /// without it. What it decides is whether an unprovable change stops the run
+    /// or asks a question.
+    pub no_auto: bool,
 }
 
 pub struct MigrateStatusOptions {
@@ -157,23 +174,40 @@ fn resolve_app(app: &AppRef) -> Result<ResolvedApp> {
 }
 
 /// A deleted flag that still **parses**, so that passing it is an error naming
-/// the replacement (#335 §9).
+/// the replacement (#335 §9, #374).
 ///
 /// Removing the flag outright hands the user clap's "unexpected argument",
 /// which names no replacement. Keeping it and ignoring it is worse still: a
 /// flag that reads as applied and is not is the exact failure mode this design
 /// deletes everywhere else. So the flag survives as a tombstone whose entire
 /// behavior is this refusal.
-fn refuse_removed_flag(flag: &str, value: Option<&PathBuf>, replacement: &str) -> Result<()> {
-    match value {
+///
+/// `given` is the rendered value the operator passed, or `Some("")` for a
+/// valueless flag — every removed flag routes through here, so that
+/// `scenario_34_every_refusal_site_has_a_row` counts them all. Adding a
+/// removal without adding a row is then a failure rather than a silence.
+fn refuse_removed_flag(flag: &str, given: Option<String>, explanation: &str) -> Result<()> {
+    match given {
         None => Ok(()),
-        Some(v) => Err(CliError::Migration(format!(
-            "`{flag} {}` was removed (#335): ForgeDB owns where this is built, and it is \
-             built as a member of the project's own cache workspace rather than into a \
-             directory of your choosing. {replacement}",
-            v.display()
-        ))),
+        Some(v) => {
+            let shown = if v.is_empty() {
+                flag.to_string()
+            } else {
+                format!("{flag} {v}")
+            };
+            Err(CliError::Migration(format!("`{shown}` was removed. {explanation}")))
+        }
     }
+}
+
+/// The shared explanation for the three flags #335 §9 removed, so the sentence
+/// has one home rather than three.
+fn cache_owns_the_build(replacement: &str) -> String {
+    format!(
+        "ForgeDB owns where this is built, and it is built as a member of the \
+         project's own cache workspace rather than into a directory of your \
+         choosing (#335). {replacement}"
+    )
 }
 
 /// `forgedb migrate up`, removed (#335 §9, maintainer decision 3).
@@ -200,163 +234,191 @@ pub fn up() -> Result<()> {
     ))
 }
 
-/// Create a new migration
+/// Create a new migration by diffing the app's schema against the recorded
+/// snapshot, capturing an answer for anything the differ cannot prove (#374).
+///
+/// # There is no way to create a migration ForgeDB did not detect
+///
+/// The old `--auto`-less branch wrote an empty record with `changes: []` and
+/// told the operator to edit it by hand. It is gone, and so is the flag: a
+/// record's `changes` array is DERIVED from a schema diff, so it cannot
+/// disagree with `migrations/schemas/vN.forge`. Anything the diff cannot prove
+/// is answered by prompt or escapes to the author's own runtime — never by
+/// hand-editing the record.
 pub fn create(opts: MigrateCreateOptions) -> Result<()> {
+    // Routed through the SAME refusal as the three flags #335 removed, so
+    // `scenario_34_every_refusal_site_has_a_row` counts it. Giving it a private
+    // error here instead would have kept that test green while adding a
+    // removed surface it does not cover.
+    refuse_removed_flag(
+        "--auto",
+        opts.removed_auto.then(String::new),
+        "Detecting schema changes is what `migrate create` DOES (#374), so there is no \
+         flag for it and no second mode to choose — drop it. To opt out of the \
+         *prompt*, and only the prompt, pass `--no-auto`: detection still runs, and a \
+         change ForgeDB cannot prove becomes a hard error naming itself instead of a \
+         question.",
+    )?;
+
     let app = resolve_app(&opts.app)?;
     // Derived from the app the operator named, never from the working directory
     // (#335 §9): one root config can govern many apps, and a CWD-relative
     // `migrations/` gave whichever of them the operator happened to `cd` into.
     let migrations_dir = app.migrations_dir.clone();
+    let schema_path = app.schema.clone();
 
-    if opts.auto {
-        // Auto-detect changes by diffing the current schema against the recorded
-        // snapshot.  Since #74 Phase 4 the gate no longer REFUSES breaking changes:
-        // every non-empty diff is recorded as a versioned hop (`from -> to`), and
-        // any residue the differ cannot prove a value for (a type change, a
-        // nullable→NOT-NULL narrowing, a required-add-without-default) is
-        // classified `Authored` and gets a `migrations/{id}/transform.rs` scaffold
-        // the operator fills in.  Purely-additive changes still get the cheap
-        // reopen-backfill fast path; anything that rewrites data-at-rest routes
-        // through the offline transformer (`forgedb migrate build` + `run`).
-        //
-        // The schema is the one the operator named. The CWD-relative
-        // `schema.forge` default that used to sit here died with the rest of
-        // the discovery (#335 §9): a defaulted schema path is the same defect
-        // wearing a different name — it picks an app out of the working
-        // directory and diffs *that* app's snapshot.
-        let schema_path = app.schema.clone();
-        ui::info(&format!(
-            "Auto-detecting schema changes ({})...",
-            schema_path.display()
-        ));
+    ui::info(&format!(
+        "Detecting schema changes ({})...",
+        schema_path.display()
+    ));
 
-        let new_src = std::fs::read_to_string(&schema_path).map_err(|e| {
-            CliError::Migration(format!(
-                "Failed to read schema '{}': {}",
-                schema_path.display(),
-                e
-            ))
-        })?;
+    let new_src = std::fs::read_to_string(&schema_path).map_err(|e| {
+        CliError::Migration(format!(
+            "Failed to read schema '{}': {}",
+            schema_path.display(),
+            e
+        ))
+    })?;
+    let dest_schema = forgedb_parser::Parser::new(&new_src)
+        .and_then(|mut p| p.parse())
+        .map_err(|e| CliError::Migration(format!("Failed to parse schema: {}", e)))?;
 
-        let changes = detect_schema_changes(&migrations_dir, &new_src)?;
+    let mut changes = detect_schema_changes(&migrations_dir, &new_src)?;
 
-        if changes.is_empty() {
-            // First run records a baseline snapshot with no prior schema to diff.
-            // Also record the full-schema snapshot for the CURRENT format version
-            // (the baseline is v1 for a fresh lineage) so the transformer (#74
-            // Phase 3) has every version's `.forge` in its range.
-            save_schema_snapshot(&migrations_dir, &new_src)?;
-            let lineage = forgedb_migrations::MigrationLineage::load(&migrations_dir)
-                .map_err(map_err)?;
-            forgedb_migrations::save_versioned_schema(
-                &migrations_dir,
-                lineage.current_schema_version(),
-                &new_src,
-            )
-            .map_err(map_err)?;
-            ui::success("No schema changes detected (snapshot up to date)");
-            return Ok(());
-        }
-
-        // Classify the diff.  `Authored` residue is the semantic mapping the differ
-        // cannot synthesize; a "breaking" change may still be fully `Auto` (drop a
-        // field/model, add `&unique`) — the row transform is provable, uniqueness
-        // is *validated* during replay.  The two classifications are independent.
-        let authored: Vec<_> = changes
-            .iter()
-            .filter(|c| c.hop_body_class() == HopBodyClass::Authored)
-            .collect();
-        let has_breaking = changes.iter().any(|c| c.is_breaking());
-        let authored_count = authored.len();
-
-        ui::info(&format!("Detected {} change(s)", changes.len()));
-        for change in &changes {
-            let marker = if change.hop_body_class() == HopBodyClass::Authored {
-                " [authored]".yellow()
-            } else {
-                "".normal()
-            };
-            println!("  • {}{}", change.description(), marker);
-        }
-
-        // Assign the serial version interlock (#74 Phase 2) from the committed
-        // lineage: this migration bumps the on-disk format version by one, so a
-        // regenerated app expects the new version and refuses a not-yet-migrated
-        // data dir (the Phase 1 open guard).  `EXPECTED_SCHEMA_VERSION` is derived
-        // from this lineage at `generate` time — never hand-edited (red line #8).
-        let lineage = forgedb_migrations::MigrationLineage::load(&migrations_dir)
-            .map_err(map_err)?;
-        let (from_version, to_version) = lineage.next_version_span();
-
-        let migration = MigrationGenerator::generate_versioned(
+    if changes.is_empty() {
+        // First run records a baseline snapshot with no prior schema to diff.
+        // Also record the full-schema snapshot for the CURRENT format version
+        // (the baseline is v1 for a fresh lineage) so the transformer (#74
+        // Phase 3) has every version's `.forge` in its range.
+        save_schema_snapshot(&migrations_dir, &new_src)?;
+        let lineage =
+            forgedb_migrations::MigrationLineage::load(&migrations_dir).map_err(map_err)?;
+        forgedb_migrations::save_versioned_schema(
             &migrations_dir,
+            lineage.current_schema_version(),
+            &new_src,
+        )
+        .map_err(map_err)?;
+        ui::success("No schema changes detected (snapshot up to date)");
+        return Ok(());
+    }
+
+    ui::info(&format!("Detected {} change(s)", changes.len()));
+    for change in &changes {
+        let marker = if change.hop_body_class() == HopBodyClass::Authored {
+            " [needs an answer]".yellow()
+        } else {
+            "".normal()
+        };
+        println!("  • {}{}", change.description(), marker);
+    }
+
+    // Assign the serial version interlock (#74 Phase 2) from the committed
+    // lineage: this migration bumps the on-disk format version by one, so a
+    // regenerated app expects the new version and refuses a not-yet-migrated
+    // data dir (the Phase 1 open guard).  `EXPECTED_SCHEMA_VERSION` is derived
+    // from this lineage at `generate` time — never hand-edited (red line #8).
+    let lineage = forgedb_migrations::MigrationLineage::load(&migrations_dir).map_err(map_err)?;
+    let (from_version, to_version) = lineage.next_version_span();
+
+    // The id is allocated HERE, before the record exists, so an escape
+    // scaffold can be written under `migrations/<id>/` and hashed into the
+    // answer that the record's own checksum then covers (#374).
+    let migration_id = forgedb_migrations::Migration::next_id();
+
+    // Which language an escape transform would be written in — DERIVED from
+    // `[generate].targets`, never declared (gate 1 decision 2).
+    let governing = crate::project::govern(
+        opts.app.config.as_deref(),
+        crate::project::schema_dir(&schema_path),
+    )?;
+    let (internal_targets, _) = governing.config().resolved_targets()?;
+    let escape_language = escape::language_for(&internal_targets);
+
+    // EVERY answer is resolved BEFORE the first write. `create` writes the
+    // record, then the snapshot, then the versioned schema; prompting in the
+    // middle would add a window in which the operator answers, hits Ctrl-C, and
+    // leaves a partial lineage behind.
+    let askable = crate::prompt::askable();
+    let mut tty = crate::prompt::Tty;
+    let ask: Option<&mut dyn crate::prompt::Ask> = if opts.no_auto || !askable.is_yes() {
+        None
+    } else {
+        Some(&mut tty)
+    };
+    let reason = if opts.no_auto {
+        "--no-auto"
+    } else {
+        askable.reason()
+    };
+    let scaffold = answers::resolve_answers(
+        &mut changes,
+        &dest_schema,
+        escape_language,
+        &migrations_dir,
+        &migration_id,
+        ask,
+        reason,
+    )?;
+
+    let has_breaking = changes.iter().any(|c| c.is_breaking());
+    let authored_count = changes
+        .iter()
+        .filter(|c| c.hop_body_class() == HopBodyClass::Authored)
+        .count();
+
+    let migration = MigrationGenerator::write_migration(
+        &migrations_dir,
+        forgedb_migrations::Migration::with_id(
+            migration_id,
             opts.description,
-            changes.clone(),
+            changes,
             from_version,
             to_version,
-        )
+        ),
+    )
+    .map_err(map_err)?;
+    save_schema_snapshot(&migrations_dir, &new_src)?;
+    // Record the destination version's full-schema snapshot so the transformer
+    // (#74 Phase 3) can emit this version's typed structs for the range.
+    forgedb_migrations::save_versioned_schema(&migrations_dir, to_version, &new_src)
         .map_err(map_err)?;
-        save_schema_snapshot(&migrations_dir, &new_src)?;
-        // Record the destination version's full-schema snapshot so the transformer
-        // (#74 Phase 3) can emit this version's typed structs for the range.
-        forgedb_migrations::save_versioned_schema(&migrations_dir, to_version, &new_src)
-            .map_err(map_err)?;
 
-        // Scaffold an authored-transform stub for any `Authored` residue (#74 Phase
-        // 2/4).  Never clobbers a frozen body — an existing `transform.rs` is left
-        // untouched.
-        let scaffold = forgedb_migrations::scaffold_authored_body(&migrations_dir, &migration)
-            .map_err(map_err)?;
+    ui::success(&format!(
+        "Created migration: {} (format v{} → v{})",
+        migration.filename(),
+        from_version,
+        to_version
+    ));
+    println!("\n{}", MigrationGenerator::generate_report(&migration));
 
-        ui::success(&format!(
-            "Created migration: {} (format v{} → v{})",
-            migration.filename(),
-            from_version,
-            to_version
+    if let Some(path) = &scaffold {
+        ui::warning(&format!(
+            "Write your transform in {} — `forgedb migrate build` refuses this hop \
+             until its bytes differ from the scaffold ForgeDB just wrote.",
+            path.display()
         ));
-        println!("\n{}", MigrationGenerator::generate_report(&migration));
+    }
 
-        // A change needs the offline transformer when it rewrites data-at-rest:
-        // any `Authored` residue, or any breaking-but-`Auto` change (drop/unique).
-        // A purely-additive diff keeps the cheap reopen-backfill path.
-        let needs_transform = has_breaking || authored_count > 0;
-        if !needs_transform {
-            ui::info(
-                "Additive change: run `forgedb generate` and restart your app — existing \
-                 rows are backfilled with defaults on reopen (no data step needed).",
-            );
-        } else {
-            if let Some((path, created)) = &scaffold {
-                if *created {
-                    ui::warning(&format!(
-                        "Authored transform scaffolded at {} — fill in every TODO before building.",
-                        path.display()
-                    ));
-                } else {
-                    ui::info(&format!(
-                        "Authored transform already present at {} (left unchanged).",
-                        path.display()
-                    ));
-                }
-            }
-            print_migration_next_steps(&app.schema, from_version, to_version, authored_count > 0);
-        }
+    // A change needs the offline transformer when it rewrites data-at-rest.
+    // A purely-additive diff keeps the cheap reopen-backfill path.
+    if has_breaking || authored_count > 0 {
+        print_migration_next_steps(&app.schema, from_version, to_version, scaffold.is_some());
     } else {
-        // Manual migration - create empty template
-        ui::warning("Manual migration mode - you'll need to edit the migration file manually");
-
-        let migration = MigrationGenerator::generate(
-            migrations_dir,
-            opts.description,
-            vec![], // Empty changes
-        )
-        .map_err(map_err)?;
-
-        ui::success(&format!(
-            "Created migration template: {}",
-            migration.filename()
-        ));
-        ui::info("Edit the migration file to add your changes");
+        // CORRECTED (#374 gate 1's carried item). This message used to say
+        // "restart your app — existing rows are backfilled with defaults on
+        // reopen (no data step needed)", which describes a path this very
+        // command has just foreclosed: `next_version_span` bumps the serial for
+        // EVERY non-empty diff, `generate` bakes it, and the generated open
+        // guard PANICS on a mismatch. So a recorded migration always needs the
+        // transformer, however additive it is; the reopen backfill applies only
+        // to a schema edit with no recorded migration at all.
+        ui::info(
+            "Every change in this hop is provable, so no transform has to be written — \
+             but the on-disk format version still moved, and a regenerated app refuses a \
+             data dir that has not been migrated.",
+        );
+        print_migration_next_steps(&app.schema, from_version, to_version, false);
     }
 
     Ok(())
@@ -439,9 +501,11 @@ pub fn status(opts: MigrateStatusOptions) -> Result<()> {
 pub fn build(opts: MigrateBuildOptions) -> Result<()> {
     refuse_removed_flag(
         "--output",
-        opts.removed_output.as_ref(),
-        "Pass `--schema <app.forge>` instead: the transformer is emitted into that app's \
-         build-cache container as `transform-<from>-<to>/`, and the command prints the path.",
+        opts.removed_output.as_ref().map(|p| p.display().to_string()),
+        &cache_owns_the_build(
+            "Pass `--schema <app.forge>` instead: the transformer is emitted into that app's \
+             build-cache container as `transform-<from>-<to>/`, and the command prints the path.",
+        ),
     )?;
     let app = resolve_app(&opts.app)?;
     let kind = PackageKind::Transform {
@@ -687,9 +751,11 @@ fn run_transformer(bin: &Path, src: &Path, dest: &Path) -> Result<()> {
 pub fn run(opts: MigrateRunOptions) -> Result<()> {
     refuse_removed_flag(
         "--bin-dir",
-        opts.removed_bin_dir.as_ref(),
-        "Pass `--schema <app.forge> --from <F> --to <T>` instead: those name the exact \
-         cache member `migrate build` produced, which a directory alone cannot.",
+        opts.removed_bin_dir.as_ref().map(|p| p.display().to_string()),
+        &cache_owns_the_build(
+            "Pass `--schema <app.forge> --from <F> --to <T>` instead: those name the exact \
+             cache member `migrate build` produced, which a directory alone cannot.",
+        ),
     )?;
     let app = resolve_app(&opts.app)?;
     let kind = PackageKind::Transform {
@@ -732,9 +798,11 @@ pub fn run(opts: MigrateRunOptions) -> Result<()> {
 pub fn engine(opts: MigrateEngineOptions) -> Result<()> {
     refuse_removed_flag(
         "--output",
-        opts.removed_output.as_ref(),
-        "Pass `--schema <app.forge>` instead: the hop crate is emitted into that app's \
-         build-cache container as `engine-<from>-<to>/`, and the command prints the path.",
+        opts.removed_output.as_ref().map(|p| p.display().to_string()),
+        &cache_owns_the_build(
+            "Pass `--schema <app.forge>` instead: the hop crate is emitted into that app's \
+             build-cache container as `engine-<from>-<to>/`, and the command prints the path.",
+        ),
     )?;
 
     let Some((schema_version, from_engine)) = detect_src_versions(&opts.src)? else {
@@ -1071,7 +1139,7 @@ fn emit_transform_crate(app: &ResolvedApp, kind: &PackageKind) -> Result<()> {
 /// semantic residue is carried by the hop's embedded authored transform.
 fn build_model_ops(
     changes: &[SchemaChange],
-    dest_schema: &forgedb_parser::Schema,
+    _dest_schema: &forgedb_parser::Schema,
 ) -> Vec<forgedb_codegen::ModelOp> {
     use std::collections::BTreeMap;
 

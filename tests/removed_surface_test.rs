@@ -278,6 +278,35 @@ fn scenario_34_migrate_run_bin_dir() {
 }
 
 // ---------------------------------------------------------------------------
+// 7 · `forgedb migrate create --auto`
+// ---------------------------------------------------------------------------
+
+/// Detection is what `migrate create` **does** (#374), so there is no flag for
+/// it — and the removal must not be a silent success.
+///
+/// Two failure modes it sits between. Deleting the clap argument outright gives
+/// clap's "unexpected argument", which names no replacement, to an operator
+/// following any of the six `--auto` examples the docs shipped. Keeping it as a
+/// no-op is worse: a flag that reads as applied and is not.
+///
+/// The refusal must also point at `--no-auto`, which is the thing an operator
+/// reaching for `--auto` in a script actually wants: it opts out of the
+/// *prompt*, not of detection.
+#[test]
+fn scenario_34_migrate_create_auto() {
+    let tmp = project();
+    for flag in ["-a", "--auto"] {
+        let args: &[&str] = &["migrate", "create", "some change", "--schema", "schema.forge", flag];
+        let log = forgedb(tmp.path(), args);
+        must_name(&log, args, &["removed", "--no-auto"]);
+        assert!(
+            !tmp.path().join("migrations").exists(),
+            "`migrate create {flag}` recorded a migration while refusing the flag:\n{log}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The rule, not the rows
 // ---------------------------------------------------------------------------
 
@@ -290,13 +319,14 @@ fn scenario_34_migrate_run_bin_dir() {
 /// grows a seventh call site, and this test says so.
 #[test]
 fn scenario_34_every_refusal_site_has_a_row() {
-    let migrate = include_str!("../src/commands/migrate.rs");
+    let migrate = include_str!("../src/commands/migrate/mod.rs");
     // `refuse_removed_flag(` — one definition plus one call per removed flag.
     let migrate_calls = migrate.matches("refuse_removed_flag(").count() - 1;
     assert_eq!(
-        migrate_calls, 3,
-        "`migrate.rs` has {migrate_calls} removed-flag refusals; this file covers 3 \
-         (`migrate build -o`, `migrate engine -o`, `migrate run --bin-dir`). Add a row."
+        migrate_calls, 4,
+        "`migrate/mod.rs` has {migrate_calls} removed-flag refusals; this file covers 4 \
+         (`migrate build -o`, `migrate engine -o`, `migrate run --bin-dir`, \
+         `migrate create --auto`). Add a row."
     );
     assert!(
         migrate.contains("pub fn up()"),

@@ -1,0 +1,219 @@
+//! The escape hatch: a transform written in the author's OWN language (#374
+//! direction C).
+//!
+//! ForgeDB **does not embed a JS or Python runtime** — no QuickJS, no CPython,
+//! no bundled interpreter. The generated transformer links the runtime the
+//! author already has installed, located through `[toolchain]`. This module
+//! owns the author-facing half: which language the escape is written in, and
+//! the scaffold ForgeDB writes for them to fill in.
+//!
+//! # Ownership inside `migrations/<id>/`, stated once
+//!
+//! * `transform.{rs,ts,py}` is **the author's**. It is never rewritten once it
+//!   exists.
+//! * `v{n}.{ts,py}` are **ForgeDB's**, derived from the committed
+//!   `migrations/schemas/v{n}.forge`, and are always rewritten — by `migrate
+//!   create` and again by `migrate build` — so a CLI upgrade reaches them and
+//!   any drift shows up in the author's own diff rather than as a type error.
+
+use crate::{Result, error::CliError};
+use forgedb_migrations::{EscapeLanguage, HopBodyClass, SchemaChange, checksum};
+use std::path::{Path, PathBuf};
+
+/// Which language an escape transform is written in, **derived from
+/// `[generate].targets`** (gate 1 decision 2).
+///
+/// There is no config key for it, and that is the point: a project that
+/// generates a TypeScript SDK writes its transforms in TypeScript because that
+/// is the language it already chose. A second declaration could disagree with
+/// the first.
+///
+/// Precedence is fixed — TypeScript, then Python, then Rust — rather than
+/// taken from the order the user listed targets in, so that `targets = ["all"]`
+/// (the default for a project with no config, and a set with no order) resolves
+/// the same way every time.
+///
+/// **Go falls back to Rust.** Go is compiled, so "run the author's own runtime
+/// out of process" would mean invoking a Go toolchain and linking generated
+/// packages — materially more than the line-oriented host loop the interpreted
+/// languages need, and not what `[toolchain]`'s location-and-version shape
+/// describes.
+pub fn language_for(internal_targets: &[String]) -> EscapeLanguage {
+    let has = |t: &str| internal_targets.iter().any(|x| x == t);
+    if has("typescript") || has("napi") {
+        EscapeLanguage::TypeScript
+    } else if has("pyo3") || has("python-sdk") {
+        EscapeLanguage::Python
+    } else {
+        EscapeLanguage::Rust
+    }
+}
+
+/// Write the authored-transform scaffold for a migration, returning its path
+/// and the checksum of **what ForgeDB wrote**.
+///
+/// The checksum is captured here, once, and stored in the record — never
+/// recomputed at build time. A scaffold regenerated at build reads as
+/// equivalent and is not: any improvement to the scaffold text would then make
+/// every previously-authored file compare unequal to a scaffold that was never
+/// written, and an author whose file happened to match the *new* scaffold would
+/// be refused for no reason.
+///
+/// An existing file is **never clobbered** — an authored body is authoritative.
+/// The checksum returned is of the scaffold text either way, INCLUDING when the
+/// file was already there and the scaffold was therefore not written. That is
+/// the meaning the build-time comparison wants: "are these bytes still the ones
+/// ForgeDB would have handed you?". Returning the hash of the *existing* file
+/// instead would make every pre-authored transform compare equal to its own
+/// recorded hash and be refused as unedited.
+pub fn write_scaffold(
+    migrations_dir: &Path,
+    migration_id: &str,
+    lang: EscapeLanguage,
+    changes: &[SchemaChange],
+    dest_schema: &forgedb_parser::Schema,
+) -> Result<(PathBuf, String)> {
+    let dir = forgedb_migrations::migration_body_dir(migrations_dir, migration_id);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| CliError::Migration(format!("could not create {}: {e}", dir.display())))?;
+    let path = dir.join(lang.transform_file());
+    let body = scaffold(lang, changes, dest_schema);
+
+    if !path.exists() {
+        std::fs::write(&path, &body).map_err(|e| {
+            CliError::Migration(format!("could not write {}: {e}", path.display()))
+        })?;
+    }
+    Ok((path, checksum::compute(body.as_bytes())))
+}
+
+/// Every model this migration has authored residue for, with the residue's
+/// descriptions.
+fn residue_by_model(changes: &[SchemaChange]) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut by_model: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for c in changes {
+        if c.hop_body_class() != HopBodyClass::Authored {
+            continue;
+        }
+        by_model
+            .entry(c.target_model().to_string())
+            .or_default()
+            .push(c.description());
+    }
+    by_model
+}
+
+/// The scaffold text.
+///
+/// It deliberately does **not** say "fill in every TODO, then this migration is
+/// ready to build". That sentence taught the `TODO` convention the build-time
+/// refusal must not use — a grep for `TODO` is satisfied by deleting a comment,
+/// and refuses a genuinely authored file that happens to contain the word.
+fn scaffold(
+    lang: EscapeLanguage,
+    changes: &[SchemaChange],
+    dest_schema: &forgedb_parser::Schema,
+) -> String {
+    match lang {
+        EscapeLanguage::Rust => rust_scaffold(changes),
+        EscapeLanguage::TypeScript => typescript_scaffold(changes, dest_schema),
+        EscapeLanguage::Python => python_scaffold(changes, dest_schema),
+    }
+}
+
+/// The shared header, in the target language's comment syntax.
+fn header(comment: &str, changes: &[SchemaChange], lang: EscapeLanguage) -> String {
+    let mut s = String::new();
+    let l = |s: &mut String, line: &str| {
+        s.push_str(comment);
+        if !line.is_empty() {
+            s.push(' ');
+            s.push_str(line);
+        }
+        s.push('\n');
+    };
+    l(&mut s, "Authored transform for this migration.");
+    l(&mut s, "");
+    l(
+        &mut s,
+        "ForgeDB could not PROVE a new-row value for the change(s) below from the",
+    );
+    l(&mut s, "schema diff alone, so you are writing it. This function is called for");
+    l(&mut s, "EVERY row of EVERY model in this hop, AFTER the automatic (additive /");
+    l(&mut s, "rename / drop) field ops have been applied. Return the row reshaped");
+    l(&mut s, "into the NEXT version; a model you do not need to touch, return as-is.");
+    l(&mut s, "");
+    for (model, residue) in residue_by_model(changes) {
+        l(&mut s, &format!("{model}:"));
+        for r in residue {
+            l(&mut s, &format!("  - {r}"));
+        }
+    }
+    if !matches!(lang, EscapeLanguage::Rust) {
+        l(&mut s, "");
+        l(
+            &mut s,
+            "This file is YOURS — ForgeDB never rewrites it. The v*.ts / v*.py type",
+        );
+        l(&mut s, "modules beside it are ForgeDB's and are regenerated every time.");
+    }
+    s
+}
+
+fn rust_scaffold(changes: &[SchemaChange]) -> String {
+    let mut s = header("//", changes, EscapeLanguage::Rust);
+    s.push('\n');
+    s.push_str(
+        "pub fn authored_transform(model: &str, mut row: serde_json::Value) -> serde_json::Value {\n",
+    );
+    s.push_str("    match model {\n");
+    for (model, _) in residue_by_model(changes) {
+        s.push_str(&format!("        {model:?} => {{\n"));
+        s.push_str("            // e.g. re-encode a changed field:\n");
+        s.push_str(
+            "            // if let Some(v) = row.get(\"<field>\").and_then(|x| x.as_u64()) {\n\
+             \x20           //     row[\"<field>\"] = serde_json::Value::String(v.to_string());\n\
+             \x20           // }\n",
+        );
+        s.push_str("            row\n        }\n");
+    }
+    s.push_str("        _ => row,\n    }\n}\n");
+    s
+}
+
+fn typescript_scaffold(changes: &[SchemaChange], _dest: &forgedb_parser::Schema) -> String {
+    let mut s = header("//", changes, EscapeLanguage::TypeScript);
+    s.push('\n');
+    s.push_str("import { runTransform, type Row } from \"./host\";\n\n");
+    s.push_str("export function transform(model: string, row: Row): Row {\n");
+    s.push_str("  switch (model) {\n");
+    for (model, _) in residue_by_model(changes) {
+        s.push_str(&format!("    case {model:?}:\n"));
+        s.push_str("      // e.g. re-encode a changed field:\n");
+        s.push_str("      // return { ...row, views: String(row.views) };\n");
+        s.push_str("      return row;\n");
+    }
+    s.push_str("    default:\n      return row;\n  }\n}\n\n");
+    s.push_str("// The host loop. ForgeDB spawns this file and speaks one JSON object per\n");
+    s.push_str("// line on stdin/stdout; you never edit below this line.\n");
+    s.push_str("runTransform(transform);\n");
+    s
+}
+
+fn python_scaffold(changes: &[SchemaChange], _dest: &forgedb_parser::Schema) -> String {
+    let mut s = header("#", changes, EscapeLanguage::Python);
+    s.push('\n');
+    s.push_str("from host import run_transform, Row\n\n\n");
+    s.push_str("def transform(model: str, row: Row) -> Row:\n");
+    for (model, _) in residue_by_model(changes) {
+        s.push_str(&format!("    if model == {model:?}:\n"));
+        s.push_str("        # e.g. re-encode a changed field:\n");
+        s.push_str("        # return {**row, \"views\": str(row[\"views\"])}\n");
+        s.push_str("        return row\n");
+    }
+    s.push_str("    return row\n\n\n");
+    s.push_str("# The host loop. ForgeDB spawns this file and speaks one JSON object per\n");
+    s.push_str("# line on stdin/stdout; you never edit below this line.\n");
+    s.push_str("if __name__ == \"__main__\":\n    run_transform(transform)\n");
+    s
+}

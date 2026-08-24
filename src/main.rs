@@ -270,9 +270,23 @@ enum MigrateCommands {
         /// Description of the migration
         description: String,
 
-        /// Auto-detect schema changes
-        #[arg(short, long)]
+        /// TOMBSTONE for the removed `--auto` (#374).
+        ///
+        /// Detecting schema changes is what this command DOES, so there is no
+        /// flag for it. It still parses so that passing it is an error naming
+        /// that fact, rather than clap's "unexpected argument" — six examples
+        /// in `docs/MIGRATIONS.md` and any runbook written against 0.4 pass it.
+        #[arg(short, long, hide = true)]
         auto: bool,
+
+        /// Opt out of the interactive PROMPT, not of detection (#374).
+        ///
+        /// Detection still runs and the diff is identical. What this decides is
+        /// whether a change ForgeDB cannot prove a value for stops the run with
+        /// a hard error naming it, or asks you a question. A session with no
+        /// terminal behaves as if this were passed.
+        #[arg(long)]
+        no_auto: bool,
 
         /// The app this migration belongs to (REQUIRED — #335 §9).
         ///
@@ -905,11 +919,13 @@ fn run(cli: Cli) -> Result<()> {
             MigrateCommands::Create {
                 description,
                 auto,
+                no_auto,
                 schema,
             } => commands::migrate::create(commands::migrate::MigrateCreateOptions {
                 app: migrate_app(schema, explicit_config),
                 description,
-                auto,
+                removed_auto: auto,
+                no_auto,
             }),
             MigrateCommands::Status { schema } => {
                 commands::migrate::status(commands::migrate::MigrateStatusOptions {

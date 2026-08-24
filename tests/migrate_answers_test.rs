@@ -64,10 +64,8 @@ fn fixture(dir: &Path, baseline: &str) {
 /// Run `migrate create <description>` with extra args.
 fn create(dir: &Path, description: &str, extra: &[&str]) -> std::process::Output {
     let mut cmd = forgedb(dir);
-    // `--auto` is passed here only until #374 step 8 makes detection the
-    // default and turns the flag into a refusing tombstone.
     cmd.args([
-        "migrate", "create", description, "--auto", "--schema", "schema.forge",
+        "migrate", "create", description, "--schema", "schema.forge",
     ]);
     cmd.args(extra);
     cmd.output().expect("run migrate create")
@@ -338,16 +336,18 @@ fn test_scenario_11_an_unanswered_hop_cannot_be_built() {
     let dir = temp.path();
     fixture(dir, "Post {\n  id: +uuid\n  title: string\n}\n");
 
-    // A required add with no default: unprovable, and nothing has answered it.
+    // The add is recorded PROVABLE (the schema defaults it), so `create`
+    // succeeds — and is then hand-stripped, which is what a record looks like
+    // when a change was recorded and its answer removed. `create` will not
+    // write an unanswered record itself, which is the whole point of step 8;
+    // this test is about `build` refusing one that exists.
     fs::write(
         dir.join("schema.forge"),
-        "Post {\n  id: +uuid\n  title: string\n  slug: string\n}\n",
+        "Post {\n  id: +uuid\n  title: string\n  slug: string @default(\"untitled\")\n}\n",
     )
     .unwrap();
     let out = create(dir, "add slug", &[]);
     assert!(out.status.success(), "create failed:\n{}", combined(&out));
-
-    // Strip the answer, if create recorded one, so this test is about `build`.
     strip_answers(dir);
 
     let out = forgedb(dir)
@@ -377,37 +377,203 @@ fn test_scenario_11_an_unanswered_hop_cannot_be_built() {
     }
 }
 
-/// Remove every `answer` from every recorded change, rewriting the checksum so
-/// the record still loads.
+/// Remove every recorded answer — the operator's `answer` **and** the schema's
+/// `default_value` — rebuilding the record so its checksum still verifies.
 ///
 /// A hand-stripped record is the fixture scenario 11 asks for: it is what a
-/// lineage looks like when a change was detected and never answered.
+/// lineage looks like when a change was recorded and its answer removed.
+///
+/// It goes through `Migration` rather than through `serde_json::Value` on
+/// purpose: a `Value` round-trip reorders the object's keys, and the checksum
+/// is computed over the serialized text, so a re-checksummed `Value` verifies
+/// against bytes forgedb would never have written.
 fn strip_answers(dir: &Path) {
+    use forgedb_migrations::{Migration, SchemaChange};
     for path in fs::read_dir(migrations_dir(dir))
         .unwrap()
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|e| e == "json"))
     {
-        let mut rec: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        let mut touched = false;
-        for change in rec["changes"].as_array_mut().unwrap() {
-            for (_, body) in change.as_object_mut().unwrap().iter_mut() {
-                if let Some(o) = body.as_object_mut() {
-                    touched |= o.remove("answer").is_some();
-                }
-            }
-        }
-        if !touched {
-            continue;
-        }
-        // Re-checksum, exactly as `Migration::calculate_checksum` does.
-        rec["checksum"] = serde_json::Value::String(String::new());
-        let body = serde_json::to_string(&rec).unwrap();
-        rec["checksum"] = serde_json::Value::String(forgedb_migrations::checksum::compute(
-            body.as_bytes(),
-        ));
-        fs::write(&path, serde_json::to_string(&rec).unwrap()).unwrap();
+        let m: Migration = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let changes: Vec<SchemaChange> = m
+            .changes
+            .iter()
+            .cloned()
+            .map(|c| match c {
+                SchemaChange::AddField {
+                    model_name,
+                    field_name,
+                    field_type,
+                    nullable,
+                    ..
+                } => SchemaChange::AddField {
+                    model_name,
+                    field_name,
+                    field_type,
+                    nullable,
+                    default_json: None,
+                    answer: None,
+                },
+                other => other,
+            })
+            .collect();
+        let rebuilt = Migration::with_id(
+            m.id.clone(),
+            m.description.clone(),
+            changes,
+            m.from_version,
+            m.to_version,
+        );
+        assert!(rebuilt.verify_checksum());
+        fs::write(&path, serde_json::to_string_pretty(&rebuilt).unwrap()).unwrap();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Scenarios 6, 7, 9 — the non-interactive contract, driven through the binary
+// ---------------------------------------------------------------------------
+
+/// Non-interactive runs fail at the **FIRST** unprovable change, name it, and
+/// write nothing.
+///
+/// Three assertions, and the second and third are the load-bearing ones.
+///
+/// * *Names the first.* `Post.slug` specifically, not "2 changes need answers".
+/// * *Does not mention the second.* A CI run gets one specific failure, not a
+///   batch that reads as ten problems when it is one schema edit.
+/// * *Writes nothing.* A refused create that still recorded the migration would
+///   leave a lineage whose hop can never be built, and the operator would find
+///   out at `migrate build`.
+#[test]
+fn test_scenario_6_non_interactive_fails_at_the_first_unprovable_change() {
+    let temp = TempDir::new().unwrap();
+    let dir = temp.path();
+    fixture(dir, "Post {\n  id: +uuid\n  title: string\n  views: u32\n}\n");
+
+    // A required add AND a type change. `slug` sorts before `views`, so the
+    // differ reports it first.
+    fs::write(
+        dir.join("schema.forge"),
+        "Post {\n  id: +uuid\n  title: string\n  views: string\n  slug: string\n}\n",
+    )
+    .unwrap();
+    let out = create(dir, "two problems", &[]);
+    let log = combined(&out);
+
+    assert!(!out.status.success(), "must refuse:\n{log}");
+    assert!(
+        log.contains("Post.slug"),
+        "the refusal must name the first change specifically:\n{log}"
+    );
+    assert!(
+        !log.contains("Post.views —") && !log.contains("cannot derive how to re-encode"),
+        "only the FIRST change is reported; a batch reads as many problems when it \
+         is one schema edit:\n{log}"
+    );
+    assert!(
+        records(dir).is_empty(),
+        "a refused create must write NO migration record"
+    );
+    assert!(
+        !dir.join("migrations/schemas/v2.forge").exists(),
+        "a refused create must write no versioned schema either"
+    );
+}
+
+/// `--no-auto` suppresses the prompt, **not** detection.
+///
+/// A purely provable edit produces byte-identical `changes` with and without
+/// it, and both succeed. The flag decides whether an unprovable change stops the
+/// run or asks a question — nothing else.
+#[test]
+fn test_scenario_7_no_auto_suppresses_the_prompt_not_detection() {
+    let mut recorded = Vec::new();
+    for extra in [vec![], vec!["--no-auto"]] {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+        fixture(dir, "Post {\n  id: +uuid\n  title: string\n}\n");
+        fs::write(
+            dir.join("schema.forge"),
+            "Post {\n  id: +uuid\n  title: string\n  summary: string?\n}\n",
+        )
+        .unwrap();
+        let out = create(dir, "add summary", &extra);
+        assert!(
+            out.status.success(),
+            "a provable edit must succeed with {extra:?}:\n{}",
+            combined(&out)
+        );
+        recorded.push(only_record(dir)["changes"].clone());
+    }
+    assert_eq!(
+        recorded[0], recorded[1],
+        "`--no-auto` must not change the DIFF, only whether an unprovable change \
+         stops the run"
+    );
+}
+
+/// There is no way to create a migration ForgeDB did not detect.
+///
+/// The `--auto`-less branch used to write an empty record with `changes: []`
+/// and tell the operator to edit it by hand — which is exactly the Rust-authoring
+/// default #374 removes, and which lets a record disagree with
+/// `migrations/schemas/vN.forge`.
+#[test]
+fn test_scenario_9_an_unchanged_schema_writes_no_record() {
+    let temp = TempDir::new().unwrap();
+    let dir = temp.path();
+    fixture(dir, "Post {\n  id: +uuid\n  title: string\n}\n");
+
+    for extra in [vec![], vec!["--no-auto"]] {
+        let out = create(dir, "nothing changed", &extra);
+        assert!(out.status.success(), "{}", combined(&out));
+        assert!(
+            combined(&out).contains("No schema changes"),
+            "{}",
+            combined(&out)
+        );
+        assert!(
+            records(dir).is_empty(),
+            "an unchanged schema must write NO record — least of all one with an \
+             empty `changes` array"
+        );
+    }
+}
+
+/// A `@default` in the schema answers the question, so nothing is asked and the
+/// required add is provable.
+///
+/// This is direction B's arithmetic showing up at the CLI: the same edit that
+/// refuses in scenario 6 succeeds here, non-interactively, because the answer
+/// is written down in the `.forge`.
+#[test]
+fn test_a_schema_default_answers_the_question_before_it_is_asked() {
+    let temp = TempDir::new().unwrap();
+    let dir = temp.path();
+    fixture(dir, "Post {\n  id: +uuid\n  title: string\n}\n");
+    fs::write(
+        dir.join("schema.forge"),
+        "Post {\n  id: +uuid\n  title: string\n  slug: string @default(\"untitled\")\n}\n",
+    )
+    .unwrap();
+    let out = create(dir, "add slug", &[]);
+    assert!(
+        out.status.success(),
+        "a defaulted required add is provable:\n{}",
+        combined(&out)
+    );
+    let rec = only_record(dir);
+    let add = &rec["changes"][0]["AddField"];
+    assert_eq!(
+        add["default_value"],
+        serde_json::json!("\"untitled\""),
+        "the resolved default is recorded as the JSON literal both routes write: {rec:#}"
+    );
+    assert!(
+        add.get("answer").is_none(),
+        "a schema default is not an operator answer; recording both would be two \
+         carriers for one value: {rec:#}"
+    );
+    assert_eq!(rec["record_version"], 1);
 }
