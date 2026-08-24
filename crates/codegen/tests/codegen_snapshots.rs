@@ -4438,6 +4438,11 @@ const SYM: &str = "blog_3f2a1b4c5d6e7f80_";
 /// two schemas in one project produce.
 const SYM_B: &str = "blog_00112233445566ff_";
 
+/// A stand-in source fingerprint (#337). A FIXED literal, never a computed one:
+/// these are snapshot tests, and a value derived from the schema under test
+/// would change every snapshot whenever any generator's output changed.
+const FP: &str = "0123456789abcdef";
+
 /// The app `core` package name a wrapper manifest renames to `forgedb_core`.
 const CORE_PKG: &str = "blog-3f2a1b4c5d6e7f80-core";
 
@@ -7203,7 +7208,7 @@ fn test_go_generation_binding() {
     // reference the generated per-model C symbols by name; rows/ids cross cgo as
     // opaque JSON. No generic query builder, no `switch model` (the red line).
     let schema = go_binding_schema();
-    let code = GoGenerator::generate(&schema, SYM).unwrap().code;
+    let code = GoGenerator::generate(&schema, SYM, FP).unwrap().code;
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
     // Package + cgo boundary + the schema-invariant lifecycle spine.
@@ -7361,12 +7366,12 @@ fn test_go_calls_match_ffi_symbols() {
     let schema = go_binding_schema();
     // Concatenate every generated Go file so the guard also covers the arrow +
     // async-bridge C calls, not just the main package file.
-    let mut go_code = GoGenerator::generate(&schema, SYM).unwrap().code;
+    let mut go_code = GoGenerator::generate(&schema, SYM, FP).unwrap().code;
     go_code.push_str(&GoGenerator::generate_async_bridge(SYM).code);
     if let Some(arrow) = GoGenerator::generate_arrow(&schema, SYM) {
         go_code.push_str(&arrow.code);
     }
-    let header = GoGenerator::generate_header(&schema, SYM).unwrap().code;
+    let header = FfiGenerator::generate_header(&schema, SYM, FP).unwrap().code;
     let ffi_flat: String = FfiGenerator::generate(&schema, SYM)
         .unwrap()
         .code
@@ -7572,12 +7577,12 @@ fn test_two_apps_export_disjoint_ffi_symbols() {
     // and what its Go package //export's. Linked into one binary that union must
     // have no duplicate.
     let go_a = {
-        let mut s = GoGenerator::generate(&schema, SYM).unwrap().code;
+        let mut s = GoGenerator::generate(&schema, SYM, FP).unwrap().code;
         s.push_str(&GoGenerator::generate_async_bridge(SYM).code);
         s
     };
     let go_b = {
-        let mut s = GoGenerator::generate(&schema, SYM_B).unwrap().code;
+        let mut s = GoGenerator::generate(&schema, SYM_B, FP).unwrap().code;
         s.push_str(&GoGenerator::generate_async_bridge(SYM_B).code);
         s
     };
@@ -9308,7 +9313,7 @@ fn test_generation_string_n_is_a_string_on_every_wire() {
         ("rust-sdk", RustSdkGenerator::generate(&schema).unwrap().code),
         ("python-sdk", PythonSdkGenerator::generate(&schema).unwrap().code),
         ("go-sdk", GoSdkGenerator::generate(&schema).unwrap().code),
-        ("go", GoGenerator::generate(&schema, SYM).unwrap().code),
+        ("go", GoGenerator::generate(&schema, SYM, FP).unwrap().code),
     ] {
         assert!(
             !code.contains("StringN") && !code.contains("string_n"),
@@ -9650,7 +9655,7 @@ fn test_bindings_fk_type_equals_the_targets_own_id_type() {
 
     // Go binding: the struct field for `Comment.post` must be spelled the same
     // as `Post.id`'s own field.
-    let go = GoGenerator::generate(&schema, SYM).unwrap().code;
+    let go = GoGenerator::generate(&schema, SYM, FP).unwrap().code;
     let field_type = |decl: &str, name: &str| {
         let body = &go[go.find(decl).unwrap_or_else(|| panic!("`{decl}` in the Go binding"))..];
         body.lines()

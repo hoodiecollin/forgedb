@@ -645,6 +645,7 @@ fn report_of(rows: &[(&str, TargetKind, &str)]) -> BuildReport {
                 triple: "aarch64-apple-darwin".to_string(),
             })
             .collect(),
+        delivered: Vec::new(),
     }
 }
 
