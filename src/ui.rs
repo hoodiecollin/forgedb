@@ -26,6 +26,16 @@ fn level() -> u8 {
     LEVEL.load(Ordering::Relaxed)
 }
 
+/// Is output suppressed? (`--quiet`.)
+///
+/// Read by [`crate::prompt::askable`]: under `--quiet` a question would be a
+/// prompt nobody can see, so the interactive path is refused rather than
+/// entered. Exposed here rather than re-derived, so there is one definition of
+/// what quiet means.
+pub fn is_quiet() -> bool {
+    level() == QUIET
+}
+
 /// Print a success message with checkmark (suppressed by `--quiet`).
 pub fn success(msg: &str) {
     if level() >= NORMAL {
