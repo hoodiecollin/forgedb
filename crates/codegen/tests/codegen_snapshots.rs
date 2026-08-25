@@ -6174,52 +6174,86 @@ Post {
     // #170 group commit: staged rows use the BUFFERED (no-fsync) WAL append, so a
     // transaction pays ONE barrier (the commit's `wal.flush()`) instead of one per
     // staged row. The committed insert/update/delete path keeps the per-op `write`.
-    let stage_body = &code[code.find("fn __stage_append").unwrap()..];
-    let stage_body = &stage_body[..stage_body.find("row_index\n").unwrap_or(stage_body.len().min(1500))];
-    assert!(
-        stage_body.contains(".write_buffered("),
-        "#170: __stage_append uses the buffered (no-fsync) WAL append"
-    );
-    assert!(
-        !stage_body.contains(".write(&forgedb_wal::WalEntry"),
-        "#170: __stage_append does NOT per-record fsync (no plain wal.write)"
-    );
-    // The committed single-write path keeps the durable per-op fsync.
+    // #424, remaining two thirds. #427 fixed one of the three halves of this guard and
+    // the other two shipped unfixed, in a CLOSED issue that reads as complete — which is
+    // the exact state #424 was filed to describe, one level down.
     //
-    // The window is BOUNDED to `insert`'s own body, and both ends are FATAL on a miss.
-    // It used to read `&code[code.find("pub fn insert(").unwrap_or(0)..]`, which was
-    // wrong twice over:
+    // What was still wrong here:
     //
-    //   * `unwrap_or(0)` meant a stale needle did not fail — it silently widened the
-    //     window to the WHOLE FILE from byte 0, leaving the assertion live but aimed at
-    //     the wrong subject.
-    //   * even when the needle matched, the window ran to EOF. Measured on this schema:
-    //     the window covered 237 KB of a 261 KB file and contained EIGHT
-    //     `.write(&forgedb_wal::WalEntry` calls, only ONE of them `insert`'s. The other
-    //     seven belong to `update`, `delete`, the second model's `insert`/`update`/
-    //     `delete`, `commit`, and a shared helper — so this assertion passed even with
-    //     `insert`'s own WAL write deleted outright. It was not guarding #170.
+    //   1. `stage_body`'s window ended at a `row_index\n` needle with
+    //      `unwrap_or(len().min(1500))`. A degrading fallback: when the terminator stops
+    //      matching the scope silently WIDENS to 1500 bytes of whatever follows rather
+    //      than failing. Same defect class as the `unwrap_or(0)` #427 removed.
+    //   2. BOTH guards resolved only the FIRST match. This schema declares `User` and
+    //      `Post`, and generated code emits one `__stage_append` and one `insert` per
+    //      MODEL — so `code.find` asserted about `UserStorage` and never looked at
+    //      `PostStorage`. A two-model test was running a one-model guard, and nothing
+    //      said so, because no substring can express "exactly one".
     //
-    // Hence `assert_eq!(…, 1)` rather than `contains`: a count pins the claim to
-    // insert's single write, and goes RED if the window ever widens to swallow a
-    // sibling method again. Superseded by AST scoping under #388; until then this is
-    // the bounded-and-fatal form.
-    let insert_at = code
-        .find("pub fn insert(")
-        .expect("#170: `pub fn insert(` must be present to scope the fsync guard");
-    let insert_body = {
-        let tail = &code[insert_at..];
-        let end = tail[1..]
-            .find("\n    pub fn ")
-            .map(|i| i + 1)
-            .expect("#170: a following `pub fn` must bound insert's body");
-        &tail[..end]
-    };
+    // `bodies_of` below is deliberately plain byte logic with NO dependency on
+    // `forgedb-source-guard`: that crate is #388, milestoned v0.6.0, and this fix has to
+    // ship in v0.5.0 without dragging a next-cycle crate into the tag. #388 replaces all
+    // of this with AST scoping, where a miss is an error by construction.
+
+    /// Every body of a method whose declaration starts with `decl`, one per model.
+    ///
+    /// Both ends are FATAL. The start must match at least once; each body is bounded by
+    /// the next `pub fn ` at method indentation, and a body with no following method is
+    /// an error rather than "the rest of the file".
+    fn bodies_of<'a>(code: &'a str, decl: &str) -> Vec<&'a str> {
+        let mut out = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = code[from..].find(decl) {
+            let start = from + rel;
+            let tail = &code[start..];
+            let end = tail[1..]
+                .find("\n    pub fn ")
+                .map(|i| i + 1)
+                .unwrap_or_else(|| {
+                    panic!("#170: no following `pub fn` bounds `{decl}` at byte {start}")
+                });
+            out.push(&tail[..end]);
+            from = start + 1;
+        }
+        assert!(!out.is_empty(), "#170: `{decl}` is not emitted at all");
+        out
+    }
+
+    // Two models in this schema, so two of each. Asserting the COUNT is what makes the
+    // per-model coverage real: without it a regression to one-model emission would just
+    // quietly shrink the loop and every assertion inside would still pass.
+    let stage_bodies = bodies_of(&code, "fn __stage_append");
     assert_eq!(
-        insert_body.matches(".write(&forgedb_wal::WalEntry").count(),
-        1,
-        "#170: committed insert still fsyncs per op — exactly one WAL write, inside          insert's own body (got:\n{insert_body})"
+        stage_bodies.len(),
+        2,
+        "#170: one __stage_append per model (User, Post)"
     );
+    for (i, stage_body) in stage_bodies.iter().enumerate() {
+        assert!(
+            stage_body.contains(".write_buffered("),
+            "#170: __stage_append #{i} uses the buffered (no-fsync) WAL append"
+        );
+        assert_eq!(
+            stage_body.matches(".write(&forgedb_wal::WalEntry").count(),
+            0,
+            "#170: __stage_append #{i} does NOT per-record fsync (no plain wal.write)"
+        );
+    }
+
+    // The committed single-write path keeps the durable per-op fsync — again, per model.
+    //
+    // A COUNT rather than `contains`: presence is satisfiable by a sibling method's write
+    // if a scope ever widens again, a count of exactly one is not. That form came from
+    // #427 and is kept.
+    let insert_bodies = bodies_of(&code, "pub fn insert(");
+    assert_eq!(insert_bodies.len(), 2, "#170: one insert per model (User, Post)");
+    for (i, insert_body) in insert_bodies.iter().enumerate() {
+        assert_eq!(
+            insert_body.matches(".write(&forgedb_wal::WalEntry").count(),
+            1,
+            "#170: insert #{i} still fsyncs per op — exactly one WAL write, inside its own body"
+        );
+    }
 }
 
 #[test]
