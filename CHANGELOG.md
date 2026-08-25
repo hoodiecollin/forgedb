@@ -6,6 +6,87 @@ commits with [git-cliff](https://git-cliff.org); do not edit it by hand — run
 `make changelog`. The format follows [Keep a Changelog](https://keepachangelog.com),
 and the project honors [Semantic Versioning](https://semver.org) per `docs/SEMVER.md`.
 
+## [0.5.0] - 2026-08-25
+
+> **Breaking release — upgrading needs action.** Required migration steps are in
+> [docs/UPGRADING.md](https://github.com/hoodiecollin/forgedb/blob/main/docs/UPGRADING.md).
+
+### Breaking changes
+
+- **config:** **breaking:** Require [generate].targets, and speak the CLI's vocabulary
+- **naming:** **breaking:** Derive every name from the schema's path, not from a hash
+- **config:** **breaking:** [project].symbol_naming, and the targets doc it owed
+- **build:** **breaking:** A cargo driver owns every compile, and refuses collisions first
+- **migrate:** **breaking:** --schema is required, and there is no fallback
+- **init:** **breaking:** Scaffold no cargo package at all
+- **build:** **breaking:** The Tauri inspector is its own workspace, not a root member
+- **codegen:** **breaking:** Floor a timestamp probe to the field quantum, like the write
+- **migrations:** **breaking:** A specified checksum, tagged with its own name
+- **generate:** **breaking:** Read the migration lineage from the schema's directory, not the CWD
+
+### Features
+
+- **cache:** The ForgeDB-owned build cache dir and its workspace root
+- **config:** Read [project], reject unknown keys, remove [generate].schema
+- **project:** Resolve which project a schema belongs to
+- **cli:** Resolve config by walking up from the schema
+- **cache:** Place each app in its project's cache workspace
+- **naming:** Derive every artifact name, so no two apps can collide
+- **cache:** Apps/<hash> becomes a container, members are derived by scanning
+- **cache:** Drop Cargo.lock when the CLI version changes (C9)
+- **codegen:** Gate the OpenAPI surface behind a GenConfig.web knob
+- **codegen:** Emit the core/ and server/ cache packages
+- **cache:** Reserve before emission, sync the root after
+- **cache:** Record the derived app name, and wire the per-kind prune
+- **codegen:** The four wrappers link core, behind a per-app symbol prefix
+- **codegen:** Range-stamp the transform and engine members
+- **dev:** Route dev through generate, so it stops emitting defaults
+- **cli:** Govern -> identify -> reserve -> emit -> sync, on every command
+- **config:** The [placement] table, and its one reader
+- **generate:** Emit the in-tree Rust package, and print the line that links it
+- **generate:** Refuse a placement inside the cache, and check it without writing
+- **project:** An askable boundary, and the vocabulary of a decision ([#367](https://github.com/hoodiecollin/forgedb/issues/367))
+- **project:** `forgedb project name` — the act a prompt is sugar over ([#367](https://github.com/hoodiecollin/forgedb/issues/367))
+- **project:** Detect a dead claim, and offer to take it over ([#367](https://github.com/hoodiecollin/forgedb/issues/367))
+- **init:** `--project-name` — a project id is not a directory name ([#367](https://github.com/hoodiecollin/forgedb/issues/367))
+- **project:** The resolution asks, and the answer persists ([#367](https://github.com/hoodiecollin/forgedb/issues/367))
+- **ask:** The terminal widget, last and smallest ([#367](https://github.com/hoodiecollin/forgedb/issues/367))
+- **fingerprint:** One FNV, and a source fingerprint that excludes itself
+- **codegen:** Both halves of the load check, and the header moves to its definitions
+- **generate:** Plan packages before writing them, and emit the consumer half
+- **build:** One delivery table, total over PackageKind
+- **migrations:** Widen the provable set, and make both classifiers exhaustive
+- **migrations:** Record the answer as data, beside the change
+- **migrate:** Refuse an unanswered hop, and lower the answer into the ops
+- **cli:** The askability boundary and two prompt widgets
+- **migrate:** Create detects by default, and asks what it cannot prove
+- **migrations:** A rename is proposed, never assumed
+- **config:** [toolchain] — where the interpreters ForgeDB links to live
+- **codegen:** Escape to the author's own runtime, over baked NDJSON
+
+### Bug Fixes
+
+- **cli:** Build honors --config for the [runtime]/[storage] knobs
+- **tests:** Stop config_flag_test doing a real release build ([#380](https://github.com/hoodiecollin/forgedb/issues/380))
+- **tests:** Stop scenario_15 doing a real release build ([#380](https://github.com/hoodiecollin/forgedb/issues/380))
+- **tests:** Resolve scenario_3's staticlibs through cargo, not a hash substring ([#386](https://github.com/hoodiecollin/forgedb/issues/386))
+- **tests:** Parse `ldd` as `ldd`, not as `otool -L`
+- **codegen:** Make GenConfig::needs_utoipa the one utoipa condition
+- **generate:** Render core/Cargo.toml from the config that generated core
+- **migrations:** Classify an enum/struct definition change positionally
+- **migrations:** Let the differ see enum and struct definitions
+- **migrate:** Project enums, structs and their transitive deps into the diff
+- **ask:** Restore two mangled prompt strings, and assert the rendering ([#367](https://github.com/hoodiecollin/forgedb/issues/367))
+- **tests:** Bound the #170 insert-fsync guard to insert's own body
+- **migrate:** Decompose nullability out of the diffed type
+- **codegen:** Honour @default on BOTH routes, from one definition
+- **migrate:** A hop answered in the record needs no transform.rs
+- **codegen:** An optional FK is nullable once, not twice
+- **generate:** Running `generate` a second time is not an error
+- **ui:** A quiet stdout carries the payload and nothing else
+- **codegen:** Index.d.ts declares every method the addon exports
+- **tests:** The #170 fsync guard checked one model and still degraded on a miss
+- **codegen:** A snapshot read returns rows in ascending physical row order
 ## [0.4.1] - 2026-08-13
 
 ### Bug Fixes
