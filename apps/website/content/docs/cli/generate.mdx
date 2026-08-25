@@ -56,7 +56,7 @@ implemented and errors explicitly. The old flat verbs `generate typescript` /
 | `--check` | bool (false) | Verify nothing needs regeneration (CI mode); do not write. |
 | `-o`, `--output <DIR>` | string (`[generate].output`, else `generated`) | Output directory. The flag is used verbatim; the other two resolve against **the schema's** directory. |
 | `-s`, `--schema <PATH>` | string (auto-discover) | Schema file path. Auto-discovery looks for `schema.forge`, `schema.lang`, `schema.forgedb`. **No config names the schema** — the config that applies is found by walking up from it. |
-| `-f`, `--force` | bool (false) | Regenerate even if up-to-date; overwrite existing output. |
+| `-f`, `--force` | bool (false) | **Accepted and ignored.** Regeneration always overwrites what ForgeDB authored; there is nothing left to force. Kept because scripts and Dockerfiles pass it. |
 | `--from <N>` | u32 | Origin format version — `transform` target only. |
 | `--to <N>` | u32 | Destination format version — `transform` target only. |
 

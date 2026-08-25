@@ -244,57 +244,44 @@ fn test_validate_command_passes_valid_schema() {
     );
 }
 
-/// C1: `forgedb build` must be idempotent — a second consecutive run must not
-/// fail with "File exists" on already-generated output files.
+/// C1: a second consecutive `generate` must not fail with "File exists".
 ///
-/// The `build` command internally calls `generate all` with `force: true` so
-/// that generated artifacts are always overwritten rather than erroring on an
-/// existing file.  We verify this by testing the generate layer directly:
+/// This test used to assert the OPPOSITE for the bare command, and the comment
+/// it carried is the reason the bug survived: C1 fixed `build` by having it
+/// pass `force: true` internally, and then pinned the unfixed `generate` here
+/// as "baseline for why the bug existed". A defect asserted by a passing test
+/// stops reading as a defect. `forgedb generate` — the command the scaffolded
+/// README, `migrate create`'s printed next steps and `generate --check`'s own
+/// remedy line all tell you to run — exited 1 on every run after the first,
+/// with a green suite.
 ///
-/// - `generate all` without `--force` fails on a second run (baseline for why
-///   the bug existed).
-/// - `generate all --force` succeeds on a second run (proof of the fix, which
-///   is exactly what `build` now does internally).
-///
-/// We cannot run `forgedb build` end-to-end in a hermetic temp dir because
-/// `build` also invokes `cargo build` as a subprocess, which requires a full
-/// Rust workspace — that is separate infrastructure from the C1 fix.
+/// So the third leg is inverted rather than deleted: the run WITHOUT `--force`
+/// is now the one that must succeed, and `--force` is checked only for still
+/// being accepted. `tests/cli_loop_test.rs` carries the rest, including the
+/// case this shape cannot see — a `generate` that skips silently instead of
+/// refusing loudly also passes every assertion below.
 #[test]
-fn test_generate_all_is_idempotent_with_force() {
+fn test_generate_all_is_idempotent() {
     let temp_dir = setup_test_dir();
     create_test_schema(temp_dir.path());
 
-    // First run — succeeds unconditionally.
-    let first = forgedb_cmd(temp_dir.path())
-        .args(["generate", "all", "--output", "generated", "--force"])
-        .output()
-        .expect("Failed to run forgedb generate all (first run)");
-    assert!(
-        first.status.success(),
-        "First generate all --force should succeed: {}",
-        String::from_utf8_lossy(&first.stderr)
-    );
+    let run = |args: &[&str], what: &str| {
+        let out = forgedb_cmd(temp_dir.path())
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run forgedb {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "{what} should succeed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
 
-    // Second run with --force — must also succeed (files already exist).
-    // This is what `forgedb build` now does internally (force: true).
-    let second = forgedb_cmd(temp_dir.path())
-        .args(["generate", "all", "--output", "generated", "--force"])
-        .output()
-        .expect("Failed to run forgedb generate all (second run)");
-    assert!(
-        second.status.success(),
-        "Second generate all --force should succeed (idempotency — C1 fix): {}",
-        String::from_utf8_lossy(&second.stderr)
-    );
-
-    // Confirm the failure mode: without --force the second run must fail.
-    let third_no_force = forgedb_cmd(temp_dir.path())
-        .args(["generate", "all", "--output", "generated"])
-        .output()
-        .expect("Failed to run forgedb generate all (no-force third run)");
-    assert!(
-        !third_no_force.status.success(),
-        "generate all without --force should fail when files already exist"
+    run(&["generate", "all", "--output", "generated"], "first generate all");
+    run(&["generate", "all", "--output", "generated"], "second generate all");
+    run(
+        &["generate", "all", "--output", "generated", "--force"],
+        "generate all --force (still accepted)",
     );
 }
 

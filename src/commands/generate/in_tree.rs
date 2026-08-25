@@ -46,13 +46,12 @@
 //! So the emitted package is checked in, like every other generated text
 //! artifact under the epic's rule.
 //!
-//! # `fs::write`, never `write_file`
+//! # Rewritten in full, every run
 //!
-//! `write_file` refuses an existing file without `--force`, so routing this
-//! through it would make the second `generate` fail — and, worse, would make a
-//! stale substrate pin survivable. This package is **ForgeDB's file**: its
-//! header says so, and rewriting it in full on every generate is exactly what
-//! keeps #290's floor problem out of user property.
+//! This package is **ForgeDB's file**: its header says so, and rewriting it in
+//! full on every generate is exactly what keeps #290's floor problem out of
+//! user property. Anything that let a copy freeze at whatever the first run
+//! wrote would make a stale substrate pin survivable.
 
 use std::path::{Path, PathBuf};
 

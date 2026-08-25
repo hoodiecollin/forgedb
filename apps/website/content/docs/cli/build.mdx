@@ -4,8 +4,8 @@ description: "Validate, regenerate, and compile the generated code in ForgeDB's 
 purpose: "reference"
 ---
 Produce production artifacts end to end: validate the schema, regenerate the code (baking
-the `[runtime]`/`[storage]` config from `forgedb.toml` into it), then compile. `build`
-always regenerates with force, so a repeated build never fails on existing files.
+the `[runtime]`/`[storage]` config from `forgedb.toml` into it), then compile. Regeneration
+overwrites what ForgeDB wrote last time, so a repeated build never fails on existing files.
 
 **Compilation happens in ForgeDB's build cache, not in your project.** Your project
 contains no `Cargo.toml`; `~/.forgedb/projects/<project>/` is a ForgeDB-owned cargo

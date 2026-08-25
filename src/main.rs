@@ -111,7 +111,8 @@ enum Commands {
         #[arg(short, long)]
         schema: Option<String>,
 
-        /// Force regeneration even if up-to-date
+        /// Accepted and ignored — regeneration always overwrites what ForgeDB
+        /// authored. Kept because scripts and Dockerfiles pass it.
         #[arg(short, long)]
         force: bool,
 
