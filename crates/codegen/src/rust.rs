@@ -1775,15 +1775,30 @@ impl RustGenerator {
                 /// #159: resolve each id via its version list (O(distinct_ids × log v))
                 /// instead of two O(watermark) passes; a tombstoned newest is filtered
                 /// by `read_at`.
+                ///
+                /// #457: rows come back in **ascending physical row order**, which for
+                /// an append-only store is insertion order — the same order the live
+                /// list endpoint returns, and the same order the no-id `all_at` below
+                /// gets for free from `0..watermark`.  The sort is what makes
+                /// `?as_of=` pageable: `id_versions` is a `HashMap`, its iteration
+                /// order is seeded per process, and without this the row order of a
+                /// snapshot read is a different random permutation in every process.
+                /// Paging then silently skips and repeats rows across a restart or a
+                /// second replica while each page is individually well-formed.
                 pub fn all_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<#model_name> {
                     let watermark = snap.watermark();
-                    let mut records = Vec::new();
+                    let mut rows = Vec::new();
                     for versions in self.id_versions.values() {
                         let pos = versions.partition_point(|&r| r < watermark);
                         if pos == 0 {
                             continue; // id not yet present as of `snap`
                         }
-                        if let Some(record) = self.read_at(versions[pos - 1]) {
+                        rows.push(versions[pos - 1]);
+                    }
+                    rows.sort_unstable();
+                    let mut records = Vec::new();
+                    for row in rows {
+                        if let Some(record) = self.read_at(row) {
                             records.push(record);
                         }
                     }
@@ -9393,6 +9408,10 @@ impl RustGenerator {
                         }
                         rows.push(versions[pos - 1]);
                     }
+                    // #457: ascending physical row order, matching the model-level
+                    // `all_at` and the `0..watermark` the no-id branch below returns.
+                    // `id_versions` iterates in a per-process-seeded order.
+                    rows.sort_unstable();
                     rows
                 }
             },

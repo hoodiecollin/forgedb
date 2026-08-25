@@ -77,6 +77,13 @@ The `?as_of` branch swaps only the row source — it routes through the same gen
 filter/sort/paginate body as a live list, so there is no parallel point-in-time handler to
 drift out of sync with the live one.
 
+The row source it swaps in returns rows in **ascending physical row order**, the same order
+the live list uses, so an unsorted snapshot page is ordered and pageable rather than
+arbitrary. This is what makes `?as_of=` safe to combine with `offset`/`limit`: the order has
+to be identical in every process, or two pages of one snapshot come from two different
+permutations and the client silently skips some rows and repeats others while every page
+still looks well-formed (#457).
+
 `/snapshot` is the read-side peer of `/metrics` in the unauthenticated ops routes: opaque
 `usize` watermarks over a fixed per-schema key set. It reports models only; junctions are
 deferred.
