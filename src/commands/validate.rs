@@ -64,9 +64,9 @@ pub fn run(options: ValidateOptions) -> Result<()> {
     let diag = if parsed.diagnostics.is_empty() {
         crate::diagnostics::Report::default()
     } else {
-        println!();
+        ui::blank();
         let counts = crate::diagnostics::report(&parsed.diagnostics);
-        println!();
+        ui::blank();
         counts
     };
 
@@ -93,11 +93,11 @@ pub fn run(options: ValidateOptions) -> Result<()> {
         })
         .sum();
 
-    println!();
+    ui::blank();
     ui::info(&format!("  {} models", model_count));
     ui::info(&format!("  {} fields", field_count));
     ui::info(&format!("  {} relations", relation_count));
-    println!();
+    ui::blank();
 
     // If schema-only mode, we're done
     if options.schema_only {
@@ -204,14 +204,14 @@ pub fn run(options: ValidateOptions) -> Result<()> {
 
     // Report errors and warnings
     if !errors.is_empty() {
-        println!();
+        ui::blank();
         for error in &errors {
             ui::error(error);
         }
     }
 
     if !warnings.is_empty() {
-        println!();
+        ui::blank();
         for warning in &warnings {
             ui::warning(warning);
         }
@@ -223,7 +223,7 @@ pub fn run(options: ValidateOptions) -> Result<()> {
     // plain `validate` is advisory and always exits 0. Keep the message honest so
     // it never says "failed" while the process exits successfully.
     if !errors.is_empty() {
-        println!();
+        ui::blank();
         if options.strict {
             ui::error(&format!("Validation failed with {} error(s)", errors.len()));
             return Err(CliError::SchemaValidation(

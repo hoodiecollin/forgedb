@@ -73,11 +73,11 @@ pub fn run_with(options: InitOptions, asker: &dyn Asker) -> Result<()> {
     create_deploy_files(&options)?;
 
     ui::success("Done! Run the following to get started:");
-    println!();
-    println!("  cd {}", options.project_name);
-    println!("  forgedb generate");
-    println!("  forgedb build");
-    println!();
+    ui::blank();
+    ui::line(&format!("  cd {}", options.project_name));
+    ui::line("  forgedb generate");
+    ui::line("  forgedb build");
+    ui::blank();
     ui::info(
         "This project contains no Cargo.toml on purpose (#335): ForgeDB compiles the \
          generated Rust in its own build cache. `forgedb build` prints where the \

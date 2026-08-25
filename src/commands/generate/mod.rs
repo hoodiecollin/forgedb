@@ -51,6 +51,10 @@ pub struct GenerateOptions {
     /// Generate-time runtime-behavior config (epic #126) resolved from the
     /// `[runtime]`/`[storage]` tables, baked into the emitted `database.rs`.
     pub gen_config: forgedb_codegen::GenConfig,
+    /// Accepted and ignored (see [`write_file`]). Regeneration always
+    /// overwrites what ForgeDB authored, so there is nothing left to force —
+    /// but the Makefile, the reclose harness and an unknown number of user
+    /// Dockerfiles pass it, and breaking those to delete a bool is not a trade.
     pub force: bool,
     /// Origin format version for the `transform` target (#74 Phase 3).
     pub from: Option<u32>,
@@ -141,7 +145,6 @@ struct Emit<'a> {
     /// Where `output`-placed artifacts go. In `--check` mode this is a scratch
     /// directory, never the committed one.
     output: &'a Path,
-    force: bool,
     schema_version: u32,
     gen_config: forgedb_codegen::GenConfig,
     naming: &'a AppNaming,
@@ -378,9 +381,6 @@ pub fn run(options: GenerateOptions) -> Result<()> {
     } else {
         committed_path.clone()
     };
-    // A stale scratch dir must never block a write, so check mode always forces.
-    let force = options.force || options.check;
-
     // #338 C1/C8: a placement inside the build cache is refused BEFORE anything
     // is written — before the output directory is created, before the mirror.
     // A refusal that fires after the mirror lands has already done the damage it
@@ -417,7 +417,6 @@ pub fn run(options: GenerateOptions) -> Result<()> {
     let ctx = Emit {
         schema: &schema,
         output: &output_path,
-        force,
         schema_version,
         gen_config: options.gen_config,
         naming: &naming,
@@ -444,7 +443,7 @@ pub fn run(options: GenerateOptions) -> Result<()> {
             let result = TypeScriptGenerator::generate(&schema)
                 .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
             let path = output_path.join("types.ts");
-            write_file(&path, &result.code, force)?;
+            write_file(&path, &result.code)?;
             generated_files.push((path, result));
             write_ts_package_scaffold(&output_path)?;
         }
@@ -455,7 +454,7 @@ pub fn run(options: GenerateOptions) -> Result<()> {
             let result = OpenApiGenerator::generate(&schema)
                 .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
             let path = output_path.join("openapi.json");
-            write_file(&path, &result.code, force)?;
+            write_file(&path, &result.code)?;
             generated_files.push((path, result));
         }
         "stubs" => {
@@ -464,7 +463,7 @@ pub fn run(options: GenerateOptions) -> Result<()> {
             let stubs_dir = output_path.join("stubs");
             fs::create_dir_all(&stubs_dir)?;
             let path = stubs_dir.join("README.md");
-            write_file(&path, &result.code, force)?;
+            write_file(&path, &result.code)?;
             generated_files.push((path, result));
         }
         "wasm" => {
@@ -566,14 +565,14 @@ pub fn run(options: GenerateOptions) -> Result<()> {
             return Ok(());
         }
 
-        println!();
+        ui::blank();
         for path in &missing {
             ui::error(&format!("  missing: {}", path.display()));
         }
         for path in &stale {
             ui::error(&format!("  stale:   {}", path.display()));
         }
-        println!();
+        ui::blank();
         ui::error(&format!(
             "Generated code is out of date ({} missing, {} stale) — run `forgedb generate` to update.",
             missing.len(),
@@ -660,7 +659,7 @@ fn generate_all(
         let ts_result = TypeScriptGenerator::generate(ctx.schema)
             .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
         let ts_path = ctx.output.join("types.ts");
-        write_file(&ts_path, &ts_result.code, ctx.force)?;
+        write_file(&ts_path, &ts_result.code)?;
         files.push((ts_path, ts_result));
         write_ts_package_scaffold(ctx.output)?;
     }
@@ -675,7 +674,7 @@ fn generate_all(
         let openapi_result = OpenApiGenerator::generate(ctx.schema)
             .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
         let openapi_path = ctx.output.join("openapi.json");
-        write_file(&openapi_path, &openapi_result.code, ctx.force)?;
+        write_file(&openapi_path, &openapi_result.code)?;
         files.push((openapi_path, openapi_result));
     }
 
@@ -686,7 +685,7 @@ fn generate_all(
         let stubs_dir = ctx.output.join("stubs");
         fs::create_dir_all(&stubs_dir)?;
         let stub_path = stubs_dir.join("README.md");
-        write_file(&stub_path, &stub_result.code, ctx.force)?;
+        write_file(&stub_path, &stub_result.code)?;
         files.push((stub_path, stub_result));
     }
 
@@ -767,7 +766,7 @@ fn ensure_database(
     let core_lib = format!("{}{}", result.code, CORE_SUBSTRATE_REEXPORTS);
 
     let path = ctx.output.join("database.rs");
-    write_file(&path, &core_lib, ctx.force)?;
+    write_file(&path, &core_lib)?;
     files.push((
         path,
         forgedb_codegen::GeneratedCode {
@@ -807,7 +806,7 @@ fn emit_api(
     let result = ApiGenerator::generate_with_config(ctx.schema, ctx.gen_config)
         .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
     let path = ctx.output.join("api.rs");
-    write_file(&path, &result.code, ctx.force)?;
+    write_file(&path, &result.code)?;
     let core_pkg = ctx.naming.package(&crate::naming::PackageKind::Core);
     let server_pkg = ctx.naming.package(&crate::naming::PackageKind::Server);
     cache.server = Some(PackagePlan::new(
@@ -966,7 +965,7 @@ fn generate_wasm_replica(
     let client_result = WasmGenerator::generate_client(ctx.schema)
         .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
     let client_path = client_dir.join("replica-client.ts");
-    write_file(&client_path, &client_result.code, ctx.force)?;
+    write_file(&client_path, &client_result.code)?;
     files.push((client_path, client_result));
 
     // The STATIC, schema-agnostic Worker bootstrap. It runs the engine,
@@ -976,7 +975,6 @@ fn generate_wasm_replica(
     write_file(
         &worker_path,
         &WasmGenerator::worker_bootstrap_with_config(ctx.gen_config),
-        ctx.force,
     )?;
     ui::info(&format!(
         "  ✓ {} (static worker bootstrap)",
@@ -1025,14 +1023,14 @@ fn generate_go_binding(
     let go_result = GoGenerator::generate(ctx.schema, &ctx.naming.symbol_prefix, &fingerprint)
         .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
     let go_path = go_dir.join("forgedb.go");
-    write_file(&go_path, &go_result.code, ctx.force)?;
+    write_file(&go_path, &go_result.code)?;
     files.push((go_path, go_result));
 
     // The async completion bridge (the `//export` callback — a separate file, per
     // cgo's rule that an `//export` file's preamble carries no C definitions).
     let async_result = GoGenerator::generate_async_bridge(&ctx.naming.symbol_prefix);
     let async_path = go_dir.join("forgedb_async.go");
-    write_file(&async_path, &async_result.code, ctx.force)?;
+    write_file(&async_path, &async_result.code)?;
     files.push((async_path, async_result));
 
     // Arrow columnar export (only when the schema has exportable columns) — the
@@ -1040,7 +1038,7 @@ fn generate_go_binding(
     let needs_arrow = GoGenerator::needs_arrow(ctx.schema);
     if let Some(arrow_result) = GoGenerator::generate_arrow(ctx.schema, &ctx.naming.symbol_prefix) {
         let arrow_path = go_dir.join("forgedb_arrow.go");
-        write_file(&arrow_path, &arrow_result.code, ctx.force)?;
+        write_file(&arrow_path, &arrow_result.code)?;
         files.push((arrow_path, arrow_result));
         ui::warning(
             "the Go Arrow export uses the external module `github.com/apache/arrow-go/v18` \
@@ -1054,7 +1052,7 @@ fn generate_go_binding(
         FfiGenerator::generate_header(ctx.schema, &ctx.naming.symbol_prefix, &fingerprint)
             .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
     let header_path = go_dir.join("forgedb.h");
-    write_file(&header_path, &header_result.code, ctx.force)?;
+    write_file(&header_path, &header_result.code)?;
     files.push((header_path, header_result));
 
     // User-editable `go.mod` — written only when absent. This only-if-absent rule
@@ -1111,7 +1109,7 @@ fn generate_rust_sdk(
     let result = RustSdkGenerator::generate(ctx.schema)
         .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
     let lib_path = src_dir.join("lib.rs");
-    write_file(&lib_path, &result.code, ctx.force)?;
+    write_file(&lib_path, &result.code)?;
     files.push((lib_path, result));
 
     let cargo_path = sdk_dir.join("Cargo.toml");
@@ -1139,7 +1137,7 @@ fn generate_python_sdk(
     let result = PythonSdkGenerator::generate(ctx.schema)
         .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
     let py_path = sdk_dir.join("forgedb_client.py");
-    write_file(&py_path, &result.code, ctx.force)?;
+    write_file(&py_path, &result.code)?;
     files.push((py_path, result));
 
     let pyproject_path = sdk_dir.join("pyproject.toml");
@@ -1167,7 +1165,7 @@ fn generate_go_sdk(
     let result =
         GoSdkGenerator::generate(ctx.schema).map_err(|e| CliError::CodeGeneration(e.to_string()))?;
     let go_path = sdk_dir.join("client.go");
-    write_file(&go_path, &result.code, ctx.force)?;
+    write_file(&go_path, &result.code)?;
     files.push((go_path, result));
 
     let mod_path = sdk_dir.join("go.mod");
@@ -1189,8 +1187,10 @@ fn generate_go_sdk(
 
 /// Write the npm packaging scaffold for the generated TypeScript SDK (Phase 5):
 /// `package.json` + `tsconfig.json` alongside `types.ts`.  These are
-/// user-editable config, so they are written ONLY when absent — a regenerate
-/// (even `--force`, which overwrites `types.ts`) never clobbers them.
+/// user-editable config, so they are written ONLY when absent — a regenerate,
+/// which rewrites `types.ts` in full, never clobbers them. This is the whole of
+/// the "do not overwrite" rule: it belongs to the handful of files that are the
+/// USER's, not to the generated artifacts that are ForgeDB's.
 fn write_ts_package_scaffold(output_path: &Path) -> Result<()> {
     let files = [
         ("package.json", TypeScriptGenerator::package_json_scaffold()),
@@ -1206,15 +1206,22 @@ fn write_ts_package_scaffold(output_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_file(path: &PathBuf, content: &str, force: bool) -> Result<()> {
-    // Check if file exists and we're not forcing
-    if path.exists() && !force {
-        return Err(CliError::Other(format!(
-            "File exists: {}. Use --force to overwrite",
-            path.display()
-        )));
-    }
-
+/// Write one generated artifact, overwriting whatever is there.
+///
+/// Every path reaching this function is a file ForgeDB authored and stamped
+/// `DO NOT EDIT`; regeneration rewrites it in full, exactly as the cache's own
+/// manifests are rewritten. It used to refuse an existing file unless `--force`
+/// was passed, which made `forgedb generate` a ONE-SHOT command: the second run
+/// exited 1 whether or not the schema had moved. Three separate emitters had
+/// already routed around it with a bare `fs::write` (`in_tree`, the `.gitignore`
+/// and the cache packages), the Makefile passed `--force` unconditionally, and
+/// so did every test — which is what a guard nobody can leave on looks like.
+///
+/// The user-editable scaffolds (`package.json`, `tsconfig.json`, `go.mod`, the
+/// READMEs) are NOT written through here. They have their own write-only-when-
+/// absent path and are unaffected; that distinction is the one this guard was
+/// reaching for, and it is already enforced where it belongs.
+fn write_file(path: &PathBuf, content: &str) -> Result<()> {
     // Create parent directory if needed
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1407,11 +1414,10 @@ pub use forgedb_types;\n";
 /// "the same package, two destinations" structural rather than two emitters that
 /// happen to agree.
 ///
-/// `fs::write`, never `write_file`: `write_file` refuses an existing file
-/// without `--force`, and a `core` package — in the cache or in the user's tree
-/// (#338) — is **ForgeDB's file**, rewritten in full on every generate. That is
-/// what makes a CLI upgrade's substrate pin reach an existing project instead of
-/// freezing at whatever the first run wrote (#290's floor problem).
+/// A `core` package — in the cache or in the user's tree (#338) — is **ForgeDB's
+/// file**, rewritten in full on every generate. That is what makes a CLI
+/// upgrade's substrate pin reach an existing project instead of freezing at
+/// whatever the first run wrote (#290's floor problem).
 fn write_core_package<P: AsRef<Path>>(dir: &Path, files: &[(P, String)]) -> Result<Vec<PathBuf>> {
     let mut written = Vec::with_capacity(files.len());
     for (rel, body) in files {
@@ -1535,10 +1541,10 @@ fn emit_consumer_shims(
 ) -> Result<()> {
     use crate::naming::PackageKind;
 
-    // `fs::write`, not `write_file`: this is ForgeDB's statement about what
-    // ForgeDB delivers, so it is rewritten on every generate rather than frozen
-    // at whatever the project's first run wrote. A project that predates a newly
-    // delivered name would otherwise commit a binary silently.
+    // Rewritten on every generate rather than frozen at whatever the project's
+    // first run wrote: this is ForgeDB's statement about what ForgeDB delivers.
+    // A project that predates a newly delivered name would otherwise commit a
+    // binary silently.
     let gitignore = ctx.output.join(".gitignore");
     fs::write(&gitignore, OUTPUT_GITIGNORE)?;
     files.push((
@@ -1556,13 +1562,13 @@ fn emit_consumer_shims(
 
         let entry = NapiGenerator::entry_module(&fp);
         let entry_path = dir.join("index.js");
-        write_file(&entry_path, &entry.code, ctx.force)?;
+        write_file(&entry_path, &entry.code)?;
         files.push((entry_path, entry));
 
         let dts = NapiGenerator::type_declarations(ctx.schema)
             .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
         let dts_path = dir.join("index.d.ts");
-        write_file(&dts_path, &dts.code, ctx.force)?;
+        write_file(&dts_path, &dts.code)?;
         files.push((dts_path, dts));
 
         reconcile_napi_package_json(&dir)?;
@@ -1576,13 +1582,13 @@ fn emit_consumer_shims(
         let module = PyO3Generator::python_module(ctx.schema, &fp)
             .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
         let module_path = dir.join("forgedb.py");
-        write_file(&module_path, &module.code, ctx.force)?;
+        write_file(&module_path, &module.code)?;
         files.push((module_path, module));
 
         let stub = PyO3Generator::type_stub(ctx.schema)
             .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
         let stub_path = dir.join("forgedb.pyi");
-        write_file(&stub_path, &stub.code, ctx.force)?;
+        write_file(&stub_path, &stub.code)?;
         files.push((stub_path, stub));
     }
 
@@ -1599,7 +1605,7 @@ fn emit_consumer_shims(
         let header = FfiGenerator::generate_header(ctx.schema, &ctx.naming.symbol_prefix, &fp)
             .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
         let header_path = dir.join("forgedb.h");
-        write_file(&header_path, &header.code, ctx.force)?;
+        write_file(&header_path, &header.code)?;
         files.push((header_path, header));
     }
 

@@ -103,15 +103,15 @@ pub fn run(options: DevOptions) -> Result<()> {
 
     // Print initial header
     ui::header("👁️", "ForgeDB Dev Mode");
-    println!();
+    ui::blank();
     ui::info(&format!("Watching: {}", options.generate.schema));
     ui::info(&format!("Output:   {}", options.generate.output));
     ui::info(&format!("Debounce: {}ms", options.debounce));
-    println!();
+    ui::blank();
     ui::info("Press Ctrl+C to stop watching");
-    println!();
-    println!("{}", "─".repeat(60));
-    println!();
+    ui::blank();
+    ui::line(&"─".repeat(60));
+    ui::blank();
 
     let clear_terminal = options.clear;
     let emission = options.generate.clone();
@@ -134,9 +134,9 @@ pub fn run(options: DevOptions) -> Result<()> {
             }
         }
 
-        println!();
+        ui::blank();
         ui::info("Waiting for changes...");
-        println!();
+        ui::blank();
     });
 
     // NOTHING BEYOND THIS POINT MAY ASK A QUESTION (#367).
