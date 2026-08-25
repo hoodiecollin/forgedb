@@ -323,7 +323,7 @@ exported symbols. `uniform` narrows renames to schemas you actually move. Declar
 The cache's own member directories are unaffected: they are still keyed by the path hash, so no
 data directory and no cache layout needs migrating.
 
-### 9. The Node binding's `main` moved, and compiled artifacts are ignored elsewhere
+### 11. The Node binding's `main` moved, and compiled artifacts are ignored elsewhere
 
 Two changes, both mechanical, both loud if you skip them.
 
