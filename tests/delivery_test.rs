@@ -51,7 +51,7 @@ fn write(path: &Path, body: &str) {
 
 fn config(name: &str, targets: &str) -> String {
     format!(
-        "[project]\nname = \"{name}\"\n\n[generate]\ntargets = [{targets}]\n\n[storage]\nfsync = \"never\"\n"
+        "[project]\nid = \"{name}\"\n\n[generate]\ntargets = [{targets}]\n\n[storage]\nfsync = \"never\"\n"
     )
 }
 

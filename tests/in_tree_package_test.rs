@@ -59,7 +59,7 @@ fn project(tag: &str, targets: &str, placement: &str) -> tempfile::TempDir {
     write(
         &tmp.path().join("forgedb.toml"),
         &format!(
-            "[project]\nname = \"{tag}\"\n\n[generate]\ntargets = [{targets}]\n\n[storage]\nfsync = \"never\"\n{placement}"
+            "[project]\nid = \"{tag}\"\n\n[generate]\ntargets = [{targets}]\n\n[storage]\nfsync = \"never\"\n{placement}"
         ),
     );
     tmp
@@ -333,7 +333,7 @@ fn scenario_6_the_placement_is_schema_relative() {
     let root = tmp.path();
     write(
         &root.join("forgedb.toml"),
-        "[project]\nname = \"s6\"\n\n[generate]\ntargets = [\"rust\"]\n[placement]\nrust_package = \"generated/core\"\n",
+        "[project]\nid = \"s6\"\n\n[generate]\ntargets = [\"rust\"]\n[placement]\nrust_package = \"generated/core\"\n",
     );
     write(&root.join("a/schema.forge"), SCHEMA);
     write(&root.join("b/schema.forge"), SCHEMA);
@@ -496,7 +496,7 @@ fn scenario_16a_two_apps_emit_two_package_names() {
     let root = tmp.path();
     write(
         &root.join("forgedb.toml"),
-        "[project]\nname = \"s16a\"\n\n[generate]\ntargets = [\"rust\"]\n[placement]\nrust_package = \"generated/core\"\n",
+        "[project]\nid = \"s16a\"\n\n[generate]\ntargets = [\"rust\"]\n[placement]\nrust_package = \"generated/core\"\n",
     );
     write(&root.join("blog/schema.forge"), SCHEMA);
     write(&root.join("shop/schema.forge"), SCHEMA);
@@ -820,7 +820,7 @@ fn scenario_5_the_printed_line_builds_and_the_database_runs() {
     );
     write(
         &ws.join("forgedb.toml"),
-        "[project]\nname = \"s5\"\n\n[generate]\ntargets = [\"rust\"]\n[placement]\nrust_package = \"generated/core\"\n",
+        "[project]\nid = \"s5\"\n\n[generate]\ntargets = [\"rust\"]\n[placement]\nrust_package = \"generated/core\"\n",
     );
 
     let out = ok(&forgedb(ws, &["generate", "all", "--force"]), "generate all");
@@ -943,7 +943,7 @@ fn scenario_11c_the_narrowing_invocations_package_compiles() {
     write(&ws.join("schema.forge"), SCHEMA);
     write(
         &ws.join("forgedb.toml"),
-        "[project]\nname = \"s11c\"\n\n[generate]\ntargets = [\"all\"]\n[placement]\nrust_package = \"generated/core\"\n",
+        "[project]\nid = \"s11c\"\n\n[generate]\ntargets = [\"all\"]\n[placement]\nrust_package = \"generated/core\"\n",
     );
 
     let out = ok(&forgedb(ws, &["generate", "rust", "--force"]), "generate rust");
@@ -988,7 +988,7 @@ fn scenario_16b_two_apps_build_in_one_workspace() {
 
     write(
         &ws.join("forgedb.toml"),
-        "[project]\nname = \"s16b\"\n\n[generate]\ntargets = [\"rust\"]\n[placement]\nrust_package = \"core\"\n",
+        "[project]\nid = \"s16b\"\n\n[generate]\ntargets = [\"rust\"]\n[placement]\nrust_package = \"core\"\n",
     );
 
     let mut dep_lines = Vec::new();

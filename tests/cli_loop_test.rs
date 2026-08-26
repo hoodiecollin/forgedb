@@ -43,7 +43,7 @@ fn project(dir: &Path, targets: &str) {
     write(
         &dir.join("forgedb.toml"),
         &format!(
-            "[project]\nname = \"cliloop\"\nisolated = true\n\n\
+            "[project]\nid = \"cliloop\"\nisolated = true\n\n\
              [generate]\noutput = \"generated\"\ntargets = [{targets}]\n"
         ),
     );

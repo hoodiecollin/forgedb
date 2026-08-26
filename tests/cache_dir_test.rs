@@ -506,7 +506,7 @@ fn scenario_4_two_apps_in_one_project_share_one_workspace() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     std::fs::create_dir_all(root.join(".git")).unwrap();
-    write(&root.join("forgedb.toml"), "[project]\nname = \"shared\"\n");
+    write(&root.join("forgedb.toml"), "[project]\nid = \"shared\"\n");
 
     for app in ["api", "web"] {
         write(&root.join(format!("apps/{app}/schema.forge")), SCHEMA);
@@ -616,7 +616,7 @@ fn scenario_7_a_wipe_reproduces_identical_generated_source() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     std::fs::create_dir_all(root.join(".git")).unwrap();
-    write(&root.join("forgedb.toml"), "[project]\nname = \"wipe\"\n");
+    write(&root.join("forgedb.toml"), "[project]\nid = \"wipe\"\n");
     write(&root.join("schema.forge"), SCHEMA);
 
     let generate = |out_dir: &str| {
@@ -693,7 +693,7 @@ fn generate_names_the_cache_directory_it_wrote_to() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     std::fs::create_dir_all(root.join(".git")).unwrap();
-    write(&root.join("forgedb.toml"), "[project]\nname = \"visible\"\n");
+    write(&root.join("forgedb.toml"), "[project]\nid = \"visible\"\n");
     write(&root.join("schema.forge"), SCHEMA);
 
     let out = forgedb(&root, &env.home, &["generate", "rust"]);
@@ -764,7 +764,7 @@ fn a_member_whose_schema_is_gone_drops_out_of_the_set() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     std::fs::create_dir_all(root.join(".git")).unwrap();
-    write(&root.join("forgedb.toml"), "[project]\nname = \"accrete\"\n");
+    write(&root.join("forgedb.toml"), "[project]\nid = \"accrete\"\n");
 
     for app in ["keep", "doomed"] {
         write(&root.join(format!("apps/{app}/schema.forge")), SCHEMA);
@@ -1140,7 +1140,7 @@ fn s335_5_a_cold_cache_first_generate_is_addressable() {
     std::fs::create_dir_all(root.join(".git")).unwrap();
     write(
         &root.join("forgedb.toml"),
-        "[project]\nname = \"cold\"\n\n[generate]\ntargets = [\"rust\", \"api\"]\n",
+        "[project]\nid = \"cold\"\n\n[generate]\ntargets = [\"rust\", \"api\"]\n",
     );
     write(&root.join("schema.forge"), SCHEMA);
 
@@ -1175,7 +1175,7 @@ fn s335_6_a_rust_only_app_lists_its_sole_core() {
     std::fs::create_dir_all(root.join(".git")).unwrap();
     write(
         &root.join("forgedb.toml"),
-        "[project]\nname = \"solo\"\n\n[generate]\ntargets = [\"rust\"]\n",
+        "[project]\nid = \"solo\"\n\n[generate]\ntargets = [\"rust\"]\n",
     );
     write(&root.join("schema.forge"), SCHEMA);
 
@@ -1212,7 +1212,7 @@ fn s335_10_no_server_means_no_utoipa_anywhere() {
     std::fs::create_dir_all(root.join(".git")).unwrap();
     write(
         &root.join("forgedb.toml"),
-        "[project]\nname = \"noweb\"\n\n[generate]\ntargets = [\"rust\"]\n",
+        "[project]\nid = \"noweb\"\n\n[generate]\ntargets = [\"rust\"]\n",
     );
     write(&root.join("schema.forge"), SCHEMA);
     assert!(forgedb(&root, &env.home, &["generate", "all"]).status.success());
@@ -1252,7 +1252,7 @@ fn s335_10_a_server_app_carries_utoipa() {
     std::fs::create_dir_all(root.join(".git")).unwrap();
     write(
         &root.join("forgedb.toml"),
-        "[project]\nname = \"web\"\n\n[generate]\ntargets = [\"rust\", \"api\"]\n",
+        "[project]\nid = \"web\"\n\n[generate]\ntargets = [\"rust\", \"api\"]\n",
     );
     write(&root.join("schema.forge"), SCHEMA);
     assert!(forgedb(&root, &env.home, &["generate", "all"]).status.success());
@@ -1318,7 +1318,7 @@ fn s335_12_an_interrupted_prune_leaves_every_app_in_the_project_buildable() {
     std::fs::create_dir_all(root.join(".git")).unwrap();
     write(
         &root.join("forgedb.toml"),
-        "[project]\nname = \"killed\"\n\n[generate]\ntargets = [\"rust\"]\n",
+        "[project]\nid = \"killed\"\n\n[generate]\ntargets = [\"rust\"]\n",
     );
 
     for app in ["api", "web"] {
@@ -1408,7 +1408,7 @@ fn s335_13_a_prune_judges_only_the_container_it_was_given() {
     std::fs::create_dir_all(root.join(".git")).unwrap();
     write(
         &root.join("forgedb.toml"),
-        "[project]\nname = \"siblings\"\n\n[generate]\ntargets = [\"rust\"]\n",
+        "[project]\nid = \"siblings\"\n\n[generate]\ntargets = [\"rust\"]\n",
     );
 
     for app in ["api", "web"] {
@@ -1473,7 +1473,7 @@ fn s335_14_generate_rust_does_not_prune_a_declared_napi() {
     let root = tmp.path().canonicalize().unwrap();
     std::fs::create_dir_all(root.join(".git")).unwrap();
     let config = root.join("forgedb.toml");
-    write(&config, "[project]\nname = \"declared\"\n\n[generate]\ntargets = [\"all\"]\n");
+    write(&config, "[project]\nid = \"declared\"\n\n[generate]\ntargets = [\"all\"]\n");
     write(&root.join("schema.forge"), SCHEMA);
     assert!(forgedb(&root, &env.home, &["generate", "rust"]).status.success());
 
@@ -1497,7 +1497,7 @@ fn s335_14_generate_rust_does_not_prune_a_declared_napi() {
     // what proves the call site runs at all.
     write(
         &config,
-        "[project]\nname = \"declared\"\n\n[generate]\ntargets = [\"rust\"]\n",
+        "[project]\nid = \"declared\"\n\n[generate]\ntargets = [\"rust\"]\n",
     );
     let out = forgedb(&root, &env.home, &["generate", "rust", "--force"]);
     assert!(out.status.success(), "{}", combined(&out));
@@ -1535,7 +1535,7 @@ fn s335_15_generate_does_not_prune_what_migrate_owns() {
     std::fs::create_dir_all(root.join(".git")).unwrap();
     write(
         &root.join("forgedb.toml"),
-        "[project]\nname = \"owned\"\n\n[generate]\ntargets = [\"rust\"]\n",
+        "[project]\nid = \"owned\"\n\n[generate]\ntargets = [\"rust\"]\n",
     );
     write(&root.join("schema.forge"), SCHEMA);
     assert!(forgedb(&root, &env.home, &["generate", "rust"]).status.success());
@@ -1580,7 +1580,7 @@ fn s335_15_an_unrecognised_directory_is_never_reaped() {
     std::fs::create_dir_all(root.join(".git")).unwrap();
     write(
         &root.join("forgedb.toml"),
-        "[project]\nname = \"strangers\"\n\n[generate]\ntargets = [\"rust\"]\n",
+        "[project]\nid = \"strangers\"\n\n[generate]\ntargets = [\"rust\"]\n",
     );
     write(&root.join("schema.forge"), SCHEMA);
     assert!(forgedb(&root, &env.home, &["generate", "rust"]).status.success());
@@ -1613,7 +1613,7 @@ fn s335_14_check_mode_prunes_nothing() {
     std::fs::create_dir_all(root.join(".git")).unwrap();
     write(
         &root.join("forgedb.toml"),
-        "[project]\nname = \"checked\"\n\n[generate]\ntargets = [\"rust\"]\n",
+        "[project]\nid = \"checked\"\n\n[generate]\ntargets = [\"rust\"]\n",
     );
     write(&root.join("schema.forge"), SCHEMA);
     assert!(forgedb(&root, &env.home, &["generate", "rust"]).status.success());

@@ -114,7 +114,7 @@ fn scenario_1_knobs_come_from_the_schemas_nearest_ancestor() {
     let root = repo_root(&tmp);
     write(
         &root.join("forgedb.toml"),
-        "[project]\nname = \"mono\"\n[storage]\nfsync = \"always\"\n",
+        "[project]\nid = \"mono\"\n[storage]\nfsync = \"always\"\n",
     );
     write(
         &root.join("apps/api/forgedb.toml"),
@@ -140,7 +140,7 @@ fn scenario_1_knobs_come_from_the_schemas_nearest_ancestor() {
 fn scenario_2_identity_comes_from_the_outermost_config() {
     let tmp = tempfile::tempdir().unwrap();
     let root = repo_root(&tmp);
-    write(&root.join("forgedb.toml"), "[project]\nname = \"mono\"\n");
+    write(&root.join("forgedb.toml"), "[project]\nid = \"mono\"\n");
     for app in ["api", "web"] {
         write(
             &root.join(format!("apps/{app}/forgedb.toml")),
@@ -168,10 +168,10 @@ fn scenario_2_identity_comes_from_the_outermost_config() {
 fn scenario_3_isolated_stops_the_walk() {
     let tmp = tempfile::tempdir().unwrap();
     let root = repo_root(&tmp);
-    write(&root.join("forgedb.toml"), "[project]\nname = \"mono\"\n");
+    write(&root.join("forgedb.toml"), "[project]\nid = \"mono\"\n");
     write(
         &root.join("apps/api/forgedb.toml"),
-        "[project]\nname = \"api\"\nisolated = true\n[storage]\nfsync = \"never\"\n",
+        "[project]\nid = \"api\"\nisolated = true\n[storage]\nfsync = \"never\"\n",
     );
     write(&root.join("apps/api/schema.forge"), SCHEMA);
     write(
@@ -205,7 +205,7 @@ fn scenario_3_isolated_stops_the_walk() {
 fn scenario_4_omitted_isolated_means_isolated() {
     let tmp = tempfile::tempdir().unwrap();
     let root = repo_root(&tmp);
-    write(&root.join("forgedb.toml"), "[project]\nname = \"mono\"\n");
+    write(&root.join("forgedb.toml"), "[project]\nid = \"mono\"\n");
     // Neither app config mentions `isolated`, exactly as a pre-#333 tree would.
     write(&root.join("apps/api/forgedb.toml"), "[storage]\nfsync = \"never\"\n");
     write(&root.join("apps/api/schema.forge"), SCHEMA);
@@ -227,31 +227,33 @@ fn scenario_4_omitted_isolated_means_isolated() {
 /// `[project].name` at a config that is not the project root is a positioned
 /// error naming the key and its line.
 #[test]
-fn scenario_5_name_at_a_non_root_config_is_a_positioned_error() {
+fn scenario_5_id_at_a_non_root_config_is_a_positioned_error() {
     let tmp = tempfile::tempdir().unwrap();
     let root = repo_root(&tmp);
-    write(&root.join("forgedb.toml"), "[project]\nname = \"mono\"\n");
+    write(&root.join("forgedb.toml"), "[project]\nid = \"mono\"\n");
     write(
         &root.join("apps/api/forgedb.toml"),
-        // `name` deliberately on line 4, so a hard-coded 1 or 2 fails.
-        "[project]\nisolated = false\nversion = \"0.1.0\"\nname = \"api\"\n",
+        // `id` deliberately on line 4, so a hard-coded 1 or 2 fails.
+        "[project]\nisolated = false\nversion = \"0.1.0\"\nid = \"api\"\n",
     );
 
     let err = project::identify(&Chain::walk(&root.join("apps/api")).unwrap())
-        .expect_err("a nested config naming a project is a contradiction");
+        .expect_err("a nested config declaring an id is a contradiction");
     let msg = err.to_string();
 
     assert!(msg.contains("apps/api/forgedb.toml:4:1"), "positioned at the key: {msg}");
-    assert!(msg.contains("[project].name"), "names the key: {msg}");
+    assert!(msg.contains("[project].id"), "names the key: {msg}");
     assert!(msg.contains("isolated = true"), "offers the remedy: {msg}");
 }
 
 /// An explicit `[project].name` at the root wins over a detectable manifest.
 #[test]
-fn scenario_6_explicit_name_wins_over_a_manifest() {
+fn scenario_6_a_declared_id_is_used_verbatim() {
     let tmp = tempfile::tempdir().unwrap();
     let root = repo_root(&tmp);
-    write(&root.join("forgedb.toml"), "[project]\nname = \"chosen\"\n");
+    write(&root.join("forgedb.toml"), "[project]\nid = \"chosen\"\n");
+    // A manifest beside it names something else. Under the derivation this
+    // replaced, that was a *candidate*; now it is not read at all.
     write(
         &root.join("Cargo.toml"),
         "[package]\nname = \"detected\"\nversion = \"0.1.0\"\n",
@@ -260,14 +262,21 @@ fn scenario_6_explicit_name_wins_over_a_manifest() {
 
     let id = project::identify(&Chain::walk(&root).unwrap()).unwrap();
     assert_eq!(id.name, "chosen");
-    assert_eq!(id.source, IdSource::Explicit);
+    assert_eq!(id.source, IdSource::Declared);
 }
 
-/// Exactly one detectable manifest is picked up, and its name becomes the id.
-/// More than one is refused rather than guessed.
+/// **#479 — a manifest name is NOT an identity source.**
+///
+/// This is the guard on the deletion rather than on a behaviour: deriving the id
+/// from a package name is what let two unrelated projects want one id, and every
+/// remedy that existed (the ambiguity prompt, the take-over command, its release
+/// inverse) was a consequence of it. Reintroducing the derivation would fail
+/// here, and it is the only place that would notice.
+///
+/// Two manifests disagreeing used to be an *error*; now it is not even a
+/// question, which is the point — the resolution has no branch they can reach.
 #[test]
-fn scenario_7_exactly_one_manifest_is_auto_picked() {
-    // One manifest → adopted.
+fn scenario_7_manifest_names_are_never_adopted() {
     let tmp = tempfile::tempdir().unwrap();
     let root = repo_root(&tmp);
     write(&root.join("forgedb.toml"), "[project]\nisolated = true\n");
@@ -275,27 +284,20 @@ fn scenario_7_exactly_one_manifest_is_auto_picked() {
         &root.join("package.json"),
         "{ \"name\": \"storefront\", \"version\": \"1.0.0\" }",
     );
-    let id = project::identify(&Chain::walk(&root).unwrap()).unwrap();
-    assert_eq!(id.name, "storefront");
-    assert_eq!(id.source, IdSource::Manifest("package.json"));
-
-    // Two → an error that names both and points at the remedy. A repo with a
-    // Cargo.toml and a package.json at its root is common, so this path is
-    // routinely reached and must not silently prefer one.
     write(
         &root.join("Cargo.toml"),
         "[package]\nname = \"backend\"\nversion = \"0.1.0\"\n",
     );
-    let err = project::identify(&Chain::walk(&root).unwrap()).expect_err("ambiguous");
-    let msg = err.to_string();
-    assert!(msg.contains("storefront") && msg.contains("backend"), "{msg}");
-    assert!(msg.contains("[project].name"), "{msg}");
+    write(&root.join("schema.forge"), SCHEMA);
 
-    // A workspace-only Cargo.toml names nothing, so it does not make the answer
-    // ambiguous — reporting no name is the correct reading of it.
-    write(&root.join("Cargo.toml"), "[workspace]\nmembers = []\n");
+    // Neither name is adopted, and two of them is not an ambiguity to resolve.
     let id = project::identify(&Chain::walk(&root).unwrap()).unwrap();
-    assert_eq!(id.name, "storefront");
+    assert_eq!(id.source, IdSource::PathHash, "id was {:?}", id.name);
+    assert!(
+        !id.name.starts_with("storefront") && !id.name.starts_with("backend"),
+        "a manifest name reached the id: {:?}",
+        id.name
+    );
 }
 
 /// The path-hash fallback is stable across runs, differs between two roots, and
@@ -346,11 +348,11 @@ fn scenario_9_the_walk_stops_at_the_boundary() {
     let outside = tmp.path().canonicalize().unwrap();
     // A config ABOVE the repo — the shape of a stray `~/forgedb.toml`, which
     // would otherwise capture every project beneath it.
-    write(&outside.join("forgedb.toml"), "[project]\nname = \"captured\"\n");
+    write(&outside.join("forgedb.toml"), "[project]\nid = \"captured\"\n");
 
     let root = outside.join("repo");
     std::fs::create_dir_all(root.join(".git")).unwrap();
-    write(&root.join("forgedb.toml"), "[project]\nname = \"mine\"\n");
+    write(&root.join("forgedb.toml"), "[project]\nid = \"mine\"\n");
     write(&root.join("apps/api/schema.forge"), SCHEMA);
 
     let chain = Chain::walk(&root.join("apps/api")).unwrap();
@@ -395,7 +397,7 @@ fn scenario_10_the_scaffold_parses_strictly() {
 #[test]
 fn scenario_11_an_unknown_table_errors() {
     let err = forgedb::config::parse_config(
-        "[project]\nname = \"x\"\n\n[projekt]\nname = \"y\"\n",
+        "[project]\nid = \"x\"\n\n[projekt]\nname = \"y\"\n",
         Path::new("forgedb.toml"),
     )
     .expect_err("a misspelled table must not be ignored");
@@ -429,7 +431,7 @@ fn scenario_12_an_unknown_key_errors() {
 #[test]
 fn scenario_16_removed_generate_schema_has_its_own_diagnostic() {
     let err = forgedb::config::parse_config(
-        "[project]\nname = \"x\"\n\n[generate]\noutput = \"./generated\"\nschema = \"schema.forge\"\n",
+        "[project]\nid = \"x\"\n\n[generate]\noutput = \"./generated\"\nschema = \"schema.forge\"\n",
         Path::new("forgedb.toml"),
     )
     .expect_err("the removed key must be rejected");
@@ -459,7 +461,7 @@ fn scenario_13_a_taken_id_is_refused() {
     for side in ["one", "two"] {
         let root = base.join(side);
         std::fs::create_dir_all(root.join(".git")).unwrap();
-        write(&root.join("forgedb.toml"), "[project]\nname = \"clash\"\n");
+        write(&root.join("forgedb.toml"), "[project]\nid = \"clash\"\n");
         write(&root.join("schema.forge"), SCHEMA);
     }
 
@@ -477,8 +479,8 @@ fn scenario_13_a_taken_id_is_refused() {
     );
     assert!(!second.status.success(), "a taken id must be refused");
     let msg = combined(&second);
-    assert!(msg.contains("already claimed"), "{msg}");
-    assert!(msg.contains("[project].name"), "names the remedy: {msg}");
+    assert!(msg.contains("already held"), "{msg}");
+    assert!(msg.contains("[project].id"), "names the remedy: {msg}");
 }
 
 /// A resolved collision survives a cache wipe.
@@ -498,10 +500,10 @@ fn scenario_14_a_resolved_collision_survives_a_cache_wipe() {
         std::fs::create_dir_all(root.join(".git")).unwrap();
         write(&root.join("schema.forge"), SCHEMA);
     }
-    write(&base.join("one/forgedb.toml"), "[project]\nname = \"clash\"\n");
+    write(&base.join("one/forgedb.toml"), "[project]\nid = \"clash\"\n");
     // The resolution: the second project picks a different name, in ITS OWN
     // config — not in the ledger.
-    write(&base.join("two/forgedb.toml"), "[project]\nname = \"resolved\"\n");
+    write(&base.join("two/forgedb.toml"), "[project]\nid = \"resolved\"\n");
 
     let regenerate = |side: &str| {
         run(
@@ -540,7 +542,7 @@ fn scenario_15_generate_and_build_agree() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let root = repo_root(&tmp);
-    write(&root.join("forgedb.toml"), "[project]\nname = \"mono\"\n");
+    write(&root.join("forgedb.toml"), "[project]\nid = \"mono\"\n");
     write(
         &root.join("apps/api/forgedb.toml"),
         "[project]\nisolated = false\n[storage]\nfsync = \"never\"\n",
@@ -565,7 +567,7 @@ fn scenario_15_generate_and_build_agree() {
     // left that may legitimately fail, so this is now assertable (#380).
     assert!(build.status.success(), "build --plan failed:\n{}", combined(&build));
 
-    assert_eq!(project_line(&generate), "mono (from [project].name)");
+    assert_eq!(project_line(&generate), "mono (from [project].id)");
     assert_eq!(
         project_line(&build),
         project_line(&generate),
@@ -584,7 +586,7 @@ fn scenario_17_output_is_schema_relative() {
         &root.join("forgedb.toml"),
         // `targets` is required as of #335 §12 — a config that declares part of
         // `[generate]` may not leave the most consequential key to be guessed.
-        "[project]\nname = \"mono\"\n\n[generate]\noutput = \"generated\"\ntargets = [\"all\"]\n",
+        "[project]\nid = \"mono\"\n\n[generate]\noutput = \"generated\"\ntargets = [\"all\"]\n",
     );
     for app in ["api", "web"] {
         write(&root.join(format!("apps/{app}/schema.forge")), SCHEMA);
@@ -619,7 +621,7 @@ fn init_inside_a_project_scaffolds_a_config_that_resolves() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let root = repo_root(&tmp);
-    write(&root.join("forgedb.toml"), "[project]\nname = \"mono\"\n");
+    write(&root.join("forgedb.toml"), "[project]\nid = \"mono\"\n");
 
     let out = run(&root, home.path(), &["init", "api"]);
     assert!(out.status.success(), "init failed:\n{}", combined(&out));
@@ -647,30 +649,43 @@ fn init_isolated_inside_a_project_names_itself() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let root = repo_root(&tmp);
-    write(&root.join("forgedb.toml"), "[project]\nname = \"mono\"\n");
+    write(&root.join("forgedb.toml"), "[project]\nid = \"mono\"\n");
 
     let out = run(&root, home.path(), &["init", "api", "--isolated"]);
     assert!(out.status.success(), "init failed:\n{}", combined(&out));
 
     let emitted = std::fs::read_to_string(root.join("api/forgedb.toml")).unwrap();
     assert!(emitted.contains("isolated = true"), "{emitted}");
-    assert!(emitted.contains("name = \"api\""), "{emitted}");
 
+    // The id is MINTED, so this asserts its shape rather than its value: the
+    // directory slug for legibility, then entropy. Asserting `api` exactly is
+    // what made two `init api`s in unrelated repos collide (#479).
     let id = project::identify(&Chain::walk(&root.join("api")).unwrap()).unwrap();
-    assert_eq!(id.name, "api");
+    assert!(
+        id.name.starts_with("api-") && id.name.len() > "api-".len(),
+        "minted id carries the slug and entropy: {:?}",
+        id.name
+    );
+    assert!(emitted.contains(&format!("id = \"{}\"", id.name)), "{emitted}");
 }
 
-/// C12 at the point the name is chosen: `init` refuses a name another root holds,
-/// rather than letting the scaffold succeed and the first `generate` fail.
+/// **#479 — a directory name that matches a held id is not a collision.**
+///
+/// This inverts the scenario it replaces. While the id was *derived* from the
+/// directory's last path component, `forgedb init taken` next to a project
+/// already holding `taken` was a guaranteed clash, and `init` had to refuse it
+/// at the point the name was chosen. A minted id has no such relationship to the
+/// directory, so the scaffold simply succeeds — and it is worth a test, because
+/// this is the whole user-visible payoff of the change.
 #[test]
-fn init_refuses_a_project_name_another_root_holds() {
+fn init_into_a_directory_named_like_a_held_id_succeeds() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let base = tmp.path().canonicalize().unwrap();
 
     let first = base.join("first");
     std::fs::create_dir_all(first.join(".git")).unwrap();
-    write(&first.join("forgedb.toml"), "[project]\nname = \"taken\"\n");
+    write(&first.join("forgedb.toml"), "[project]\nid = \"taken\"\n");
     write(&first.join("schema.forge"), SCHEMA);
     let claimed = run(
         &first,
@@ -682,8 +697,22 @@ fn init_refuses_a_project_name_another_root_holds() {
     let elsewhere = base.join("elsewhere");
     std::fs::create_dir_all(elsewhere.join(".git")).unwrap();
     let out = run(&elsewhere, home.path(), &["init", "taken"]);
-    assert!(!out.status.success(), "a taken name must be refused at init");
-    assert!(combined(&out).contains("already claimed"), "{}", combined(&out));
+    assert!(
+        out.status.success(),
+        "a minted id cannot collide with a held one:\n{}",
+        combined(&out)
+    );
+
+    // And the scaffold got an id of its own rather than the held one.
+    let emitted = std::fs::read_to_string(elsewhere.join("taken/forgedb.toml")).unwrap();
+    assert!(
+        emitted.contains("id = \"taken-"),
+        "the id carries the slug plus entropy, not the bare directory name: {emitted}"
+    );
+    assert!(
+        !emitted.contains("id = \"taken\""),
+        "the scaffold must not adopt the held id verbatim: {emitted}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -704,11 +733,11 @@ fn a_project_name_that_is_a_path_is_refused() {
     for hostile in ["../escape", "a/b", ""] {
         write(
             &root.join("forgedb.toml"),
-            &format!("[project]\nname = \"{hostile}\"\n"),
+            &format!("[project]\nid = \"{hostile}\"\n"),
         );
         let err = project::identify(&Chain::walk(&root).unwrap())
             .unwrap_err_or_else_name(hostile);
-        assert!(err.contains("project name"), "{hostile}: {err}");
+        assert!(err.contains("project id"), "{hostile}: {err}");
     }
 }
 
@@ -746,7 +775,7 @@ fn s335_16_absent_targets_is_a_positioned_error() {
     let root = repo_root(&tmp);
     write(
         &root.join("forgedb.toml"),
-        "[project]\nname = \"needs-targets\"\n\n[generate]\noutput = \"generated\"\n",
+        "[project]\nid = \"needs-targets\"\n\n[generate]\noutput = \"generated\"\n",
     );
     write(&root.join("schema.forge"), SCHEMA);
 
@@ -794,7 +823,7 @@ fn s335_16_a_config_without_a_generate_table_still_generates() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let root = repo_root(&tmp);
-    write(&root.join("forgedb.toml"), "[project]\nname = \"no-gen-table\"\n");
+    write(&root.join("forgedb.toml"), "[project]\nid = \"no-gen-table\"\n");
     write(&root.join("schema.forge"), SCHEMA);
 
     let out = run(&root, home.path(), &["generate", "all"]);
@@ -819,7 +848,7 @@ fn s335_17_an_unknown_target_value_is_refused() {
     let root = repo_root(&tmp);
     write(
         &root.join("forgedb.toml"),
-        "[project]\nname = \"bad-target\"\n\n[generate]\ntargets = [\"napi\"]\n",
+        "[project]\nid = \"bad-target\"\n\n[generate]\ntargets = [\"napi\"]\n",
     );
     write(&root.join("schema.forge"), SCHEMA);
 
@@ -844,7 +873,7 @@ fn s335_19_a_deprecated_target_spelling_warns() {
     let root = repo_root(&tmp);
     write(
         &root.join("forgedb.toml"),
-        "[project]\nname = \"deprecated\"\n\n[generate]\ntargets = [\"typescript\", \"rust\"]\n",
+        "[project]\nid = \"deprecated\"\n\n[generate]\ntargets = [\"typescript\", \"rust\"]\n",
     );
     write(&root.join("schema.forge"), SCHEMA);
 
@@ -871,7 +900,7 @@ fn s335_18_all_reaches_the_opt_in_targets() {
     let root = repo_root(&tmp);
     write(
         &root.join("forgedb.toml"),
-        "[project]\nname = \"reach-all\"\n\n[generate]\ntargets = [\"all\"]\n",
+        "[project]\nid = \"reach-all\"\n\n[generate]\ntargets = [\"all\"]\n",
     );
     write(&root.join("schema.forge"), SCHEMA);
 
@@ -904,7 +933,7 @@ fn s335_18_all_reaches_the_opt_in_targets() {
 #[test]
 fn s338_13a_a_misspelled_placement_key_errors() {
     let err = forgedb::config::parse_config(
-        "[project]\nname = \"x\"\n\n[placement]\nrust_packge = \"generated/core\"\n",
+        "[project]\nid = \"x\"\n\n[placement]\nrust_packge = \"generated/core\"\n",
         Path::new("forgedb.toml"),
     )
     .expect_err("a misspelled key inside [placement] must not be ignored");
@@ -921,7 +950,7 @@ fn s338_13a_a_misspelled_placement_key_errors() {
 #[test]
 fn s338_13b_a_misspelled_placement_table_errors() {
     let err = forgedb::config::parse_config(
-        "[project]\nname = \"x\"\n\n[placment]\nrust_package = \"generated/core\"\n",
+        "[project]\nid = \"x\"\n\n[placment]\nrust_package = \"generated/core\"\n",
         Path::new("forgedb.toml"),
     )
     .expect_err("a misspelled table must not be ignored");
@@ -945,7 +974,7 @@ fn s338_13c_the_accepted_spelling_parses_and_absence_means_none() {
     assert_eq!(with.placement.rust_package.as_deref(), Some("generated/core"));
 
     let without = forgedb::config::parse_config(
-        "[project]\nname = \"x\"\n",
+        "[project]\nid = \"x\"\n",
         Path::new("forgedb.toml"),
     )
     .expect("a config with no [placement] table must parse");

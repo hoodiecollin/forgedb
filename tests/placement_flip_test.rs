@@ -42,7 +42,7 @@ Post {
 /// A config naming every target the flip moves, plus the two it mirrors.
 fn config(name: &str, targets: &str) -> String {
     format!(
-        "[project]\nname = \"{name}\"\n\n[generate]\ntargets = [{targets}]\n\n[storage]\nfsync = \"never\"\n"
+        "[project]\nid = \"{name}\"\n\n[generate]\ntargets = [{targets}]\n\n[storage]\nfsync = \"never\"\n"
     )
 }
 

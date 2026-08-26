@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
 
-const CONFIG: &str = "[project]\nname = \"migrate-answers\"\n\n[generate]\ntargets = [\"all\"]\n";
+const CONFIG: &str = "[project]\nid = \"migrate-answers\"\n\n[generate]\ntargets = [\"all\"]\n";
 
 fn home(dir: &Path) -> PathBuf {
     dir.join(".forgedb-home")

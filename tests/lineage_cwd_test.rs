@@ -77,7 +77,7 @@ fn fixture(app_version: u32, decoy_version: Option<u32>) -> Fixture {
     let app = root.join("app");
     fs::create_dir_all(&app).expect("create app dir");
 
-    fs::write(root.join("forgedb.toml"), "[project]\nname = \"lineage-cwd-fixture\"\n")
+    fs::write(root.join("forgedb.toml"), "[project]\nid = \"lineage-cwd-fixture\"\n")
         .expect("write config");
     fs::write(app.join("schema.forge"), SCHEMA).expect("write schema");
 

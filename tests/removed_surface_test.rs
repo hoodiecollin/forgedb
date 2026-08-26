@@ -38,7 +38,7 @@ use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
 
-const CONFIG: &str = "[project]\nname = \"removed-surface\"\n\n[generate]\ntargets = [\"rust\"]\n";
+const CONFIG: &str = "[project]\nid = \"removed-surface\"\n\n[generate]\ntargets = [\"rust\"]\n";
 const SCHEMA: &str = "Widget {\n  id: +uuid\n  sku: &string\n  qty: u32\n}\n";
 
 /// Run the real binary with `FORGEDB_HOME` redirected into the fixture.

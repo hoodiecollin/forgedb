@@ -165,43 +165,69 @@ fn s1b_each_clause_vetoes_on_its_own() {
 // S2 — a piped invocation never asks, and says so
 // ---------------------------------------------------------------------------
 
-/// The contract for every scripted invocation: identical diagnostic, identical
-/// non-zero exit, and — the only change — a **command** that records the answer.
+/// The contract for every scripted invocation: an identical diagnostic and an
+/// identical non-zero exit whether or not a terminal is attached.
+///
+/// **Retargeted by #479.** This drove the *ambiguity* case — two ecosystem
+/// manifests naming one root — which no longer exists, because a manifest name
+/// is no longer an identity source. The surviving refusal is the id collision,
+/// and the shape of the assertion is unchanged: refuse, name the cause, name the
+/// remedy. What is deliberately gone is the trailing `forgedb project name …`
+/// command, because the remedy is now a one-key edit in a file the user owns
+/// rather than an act ForgeDB performs on their behalf.
 #[test]
-fn s2_a_piped_invocation_never_asks_and_names_a_command() {
+fn s2_a_piped_invocation_never_asks_and_names_a_remedy() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let trace = tmp.path().join("ask.trace");
-    let root = ambiguous_root(&tmp);
+    let base = tmp.path().canonicalize().unwrap();
 
-    let out = run_traced(
-        &root,
+    // Two roots carrying one id — what copying a project directory produces.
+    for side in ["one", "two"] {
+        let root = base.join(side);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        write(&root.join("forgedb.toml"), "[project]\nid = \"copied\"\n");
+        write(&root.join("schema.forge"), SCHEMA);
+    }
+    let first = run_traced(
+        &base.join("one"),
         home.path(),
         &trace,
-        &[
-            "generate",
-            "rust",
-            "--output",
-            root.join("generated").to_str().unwrap(),
-        ],
+        &["generate", "rust", "--output", base.join("one/generated").to_str().unwrap()],
+    );
+    assert!(first.status.success(), "{}", combined(&first));
+
+    let out = run_traced(
+        &base.join("two"),
+        home.path(),
+        &trace,
+        &["generate", "rust", "--output", base.join("two/generated").to_str().unwrap()],
     );
 
-    assert!(!out.status.success(), "ambiguity is still refused");
+    assert!(!out.status.success(), "a taken id is still refused");
     let msg = combined(&out);
-    // Today's diagnostic, unchanged.
-    assert!(msg.contains("cannot pick a project name"), "{msg}");
-    assert!(msg.contains("backend") && msg.contains("storefront"), "{msg}");
-    assert!(msg.contains("[project].name"), "{msg}");
-    // …plus the persisting act, carrying the schema the failing invocation
-    // resolved. Without `--schema` the same command run from another directory
-    // in a monorepo resolves a DIFFERENT project — copy-pasteable and wrong.
-    assert!(msg.contains("forgedb project name"), "{msg}");
-    assert!(msg.contains("--schema"), "names the resolved schema: {msg}");
+    assert!(msg.contains("already held"), "{msg}");
+    assert!(msg.contains("copied"), "names the contested id: {msg}");
+    assert!(msg.contains("[project].id"), "names the key to change: {msg}");
+    assert!(
+        msg.contains(&base.join("one").display().to_string()),
+        "names the root that holds it: {msg}"
+    );
+    // The remedy is an edit, not a command — asserted as an ABSENCE so that
+    // reintroducing a `forgedb project <verb>` remedy has to come back through
+    // this test rather than past it.
+    assert!(
+        !msg.contains("forgedb project name") && !msg.contains("forgedb project claim"),
+        "the deleted remedy commands must not reappear in a diagnostic: {msg}"
+    );
 
-    assert_eq!(
-        trace_lines(&trace),
-        vec!["no-stdin-tty".to_string()],
-        "a piped invocation decided ONCE, and decided it could not ask"
+    // Nothing asked, and nothing even evaluated whether it could: `generate`
+    // constructs no prompt, which is a stronger statement than "it decided not
+    // to ask" and is why this is empty rather than ["no-stdin-tty"].
+    assert!(
+        trace_lines(&trace).is_empty(),
+        "generate reaches no asking boundary at all: {:?}",
+        trace_lines(&trace)
     );
 }
 
@@ -225,7 +251,7 @@ fn s3_machine_readable_stdout_forbids_rather_than_merely_silencing() {
     let home = tempfile::tempdir().unwrap();
     let trace = tmp.path().join("ask.trace");
     let root = repo_root(&tmp);
-    write(&root.join("forgedb.toml"), "[project]\nname = \"clean\"\n");
+    write(&root.join("forgedb.toml"), "[project]\nid = \"clean\"\n");
     write(&root.join("schema.forge"), SCHEMA);
 
     // `--plan` keeps this cheap. It conflicts with `--print-artifact` and the
@@ -248,15 +274,19 @@ fn s3_machine_readable_stdout_forbids_rather_than_merely_silencing() {
         "the forbid() CALL SITE must run, not merely exist: {lines:?}\n{msg}"
     );
     assert!(
-        lines.contains(&"forbidden".to_string()),
-        "…and the latch must be what decided it — `quiet` here would mean the \
-         explicit forbid is doing nothing and a `--quiet` change could \
-         reintroduce the hang: {lines:?}\n{msg}"
-    );
-    assert!(
         !lines.contains(&"terminal".to_string()),
         "a machine-readable stdout may never ask: {lines:?}"
     );
+    // **#479 narrowed what this can observe.** A second assertion stood here on
+    // a `"forbidden"` line, proving that when askability was later evaluated the
+    // forbid clause — not `--quiet` — was the vetoing one. That line came from
+    // `ask::asker()`, which every `build` constructed in order to resolve
+    // identity. Identity no longer asks anything, so nothing evaluates
+    // askability during a build and there is no longer a decision to attribute.
+    //
+    // The trap the assertion guarded is unchanged and still caught: `"forbid"`
+    // above is emitted by `forbid()` ITSELF, so it is absent exactly when the
+    // call site is deleted, and `--quiet` cannot produce it.
 }
 
 /// The same arm without a machine-readable flag does **not** forbid.
@@ -270,7 +300,7 @@ fn s3b_a_plain_build_does_not_forbid() {
     let home = tempfile::tempdir().unwrap();
     let trace = tmp.path().join("ask.trace");
     let root = repo_root(&tmp);
-    write(&root.join("forgedb.toml"), "[project]\nname = \"clean\"\n");
+    write(&root.join("forgedb.toml"), "[project]\nid = \"clean\"\n");
     write(&root.join("schema.forge"), SCHEMA);
 
     run_traced(&root, home.path(), &trace, &["build", "--plan"]);
@@ -280,10 +310,13 @@ fn s3b_a_plain_build_does_not_forbid() {
         !lines.contains(&"forbid".to_string()),
         "forbidding is per-mode, not global: {lines:?}"
     );
-    assert_eq!(
-        lines,
-        vec!["no-stdin-tty".to_string()],
-        "piped, and that is the only reason it did not ask: {lines:?}"
+    // Empty rather than `["no-stdin-tty"]` since #479: a plain build evaluates
+    // askability nowhere, because nothing in `generate`/`build` asks. The
+    // discrimination this scenario exists for survives intact — `s3` sees
+    // `"forbid"` and this one must not.
+    assert!(
+        lines.is_empty(),
+        "a plain build reaches no asking boundary at all: {lines:?}"
     );
 }
 
@@ -326,7 +359,7 @@ fn s4b_dev_stays_forbidden_across_a_regeneration() {
     let home = tempfile::tempdir().unwrap();
     let trace = tmp.path().join("ask.trace");
     let root = repo_root(&tmp);
-    write(&root.join("forgedb.toml"), "[project]\nname = \"watched\"\n");
+    write(&root.join("forgedb.toml"), "[project]\nid = \"watched\"\n");
     write(&root.join("schema.forge"), SCHEMA);
 
     let mut child = Command::new(BIN)
@@ -415,20 +448,37 @@ fn s5_the_language_server_cannot_reach_an_asker() {
 // ---------------------------------------------------------------------------
 // S19 — the widget is constructed in exactly one place
 // ---------------------------------------------------------------------------
+//
+// #479 merged the two halves of this scenario. It asserted the property twice —
+// once for `TerminalAsk` (identity's widget) and once for `TerminalPrompt`
+// (migrations') — because there were two traits in front of one boundary.
+// Deleting the identity questions left one widget, so the cross-file sweep that
+// lived in `s19` moved into `s19c` below rather than being dropped: the sweep is
+// the half that catches a NEW construction site, which is the failure the whole
+// scenario exists for.
 
-/// The boundary is only worth anything if it cannot be walked around.
+/// The prompt widget is constructed in exactly one place, past the boundary.
 ///
-/// `ask::asker()` is the one function that constructs `TerminalAsk`, and it is
-/// the one that consults `may_ask()`. A second construction site anywhere would
-/// be a prompt with no boundary in front of it — and it would look completely
-/// ordinary at the call site, which is why this is a guard rather than a
-/// convention.
+/// The boundary is only worth anything if it cannot be walked around. `prompt()`
+/// is the one function that constructs `TerminalPrompt` and the one that
+/// consults `may_ask()`. A second construction site anywhere would be a prompt
+/// with no boundary in front of it — and it would look completely ordinary at
+/// the call site, which is why this is a guard rather than a convention.
+///
+/// Three assertions: no file outside `ask.rs` names the widget at all, `ask.rs`
+/// constructs it exactly once, and that construction is gated by `may_ask()` in
+/// the same function.
 ///
 /// Anchored on the **constructor expression**, not on a comment or a binding
 /// name (#281): a guard that matches a label passes when the work it labels has
 /// moved somewhere else.
+///
+/// It is a **test-file** guard rather than a `#[cfg(test)]` one inside
+/// `ask.rs`, and that is not a preference: a module counting occurrences of a
+/// literal in its own source counts its own assertion too, and reads 2 where it
+/// means 1.
 #[test]
-fn s19_the_widget_is_constructed_in_exactly_one_place() {
+fn s19c_the_prompt_widget_is_reachable_only_through_the_boundary() {
     let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut offenders = Vec::new();
     for file in rust_files(&src_dir) {
@@ -437,62 +487,23 @@ fn s19_the_widget_is_constructed_in_exactly_one_place() {
         }
         if std::fs::read_to_string(&file)
             .unwrap_or_default()
-            .contains("TerminalAsk")
+            .contains("TerminalPrompt")
         {
             offenders.push(file.display().to_string());
         }
     }
     assert!(
         offenders.is_empty(),
-        "the prompt widget must be reachable only through `ask::asker()`, which \
+        "the prompt widget must be reachable only through `ask::prompt()`, which \
          is what checks whether asking is allowed at all:\n  {}",
         offenders.join("\n  ")
     );
 
-    let ask_rs = std::fs::read_to_string(src_dir.join("ask.rs")).unwrap();
-    assert_eq!(
-        ask_rs.matches("Box::new(TerminalAsk)").count(),
-        1,
-        "exactly one construction site"
-    );
-    // …and it is inside `asker()`, past `may_ask()`.
-    let asker_fn = ask_rs
-        .split("pub fn asker()")
-        .nth(1)
-        .expect("asker() exists");
-    let body = &asker_fn[..asker_fn.find("\n}\n").expect("a function body")];
-    assert!(
-        body.contains("may_ask()") && body.contains("Box::new(TerminalAsk)"),
-        "the construction is gated by the boundary in the same function: {body}"
-    );
-}
-
-/// The **second** question kind shares the first one's boundary (#374).
-///
-/// `migrate create` asks a different shape of question — pick one of N, or
-/// yes/no — and needs its own trait, because `Asker`'s `Question` is a closed
-/// two-variant enum about project identity. What it must NOT have is its own
-/// *boundary*: a second definition of "is this interactive" would agree with
-/// this one until the day either grew a clause.
-///
-/// So the row is here, beside `TerminalAsk`'s, and it asserts the same two
-/// things: `prompt()` is the only constructor of `TerminalPrompt`, and it is
-/// gated by `Askability::may_ask()` in the same function.
-///
-/// It is a **test-file** guard rather than a `#[cfg(test)]` one inside
-/// `ask.rs`, and that is not a preference: a module counting occurrences of a
-/// literal in its own source counts its own assertion too, and reads 2 where it
-/// means 1.
-#[test]
-fn s19c_the_migrate_prompt_shares_the_one_boundary() {
-    let ask_rs = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ask.rs"),
-    )
-    .expect("src/ask.rs");
+    let ask_rs = std::fs::read_to_string(src_dir.join("ask.rs")).expect("src/ask.rs");
     assert_eq!(
         ask_rs.matches("Box::new(TerminalPrompt)").count(),
         1,
-        "`TerminalPrompt` has exactly one constructor, like `TerminalAsk`"
+        "`TerminalPrompt` has exactly one constructor"
     );
     let start = ask_rs
         .find("pub fn prompt() -> Option<Box<dyn Prompt>> {")
@@ -556,6 +567,12 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
 /// covered by an assertion rather than by a procedure someone has to remember
 /// to run.
 ///
+/// **Retargeted by #479.** This drove the identity prompt, which no longer
+/// exists. It is retargeted rather than deleted because it is the only pty
+/// coverage in the repository, and every property below is about the *widget and
+/// the boundary* rather than about the question — they apply unchanged to the
+/// migration prompt, which is now the one consumer.
+///
 /// What it proves, none of which any tier-1 scenario can see:
 ///
 /// 1. At a terminal the boundary says `terminal` — so this test genuinely got a
@@ -563,29 +580,57 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
 ///    allocate one would otherwise take the piped path and pass vacuously.
 /// 2. The question renders on **stderr**: stdout is redirected to a file inside
 ///    the pty session, and the question must not be in it.
-/// 3. Answering persists, and a second run asks nothing.
-/// 4. `ESC` is a decline — the unchanged diagnostic and the unchanged exit
-///    status (10, `ConfigDiagnostic`), not a third outcome.
+/// 3. The keystrokes actually drove the widget — the typed constant reaches the
+///    migration record, which no piped path could have produced.
+///
+/// What is deliberately NOT asserted is a decline. The identity widget treated
+/// `ESC` as "no answer" and fell through to the non-interactive diagnostic; this
+/// one does not, by design — `ask.rs` resolves a cancelled menu to the first
+/// option, because every question #374 raises is answered before anything is
+/// written and a "no answer" here would be indistinguishable from a session that
+/// should already have errored.
 #[test]
 #[ignore = "tier 2: allocates a pty via script(1)"]
-fn s20_the_widget_renders_on_stderr_and_cancels_cleanly() {
+fn s20_the_widget_renders_on_stderr_and_the_answer_lands() {
+    // A required add with no `@default` — the differ cannot prove a value, so a
+    // terminal is asked and a pipe is refused. Same fixture shape as
+    // `migrate_answers_test`'s scenario 6.
+    let build_fixture = |dir: &Path| {
+        write(&dir.join("forgedb.toml"), "[project]\nid = \"ptyprompt\"\n");
+        write(&dir.join("schema.forge"), "Post {\n  id: +uuid\n  title: string\n}\n");
+        let baseline = std::process::Command::new(BIN)
+            .current_dir(dir)
+            .env("FORGEDB_HOME", dir.join(".home"))
+            .args(["migrate", "create", "baseline", "--schema", "schema.forge"])
+            .output()
+            .expect("baseline migrate create");
+        assert!(baseline.status.success(), "{}", combined(&baseline));
+        write(
+            &dir.join("schema.forge"),
+            "Post {\n  id: +uuid\n  title: string\n  slug: string\n}\n",
+        );
+    };
+
     let tmp = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    let root = ambiguous_root(&tmp);
+    let root = repo_root(&tmp);
+    build_fixture(&root);
     let trace = tmp.path().join("ask.trace");
     let stdout_log = tmp.path().join("stdout.log");
-    let out_dir = root.join("generated");
 
-    // Answer the select by taking its default (the first candidate, from
-    // `Cargo.toml`).
+    // Select the first option ("a constant value"), then type the constant.
+    //
+    // Deterministic input matters more than brevity here: every option on this
+    // menu except the escape hatch asks a follow-up, so a session that sends one
+    // keystroke and stops does not decline — it BLOCKS on the second question,
+    // which is a hang rather than a failure.
     let session = pty_run(
         &root,
         home.path(),
         &trace,
-        "\n",
+        "\nplaceholder\n",
         &format!(
-            "{BIN} generate rust --output {} > {}",
-            out_dir.display(),
+            "{BIN} migrate create 'add slug' --schema schema.forge > {}; echo FORGEDB_EXIT=$?",
             stdout_log.display()
         ),
     );
@@ -598,159 +643,36 @@ fn s20_the_widget_renders_on_stderr_and_cancels_cleanly() {
          piped path and pass while proving nothing.\n{session}"
     );
 
-    let config = std::fs::read_to_string(root.join("forgedb.toml"))
-        .expect("answering the prompt persisted the answer");
-    assert!(config.contains("name = \"backend\""), "{config}");
-
-    // The question is on STDERR: the redirect above captured stdout, and it
-    // must not hold it. `forgedb generate > build.log` has to still show the
+    // The question is on STDERR: the redirect above captured stdout, and it must
+    // not hold it. `forgedb migrate create … > log` has to still show the
     // question to the person running it.
     let captured = std::fs::read_to_string(&stdout_log).unwrap_or_default();
     assert!(
-        !captured.contains("Which name is this project"),
+        !captured.contains("What should existing rows get?"),
         "the question leaked into a captured stdout:\n{captured}"
     );
     assert!(
-        session.contains("Which name is this project"),
+        session.contains("What should existing rows get?"),
         "…and it must have been on stderr, which the pty saw:\n{session}"
     );
-
-    // A second, wholly non-interactive run asks nothing.
-    let again = run_traced(
-        &root,
-        home.path(),
-        &trace,
-        &[
-            "generate",
-            "rust",
-            "--force",
-            "--output",
-            out_dir.to_str().unwrap(),
-        ],
-    );
-    assert!(again.status.success(), "{}", combined(&again));
-
-    // ESC declines: the unchanged diagnostic, and the unchanged exit status.
-    let tmp2 = tempfile::tempdir().unwrap();
-    let home2 = tempfile::tempdir().unwrap();
-    let root2 = ambiguous_root(&tmp2);
-    let trace2 = tmp2.path().join("ask.trace");
-    let escaped = pty_run(
-        &root2,
-        home2.path(),
-        &trace2,
-        "\x1b",
-        &format!(
-            "{BIN} generate rust --output {}; echo FORGEDB_EXIT=$?",
-            root2.join("generated").display()
-        ),
-    );
-    assert_eq!(trace_lines(&trace2), vec!["terminal".to_string()]);
     assert!(
-        escaped.contains("cannot pick a project name"),
-        "ESC produces the UNCHANGED diagnostic:\n{escaped}"
+        session.contains("FORGEDB_EXIT=0"),
+        "an answered prompt completes the run:\n{session}"
     );
+
+    // The answer reached the record — which is what proves the keystrokes drove
+    // the widget rather than the run having taken some non-interactive path.
+    let record = std::fs::read_dir(root.join("migrations"))
+        .expect("migrations/")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().and_then(|x| x.to_str()) == Some("json")
+            && std::fs::read_to_string(p).unwrap_or_default().contains("slug"))
+        .expect("a record naming the answered field");
+    let body = std::fs::read_to_string(&record).unwrap();
     assert!(
-        escaped.contains("FORGEDB_EXIT=10"),
-        "…and the unchanged exit status (ConfigDiagnostic = 10):\n{escaped}"
-    );
-    assert!(
-        !root2.join("forgedb.toml").exists(),
-        "a decline writes nothing"
-    );
-}
-
-/// The other widget path: a dead claim, offered a take-over.
-///
-/// Tier 2 for the same reason as S20, and worth its own scenario because the
-/// *offered answers differ by holder liveness* — which is the sharpest statement
-/// of why this decision is not expressible as a flag, and is the branch a
-/// scripted `Asker` exercises without ever rendering.
-///
-/// It also asserts the rendered prose has no absurd whitespace run. That is not
-/// fussiness: these strings are the only user-facing text in the issue with no
-/// other assertion on their content, and a mangled multi-line literal renders
-/// perfectly plausibly to `cargo build` while reading as broken to a human.
-#[test]
-#[ignore = "tier 2: allocates a pty via script(1)"]
-fn s20b_a_dead_claim_is_offered_a_take_over_at_a_terminal() {
-    let tmp = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
-    let trace = tmp.path().join("ask.trace");
-    let base = tmp.path().canonicalize().unwrap();
-    let a = base.join("a");
-    std::fs::create_dir_all(a.join(".git")).unwrap();
-    write(&a.join("forgedb.toml"), "[project]\nname = \"moved\"\n");
-    write(&a.join("schema.forge"), SCHEMA);
-
-    let first = run_traced(
-        &a,
-        home.path(),
-        &trace,
-        &[
-            "generate",
-            "rust",
-            "--output",
-            base.join("gen1").to_str().unwrap(),
-        ],
-    );
-    assert!(first.status.success(), "{}", combined(&first));
-
-    // Move the project. Nothing tells the ledger.
-    let b = base.join("b");
-    std::fs::rename(&a, &b).unwrap();
-    std::fs::remove_file(&trace).unwrap();
-
-    let session = pty_run(
-        &b,
-        home.path(),
-        &trace,
-        "\n",
-        &format!(
-            "{BIN} generate rust --force --output {}",
-            base.join("gen2").display()
-        ),
-    );
-    assert_eq!(
-        trace_lines(&trace),
-        vec!["terminal".to_string()],
-        "no pty, no scenario:\n{session}"
-    );
-    assert!(
-        session.contains("no longer exists"),
-        "the terminal path says the holding root is gone:\n{session}"
-    );
-    assert!(
-        session.contains("Take over the claim"),
-        "…and offers the take-over, which a LIVE holder is never offered:\n{session}"
-    );
-    assert!(
-        session.contains("unmounted"),
-        "…carrying the caveat that made automatic reaping wrong:\n{session}"
-    );
-
-    // Rendered prose, not source shape: a collapsed multi-line literal compiles
-    // and renders as a wall of spaces.
-    for line in strip_ansi(&session).lines() {
-        assert!(
-            !line.trim_end().contains("        "),
-            "a rendered prompt line carries a whitespace run, which means a \
-             multi-line string literal lost its continuations: {line:?}"
-        );
-    }
-
-    // Accepting wrote the LEDGER and left the config alone.
-    assert_eq!(
-        std::fs::read_to_string(b.join("forgedb.toml")).unwrap(),
-        "[project]\nname = \"moved\"\n",
-        "a take-over never touches the project's config"
-    );
-    assert_eq!(
-        std::fs::read_to_string(home.path().join("ledger/moved.claim"))
-            .unwrap()
-            .trim(),
-        b.to_string_lossy(),
-        "…and the ledger now points at us"
+        body.contains("placeholder"),
+        "the typed constant must be recorded as the answer:\n{body}"
     );
 }
 
