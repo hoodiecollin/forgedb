@@ -376,7 +376,21 @@ bun    = { path = "/opt/homebrew/bin/bun", min_version = "1.1" }
 python = { path = ".venv/bin/python",      min_version = "3.11" }
 ```
 
-`[project]` is now read rather than ignored. `[project].name` is your project's id, and
+`[project]` is now read rather than ignored, and it carries two keys that matter.
+
+`[project].id` is your project's id, and **`forgedb init` generates it** — a directory slug
+plus entropy, e.g. `storefront-7f3a9c2e`. Commit it: the id keys the build cache, so a
+teammate or a CI runner resolving a different one is a different project. A tree without an
+id still works — the id falls back to a hash of the root's path — but that hash changes if
+the directory moves, which re-keys the cache and forces a cold rebuild. Adding the key by
+hand pins it, and `forgedb project show` prints a usable value to paste.
+
+The id is **generated, never derived from a package name**. Two projects both called `api`
+in two repositories get different ids, which is the point. If two projects *do* end up
+sharing one — which happens when a project directory is copied and the copy inherits its
+`[project].id` — the second one is refused with a diagnostic naming the file and key to
+change.
+
 `isolated` says whether the schemas beneath a config form their own project or join an
 enclosing one. **An omitted `isolated` means `true`** — deliberately the opposite of how a
 missing boolean usually reads — so no existing tree regroups on upgrade. See
