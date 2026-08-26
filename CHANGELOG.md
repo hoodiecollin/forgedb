@@ -6,7 +6,7 @@ commits with [git-cliff](https://git-cliff.org); do not edit it by hand — run
 `make changelog`. The format follows [Keep a Changelog](https://keepachangelog.com),
 and the project honors [Semantic Versioning](https://semver.org) per `docs/SEMVER.md`.
 
-## [0.5.0] - 2026-08-25
+## [0.5.0] - 2026-08-26
 
 > **Breaking release — upgrading needs action.** Required migration steps are in
 > [docs/UPGRADING.md](https://github.com/hoodiecollin/forgedb/blob/main/docs/UPGRADING.md).
@@ -46,10 +46,6 @@ and the project honors [Semantic Versioning](https://semver.org) per `docs/SEMVE
 - **generate:** Emit the in-tree Rust package, and print the line that links it
 - **generate:** Refuse a placement inside the cache, and check it without writing
 - **project:** An askable boundary, and the vocabulary of a decision ([#367](https://github.com/hoodiecollin/forgedb/issues/367))
-- **project:** `forgedb project name` — the act a prompt is sugar over ([#367](https://github.com/hoodiecollin/forgedb/issues/367))
-- **project:** Detect a dead claim, and offer to take it over ([#367](https://github.com/hoodiecollin/forgedb/issues/367))
-- **init:** `--project-name` — a project id is not a directory name ([#367](https://github.com/hoodiecollin/forgedb/issues/367))
-- **project:** The resolution asks, and the answer persists ([#367](https://github.com/hoodiecollin/forgedb/issues/367))
 - **ask:** The terminal widget, last and smallest ([#367](https://github.com/hoodiecollin/forgedb/issues/367))
 - **fingerprint:** One FNV, and a source fingerprint that excludes itself
 - **codegen:** Both halves of the load check, and the header moves to its definitions
@@ -63,6 +59,7 @@ and the project honors [Semantic Versioning](https://semver.org) per `docs/SEMVE
 - **migrations:** A rename is proposed, never assumed
 - **config:** [toolchain] — where the interpreters ForgeDB links to live
 - **codegen:** Escape to the author's own runtime, over baked NDJSON
+- **project:** Mint the id at init instead of deriving it
 
 ### Bug Fixes
 
@@ -87,6 +84,7 @@ and the project honors [Semantic Versioning](https://semver.org) per `docs/SEMVE
 - **codegen:** Index.d.ts declares every method the addon exports
 - **tests:** The #170 fsync guard checked one model and still degraded on a miss
 - **codegen:** A snapshot read returns rows in ascending physical row order
+- **test:** The [project] fixtures the scoped rename missed
 ## [0.4.1] - 2026-08-13
 
 ### Bug Fixes
