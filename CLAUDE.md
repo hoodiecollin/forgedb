@@ -60,11 +60,34 @@ cargo clippy --workspace             # no dead-code warnings (style lints remain
 ```
 
 CLI commands: `init`, `generate`, `validate`, `build`, `dev`, `migrate`, `compact`, `backup`,
+`project` (`show` — #367/#479; reports identity and decides nothing. The three sibling verbs that
+recorded identity decisions were deleted when the id became something `init` mints),
 `tenant` (`create|list|drop` — #59 multi-tenancy dir management),
 `coordinate <root>` (#75/#84 MVCC Tier 3 — run the multi-process write coordinator for a data dir).
 Example: `cargo run -- generate all --output ./generated`.
 
 ### Test baseline
+
+**Two tiers, and CI runs both (#390) — it previously ran neither.**
+
+| Tier | Command | Where |
+|---|---|---|
+| 1 — default suite | `make test` | `.github/workflows/test.yml`; required check on PRs into `develop`/`main` |
+| 2 — ignored suite | `make test-ignored` | `.github/workflows/nightly-ignored.yml`, nightly against `develop`; files an issue on failure |
+
+`make test` is exactly `cargo test --workspace --no-fail-fast` + `cargo build --workspace
+--examples`; the workflow invokes the target rather than repeating it, so there is one
+definition. `tests/ci_gate_test.rs` guards the properties that would otherwise break
+*silently* — the tier-2 command staying workspace-level rather than degrading into a list of
+test binaries (that form covers 13 of the 20 ignored tests and looks complete), the `--skip`
+still matching exactly the one test that belongs on the `main` surface, and the examples build
+still being there.
+
+**A build-only check does NOT substitute for running tier 2.** `cargo test --no-run --
+--ignored` reports **green on a broken tree** (verified, #384): `#[ignore]` is a runtime
+attribute, so rustc compiles those tests either way, and the rot lives inside `const DRIVER:
+&str` literals a subprocess compiles at run time. The class is *Rust source held as data* and
+only execution covers it.
 
 Plain `cargo test --workspace --no-fail-fast` is **green**:
 
@@ -108,6 +131,93 @@ count written in prose.
 Root crate `forgedb` (`src/`) is the CLI: `src/main.rs` (clap), `src/commands/*`
 (one module per subcommand), `src/{templates,ui,error}.rs`. It orchestrates the crates
 in `crates/`:
+
+Two modules answer "where does this build happen", and both are the ONE definition of what
+they own (epic #332) — do not re-derive either inline:
+- `src/project.rs` (#333) — **which project is this.** One upward walk from **the schema's**
+  directory (never the CWD), yielding two different answers that are frequently different
+  directories: knobs from `Chain::nearest()`, identity from `Chain::project_root()` (nearest
+  `[project].isolated`, else outermost). Also the **single entry point for reading config** —
+  `config::{parse_config, load_config_file}` are reached from here and nowhere else, which is
+  the greppable form of #361's one-loader invariant. **Id order (#479): `[project].id` → hash of
+  the root's **absolute** path.** Two branches, both collision-free by construction — the id is
+  **minted by `forgedb init`** (`mint_id`: a directory slug plus `RandomState` entropy, no new
+  dep) and committed, never derived from a package name. The manifest-name branch, the ambiguity
+  case and every remedy built on them were deleted together, because each existed only because
+  a derived id could collide. The claim ledger under `~/.forgedb/ledger/` survives as a **pure
+  detector** with ONE cause — a copied project directory whose copy inherited the original's
+  `[project].id` — and its diagnostic names the file and key to change rather than a command:
+  there is no take-over, no release, and nothing that edits a config on the user's behalf.
+- `src/ask.rs` (#367) — **may ForgeDB ask a question, and who answers it.** The ONE
+  `IsTerminal` call in the tree, behind `Askability` — a pure predicate over four booleans
+  (stdin tty, stderr tty, `--quiet`, `forbid()`), each a veto for a different reason. Prompts
+  render to **stderr**, unlike `ui.rs`. `ask::forbid()` latches the contexts that must never
+  ask however the process was started: `build`'s machine-readable modes and `dev`'s watch
+  loop. The `Prompt` trait is the seam that makes the interactive path testable with no pty —
+  the decision is on this side of it, the widget on the far side, and **the widget must stay the
+  last and smallest layer**. `FORGEDB_ASK_TRACE=<path>` appends the boundary's reason, which is
+  how a piped harness tells "did not ask because forbidden" from "did not ask because piped".
+  **Since #479 `migrate create` is the ONLY consumer**: identity asked the other two questions,
+  and `generate`/`build` now reach no asking boundary at all — so a build's trace is *empty*
+  rather than carrying a reason, and `forbid()` traces its own call so the latch stays visible.
+- `src/cache.rs` (#334) — **where generated code is built.** `~/.forgedb/projects/<id>/` as a
+  ForgeDB-owned cargo workspace: virtual manifest pinning `resolver = "3"`, one `Cargo.lock`
+  and one `target/` shared by every member, `apps/<member-hash>/` per app. The member hash is
+  FNV-1a over the **project-relative** schema path (asymmetric with the project fallback id
+  above, on purpose) and is pinned by golden vectors — `DefaultHasher` is not stable across
+  Rust releases and `cargo install` uses the user's toolchain. The root manifest is
+  **rewritten, never patched**, around a member set that **accretes from disk**: each member
+  records the absolute schema it belongs to, so liveness is a `stat` per member rather than a
+  scan of the user's repo, and a member that recorded nothing is KEPT.
+
+**A relative output directory resolves against the SCHEMA's directory, not the CWD — the
+built-in `generated` default included** (`Governing::output` owns all three cases; a
+`--output` flag is the invocation's own word and stays verbatim). Under one root config,
+`output` is a per-app pattern; the CWD-relative reading had every app in a project
+overwriting its siblings.
+
+**`forgedb build` DELIVERS the compiled half (#337)** — `src/commands/build/deliver.rs` is the ONE
+table, a **total match over `PackageKind` with no wildcard arm** (a new kind is a compile error, never
+a silent non-delivery), and every path is read from the build report, never joined (#292's class).
+`napi` → `<output>/napi/forgedb.node`, `pyo3` → `<output>/pyo3/_forgedb_native.abi3.so` (the name is
+COMPOSED from `PyO3Generator::EXTENSION_STEM`, because CPython resolves `PyInit_<stem>` from the
+delivered filename — the stem and the `#[pymodule]` name are one decision), `ffi` → the **staticlib**
+into `<output>/ffi/` *and* `<output>/go/` (a copied cdylib inherits the cache's absolute
+`LC_ID_DYLIB`; Node/CPython `dlopen` by path and are unaffected, verified with `otool -L`, not
+assumed). `core`/`server`/`wasm`/`transform-*`/`engine-*` deliver nothing.
+
+**Both halves carry a SOURCE fingerprint (`src/fingerprint.rs`)** — FNV-1a (the same `cache::fnv1a_hex`
+the member hash uses) over the app's `core` package plus that package's own directory, manifests
+included, `src/fingerprint.rs` excluded from its own input by name. **Per (app, package)**, never
+per-app and never the CLI version. Computed from what the run is about to emit, before any of it
+reaches disk. The constant lives in each wrapper, NEVER in `core` (`core/src/lib.rs` is the exact
+`String` the `<output>/database.rs` mirror gets, and a `mod fingerprint;` there names a file that is
+not beside it). Node's `index.js` and Python's `forgedb.py` compare at load and throw; Go compares in
+`init()`; C gets a macro plus an **advisory** inline check (ForgeDB generates no C that runs).
+`generate` writes `<output>/.gitignore` — **extensions only**, never a directory / `*.rs` /
+`Cargo.toml`, because #338's in-tree package is committed source — and the artifact patterns came OUT
+of `init`'s root `.gitignore`.
+
+**A THIRD destination is opt-in: `[placement].rust_package` (#338).** A Rust consumer who builds
+with cargo can have the generated database emitted into their own tree as a ForgeDB-owned cargo
+package — `Cargo.toml` + `src/lib.rs`, **never** an `api.rs`/`main.rs`/`[[bin]]`, whatever
+`[generate].targets` says. The cache emitter, the in-tree emitter and `--check` all render through
+`CorePackage::files`, so the three copies of `database.rs` (mirror, cache, in-tree) are
+byte-identical by construction. `Governing::rust_package()` is the knob's ONE reader (schema-relative,
+from `Chain::nearest()` — it is a knob, not a project-wide fact). The key's **absence is the
+opt-out**; there is no affirmative "cache-only" spelling. `forgedb build` never compiles it (class D
+has no delivery step), and **ForgeDB prints the dep line rather than writing it** — it edits no
+manifest it did not author, emits no `[workspace]` table (a nested one that a member path-depends on
+fails the whole workspace), and writes no `members` entry (a path dep inside the workspace directory
+joins on its own). The table name is a **one-way door**: `deny_unknown_fields` means every released
+CLI rejects a config carrying it.
+
+**`src/main.rs` links the library** (`use forgedb::{…}`) rather than re-declaring its
+modules. Re-declaring compiles each twice and makes every `pub` item only the tests use read
+as dead code in the binary — do not reintroduce `mod` declarations there.
+
+`forgedb.toml` **rejects unknown tables and keys** (#333) and there is no `[generate].schema`
+key; both are breaking, both are in `docs/UPGRADING.md`.
 
 **Published to crates.io — schema-agnostic substrate (independent version lines, do NOT normalize):**
 
@@ -205,6 +315,14 @@ The root `forgedb` crate is now published **with** that `lsp` feature (2026-07-2
 `codegen` for the REST-SDK generators and `compaction`/`query-params` for bugfixes), so
 `cargo install forgedb --features lsp` builds both `forgedb` + `forgedb-lsp` from the registry.
 - `parser` — lexer + parser → AST (`crates/parser/src/ast.rs`)
+- `migrations` — the differ + the migration record. Since #374 the record carries the operator's
+  **`Answer`** (`Constant` / `CopyField` / `Escape`) beside each change the differ cannot prove, plus a
+  `record_version`; `migrate build` **lowers** an answer into the emitted hop and refuses a hop that has
+  none (decided from the record + the recorded scaffold hash, never a `TODO` grep). `SimpleField.ty` is a
+  structured `SimpleType` — the crate still has **no parser dependency**, and the AST projection stays in
+  the CLI's `to_simple_type`. `SchemaDiffer::diff` returns a `DiffResult`: the changes it is sure of plus
+  `RenameProposal`s, because a drop+add of the same type is a *guess* and the two readings produce
+  opposite data.
 - `codegen` — code generators; exports `RustGenerator`, `TypeScriptGenerator`,
   `ApiGenerator`, `StubGenerator`, and the REST client SDK generators
   `RustSdkGenerator` / `PythonSdkGenerator` / `GoSdkGenerator` (#206/#118/#205 — the
@@ -243,6 +361,8 @@ schema.forge → parser (lexer→AST) → validation → codegen
   ├─ TypeScriptGenerator → types.ts
   ├─ ApiGenerator        → api.rs
   ├─ StubGenerator       → placeholder stubs README (no UI/component codegen today)
+  ├─ FfiGenerator        → ffi/src/lib.rs + <output>/ffi/forgedb.h (the header MOVED here
+  │                        from GoGenerator in #337 — it declares symbols ffi.rs defines)
   ├─ OpenApiGenerator    → openapi.json (offline OpenAPI 3.1)
   ├─ WasmGenerator       → replica/* (browser read-replica; opt-in)
   ├─ RustSdkGenerator    → rust-sdk/*   (reqwest REST client crate; `rust --sdk`, opt-in)
@@ -315,7 +435,13 @@ ones are `@min @max @length @email @url @pattern`/`@regex` `@utf8`, all ENFORCED
 single-arg `@length(n)` means **exactly** n, NOT a maximum (#235); `@pattern` is a per-field `LazyLock<Regex>`,
 #104). **Semantic-only markers** (parsed, carried,
 never checked at write): `@default @index @computed @fulltext @materialized` — for a real index use the `^`
-modifier. Per-directive truth table: `docs/SCHEMA.md`. **`@on_delete(restrict|cascade|set_null)`
+modifier. **`@default` is the one exception, and only outside the write path (#374):** it is the value
+existing rows get when a required field is added, applied identically by the generated reopen backfill and by
+the offline transformer through ONE lowering (`forgedb_codegen::default_fill`), which is why such an add needs
+no answer from the operator. It resolves for `bool`, the integer types, `f64`, bare `string`, `json`, `decimal`
+and a declared enum variant — never for a nullable field, `timestamp`, `uuid`, `bytes(N)`, `string(N)`, arrays,
+structs, relations, or a literal that does not fit its field; each of those routes to the prompt instead of to
+a substituted zero. Insert still requires the field. Per-directive truth table: `docs/SCHEMA.md`. **`@on_delete(restrict|cascade|set_null)`
 ENFORCED** (relation-FK field; default `restrict` refuses deleting a referenced parent → 409, `cascade` recursive,
 `set_null` optional-FK only), `@soft_delete` + composite `@index(a,b)` + `@projection(name: a, b)` (#113 —
 model-level; generates a partial-read struct/methods over PK + the named columns), `@relations(*|fields)`
@@ -473,9 +599,14 @@ of truth.
 
    - **Core work branches off `develop` and merges back to `develop`** (keep branch-per-scope +
      auto-merge; only the base changes). Nothing core lands on `main` except a release merge.
+   - **Core work goes through a PULL REQUEST (#390).** It used to merge locally, and that is
+     why nothing gated it: a merge gate can only stop a merge it sees, so a PR-only check
+     would have watched an empty road. The branch-per-scope + auto-merge rhythm is unchanged —
+     only the mechanism is. Note the enforcement is a repo *ruleset*, not a file, and admins
+     retain `bypass_mode: always`: the gate is refusable deliberately, never by accident.
    - **Branches land as merge commits — `git merge --no-ff`, never squash, never rebase.**
      Squash and rebase are disabled in the repo settings, so the GitHub button refuses anything
-     else; most work merges locally anyway. Subject form:
+     else. Subject form:
      `Merge <branch>: <what it did> (#<issue>)`. `--no-ff` is load-bearing — a branch that is
      merely ahead fast-forwards otherwise, erasing the boundary exactly as a rebase would.
      **Close the issue by hand**: GitHub honours `Closes #N` only for PRs into the *default*
@@ -517,8 +648,9 @@ of truth.
 
    A **deny-list on future milestones**, not an allow-list on the current one — so chores, CI fixes
    and typo PRs close no issue and pass silently, correctly: work with no issue cannot be
-   next-cycle work. `.github/workflows/cycle-scope.yml` gates PRs into `develop`; since most work
-   here merges locally, run it yourself before merging a branch back:
+   next-cycle work. `.github/workflows/cycle-scope.yml` gates PRs into `develop` — which now
+   reaches core work, since it goes through PRs (#390). For anything that still lands directly,
+   run the same check yourself before merging a branch back:
 
    ```bash
    make cycle-scope ISSUE=245        # what the branch closes
@@ -598,7 +730,7 @@ of truth.
 - `rust-core-library` — idiomatic Rust for core library/crate work.
 
 <!-- pm-playbook:begin -->
-## Project management — pm-playbook v2.0.0
+## Project management — pm-playbook v2.3.0
 
 Issue tracking in this repo follows the **pm-playbook** two-axis model. The full doctrine is
 vendored at `.pm-playbook/` and is authoritative; this block is only a summary.
@@ -629,7 +761,8 @@ gates in order; the first not closed decides the rung. Ask for it with `pm-playb
 GitHub filter can compute it.
 
 **Invariants — violating one is a bug, not a style preference:**
-- Exactly **one** type label per work item — never zero, never two (PM010).
+- Exactly **one** type label per work item — never zero, never two (PM010). An `epic`, a gate and
+  a `release-gate` are not work items for this purpose and need no type.
 - `experiment` never carries a milestone. A spike's deliverable is a finding; it feeds the
   release spine, it never rides it (PM003).
 - **Never create a gate by hand** — `pm-playbook materialize` owns them and creates a complete
@@ -639,9 +772,14 @@ GitHub filter can compute it.
   means its milestone **cannot be tagged** (PM004/PM005).
 - A non-core `surface:*` issue never rides a core `v*` milestone (PM006).
 
-**Verify before opening a PR** — exit code 0 means compliant:
+**Read the backlog from the local mirror when it exists.** `.pm-playbook/backlog/` holds every
+issue body and comment as files — grep it instead of spending an API round trip per question. It is
+gitignored and machine-local, so its absence means "not pulled here yet", never "no issues", and it
+goes stale as soon as anyone else moves an issue. Reading is local; **writing is not** — edit and
+`push` (it refuses when both sides moved), or use `gh` directly.
 
 ```bash
-npx @hoodiecollin/pm-playbook check
+npx @hoodiecollin/pm-playbook pull     # refresh the mirror (idempotent)
+npx @hoodiecollin/pm-playbook check    # verify before opening a PR — exit 0 means compliant
 ```
 <!-- pm-playbook:end -->

@@ -16,6 +16,9 @@ fn setup_test_dir() -> TempDir {
 /// hermetic and safe to run in parallel (no process-global `set_current_dir`).
 fn forgedb_cmd(dir: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_forgedb"));
+    // #333: keep every claim this suite makes inside its own tempdir rather than
+    // in the developer's real `~/.forgedb`.
+    cmd.env("FORGEDB_HOME", dir.join(".forgedb-home"));
     cmd.current_dir(dir);
     cmd
 }
@@ -42,8 +45,15 @@ fn test_init_command_creates_project_structure() {
     let options = InitOptions {
         project_name: project_path.to_string_lossy().to_string(),
         template: None,
-        rust: true,
+        // Both are TOMBSTONES (#335 §15): they still exist so that setting one
+        // is an error naming its replacement, so a fixture that sets either is
+        // asserting the refusal, not the scaffold. What they used to select is
+        // now `[generate].targets`.
+        rust: false,
         api_only: false,
+        // Explicit: these fixtures live in a tempdir with no enclosing project,
+        // and pinning the answer keeps them independent of what is above them.
+        isolated: Some(true),
     };
 
     let result = run(options);
@@ -51,7 +61,6 @@ fn test_init_command_creates_project_structure() {
 
     // Check that directories were created
     assert!(project_path.exists());
-    assert!(project_path.join("src").exists());
     assert!(project_path.join("generated").exists());
     assert!(project_path.join("data/db").exists());
 
@@ -60,8 +69,19 @@ fn test_init_command_creates_project_structure() {
     assert!(project_path.join("forgedb.toml").exists());
     assert!(project_path.join(".gitignore").exists());
     assert!(project_path.join("README.md").exists());
-    assert!(project_path.join("Cargo.toml").exists());
-    assert!(project_path.join("src/main.rs").exists());
+
+    // ...and that the two the scaffold STOPPED writing are absent (#335 §15).
+    // Asserted rather than merely deleted: `init` scaffolding no cargo package
+    // is the change, and an absent assertion cannot notice it coming back.
+    assert!(
+        !project_path.join("Cargo.toml").exists(),
+        "init scaffolded a cargo package; the generated Rust is compiled in \
+         ForgeDB's build cache now"
+    );
+    assert!(
+        !project_path.join("src").exists(),
+        "init scaffolded a src/ directory; the server is a cache artifact"
+    );
 }
 
 #[test]
@@ -75,8 +95,15 @@ fn test_init_with_blog_template() {
     let options = InitOptions {
         project_name: project_path.to_string_lossy().to_string(),
         template: Some("blog".to_string()),
-        rust: true,
+        // Both are TOMBSTONES (#335 §15): they still exist so that setting one
+        // is an error naming its replacement, so a fixture that sets either is
+        // asserting the refusal, not the scaffold. What they used to select is
+        // now `[generate].targets`.
+        rust: false,
         api_only: false,
+        // Explicit: these fixtures live in a tempdir with no enclosing project,
+        // and pinning the answer keeps them independent of what is above them.
+        isolated: Some(true),
     };
 
     let result = run(options);
@@ -104,8 +131,15 @@ fn test_init_emits_onhost_systemd_deploy() {
     let options = InitOptions {
         project_name: project_path.to_string_lossy().to_string(),
         template: None,
-        rust: true,
+        // Both are TOMBSTONES (#335 §15): they still exist so that setting one
+        // is an error naming its replacement, so a fixture that sets either is
+        // asserting the refusal, not the scaffold. What they used to select is
+        // now `[generate].targets`.
+        rust: false,
         api_only: false,
+        // Explicit: these fixtures live in a tempdir with no enclosing project,
+        // and pinning the answer keeps them independent of what is above them.
+        isolated: Some(true),
     };
     run(options).expect("init should succeed");
 
@@ -207,57 +241,44 @@ fn test_validate_command_passes_valid_schema() {
     );
 }
 
-/// C1: `forgedb build` must be idempotent — a second consecutive run must not
-/// fail with "File exists" on already-generated output files.
+/// C1: a second consecutive `generate` must not fail with "File exists".
 ///
-/// The `build` command internally calls `generate all` with `force: true` so
-/// that generated artifacts are always overwritten rather than erroring on an
-/// existing file.  We verify this by testing the generate layer directly:
+/// This test used to assert the OPPOSITE for the bare command, and the comment
+/// it carried is the reason the bug survived: C1 fixed `build` by having it
+/// pass `force: true` internally, and then pinned the unfixed `generate` here
+/// as "baseline for why the bug existed". A defect asserted by a passing test
+/// stops reading as a defect. `forgedb generate` — the command the scaffolded
+/// README, `migrate create`'s printed next steps and `generate --check`'s own
+/// remedy line all tell you to run — exited 1 on every run after the first,
+/// with a green suite.
 ///
-/// - `generate all` without `--force` fails on a second run (baseline for why
-///   the bug existed).
-/// - `generate all --force` succeeds on a second run (proof of the fix, which
-///   is exactly what `build` now does internally).
-///
-/// We cannot run `forgedb build` end-to-end in a hermetic temp dir because
-/// `build` also invokes `cargo build` as a subprocess, which requires a full
-/// Rust workspace — that is separate infrastructure from the C1 fix.
+/// So the third leg is inverted rather than deleted: the run WITHOUT `--force`
+/// is now the one that must succeed, and `--force` is checked only for still
+/// being accepted. `tests/cli_loop_test.rs` carries the rest, including the
+/// case this shape cannot see — a `generate` that skips silently instead of
+/// refusing loudly also passes every assertion below.
 #[test]
-fn test_generate_all_is_idempotent_with_force() {
+fn test_generate_all_is_idempotent() {
     let temp_dir = setup_test_dir();
     create_test_schema(temp_dir.path());
 
-    // First run — succeeds unconditionally.
-    let first = forgedb_cmd(temp_dir.path())
-        .args(["generate", "all", "--output", "generated", "--force"])
-        .output()
-        .expect("Failed to run forgedb generate all (first run)");
-    assert!(
-        first.status.success(),
-        "First generate all --force should succeed: {}",
-        String::from_utf8_lossy(&first.stderr)
-    );
+    let run = |args: &[&str], what: &str| {
+        let out = forgedb_cmd(temp_dir.path())
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run forgedb {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "{what} should succeed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
 
-    // Second run with --force — must also succeed (files already exist).
-    // This is what `forgedb build` now does internally (force: true).
-    let second = forgedb_cmd(temp_dir.path())
-        .args(["generate", "all", "--output", "generated", "--force"])
-        .output()
-        .expect("Failed to run forgedb generate all (second run)");
-    assert!(
-        second.status.success(),
-        "Second generate all --force should succeed (idempotency — C1 fix): {}",
-        String::from_utf8_lossy(&second.stderr)
-    );
-
-    // Confirm the failure mode: without --force the second run must fail.
-    let third_no_force = forgedb_cmd(temp_dir.path())
-        .args(["generate", "all", "--output", "generated"])
-        .output()
-        .expect("Failed to run forgedb generate all (no-force third run)");
-    assert!(
-        !third_no_force.status.success(),
-        "generate all without --force should fail when files already exist"
+    run(&["generate", "all", "--output", "generated"], "first generate all");
+    run(&["generate", "all", "--output", "generated"], "second generate all");
+    run(
+        &["generate", "all", "--output", "generated", "--force"],
+        "generate all --force (still accepted)",
     );
 }
 
@@ -289,23 +310,29 @@ fn test_generate_check_mode() {
     );
 }
 
-/// #74 Phase 4: `migrate create --auto` diffs the schema against a recorded
-/// snapshot, records EVERY non-empty diff as a versioned hop, and classifies the
-/// hop body.  A purely-additive change (new nullable field) succeeds with the
-/// reopen-backfill fast-path advice; a change whose new-row value the differ
-/// cannot prove (a type change) succeeds too but is classified `Authored`, gets a
-/// `migrations/<id>/transform.rs` scaffold, and prints the `migrate up` next
-/// steps.  The old refuse-breaking gate is gone.  Hermetic: real binary, explicit
-/// cwd.
+/// `migrate create` detects by default, records what it can prove, and REFUSES
+/// what it cannot when there is nobody to ask (#374).
+///
+/// Three steps over one evolving app:
+///
+/// 1. a baseline records a snapshot with nothing to diff;
+/// 2. an additive nullable field is fully provable and is recorded;
+/// 3. a type change (`u32 -> string`) is NOT provable, and in a session with no
+///    terminal it is a hard error naming the field — not a scaffold of TODOs
+///    the operator discovers weeks later at `migrate build`.
+///
+/// Step 3 is the behaviour change #374 exists for, and the assertion that
+/// **nothing is written** is the load-bearing half: a refusal that still left a
+/// record behind would leave a lineage whose hop can never be built.
 #[test]
-fn test_migrate_auto_records_and_scaffolds_authored_hop() {
+fn test_migrate_create_records_the_provable_and_refuses_the_rest() {
     let temp_dir = setup_test_dir();
     let dir = temp_dir.path();
 
     let v1 = "Widget {\n  id: +uuid\n  sku: &string\n  qty: u32\n}\n";
     let v2_additive = "Widget {\n  id: +uuid\n  sku: &string\n  qty: u32\n  note: string?\n}\n";
-    // Breaking + Authored: `qty` changes u32 -> string (the differ cannot know the
-    // re-encoding, so the developer must author it).
+    // Not provable: `qty` changes u32 -> string and the differ cannot know the
+    // re-encoding.
     let v3_authored =
         "Widget {\n  id: +uuid\n  sku: &string\n  qty: string\n  note: string?\n}\n";
     fs::write(dir.join("v1.forge"), v1).unwrap();
@@ -314,62 +341,44 @@ fn test_migrate_auto_records_and_scaffolds_authored_hop() {
 
     // 1. Baseline records a snapshot with nothing to diff (succeeds, no migration).
     let out = forgedb_cmd(dir)
-        .args(["migrate", "create", "baseline", "--auto", "--schema", "v1.forge"])
+        .args(["migrate", "create", "baseline", "--schema", "v1.forge"])
         .output()
         .expect("run migrate baseline");
     assert!(out.status.success(), "baseline should succeed");
     assert!(dir.join("migrations/.schema-snapshot.forge").exists(), "snapshot recorded");
     assert!(dir.join("migrations/schemas/v1.forge").exists(), "baseline versioned schema recorded");
 
-    // 2. Additive (new nullable field) succeeds; the fast-path advice mentions
-    //    backfill-on-reopen, and the destination version schema is recorded.
+    // 2. Additive (new nullable field): provable, recorded, version bumped.
     let out = forgedb_cmd(dir)
-        .args(["migrate", "create", "add_note", "--auto", "--schema", "v2.forge"])
+        .args(["migrate", "create", "add_note", "--schema", "v2.forge"])
         .output()
         .expect("run migrate additive");
     assert!(out.status.success(), "additive migration should succeed");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("note"), "reports the added field: {stdout}");
-    assert!(
-        stdout.to_lowercase().contains("backfill"),
-        "additive prints the reopen fast-path advice: {stdout}"
-    );
     assert!(dir.join("migrations/schemas/v2.forge").exists(), "v2 versioned schema recorded");
 
-    // 3. A type change (u32 -> string) is now RECORDED (non-zero exit gone),
-    //    classified Authored, scaffolded, and prints the `migrate up` steps.
+    // 3. A type change with nobody to ask: refused, naming the field.
     let out = forgedb_cmd(dir)
-        .args(["migrate", "create", "qty_to_string", "--auto", "--schema", "v3.forge"])
+        .args(["migrate", "create", "qty_to_string", "--schema", "v3.forge"])
         .output()
         .expect("run migrate authored");
-    assert!(
-        out.status.success(),
-        "authored migration is recorded, not refused: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(combined.contains("[authored]"), "marks the authored hop: {combined}");
     assert!(
-        combined.contains("migrate up"),
-        "prints the migrate up next steps: {combined}"
+        !out.status.success(),
+        "a change ForgeDB cannot prove must not be recorded unanswered: {combined}"
     );
-    assert!(dir.join("migrations/schemas/v3.forge").exists(), "v3 versioned schema recorded");
-
-    // The authored scaffold was written under migrations/<id>/transform.rs.
-    let scaffolds: Vec<_> = fs::read_dir(dir.join("migrations"))
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_dir() && p.join("transform.rs").exists())
-        .collect();
-    assert_eq!(scaffolds.len(), 1, "exactly one authored-body scaffold written");
-    let body = fs::read_to_string(scaffolds[0].join("transform.rs")).unwrap();
     assert!(
-        body.contains("authored_transform") && body.contains("TODO"),
-        "scaffold is the fill-in-the-TODO authored transform: {body}"
+        combined.contains("Widget.qty"),
+        "the refusal must name the field: {combined}"
+    );
+    assert!(
+        !dir.join("migrations/schemas/v3.forge").exists(),
+        "a refused create must write NOTHING — a recorded v3 with no answer is a \
+         lineage whose hop can never be built"
     );
 }

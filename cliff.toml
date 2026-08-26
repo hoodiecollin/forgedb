@@ -98,6 +98,25 @@ commit_parsers = [
   # nobody. `ci(...)` is already skipped by type, but `fix(ci)` is not, and a
   # reader of the release notes cannot act on our cycle-scope gate.
   { message = "\\((website|vscode|npm|pypi|winget|docker|brew|homebrew|benchmarks|bench|ci)\\)", skip = true },
+  # SUPERSEDED WITHIN AN UNRELEASED CYCLE (#479).
+  #
+  # git-cliff builds the notes from commit subjects over a tag range, and has no
+  # notion of a feature that was added and then REMOVED before the tag. Four
+  # #367 commits describe surfaces that #479 deleted while v0.5.0 was still
+  # unreleased: `forgedb project name`, `project claim --take-over`,
+  # `init --project-name`, and the identity resolution that asked a question.
+  # None of them ever existed in a published release, so the correct entry for
+  # each is *no entry* — and left alone the notes tell a user to run commands the
+  # release does not have.
+  #
+  # Matched by SHA, deliberately, rather than by subject. A subject pattern would
+  # also swallow a future commit that legitimately reintroduced one of these
+  # names, and it would do so silently — which is the same class of failure this
+  # rule exists to fix, pointed the other way.
+  { sha = "e84d7c533861ab006fde17ba2a08426a96a5aa4b", skip = true },  # feat(project): `forgedb project name`
+  { sha = "0c0b36c9bd9bd8ca0461c584fb73f9a02992a732", skip = true },  # feat(project): detect a dead claim, and offer to take it over
+  { sha = "776f8ca6203cf0f5c28b4939e3a9781f25dd07d9", skip = true },  # feat(init): `--project-name`
+  { sha = "a6e295f244a8e92981d720e141073bf0ba98e98d", skip = true },  # feat(project): the resolution asks, and the answer persists
   # Any `type!:` / `type(scope)!:` breaking marker headlines its own section,
   # regardless of the underlying type.
   { message = "^[a-z]+(\\(.+\\))?!:", group = "<!-- 0 -->Breaking changes" },

@@ -263,6 +263,52 @@ extension-package:
 	cd $(EXTENSION) && $(BUN) install && $(BUN) run package
 	@echo "Packaged: $(EXTENSION)/forgedb-*.vsix"
 
+.PHONY: test test-ignored
+
+## TIER 1 — the default suite. What every PR is gated on (.github/workflows/test.yml).
+##
+## `--no-fail-fast` is not decoration: without it cargo halts at the FIRST failing test
+## binary, so one break hides every result behind it and a run reports a single failure
+## when there may be twenty.
+##
+## The examples build is not optional either. `--lib`, `--bins`, `--tests` AND `--doc`
+## all EXCLUDE examples, so nothing in the test command compiles them — which has
+## silently broken the tree twice. It is cheap; it stays.
+test:
+	cargo test --workspace --no-fail-fast
+	cargo build --workspace --examples
+
+## TIER 2 — the ignored suite (#390). Every test that is `#[ignore]`d out of tier 1
+## because it generates and compiles a crate. Minutes, not seconds. Run nightly by
+## .github/workflows/nightly-ignored.yml, which invokes THIS target so the command has
+## exactly one definition.
+##
+## ONE WORKSPACE-LEVEL INVOCATION, NEVER A LOOP OVER `--test <name>`.
+##
+## That is the whole point of this target and it is load-bearing. The obvious way to
+## write it is a loop over the ten per-scenario targets below — and that form looks
+## complete while covering 13 of the 20 ignored tests. It silently drops all four in
+## build_cache_compile_test plus one each from pyo3_component_compile_test,
+## placement_flip_test and migrate_tests, because those four files have no target at
+## all. `--workspace` needs no list and so cannot have a stale one.
+##
+## (`cargo test -- --ignored --list` reports 21, not 20. The extra is a `rust,ignore`
+## doc-block in crates/codegen/src/rust.rs: under `--ignored` it reports ok in 0.00s
+## compiling nothing. It is a vacuous entry — harmless to include, and evidence of
+## nothing. Do not cite it as a reason for anything.)
+##
+## migrate_tests is SKIPPED here and runs on `main` instead (substrate-reclose.yml).
+## It compiles a real transformer against the PUBLISHED substrate, so on `develop` —
+## which is allowed to carry a publish gap by design — it fails for a reason that has
+## nothing to do with the commit under test. A job that is legitimately red for most of
+## every cycle stops being read, which is the failure this whole issue exists to remove.
+## tests/ci_gate_test.rs asserts this skip still matches exactly one real test: if the
+## test is renamed the pattern matches NOTHING and migrate_tests quietly rejoins the
+## nightly, red every cycle, for a correct reason.
+test-ignored:
+	cargo test --workspace --no-fail-fast -- --ignored \
+		--skip test_migrate_build_reports_the_path_cargo_actually_wrote
+
 .PHONY: crash-test
 
 ## End-to-end crash-recovery proof (#16): generate + compile real database code,
@@ -272,16 +318,18 @@ extension-package:
 crash-test:
 	cargo test --test crash_recovery_test -- --ignored --nocapture
 
-.PHONY: index-key-parity
+.PHONY: index-test
 
-## Index-key parity proof (#230): generate a model carrying every indexable type,
-## compile it, and assert the monomorphic key emission is byte-identical to the
-## `serde_json::Value` form it replaced — plus a round-trip through the real
-## generated `find_by_*`. `f64` is the one exception: its legacy key was broken and
-## was replaced (#242), so it is asserted against its own contract, not against
-## legacy. Also #[ignore]d out of the fast suite (compiles a crate).
-index-key-parity:
-	cargo test --test index_key_parity_test -- --ignored --nocapture
+## Index contract, end to end: generate a model carrying every indexable type in both
+## its plain and nullable form (plus both FK forms), compile it, store a row per field
+## and resolve each one back through the REAL generated `find_by_*`. Proves the record
+## and probe sides of the emitted key agree, that distinct values do not collide, and
+## that the null bucket stays distinct from the literal string "null" (#102).
+## Byte-comparison against the pre-#230 key form used to live here and was removed
+## (#381) — see the file header for why it should not come back.
+## #[ignore]d out of the fast suite (compiles a crate).
+index-test:
+	cargo test --test index_test -- --ignored --nocapture
 
 .PHONY: oversized-array-test
 
@@ -385,6 +433,20 @@ auto-increment-test:
 	cargo test --test auto_increment_test -- --ignored --nocapture
 	cargo test --test auto_increment_coordinated_test -- --ignored --nocapture
 	cargo test --test sequence_claim_test -- --ignored --nocapture
+
+.PHONY: enum-remap-test
+
+## Enum discriminant positionality (#438): an enum is stored as a 1-byte discriminant
+## keyed by DECLARATION ORDER, so reordering two variants re-maps every already-stored
+## row while changing no byte on disk. Nothing that compares generated code as strings
+## can see that — a snapshot shows the two match arms swapping, which is the change the
+## author intended. So this generates and compiles TWO crates over ONE data directory:
+## one writes a row, the other reads it back through the reordered schema. It also
+## proves the other half — that the transformer's JSON-by-name round trip repairs it,
+## which is the entire justification for classifying a reorder `Auto` rather than
+## `Authored`. #[ignore]d out of the fast suite (compiles two crates).
+enum-remap-test:
+	cargo test --test enum_discriminant_remap_test -- --ignored --nocapture
 
 .PHONY: scripts-typecheck
 

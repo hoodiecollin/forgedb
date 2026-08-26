@@ -111,20 +111,50 @@ Todo {
 "#
 }
 
-/// Default forgedb.toml configuration
-pub fn default_config(project_name: &str) -> String {
+/// Default forgedb.toml configuration.
+///
+/// `isolated` is written **explicitly, always** (#333). The field's absent value
+/// is `true`, so writing it changes nothing today — it exists so that "these are
+/// separate projects" is a declaration rather than an absence. An absence is
+/// fragile: someone adds a config above this one for an unrelated reason and
+/// every app beneath it silently regroups into one build cache.
+pub fn default_config(project_id: &str, isolated: bool) -> String {
+    // `id` is written ONLY when this config is a project root. A nested,
+    // non-isolated config that declares one is a contradiction ForgeDB rejects
+    // (#333 §6) — it reads as authoritative and is not — so scaffolding one would
+    // make `init` emit a config that fails on the very next `generate`.
+    let id = if isolated {
+        format!(
+            "# Generated once, here. COMMIT IT: this id keys the build cache, and a\n\
+             # teammate or CI resolving a different one is a different project.\n\
+             id = \"{project_id}\"\n"
+        )
+    } else {
+        "# No `id`: this config joins the enclosing project, and only a project root\n\
+         # carries one. Set `isolated = true` below to make this a project of its own.\n"
+            .to_string()
+    };
     format!(
         r#"[project]
-name = "{}"
-version = "0.1.0"
+{}version = "0.1.0"
+# Do the schemas beneath this config form their own project, or do they join an
+# enclosing one? A project is the unit of build cache, lockfile and target dir.
+isolated = {}
 
 # Generator configuration — consumed by the forgedb CLI.
 # Precedence: explicit CLI flag > values below > built-in defaults.
 [generate]
-schema = "schema.forge"
-output = "./generated"
-# Uncomment to restrict which targets are generated:
-# targets = ["rust", "typescript", "api", "stubs"]
+# NOTE: there is no `schema` key. A config governs every schema beneath it, so it
+# cannot name one — pass `--schema`, or keep the schema next to this file.
+# Relative paths below resolve against the SCHEMA's directory, so under a shared
+# root config `output` is a per-app pattern rather than one shared directory.
+output = "generated"
+# Which targets to generate. REQUIRED (#335) — an absent value used to mean
+# "everything", which is the opposite of what an absent list normally reads as.
+# `all` means every target; name them individually to narrow it. The spellings
+# are the same ones the CLI takes: node-sdk, node-runtime, python-runtime,
+# go-runtime, browser-replica, rust, api, openapi, stubs, ffi, *-sdk.
+targets = ["all"]
 
 # Generate-time RUNTIME BEHAVIOR (epic #126). These schema-blind knobs are baked
 # into the generated database.rs when you run `forgedb generate` / `forgedb build`
@@ -219,22 +249,39 @@ enabled = false
 #                                  # e.g. ["RS256", "ES256"] (default ["RS256"])
 # leeway_secs = 60                 # clock-skew leeway seconds (default)
 "#,
-        project_name
+        id, isolated
     )
 }
 
 /// Default .gitignore
+///
+/// **Generated TEXT is committed; only compiled output is ignored** (#335 §15).
+/// This file used to ignore `/generated/` wholesale, which contradicted the rule
+/// outright — and after #335 it is plainly wrong: ForgeDB compiles the generated
+/// Rust in its own cache under `$FORGEDB_HOME`, so nothing under `generated/` is
+/// a build artifact any more. It holds reviewable, diffable source.
 pub fn default_gitignore() -> &'static str {
-    r#"# ForgeDB Generated Files
-/generated/
+    r#"# ForgeDB generated code is COMMITTED, not ignored.
+#
+# Your output directory holds source you review and ship — database.rs, api.rs,
+# types.ts, openapi.json, the client SDKs, go/ and the binding shims. ForgeDB
+# compiles the Rust in its own build cache under $FORGEDB_HOME, so none of this
+# is build output. Commit it.
+#
+# The COMPILED artifacts `forgedb build` delivers are ignored by a .gitignore
+# ForgeDB writes INSIDE that directory, not here (#337). This file cannot do it:
+# the patterns would have to name the output directory, and `output` is a
+# per-app setting (#333) — the literal `generated/` that used to be here was
+# already wrong for every project that configures one.
 
 # Database Files
 /data/
 
-# Rust
+# Rust — ForgeDB scaffolds no cargo package (#335); these cover a crate you add
+# yourself. Cargo.lock is deliberately NOT ignored: a binary crate commits its
+# lockfile, and ForgeDB's own lockfile lives in its cache, not here.
 /target/
 **/*.rs.bk
-Cargo.lock
 
 # TypeScript / Node
 node_modules/
@@ -268,20 +315,39 @@ A ForgeDB project.
 ### Development
 
 ```bash
-# Generate code from schema
-cargo run
+# Generate code from schema.forge
+forgedb generate
 
-# Run the application
-cargo run --example basic
+# Compile it (ForgeDB builds in its own cache — there is no Cargo.toml here)
+forgedb build
+
+# Where did the server binary land?
+forgedb build --release --print-artifact server
 ```
 
 ### Schema
 
-Edit `schema.forge` to define your data models. The code will be automatically generated.
+Edit `schema.forge` to define your data models, then re-run `forgedb generate`.
+Which generators run is declared by `targets` under `[generate]` in
+`forgedb.toml`.
 
 ### Generated Code
 
-- `generated/database.rs` - Rust database implementation
+`generated/` is source: review it, diff it, commit it. ForgeDB compiles the Rust
+in its own build cache under `$FORGEDB_HOME`, so this directory holds no build
+output.
+
+- `generated/database.rs` - Rust database implementation (a read-only mirror of
+  the copy ForgeDB compiles)
+- `generated/api.rs` - the REST API layer
+- `generated/types.ts`, `generated/openapi.json` - the TypeScript types and the
+  OpenAPI document
+
+### Deploying
+
+`Dockerfile` / `docker-compose.yml` build the image by driving the CLI, and
+`deploy/` holds the on-host systemd path. Both copy out the artifact path
+`forgedb build` reports rather than constructing one.
 
 ## Learn More
 

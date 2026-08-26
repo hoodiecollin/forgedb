@@ -7,7 +7,7 @@ every hop, and maintains the serial version lineage.
 It does **not** rewrite data at rest. Applying a migration to a data directory is
 done by an offline, per-version-range **transformer binary** that
 [`forgedb-codegen`](../codegen)'s `TransformGenerator` emits and that the
-`forgedb migrate up` CLI builds and runs. Keeping the rewrite in generated code
+`forgedb migrate` CLI builds and runs. Keeping the rewrite in generated code
 preserves ForgeDB's core invariant — the schema is a compile-time input to
 generation, never a runtime input to a generic engine.
 
@@ -54,7 +54,7 @@ hop_body_class()  ──►  Auto | Authored   (Authored hops are scaffolded for
 forgedb-codegen TransformGenerator  ──►  offline transformer bin
     │
     ▼
-forgedb migrate up  ──►  data rewritten v1 → v2 into a fresh dir
+forgedb migrate build ──► migrate run --from 1 --to 2  ──►  data rewritten
 ```
 
 ## Usage Examples
@@ -77,9 +77,12 @@ let old_schema = SimpleSchema {
             indexed: false,
             index_type: "Hash".to_string(),
             constraints: vec![],
+            depends_on: vec![],
         }],
         composite_indexes: vec![],
     }],
+    enums: vec![],
+    structs: vec![],
 };
 
 let new_schema = SimpleSchema {
@@ -94,6 +97,7 @@ let new_schema = SimpleSchema {
                 indexed: false,
                 index_type: "Hash".to_string(),
                 constraints: vec![],
+                depends_on: vec![],
             },
             SimpleField {
                 name: "email".to_string(),
@@ -103,10 +107,13 @@ let new_schema = SimpleSchema {
                 indexed: false,
                 index_type: "Hash".to_string(),
                 constraints: vec![],
+                depends_on: vec![],
             },
         ],
         composite_indexes: vec![],
     }],
+    enums: vec![],
+    structs: vec![],
 };
 
 // `SchemaDiffer` is a unit struct; `diff` is a static method.
@@ -188,9 +195,17 @@ println!("pending: {}", tracker.pending_migrations(&pending_ids).len());
 ### Diffing
 
 - **`SchemaDiffer`** — `diff(old: &SimpleSchema, new: &SimpleSchema) -> Vec<SchemaChange>`.
-- **`SimpleSchema`** / **`SimpleModel`** / **`SimpleField`** / **`SimpleConstraint`** —
-  the simplified schema representation the differ compares. The CLI builds these
-  from parsed `.forge` schemas; you can also construct them directly.
+- **`SimpleSchema`** / **`SimpleModel`** / **`SimpleField`** / **`SimpleConstraint`** /
+  **`SimpleEnum`** / **`SimpleStruct`** — the simplified schema representation the
+  differ compares. The CLI builds these from parsed `.forge` schemas; you can also
+  construct them directly.
+
+  `SimpleSchema` carries the `enum` / `struct` **definitions**, not just the models,
+  and `SimpleField` carries `depends_on` — the enum/struct names its type reaches
+  transitively (#438). Both are load-bearing: a field's `field_type` string names an
+  enum but carries none of its contents, so without them two schemas differing only
+  in `Status`'s variant order compare **equal**, and a reorder that re-maps every
+  stored 1-byte discriminant produces no change at all.
 
 ### Change model
 
@@ -198,8 +213,16 @@ println!("pending: {}", tracker.pending_migrations(&pending_ids).len());
   `AddModel`, `RemoveModel`, `RenameModel`, `AddField`, `RemoveField`,
   `RenameField`, `ChangeFieldType`, `ChangeFieldNullability`, `AddIndex`,
   `RemoveIndex`, `AddUniqueConstraint`, `RemoveUniqueConstraint`,
-  `AddCompositeIndex`, `RemoveCompositeIndex`, `AddConstraint`, `RemoveConstraint`.
+  `AddCompositeIndex`, `RemoveCompositeIndex`, `AddConstraint`, `RemoveConstraint`,
+  `ChangeEnumVariants`, `ChangeStructLayout`.
   Methods: `is_breaking()`, `hop_body_class()`, `target_model()`, `description()`.
+- **`classify_positional`** / **`classify_layout`** (→ `PositionalDelta` /
+  `LayoutDelta`) — the ONE classifier behind `ChangeEnumVariants` and
+  `ChangeStructLayout` (#438). Both variants carry the two ordered *lists* rather
+  than a pre-baked verdict, and `is_breaking` / `hop_body_class` / `description` all
+  read the classifier rather than re-deriving it — so a stored record re-classifies
+  identically forever, which is what `HopBodyClass`'s frozen-at-`migrate create`
+  contract requires.
 - **`HopBodyClass`** — `Auto` (the differ can prove the new-row body from the diff)
   or `Authored` (the body needs semantic understanding the diff cannot supply, e.g.
   re-encoding a changed type, filling a narrowed `NOT NULL`, or a newly-required
@@ -221,11 +244,11 @@ println!("pending: {}", tracker.pending_migrations(&pending_ids).len());
 ### Lineage
 
 - **`MigrationLineage`** — the ordered serial version chain loaded from a
-  `migrations/` directory: `load`, `migrations`, `current_format_version`,
+  `migrations/` directory: `load`, `migrations`, `current_schema_version`,
   `next_version_span`, and `expand_range(from, to)` (the ordered hop subsequence
   the transformer replays; refuses a non-contiguous range).
 - **`BASELINE_FORMAT_VERSION`** — the fresh-database baseline (`1`).
-- Path + scaffold helpers: `current_format_version`, `versioned_schema_dir` /
+- Path + scaffold helpers: `current_schema_version`, `versioned_schema_dir` /
   `versioned_schema_path`, `save_versioned_schema` / `load_versioned_schema`,
   `migration_body_dir`, `authored_body_path`, and `scaffold_authored_body`
   (writes a documented `transform.rs` stub for any `Authored` residue, never

@@ -1,15 +1,29 @@
-use crate::{error::CliError, templates, ui, Result};
+use crate::{error::CliError, project, templates, ui, Result};
 use std::fs;
 use std::path::Path;
 
 pub struct InitOptions {
+    /// The directory to scaffold. Frequently a path (`apps/api`), which is why
+    /// the project id is its **last component** rather than the whole argument.
     pub project_name: String,
     pub template: Option<String>,
+    /// REMOVED (#335 §15). Carried only so `refuse_removed_flags` can name the
+    /// replacement; setting it is always an error.
     pub rust: bool,
+    /// REMOVED (#335 §15). Same as `rust`.
     pub api_only: bool,
+    /// `--isolated` / `--no-isolated`.  `None` means "decide from what is
+    /// above me", which is the whole reason this is three-valued rather than a
+    /// plain flag: the useful default depends on the tree.
+    pub isolated: Option<bool>,
 }
 
 pub fn run(options: InitOptions) -> Result<()> {
+    // Before anything touches the filesystem: a removed flag is refused by name,
+    // never absorbed. Placed first so the refusal cannot leave a half-scaffolded
+    // directory behind.
+    refuse_removed_flags(&options)?;
+
     ui::header("✨", &format!("Creating project: {}", options.project_name));
 
     // Check if project directory already exists
@@ -18,6 +32,19 @@ pub fn run(options: InitOptions) -> Result<()> {
         return Err(CliError::ProjectExists(options.project_name.clone()));
     }
 
+    // Scaffolding *inside* an existing project is the normal case, not an error
+    // (#333 §6/§7) — a new schema under an existing project is exactly what
+    // adding an app looks like. So `init` asks nothing and simply reports what
+    // it found, then records the answer explicitly.
+    let isolated = resolve_isolated(&options)?;
+
+    // **The one place a project id is ever minted** (#479). It is written into
+    // the scaffolded `forgedb.toml` and committed, so every clone resolves the
+    // same one — and because it is generated rather than read off the directory
+    // name, two `init`s of `apps/api` in unrelated repositories cannot collide.
+    // There is no taken-id case to resolve here any more, and so no prompt.
+    let project_id = project::mint_id(project_path);
+
     // Create project directory structure
     create_project_structure(&options)?;
 
@@ -25,7 +52,7 @@ pub fn run(options: InitOptions) -> Result<()> {
     create_schema_file(&options)?;
 
     // Create config file
-    create_config_file(&options)?;
+    create_config_file(&options, &project_id, isolated)?;
 
     // Create .gitignore
     create_gitignore(&options)?;
@@ -33,30 +60,74 @@ pub fn run(options: InitOptions) -> Result<()> {
     // Create README
     create_readme(&options)?;
 
-    // Create Rust files if needed
-    if options.rust || !options.api_only {
-        create_rust_files(&options)?;
-        // The blessed container deploy path (Phase 5) targets the generated
-        // Rust server, so it rides along with the Rust scaffold.
-        create_deploy_files(&options)?;
-    }
+    // The deploy path is no longer gated on a Rust scaffold existing (#335 §15):
+    // there is no Rust scaffold. It drives the CLI instead, so it is emitted for
+    // every project.
+    create_deploy_files(&options)?;
 
     ui::success("Done! Run the following to get started:");
-    println!();
-    println!("  cd {}", options.project_name);
-    println!("  forgedb generate rust");
-    println!("  forgedb build");
-    println!();
+    ui::blank();
+    ui::line(&format!("  cd {}", options.project_name));
+    ui::line("  forgedb generate");
+    ui::line("  forgedb build");
+    ui::blank();
+    ui::info(
+        "This project contains no Cargo.toml on purpose (#335): ForgeDB compiles the \
+         generated Rust in its own build cache. `forgedb build` prints where the \
+         artifacts landed; `forgedb build --print-artifact server` prints just the \
+         server binary's path.",
+    );
 
+    Ok(())
+}
+
+/// Refuse `--rust` / `--api-only` by name (#335 §15).
+///
+/// Both selected between "scaffold a cargo package" and "do not", and `init` no
+/// longer scaffolds one either way — so there is nothing left for them to
+/// select. They stay in the parser (hidden) purely so this diagnostic can name
+/// the replacement: dropping them from clap would produce "unexpected argument
+/// '--rust' found", which tells the user nothing about where the Rust went.
+fn refuse_removed_flags(options: &InitOptions) -> Result<()> {
+    if options.rust {
+        return Err(CliError::ConfigDiagnostic(
+            "`--rust` was removed in #335.\n\n\
+             `forgedb init` no longer scaffolds a cargo package: the generated Rust \
+             (core, server, and the runtime bindings) is built in ForgeDB's own cache \
+             under $FORGEDB_HOME, not in your repository. There is no longer a \
+             \"without Rust\" project to opt out of.\n\n\
+             Choose which generators run with `targets` under `[generate]` in \
+             forgedb.toml — `targets = [\"all\"]` is what the scaffold writes — then \
+             run `forgedb generate` and `forgedb build`."
+                .to_string(),
+        ));
+    }
+    if options.api_only {
+        return Err(CliError::ConfigDiagnostic(
+            "`--api-only` was removed in #335.\n\n\
+             It suppressed the scaffolded cargo package, and `forgedb init` no longer \
+             scaffolds one — the generated Rust is built in ForgeDB's own cache under \
+             $FORGEDB_HOME.\n\n\
+             To narrow what is generated, set `targets` under `[generate]` in \
+             forgedb.toml — e.g. `targets = [\"api\", \"openapi\"]` — then run \
+             `forgedb generate`."
+                .to_string(),
+        ));
+    }
     Ok(())
 }
 
 fn create_project_structure(options: &InitOptions) -> Result<()> {
     let project_path = Path::new(&options.project_name);
 
-    // Create main directories
+    // Create main directories.
+    //
+    // No `src/` (#335 §15): that was the scaffolded cargo package's source dir,
+    // and there is no scaffolded cargo package. `generated/` stays — it receives
+    // the read-only mirror of `database.rs`/`api.rs` plus every non-Rust
+    // artifact (types.ts, openapi.json, the SDKs, `go/`), all of which is text
+    // the user commits.
     fs::create_dir_all(project_path)?;
-    fs::create_dir_all(project_path.join("src"))?;
     fs::create_dir_all(project_path.join("generated"))?;
     fs::create_dir_all(project_path.join("data/db"))?;
     fs::create_dir_all(project_path.join("data/wal"))?;
@@ -84,8 +155,42 @@ fn create_schema_file(options: &InitOptions) -> Result<()> {
     Ok(())
 }
 
-fn create_config_file(options: &InitOptions) -> Result<()> {
-    let config_content = templates::default_config(&options.project_name);
+/// Decide whether the new project stands alone, and say why.
+///
+/// The flags are the complete contract; the report is the only thing that would
+/// otherwise need a prompt, and it is one-way. Nothing here blocks on a TTY.
+fn resolve_isolated(options: &InitOptions) -> Result<bool> {
+    if let Some(explicit) = options.isolated {
+        return Ok(explicit);
+    }
+
+    // Walk from where the project will be created — the new directory does not
+    // exist yet, so start at its parent. `forgedb init apps/api` must see what is
+    // above `apps/`, not only what is above the CWD.
+    let parent = Path::new(&options.project_name).parent().unwrap_or(Path::new(""));
+    let from = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let chain = project::Chain::walk(from)?;
+    match chain.project_root() {
+        Some(_) => {
+            let id = project::identify(&chain)?;
+            ui::info(&format!(
+                "Joining the enclosing project {:?} (rooted at {}). \
+                 Pass --isolated to stand alone instead.",
+                id.name,
+                id.root.display()
+            ));
+            Ok(false)
+        }
+        None => Ok(true),
+    }
+}
+
+fn create_config_file(options: &InitOptions, project_id: &str, isolated: bool) -> Result<()> {
+    let config_content = templates::default_config(project_id, isolated);
     let config_path = Path::new(&options.project_name).join("forgedb.toml");
     fs::write(config_path, config_content)?;
 
@@ -110,348 +215,83 @@ fn create_readme(options: &InitOptions) -> Result<()> {
     Ok(())
 }
 
-fn create_rust_files(options: &InitOptions) -> Result<()> {
-    // Create Cargo.toml with all dependencies required by generated code.
-    //
-    // The generated `database.rs` needs: forgedb-storage, forgedb-types, serde,
-    // utoipa (with uuid feature for ToSchema on Uuid/Timestamp fields), plus
-    // forgedb-changefeed for the change-feed emits (#62 Direction A),
-    // forgedb-wal for the durable write path (#89 — WAL commit + crash recovery),
-    // and forgedb-compaction for in-process auto-compaction (#92 — schema-agnostic
-    // dead-row reclaim keyed by dir name; the trigger + reindex are generated).
-    //
-    // The generated `api.rs` needs: axum (with the `ws` feature for the
-    // change-feed subscription endpoints), utoipa-axum, tokio (full), serde_json,
-    // forgedb-query-params for list-endpoint filter/sort/paginate (#90 — the
-    // query string is parsed by this schema-agnostic substrate; all field-aware
-    // filtering/sorting is generated per-model), and tower-http (trace feature)
-    // for the request-logging layer on the generated router (Phase 5
-    // observability).  The scaffold `main.rs` installs a `tracing-subscriber`
-    // (env-filtered via `RUST_LOG`) so those spans are emitted.
-    let cargo_toml = format!(
-        r#"[package]
-name = "{}"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-forgedb-storage = "0.3"
-forgedb-types = "0.3"
-forgedb-changefeed = "0.2"
-forgedb-wal = "0.2"
-forgedb-auth = {{ version = "0.2", features = ["jwks-http"] }}
-forgedb-query-params = "0.1"
-forgedb-compaction = "0.1"
-forgedb-txn = "0.1"
-forgedb-coordinator = "0.2"
-regex = "1"
-rust_decimal = {{ version = "1", features = ["serde-with-str"] }}
-serde = {{ version = "1", features = ["derive"] }}
-serde_json = "1"
-utoipa = {{ version = "5", features = ["uuid"] }}
-utoipa-axum = "0.2"
-axum = {{ version = "0.8", features = ["ws"] }}
-tokio = {{ version = "1", features = ["full"] }}
-tower-http = {{ version = "0.6", features = ["trace", "cors"] }}
-tracing = "0.1"
-tracing-subscriber = {{ version = "0.3", features = ["env-filter", "json"] }}
-"#,
-        options.project_name
-    );
-
-    let cargo_path = Path::new(&options.project_name).join("Cargo.toml");
-    fs::write(cargo_path, cargo_toml)?;
-
-    // Create src/main.rs — a real, env-driven, process-per-tenant server (#59).
-    //
-    // The generated files are `#[path]` modules (they carry inner `#![allow]` /
-    // `//!` docs, illegal inside `include!`ed inline `mod { }`, E0753). `api.rs`
-    // refers to the model types as `super::*`, so the crate root re-exports
-    // `database::*`.
-    let main_rs = r#"#[path = "../generated/database.rs"]
-mod database;
-use database::*;
-
-#[path = "../generated/api.rs"]
-mod api;
-
-// Deployment config comes from the environment — one binary, N tenant processes
-// (12-factor). Multi-tenancy (#59) is physical: this process serves ONE tenant,
-// opening its data dir; a front proxy routes each tenant's subdomain/host to its
-// process. Nothing here reads schema.forge at runtime.
-//
-//   FORGEDB_TENANT       the tenant this process serves (selects <data>/<tenant>)
-//   FORGEDB_DATA         tenant root dir (default: data)
-//   FORGEDB_HOST         bind host (default: 127.0.0.1)
-//   FORGEDB_PORT         bind port (default: 3000)
-//   FORGEDB_SHUTDOWN_TIMEOUT  max seconds to drain in-flight requests on
-//                        SIGINT/SIGTERM before forcing exit (default: 0 = unbounded)
-//   FORGEDB_CORS_ORIGINS comma-separated origins allowed to call this API from a
-//                        browser on a different origin — e.g.
-//                        `https://app.example,https://staging.app.example`, or a
-//                        single `*` for a deliberately public API. Unset (the
-//                        default) emits no CORS layer at all, so a cross-origin
-//                        browser call is blocked by the browser; the generated
-//                        TypeScript SDK is fetch-based, so set this whenever the
-//                        page and the API are not same-origin. An unparseable
-//                        value refuses to start rather than silently serving with
-//                        CORS closed. NOTE: this covers the HTTP routes. The
-//                        WebSocket routes (/subscribe, /live-query, /replicate)
-//                        are checked against the SAME list by the handlers,
-//                        because browsers neither preflight nor CORS-enforce a
-//                        handshake — so with this unset they stay reachable from
-//                        any origin, which is the pre-existing behavior.
-//
-// Verify-only JWT tenant guard (enabled when FORGEDB_JWT_PUBKEY is set):
-//   FORGEDB_JWT_PUBKEY   path to the IdP's PEM public key (verification key)
-//   FORGEDB_JWT_ALGS     comma-separated signature-algorithm allowlist (default:
-//                        RS256; asymmetric only). FORGEDB_JWT_ALG (singular) is
-//                        still accepted for one algorithm.
-//   FORGEDB_JWT_ISSUER   expected `iss`
-//   FORGEDB_JWT_AUDIENCE expected `aud`
-//   FORGEDB_TENANT_CLAIM claim carrying the tenant id (default: tenant)
-//   FORGEDB_JWT_LEEWAY   clock-skew leeway seconds (default: 60)
-//   FORGEDB_JWKS_URL     JWKS endpoint (.well-known/jwks.json) — fetched over
-//                        HTTP + refreshed for key rotation (alternative to
-//                        FORGEDB_JWT_PUBKEY; the static PEM wins if both are set)
-//   FORGEDB_JWKS_REFRESH_SECS  JWKS re-fetch interval seconds (default: 300)
-#[tokio::main]
-async fn main() {
-    // Structured logging (Phase 5): the router logs each request as a
-    // `tracing` span via tower-http's TraceLayer; install a subscriber that
-    // honors `RUST_LOG` (default `info`) so those spans are emitted.  Set
-    // FORGEDB_LOG_FORMAT=json for machine-parseable JSON lines (log aggregators);
-    // any other value (or unset) keeps the human-readable text format.
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let json_logs = std::env::var("FORGEDB_LOG_FORMAT")
-        .map(|f| f.eq_ignore_ascii_case("json"))
-        .unwrap_or(false);
-    if json_logs {
-        tracing_subscriber::fmt().json().with_env_filter(env_filter).init();
-    } else {
-        tracing_subscriber::fmt().with_env_filter(env_filter).init();
-    }
-
-    let tenant = std::env::var("FORGEDB_TENANT").ok();
-    let data_root = std::env::var("FORGEDB_DATA").unwrap_or_else(|_| "data".to_string());
-    let host = std::env::var("FORGEDB_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let port: u16 = std::env::var("FORGEDB_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(3000);
-
-    // Per-tenant data dir: <data_root>/<tenant> when a tenant is set, else the
-    // root itself (single-tenant / tenancy off).
-    let data_dir = match &tenant {
-        Some(t) => std::path::Path::new(&data_root).join(t),
-        None => std::path::PathBuf::from(&data_root),
-    };
-    let db = std::sync::Arc::new(tokio::sync::RwLock::new(
-        database::Database::open_at(data_dir),
-    ));
-
-    // Cross-origin policy (#140) is deployment identity, not a generate-time
-    // decision: the same binary is promoted to localhost, staging and production
-    // with different allowed origins. So it is read here, at process start, and
-    // never baked into the generated code. Fail closed and LOUD on a malformed
-    // value — serving with CORS silently shut would present to the developer as
-    // "the browser is blocking me" with nothing on the server side to explain it,
-    // which is the exact no-diagnostic failure this knob exists to remove. Same
-    // stance as `build_authenticator`'s refusal to start unauthenticated.
-    let cors_origins = match std::env::var("FORGEDB_CORS_ORIGINS") {
-        Ok(raw) => match api::parse_origins(&raw) {
-            Ok(origins) => origins,
-            Err(e) => panic!("FORGEDB_CORS_ORIGINS is invalid: {e} — refusing to start"),
-        },
-        Err(_) => None,
-    };
-    if let Some(list) = &cors_origins {
-        tracing::info!(origins = ?list, "CORS enabled for the HTTP and WebSocket routes");
-    }
-    let http_opts = api::HttpOptions { allowed_origins: cors_origins };
-
-    let router = match build_authenticator(tenant.as_deref()) {
-        Some(auth) => {
-            tracing::info!(tenant = ?tenant, "JWT tenant guard enabled");
-            api::create_router_with_auth_and_options(db, std::sync::Arc::new(auth), http_opts)
-        }
-        None => api::create_router_with_options(db, http_opts),
-    };
-
-    let addr = format!("{host}:{port}");
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .expect("bind listener");
-    tracing::info!(tenant = ?tenant, data_root = %data_root, %addr, "ForgeDB serving");
-    // Graceful shutdown (Phase 5): drain in-flight requests on SIGINT/SIGTERM
-    // so a container stop or `Ctrl-C` doesn't sever open connections mid-write.
-    // The drain is unbounded by default (FORGEDB_SHUTDOWN_TIMEOUT unset or 0);
-    // set it to bound how long a stuck in-flight request can hold up the exit
-    // (#142) — after the signal fires, the process force-exits once the deadline
-    // passes even if a connection has not finished draining.
-    let drain_timeout_secs: u64 = std::env::var("FORGEDB_SHUTDOWN_TIMEOUT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    // A watch channel lets the shutdown future signal the watchdog that draining
-    // has begun, so the deadline is measured from the signal, not from boot.
-    let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
-    let server = axum::serve(listener, router).with_graceful_shutdown(async move {
-        shutdown_signal().await;
-        let _ = drain_tx.send(true);
-    });
-    if drain_timeout_secs == 0 {
-        server.await.expect("serve");
-    } else {
-        let watchdog = async move {
-            let mut rx = drain_rx;
-            // Wait until the shutdown signal fires, then start the deadline.
-            let _ = rx.changed().await;
-            tokio::time::sleep(std::time::Duration::from_secs(drain_timeout_secs)).await;
-            tracing::warn!(
-                timeout_secs = drain_timeout_secs,
-                "shutdown drain exceeded FORGEDB_SHUTDOWN_TIMEOUT — forcing exit"
-            );
-        };
-        tokio::select! {
-            r = server => r.expect("serve"),
-            _ = watchdog => std::process::exit(0),
-        }
-    }
-}
-
-/// Resolve on the first shutdown signal — `Ctrl-C` (SIGINT) or, on Unix, SIGTERM
-/// (how Docker/Kubernetes ask a container to stop).  Returning from this future
-/// tells `axum::serve` to stop accepting and drain (Phase 5).
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("install Ctrl-C handler");
-    };
-    #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler")
-            .recv()
-            .await;
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
-    tracing::info!("shutdown signal received — draining connections");
-}
-
-/// Build the verify-only JWT authenticator from env, or `None` to run without a
-/// tenant guard. Enabled when EITHER FORGEDB_JWT_PUBKEY (static PEM) OR
-/// FORGEDB_JWKS_URL (JWKS-over-HTTP, #81) is set; FORGEDB_TENANT must then name
-/// the tenant this process serves (cross-checked against the token's tenant
-/// claim). Static PEM takes precedence if both are set.
+/// Emit the blessed container deploy path: a multi-stage `Dockerfile`, a
+/// `.dockerignore`, and a `docker-compose.yml` (#335 §15).
 ///
-/// Fail-loud: if a key source is configured but cannot be loaded (unreadable PEM,
-/// or an unreachable/invalid JWKS endpoint), this PANICS rather than falling
-/// through to an unauthenticated server the operator believed was protected.
-fn build_authenticator(tenant: Option<&str>) -> Option<forgedb_auth::Authenticator> {
-    let pubkey_path = std::env::var("FORGEDB_JWT_PUBKEY").ok();
-    let jwks_url = std::env::var("FORGEDB_JWKS_URL").ok();
-    // No key source configured → run without a tenant guard.
-    if pubkey_path.is_none() && jwks_url.is_none() {
-        return None;
-    }
-    let tenant = tenant.expect("FORGEDB_TENANT is required when the JWT guard is enabled");
-
-    // Algorithm allowlist (#147): the substrate accepts a full Vec<Algorithm>, so
-    // parse the comma-separated FORGEDB_JWT_ALGS (falling back to the singular
-    // FORGEDB_JWT_ALG for back-compat). Unknown/HS* names are dropped; an empty
-    // list defaults to [RS256]. A static PEM key binds ONE algorithm, so it is
-    // built from the PRIMARY (first) of the allowlist — the allowlist may be
-    // broader than the single static key's own algorithm.
-    let algorithms: Vec<forgedb_auth::Algorithm> = std::env::var("FORGEDB_JWT_ALGS")
-        .or_else(|_| std::env::var("FORGEDB_JWT_ALG"))
-        .unwrap_or_else(|_| "RS256".to_string())
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .filter_map(forgedb_auth::parse_algorithm)
-        .collect();
-    let algorithms = if algorithms.is_empty() {
-        vec![forgedb_auth::Algorithm::RS256]
-    } else {
-        algorithms
-    };
-    let primary_alg = algorithms[0];
-    let cfg = forgedb_auth::AuthConfig {
-        algorithms,
-        issuer: std::env::var("FORGEDB_JWT_ISSUER").ok(),
-        audience: std::env::var("FORGEDB_JWT_AUDIENCE").ok(),
-        tenant_claim: std::env::var("FORGEDB_TENANT_CLAIM").unwrap_or_else(|_| "tenant".to_string()),
-        leeway_secs: std::env::var("FORGEDB_JWT_LEEWAY")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(60),
-        required_claims: vec![],
-    };
-
-    // Key source: a static PEM takes precedence; otherwise fetch the JWKS over
-    // HTTP and refresh it in the background (#81) — a signing key rotated in at
-    // the IdP is picked up within FORGEDB_JWKS_REFRESH_SECS (default 300).
-    let keys = if let Some(pubkey_path) = pubkey_path {
-        let pem = std::fs::read_to_string(&pubkey_path).expect("read FORGEDB_JWT_PUBKEY");
-        forgedb_auth::KeySource::static_pem(None, pem, primary_alg)
-    } else {
-        let url = jwks_url.expect("jwks_url is Some when pubkey_path is None");
-        let refresh_secs = std::env::var("FORGEDB_JWKS_REFRESH_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(300);
-        forgedb_auth::KeySource::jwks_url(&url, std::time::Duration::from_secs(refresh_secs))
-            .expect("fetch JWKS from FORGEDB_JWKS_URL (refusing to start unauthenticated)")
-    };
-    Some(forgedb_auth::Authenticator::new(cfg, keys, tenant))
-}
-"#;
-
-    let main_rs_path = Path::new(&options.project_name).join("src").join("main.rs");
-    fs::write(main_rs_path, main_rs)?;
-
-    ui::step("🦀", "Created Rust project files");
-    ui::info("Run 'forgedb generate rust' to generate the database code");
-    Ok(())
+/// **The image drives the CLI.** Before #335 the builder stage did
+/// `COPY Cargo.toml`, `COPY src`, `COPY generated`, `RUN cargo build --release`
+/// and then copied `target/release/<project>` — every one of those inputs is
+/// gone, because `init` no longer scaffolds a cargo package and the generated
+/// Rust is compiled in ForgeDB's own cache. So the builder installs the pinned
+/// `forgedb`, copies the project source (schema + config, never `generated/`),
+/// runs `forgedb generate` + `forgedb build`,
+/// and copies out **the path ForgeDB reports** rather than a path this file
+/// guessed.
+///
+/// It is still ops packaging: nothing here reads `schema.forge` at runtime.
+/// The scaffolded directory's last path component.
+///
+/// Deliberately **not** the project id (#479): the id is minted and carries
+/// entropy, while this names a docker image and a compose service, where a
+/// human-readable `api` beats `api-7f3a9c2e`. They were one function while the
+/// id was derived from the directory; splitting them is what stops a change to
+/// either from silently moving the other.
+fn dir_slug(project_name: &str) -> String {
+    Path::new(project_name)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| project_name.to_string())
 }
 
-/// Emit the blessed container deploy path (Phase 5): a multi-stage
-/// `Dockerfile`, a `.dockerignore`, and a `docker-compose.yml`.  The image builds
-/// the generated Rust server and runs it as a non-root user with `/data` on a
-/// volume, `FORGEDB_HOST=0.0.0.0`, and a `HEALTHCHECK` against the generated
-/// `/health` endpoint (Phase 5).  None of this reads `schema.forge` at
-/// runtime — it is ops packaging around the already-generated server binary.
 fn create_deploy_files(options: &InitOptions) -> Result<()> {
     let project_path = Path::new(&options.project_name);
-    let bin = &options.project_name;
+    // The image/service name is the project's final path component, never the
+    // whole `project_name` — which may be a path (`forgedb init apps/api`), and
+    // a `/` is illegal in both a docker tag and a compose service name.
+    let bin = dir_slug(&options.project_name);
+    // Pin the CLI that scaffolded this project. A floating `cargo install
+    // forgedb` would change the generated code between two builds of the same
+    // commit, which is the reproducibility hole a Dockerfile exists to close.
+    let forgedb_version = env!("CARGO_PKG_VERSION");
 
-    // Multi-stage: build with the full Rust toolchain, run on a slim base.
-    // `forgedb generate` must have produced ./generated/{database,api}.rs into the
-    // build context first (documented); committing Cargo.lock makes builds
-    // reproducible (it is copied when present).
     let dockerfile = format!(
         r#"# syntax=docker/dockerfile:1
-# ForgeDB generated-server image (Phase 5 deploy path).
+# ForgeDB generated-server image (#335 §15).
 #
-# Build context expects the generated code present:
-#   forgedb generate all --output ./generated
+# ForgeDB owns the build. This image copies your SCHEMA — not generated code, and
+# not a cargo package, because ForgeDB no longer scaffolds one — installs the
+# pinned CLI, and lets it generate and compile into its own build cache. The
+# server binary's path is never guessed here: it is the one `forgedb build`
+# reports.
+#
 #   docker build -t {bin} .
 
 FROM rust:1-slim AS builder
+
+# Name the build cache explicitly. Leaving it at $HOME/.forgedb works, but in a
+# container HOME is an accident of the base image, and every artifact path
+# `forgedb build` reports lives under this directory.
+ENV FORGEDB_HOME=/forgedb
+
+# Pinned to the CLI that scaffolded this project. Bump it deliberately.
+RUN cargo install forgedb --version {forgedb_version} --locked
+
 WORKDIR /build
-# Manifests first for dependency-layer caching, then sources.
-COPY Cargo.toml ./
-COPY src ./src
-COPY generated ./generated
-RUN cargo build --release --locked || cargo build --release
+# The whole project, minus what .dockerignore drops. `generated/` is dropped on
+# purpose: the builder regenerates it from schema.forge, so a stale committed
+# copy can never reach the image.
+COPY . ./
+
+RUN forgedb generate
+
+# Resolve the artifact; do not construct its path. Package names carry a per-app
+# hash and change when the schema file is renamed, so the Dockerfile names the
+# stable KIND (`server`) instead. One invocation emits both the human build and
+# the machine-readable inventory; `--print-artifact` puts the single path on
+# stdout and everything else on stderr.
+RUN mkdir -p /out \
+ && cp "$(forgedb build --release --report /out/artifacts.json --print-artifact server)" /out/server
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
@@ -459,10 +299,18 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --create-home --uid 10001 forgedb
 WORKDIR /app
-COPY --from=builder /build/target/release/{bin} /usr/local/bin/forgedb-server
+COPY --from=builder /out/server /usr/local/bin/forgedb-server
+# The build inventory, for anything downstream that wants more than one path.
+COPY --from=builder /out/artifacts.json /app/artifacts.json
 
 # Config comes from the environment (12-factor). Data lives on a mounted volume —
 # never baked into the image.
+#
+# FORGEDB_DATA is ABSOLUTE, and outside the builder's FORGEDB_HOME, on purpose:
+# the generated server refuses to open a database inside the ForgeDB build cache
+# (#335 C4), and the built-in data root is RELATIVE (`data`), which is what makes
+# the cache reachable by accident rather than by mistake. FORGEDB_HOME does not
+# exist in this stage at all.
 ENV FORGEDB_HOST=0.0.0.0 \
     FORGEDB_PORT=3000 \
     FORGEDB_DATA=/data \
@@ -472,7 +320,7 @@ VOLUME ["/data"]
 USER forgedb
 EXPOSE 3000
 
-# Liveness against the generated /health endpoint (Phase 5).
+# Liveness against the generated /health endpoint.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=5 \
     CMD curl -fsS http://localhost:3000/health || exit 1
 
@@ -481,18 +329,33 @@ CMD ["forgedb-server"]
     );
     fs::write(project_path.join("Dockerfile"), dockerfile)?;
 
+    // The builder regenerates from the schema, so generated code, build output
+    // and database files must not enter the context.
     let dockerignore = "\
-target/
+# Regenerated inside the image from schema.forge — a committed copy must never
+# win over a fresh generate (#335).
+generated/
+
+# Never ship data or build output into a build context.
 data/
+target/
 .git/
 node_modules/
 **/*.rs.bk
+
+# The deploy files themselves are not build inputs.
+Dockerfile
+.dockerignore
+docker-compose.yml
 ";
     fs::write(project_path.join(".dockerignore"), dockerignore)?;
 
     let compose = format!(
-        r#"# ForgeDB generated-server compose file (Phase 5).
+        r#"# ForgeDB generated-server compose file.
 #   docker compose up --build
+#
+# The image generates and builds from schema.forge itself (#335) — there is no
+# `forgedb generate` step to run first, and no cargo package in this directory.
 services:
   {bin}:
     build: .
@@ -501,6 +364,8 @@ services:
     environment:
       FORGEDB_HOST: 0.0.0.0
       FORGEDB_PORT: "3000"
+      # Absolute, and not inside a ForgeDB build cache — the server refuses the
+      # latter (#335 C4).
       FORGEDB_DATA: /data
       RUST_LOG: info
       # Machine-parseable JSON logs for a log aggregator (default is text):
@@ -543,7 +408,7 @@ volumes:
 /// the generated binary as a non-root `DynamicUser` with a managed
 /// `StateDirectory` (the on-host analogue of the container's non-root user +
 /// `/data` VOLUME), reads config from the env file (12-factor, same knobs as the
-/// compose file), and relies on the scaffold `main.rs` graceful-shutdown path for
+/// compose file), and relies on the generated server's graceful-shutdown path for
 /// a clean `systemctl stop`.  systemd goes under `deploy/` (not the project root
 /// like the `Dockerfile`) because a unit has no build-context root requirement —
 /// it is installed to `/etc/systemd/system/`.  Nothing here reads `schema.forge`.
@@ -564,13 +429,14 @@ fn create_systemd_files(options: &InitOptions) -> Result<()> {
     // `DynamicUser=yes` + `StateDirectory=<name>` give a non-root, isolated,
     // persistent data dir (/var/lib/<name>) without a manual useradd/chown; the
     // env file below points FORGEDB_DATA at it.  `KillSignal=SIGTERM` +
-    // `TimeoutStopSec=30` pair with the graceful-shutdown drain in main.rs.
+    // `TimeoutStopSec=30` pair with the generated server's graceful-shutdown drain.
     let service = format!(
         r#"# systemd unit for the {bin} ForgeDB generated server (#115 on-host deploy).
 #
 # Install:
-#   cargo build --release
-#   sudo install -Dm755 target/release/{bin} /usr/local/bin/{bin}
+#   forgedb generate
+#   sudo install -Dm755 \
+#       "$(forgedb build --release --print-artifact server)" /usr/local/bin/{bin}
 #   sudo install -Dm644 deploy/{bin}.env     /etc/{bin}/{bin}.env
 #   sudo install -Dm644 deploy/{bin}.service /etc/systemd/system/{bin}.service
 #   sudo systemctl daemon-reload
@@ -597,7 +463,7 @@ StateDirectory={bin}
 
 Restart=on-failure
 RestartSec=2
-# main.rs drains in-flight requests on SIGTERM (graceful shutdown).
+# The generated server drains in-flight requests on SIGTERM.
 KillSignal=SIGTERM
 TimeoutStopSec=30
 
@@ -664,8 +530,12 @@ environment — an ideal systemd citizen.
 ## systemd (Linux — the scaffolded path)
 
 ```bash
-cargo build --release
-sudo install -Dm755 target/release/{bin} /usr/local/bin/{bin}
+forgedb generate
+# ForgeDB compiles the generated Rust in its own cache and REPORTS where the
+# binary landed (#335); there is no cargo package in this directory to build,
+# and the path is never one you construct by hand.
+sudo install -Dm755 \
+    "$(forgedb build --release --print-artifact server)" /usr/local/bin/{bin}
 sudo install -Dm644 deploy/{bin}.env     /etc/{bin}/{bin}.env
 sudo install -Dm644 deploy/{bin}.service /etc/systemd/system/{bin}.service
 sudo systemctl daemon-reload
@@ -681,7 +551,7 @@ Edit config in `/etc/{bin}/{bin}.env`, then `sudo systemctl restart {bin}`.
 
 The unit runs as a non-root `DynamicUser` with a managed `StateDirectory`
 (`/var/lib/{bin}`, the data dir) and drains in-flight requests on stop (SIGTERM →
-the graceful-shutdown path in `main.rs`).
+the graceful-shutdown path in the generated server).
 
 ## One writer per data directory
 

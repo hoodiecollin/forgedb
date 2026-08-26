@@ -26,6 +26,16 @@ fn level() -> u8 {
     LEVEL.load(Ordering::Relaxed)
 }
 
+/// Is output suppressed to errors only?
+///
+/// Exposed for [`crate::ask`], which needs the *level* rather than a printer:
+/// `--quiet` plus a missing answer takes the error path, because a question
+/// printed by a process the user asked to be silent is one they will not be
+/// looking for. This is the only reason the level is readable at all.
+pub fn is_quiet() -> bool {
+    level() == QUIET
+}
+
 /// Print a success message with checkmark (suppressed by `--quiet`).
 pub fn success(msg: &str) {
     if level() >= NORMAL {
@@ -75,6 +85,32 @@ pub fn detail(msg: &str) {
 pub fn step(emoji: &str, msg: &str) {
     if level() >= NORMAL {
         println!("{} {}", emoji, msg);
+    }
+}
+
+/// A blank separator line between blocks of commentary — suppressed by
+/// `--quiet`, exactly like the commentary it separates.
+///
+/// A bare `println!()` is NOT the same thing, and the difference is not
+/// cosmetic. `build --print-artifact <kind>` and `build --report -` hand stdout
+/// to a machine and route every human word to stderr by raising the quiet
+/// level; an ungated newline survives that and lands in the payload. It did:
+/// `forgedb build --print-artifact server` used to emit `\n\n<path>\n`, which
+/// `$(...)` strips and `read -r` does not — so the Dockerfile ForgeDB itself
+/// scaffolds worked while `head -1` returned nothing.
+pub fn blank() {
+    if level() >= NORMAL {
+        println!();
+    }
+}
+
+/// A plain line of commentary with no marker — suppressed by `--quiet`, like
+/// every other line this module prints. For text that is the command's OUTPUT
+/// rather than its commentary (a stats report, `--plan`), print it directly:
+/// output is not commentary and must not vanish under `--quiet`.
+pub fn line(msg: &str) {
+    if level() >= NORMAL {
+        println!("{}", msg);
     }
 }
 

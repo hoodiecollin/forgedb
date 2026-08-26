@@ -240,14 +240,21 @@ forgedb/
 
 **All Tests:**
 ```bash
-# Run all tests in workspace
-cargo test --all
+# TIER 1 — the default suite. Exactly what CI runs (.github/workflows/test.yml).
+# --no-fail-fast surfaces ALL results; cargo otherwise halts at the first failing
+# binary. The examples build is separate because --lib/--bins/--tests AND --doc all
+# EXCLUDE examples, so no test flag covers them.
+make test
 
-# Run with output
-cargo test --all -- --nocapture
+# TIER 2 — the ~20 tests that each generate and compile a crate. #[ignore]d out of
+# tier 1; run nightly by CI. Minutes, not seconds. Run it when you touch codegen, the
+# build cache, or the generated API.
+make test-ignored
 
-# Run with specific test threads
-cargo test -- --test-threads=1
+# The individual commands, if you need to vary them
+cargo test --workspace --no-fail-fast
+cargo build --workspace --examples
+cargo test --workspace -- --nocapture
 ```
 
 **Unit Tests Only:**
@@ -265,7 +272,7 @@ cargo test --lib --package forgedb-storage
 cargo test --test '*'
 
 # Specific integration test
-cargo test --test storage_integration
+cargo test --test integration_test
 ```
 
 **Documentation Tests:**
@@ -341,120 +348,167 @@ cargo test -- --nocapture --test-threads=1
 
 ### Testing CLI Commands
 
-**Build CLI:**
+**Build the CLI:**
 ```bash
 cargo build --bin forgedb
 ```
 
-**Test Commands:**
+**Drive it from the repo root.** No `cd` is needed and none is wanted: since #333/#335 no
+ForgeDB command resolves anything from the current directory. The schema is named by
+`--schema` (or found beside itself), the governing config is the nearest `forgedb.toml`
+*above the schema*, a relative output directory resolves against the **schema's** directory,
+and the cargo workspace ForgeDB compiles in lives under `~/.forgedb`.
+
 ```bash
-# Test init command
-./target/debug/forgedb init test-project
-cd test-project
-ls -la
+FORGEDB="$PWD/target/debug/forgedb"
+SCRATCH=/tmp/forgedb-scratch
+rm -rf "$SCRATCH"                       # `init` refuses a path that already exists
 
-# Test validate command
-./target/debug/forgedb validate schema.forge
+"$FORGEDB" init "$SCRATCH"
+"$FORGEDB" validate --schema "$SCRATCH/schema.forge"
+"$FORGEDB" generate all --schema "$SCRATCH/schema.forge"
+"$FORGEDB" build --plan  --schema "$SCRATCH/schema.forge"   # print the plan, compile nothing
+"$FORGEDB" build         --schema "$SCRATCH/schema.forge"
+```
 
-# Test build command
-./target/debug/forgedb build
+Two flag details that bite: `validate` takes `-s/--schema`, **not** a positional path, and
+`forgedb dev` **watches and regenerates — it does not start a server**:
 
-# Test dev command (in background)
-./target/debug/forgedb dev &
-curl http://localhost:3000/health
+```bash
+"$FORGEDB" dev --schema "$SCRATCH/schema.forge"   # blocks until Ctrl+C
 ```
 
 ### Testing Code Generation
 
-**Create Test Schema:**
+Use a corpus schema rather than a hand-written one. Every `examples/*/schema.forge` is asserted
+diagnostic-clean by `tests/lsp_cli_parity.rs`, so a failure is your change rather than the
+fixture:
+
 ```bash
-mkdir -p /tmp/test-forgedb
-cd /tmp/test-forgedb
+SCRATCH=/tmp/forgedb-codegen
+rm -rf "$SCRATCH" && mkdir -p "$SCRATCH"
+cp examples/blog-cms/schema.forge "$SCRATCH/"
+cat > "$SCRATCH/forgedb.toml" <<'TOML'
+[project]
+id = "forgedb-codegen-scratch"
+isolated = true
 
-cat > schema.forge << 'EOF'
-User {
-  id: +uuid
-  email: ^&string
-  username: ^&string
-  created_at: ^timestamp
-  
-  @index(email)
-  @pattern(email, "^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}$")
-}
+[generate]
+targets = ["all"]
+TOML
 
-Post {
-  id: +uuid
-  title: ^string
-  content: string
-  author: *User
-  created_at: ^timestamp
-  
-  @index(author, created_at)
-}
-EOF
+./target/debug/forgedb generate all --schema "$SCRATCH/schema.forge"
 ```
 
-**Generate Code:**
-```bash
-# Use your dev version of CLI
-/path/to/forgedb/target/debug/forgedb build
+`[generate].targets` is **required** once a `[generate]` table exists, and `["all"]` means all
+— including the opt-in targets (`ffi`, the browser replica, the REST SDKs, the native runtime
+bindings). Leaving the key out of a declared table is a positioned error, not a default.
 
-# Check generated files
-ls -la generated/
-cat generated/user.rs
-cat generated/post.rs
-cat generated/lib.rs
+**Generation writes to two places, and the split is the point (#335).** Text you read, commit
+and import goes to the output directory; every Rust file ForgeDB *compiles* goes to the build
+cache, which is the only copy any ForgeDB-driven build reads:
+
+```
+/tmp/forgedb-codegen/generated/          # the output dir
+  database.rs, api.rs                    # read-only MIRROR, byte-identical to the cache copy
+  types.ts + the TS package scaffold
+  openapi.json
+  stubs/README.md
+  go/                                    # when `go-runtime` is declared: Go source,
+                                         # forgedb.h, and the delivered libforgedb.a
+
+~/.forgedb/projects/<project-id>/        # the build cache — a cargo workspace ForgeDB owns
+  Cargo.toml                             # virtual manifest, rewritten in full every time
+  Cargo.lock  target/                    # ONE resolution + ONE target dir per project
+  apps/<member-hash>/core/               # database.rs as src/lib.rs — everything links it
+  apps/<member-hash>/server/             # api.rs + a generated main.rs
+  apps/<member-hash>/{napi,pyo3,ffi,wasm}/
 ```
 
-**Test Generated Code:**
-```bash
-# Create minimal Cargo.toml
-cat > Cargo.toml << 'EOF'
-[package]
-name = "test-forgedb"
-version = "0.1.0"
-edition = "2021"
+**There is no per-model file.** `RustGenerator` emits one `database.rs` carrying every model,
+so `cat generated/user.rs` never worked. You do not have to guess either path: `generate` and
+`build` print `Project: …` and `Build cache: …` on every run.
 
-[dependencies]
-forgedb-storage = { path = "/path/to/forgedb/crates/storage" }
-forgedb-crud-api = { path = "/path/to/forgedb/crates/crud-api" }
-uuid = { version = "1.0", features = ["v4", "serde"] }
-serde = { version = "1.0", features = ["derive"] }
-EOF
+**A third destination is opt-in: `[placement]` (#338).** A Rust consumer who builds with cargo
+can have the database emitted into their own tree as a ForgeDB-owned package, so their cargo
+compiles it — one resolution, one `target/`, their profiles.
 
-# Try to build
-cargo build
+```toml
+[placement]
+rust_package = "generated/core"     # relative to the SCHEMA's directory, like [generate].output
 ```
 
-### Testing HTTP Server
+The key's **absence is the opt-out**; there is no affirmative "cache-only" spelling. What lands
+there is `Cargo.toml` + `src/lib.rs` and nothing else — no `api.rs`, no `main.rs`, no `[[bin]]`,
+whatever `[generate].targets` says. `forgedb build` does not compile it.
 
-**Start Test Server:**
-```bash
-# Build and run example
-cargo run -- generate all --output ./generated
+`generate` **prints** the one dependency line to add; it never edits a manifest it does not own,
+so the `path` is written relative to the directory `generate` ran in and you re-base it against
+the crate that receives it. `package =` is not optional — cargo matches a path dep's key against
+the package's own name:
 
-# Or use CLI
-cd /tmp/test-forgedb
-/path/to/forgedb/target/debug/forgedb dev
+```toml
+forgedb_core = { package = "myapp-core", path = "generated/core" }
 ```
 
-**Test Endpoints:**
+The emitted package is **committed source**: a path dependency naming a missing directory fails
+the workspace load for every crate in it, a fresh clone included. It carries no `[workspace]`
+table (a nested one that a member path-depends on fails the whole workspace), and cargo needs no
+`members` entry — a path dependency inside the workspace directory joins on its own.
+
 ```bash
-# Health check
+ls -la /tmp/forgedb-codegen/generated/
+head -40 /tmp/forgedb-codegen/generated/database.rs
+```
+
+### Testing Generated Code
+
+**Do not hand-write a `Cargo.toml` for it** — since #335 that is precisely what ForgeDB stopped
+making you do, and the scratch project contains no cargo package at all. `forgedb build`
+compiles the cache packages and reports the artifact path cargo actually emitted:
+
+```bash
+./target/debug/forgedb build --schema "$SCRATCH/schema.forge"
+```
+
+The path is read out of cargo's own JSON message stream and existence-checked, never composed
+by joining `target/release/…` — `CARGO_TARGET_DIR` and `[build] target-dir` in
+`$CARGO_HOME/config.toml` move it machine-wide, which is #292.
+
+When you want cargo directly — one package's diagnostics, `cargo tree`, an expanded macro —
+run `forgedb build --plan` and use the invocation it prints, against the cache workspace root.
+`--plan` compiles nothing, so it is also the cheap way to see the package set and the release
+profile floor the driver applies.
+
+### Testing the generated server
+
+`forgedb build` reports the `server` binary's path. Run it with **your project** as the working
+directory, not the cache: the generated `main.rs` refuses to open a database whose resolved
+data directory falls inside `~/.forgedb` (C4 — `FORGEDB_DATA` defaults to a *relative* `data`,
+so starting the binary from the cache would quietly turn a build cache into an installation).
+
+```bash
+SERVER=<the path `forgedb build` printed>
+(cd "$SCRATCH" && FORGEDB_PORT=3000 "$SERVER")
+```
+
+**Test Endpoints** (routes are `/api/<kebab-case model>`, singular — `blog-cms` declares
+`User`, `Post`, `Comment`, `Category`, `Tag`):
+
+```bash
+# Liveness / readiness
 curl http://localhost:3000/health
+curl http://localhost:3000/ready
 
-# Create user
-curl -X POST http://localhost:3000/users \
+# Create, read, list
+curl -X POST http://localhost:3000/api/user \
   -H "Content-Type: application/json" \
-  -d '{"email": "test@example.com", "username": "testuser"}'
+  -d '{"name": "Test User", "email": "test@example.com", "username": "testuser"}'
 
-# Get user
-curl http://localhost:3000/users/{id}
+curl http://localhost:3000/api/user/{id}
+curl "http://localhost:3000/api/user?limit=10"
 
-# List users
-curl http://localhost:3000/users?page=1&limit=10
-
-# Metrics
+# Metrics (on by default; `[server].metrics = false` omits the route entirely)
 curl http://localhost:3000/metrics
 ```
 

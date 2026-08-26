@@ -150,6 +150,26 @@ pub struct GenConfig {
     /// window must re-seed from a fresh backup — the operator's size/resume-window
     /// tradeoff.
     pub replication_log_retention: u64,
+
+    /// **Tier A, default ON (#335 §10, absorbing #336).** Emit the `utoipa`
+    /// `ToSchema` import and per-model derives.
+    ///
+    /// This is a *package-shape* decision rather than a runtime one, and it has
+    /// to be made at generate time because **the orphan rule forbids making it
+    /// later**: once `database.rs` and `api.rs` are separate crates, the derive
+    /// lives in `core` and its `#[openapi(components(schemas(...)))]` consumer
+    /// lives in `server`, so `server` cannot supply the impl — both the trait and
+    /// the type are foreign to it. Proved by compile:
+    /// `error[E0277]: the trait bound 'oc::Post: ToSchema' is not satisfied`.
+    ///
+    /// Decided from the app's **declared** target set, never from what a single
+    /// invocation happened to emit: otherwise `generate rust` and `generate all`
+    /// would produce different `database.rs` for the same project.
+    ///
+    /// Explicitly **not** a cargo feature — C11 forbids a generate-time knob
+    /// becoming a feature of a shared member, and a feature is what an
+    /// implementer reaches for here by reflex.
+    pub web: bool,
 }
 
 impl Default for GenConfig {
@@ -173,11 +193,44 @@ impl GenConfig {
         txn_max_retries: 3,
         page_default_limit: 50,
         page_max_limit: 1000,
+        // ON by default: guardrail G6 — the default must reproduce today's
+        // emitted code byte-for-byte, and today every database.rs derives
+        // ToSchema unconditionally.
+        web: true,
         metrics: true,
         wasm_commit_debounce_ms: 250,
         wasm_commit_max_frames: 100,
         replication_log_retention: 0,
     };
+
+    /// **The one condition deciding whether `utoipa` is in play for this app**
+    /// (#445).
+    ///
+    /// Both halves of that decision have to read *this* — the `ToSchema` derive
+    /// and `use utoipa::ToSchema;` that [`crate::RustGenerator`] emits into
+    /// `core/src/lib.rs`, and the `utoipa` pin that
+    /// [`crate::CorePackage::cargo_toml`] writes into `core/Cargo.toml`. They are
+    /// a matched pair: source naming a crate its own manifest does not pin is
+    /// `error[E0432]: unresolved import 'utoipa'`.
+    ///
+    /// It shipped as two conditions that were merely *expected* to agree — the
+    /// derive on `web` (the app's **declared** targets) and the pin on whether
+    /// *this invocation* happened to emit an `api.rs`. Those differ for exactly
+    /// the invocations that narrow: `generate rust` under `targets = ["all"]`,
+    /// and `build --no-api`. Naming the condition once is what makes the
+    /// disagreement unrepresentable rather than merely fixed.
+    ///
+    /// It cannot be deferred to the consumer: `ToSchema` and the generated types
+    /// are both foreign to `server`, so the **orphan rule** means `server` can
+    /// never supply the impl. It is a generate-time decision or it is nothing.
+    ///
+    /// The asymmetry is deliberate — `web` is resolved from the declared target
+    /// set and falls back to ON, because a `utoipa` pin nothing derives against
+    /// is inert while a missing derive is an `E0277` in `server` that no
+    /// downstream change can fix.
+    pub const fn needs_utoipa(&self) -> bool {
+        self.web
+    }
 
     /// The config that reproduces the *pre-#126* emitted code byte-for-byte,
     /// including the unconditional replication broker. Used by the replication

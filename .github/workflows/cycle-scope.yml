@@ -28,9 +28,10 @@
 # this job should collapse to `npx ai-pm-playbook scope-check ${{ ... }}`; until then
 # scripts/check-cycle-scope.ts is the local transcription and the playbook stays canonical.
 #
-# NOTE ON REACH: most work here merges locally under the branch-per-scope auto-merge rhythm, so
-# this PR-triggered job will not see it. `make cycle-scope ISSUE=<n>` is the same check for that
-# path — run it before merging a branch into `develop`.
+# NOTE ON REACH: core work goes through pull requests as of #390, so this PR-triggered job now
+# sees it. That was not always true — it used to merge locally, and this job saw a minority of
+# changes. `make cycle-scope ISSUE=<n>` remains the same check for anything that still lands
+# directly; run it before merging such a branch into `develop`.
 name: Cycle scope
 
 on:

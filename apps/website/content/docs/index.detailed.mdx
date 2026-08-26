@@ -61,7 +61,7 @@ forgedb-codegen       one generator per artifact:
    ├─ PythonSdkGenerator   → python-sdk/   ├ opt-in REST clients
    ├─ GoSdkGenerator       → go-sdk/       ┘
    ├─ WasmGenerator        → replica/           (opt-in browser read-replica)
-   └─ TransformGenerator   → migrations/transform/  (opt-in offline data migration)
+   └─ TransformGenerator   → transform-<F>-<T>/     (opt-in offline data migration)
 ```
 
 Every generator reads the same validated AST and emits code specialized to it. None of

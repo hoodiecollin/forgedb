@@ -1,29 +1,187 @@
 /// Compile-time generator configuration loaded from `forgedb.toml`.
 ///
-/// The generator consumes the `[generate]`, `[tenant]`, `[auth]`, `[runtime]`,
-/// and `[storage]` tables; any other table present in a project's `forgedb.toml`
-/// (e.g. `[project]`) is silently ignored, so this struct is forward-compatible
-/// with the full config file emitted by `forgedb init`.
+/// **Unknown tables and unknown keys are errors** (#333).  Every table this
+/// struct declares must be one `forgedb init` emits, and vice versa — the
+/// scaffold has to parse against its own CLI.  Silently ignoring a key was the
+/// worse failure even for the version skew it was meant to tolerate: a knob the
+/// CLI does not know reads as applied and is not, so `fsync = "never"` quietly
+/// stays `always` and the wrong bytes get generated with no signal.
+///
+/// Which config governs a schema is decided by [`crate::project`], not here:
+/// the nearest `forgedb.toml` at or above the schema's directory, or an explicit
+/// `--config` path, which is an outright override.  This module only parses.
 ///
 /// Precedence (highest → lowest):
 /// 1. Explicit CLI flag (`--output`, `--schema`, …)
-/// 2. Value from the loaded config file (`[generate]` table)
-/// 3. Built-in default (`./generated`, `schema.forge`, all targets)
+/// 2. Value from the governing config file (`[generate]` table)
+/// 3. Built-in default (`./generated`, all targets)
 use serde::Deserialize;
-use std::path::Path;
+use toml::Spanned;
 
 use crate::error::{CliError, Result};
 
+/// Project identity and grouping (`[project]` table in `forgedb.toml`) — #333.
+///
+/// A `forgedb.toml` does **not** declare an app; a `.forge` schema does.  This
+/// table says only what an enclosing config cannot: whether the schemas beneath
+/// it form a project of their own.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectConfig {
+    /// The project id, **minted by `forgedb init`** and committed with the
+    /// config (#479).  Only meaningful at the project root — declaring it at a
+    /// nested, non-isolated config is a positioned error, because it reads as
+    /// authoritative and is not.  Spanned so that error can name its line.
+    ///
+    /// Minted rather than derived, which is what makes it collision-free: an id
+    /// read off a package name is one two unrelated projects can both produce.
+    /// Nothing but `init` writes it, and a project without one is keyed on a
+    /// hash of its root path instead.
+    pub id: Option<Spanned<String>>,
+    /// Inert metadata.  Deliberately has **no** effect on generation or on
+    /// identity: identity is `id` + root path, and giving a version a role
+    /// would create a second axis on which two roots could collide.
+    pub version: Option<String>,
+    /// Whether the schemas beneath this config form their own project.
+    ///
+    /// **Absent means `true`, inverting `bool`'s own default on purpose.** Read
+    /// naturally, an absent `isolated` would be "not isolated" — grouped — so a
+    /// monorepo root config added for an unrelated reason would silently absorb
+    /// every app beneath it into one project and one lockfile.  A config that
+    /// never heard of grouping is not in a group; grouping stays opt-in, and
+    /// `forgedb init` always writes the field explicitly.
+    #[serde(default = "isolated_default")]
+    pub isolated: bool,
+    /// How much of an app's relative path its derived names carry.
+    ///
+    /// `"minimal"` (the default) uses the shortest trailing run of path
+    /// segments that is unique among the project's apps; `"uniform"` always
+    /// uses every segment.  Only meaningful at the **project root**, because it
+    /// governs the whole app set: under `minimal`, whether `blog` needs
+    /// `services_` in front is a fact about that app's *siblings*.
+    ///
+    /// This is what replaced hash-based disambiguation, and the trade is
+    /// explicit: names became legible (`foo_services_blog-core` rather than
+    /// `schema-60acb6cba9beb3cf-core`) and stopped being **stable**.  Adding an
+    /// app can rename an existing one, which re-keys its cached packages and
+    /// changes every exported C symbol, breaking already-linked FFI consumers
+    /// until they rebuild.  `uniform` narrows that to renames caused by *moving*
+    /// a schema; it cannot eliminate them.
+    #[serde(default)]
+    pub symbol_naming: crate::naming::SymbolNaming,
+}
+
+fn isolated_default() -> bool {
+    true
+}
+
+/// Hand-written, **not** derived.
+///
+/// `ForgeConfig::project` carries `#[serde(default)]`, so a config with no
+/// `[project]` table at all is built from this impl rather than from
+/// `isolated_default` — and a derived `Default` would give `isolated = false`
+/// there, quietly regrouping every app whose config predates the field. The two
+/// defaults have to agree, and only one of them is reachable from the attribute.
+impl Default for ProjectConfig {
+    fn default() -> Self {
+        ProjectConfig {
+            id: None,
+            version: None,
+            isolated: isolated_default(),
+            symbol_naming: crate::naming::SymbolNaming::default(),
+        }
+    }
+}
+
+impl ProjectConfig {
+    /// The declared project id, if any.
+    pub fn id(&self) -> Option<&str> {
+        self.id.as_ref().map(|n| n.as_ref().as_str())
+    }
+}
+
 /// Generator-specific configuration (`[generate]` table in `forgedb.toml`).
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GenerateConfig {
-    /// Schema file path (default: `schema.forge`).
-    pub schema: Option<String>,
+    /// **Removed in #333.**  Declared only so the key stays *recognized and
+    /// rejected*: under `deny_unknown_fields` it would otherwise report
+    /// `unknown field 'schema'`, which is true and useless.  A config governs
+    /// every schema beneath it, so naming one is a category error — and it
+    /// admitted a real loop (read config A to find the schema, then discover
+    /// config B is that schema's nearest ancestor).  See [`removal_error`].
+    pub schema: Option<Spanned<toml::Value>>,
     /// Output directory for generated files (default: `./generated`).
+    ///
+    /// Relative paths resolve against **the schema's** directory, not the
+    /// config's: under a root config governing several apps, config-relative
+    /// would send every app's `output = "generated"` to the same directory and
+    /// silently interleave their generated code.  Schema-relative makes this a
+    /// per-app pattern instead.
     pub output: Option<String>,
-    /// Which targets to enable.  When absent all targets are enabled.
-    /// Valid values: `rust`, `typescript`, `api`, `stubs`.
+    /// Which targets to generate — **required, and explicit** (#335 §12).
+    ///
+    /// An absent key inside a declared `[generate]` table is an error, not
+    /// "everything": the half-declared table left the most consequential key to
+    /// be guessed, and the package prune ([`crate::cache::prunable`]) is defined
+    /// against the *declared* set, which an absence cannot state.  Write
+    /// `targets = ["all"]` for today's behavior; that is what a project with no
+    /// `[generate]` table at all takes from [`GenerateConfig::default`].
+    ///
+    /// The legal values are the CLI's #122 runtime × mode vocabulary
+    /// (maintainer decision 10), hyphen-joined where a mode is required, so one
+    /// spelling means the same thing in a config file and on the command line:
+    ///
+    /// | value | equivalent command |
+    /// |---|---|
+    /// | `all` | `generate all` |
+    /// | `rust` | `generate rust` |
+    /// | `api` | `generate api` |
+    /// | `openapi` | `generate openapi` |
+    /// | `stubs` | `generate stubs` |
+    /// | `ffi` | `generate ffi` |
+    /// | `node-sdk` / `bun-sdk` | `generate node\|bun --sdk` |
+    /// | `node-runtime` / `bun-runtime` | `generate node\|bun --runtime` |
+    /// | `python-sdk` | `generate python --sdk` |
+    /// | `python-runtime` | `generate python --runtime` |
+    /// | `go-sdk` | `generate go --sdk` |
+    /// | `go-runtime` | `generate go --runtime` |
+    /// | `rust-sdk` | `generate rust --sdk` |
+    /// | `browser-replica` | `generate browser --replica` |
+    ///
+    /// The pre-#122 spellings `typescript` and `wasm` still work and **warn**,
+    /// naming their replacements.  [`crate::targets`] is the one definition of
+    /// all of this — including the error text — so this table is a pointer, not
+    /// a second list: an unknown value is a positioned error listing the set
+    /// above, rather than the silent no-op it used to be.
     pub targets: Option<Vec<String>>,
+}
+
+/// The built-in default is a **stated value**, not an absence (#335 §12).
+///
+/// This is what makes "required" mean the right thing.  With `targets` written
+/// here rather than left `None`:
+///
+/// * **no `forgedb.toml` at all** — the fallback config — declares `["all"]`,
+///   so a project that never wrote a config keeps working exactly as before;
+/// * **a config file with no `[generate]` table** takes this same default,
+///   because it has declared nothing about generation;
+/// * **a config file WITH a `[generate]` table but no `targets` key** leaves the
+///   field `None` (serde's default for an `Option` field) and is **refused**.
+///
+/// That last case is the one worth refusing: a half-declared table where the
+/// most consequential key is left to be guessed.  The distinction costs one
+/// hand-written `Default` and removes the "absent means everything" reading that
+/// #335 §12 identifies as the same class of defect as #333's
+/// `ProjectConfig::default()`.
+impl Default for GenerateConfig {
+    fn default() -> Self {
+        Self {
+            schema: None,
+            output: None,
+            targets: Some(vec![crate::targets::DEFAULT_TARGETS.to_string()]),
+        }
+    }
 }
 
 /// Multi-tenancy configuration (`[tenant]` table).  Physical, dir-per-tenant
@@ -31,6 +189,7 @@ pub struct GenerateConfig {
 /// `forgedb serve` process serves exactly one tenant.  This table declares the
 /// root the `forgedb tenant` CLI manages and generated processes open under.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TenantConfig {
     /// Root directory under which each tenant's data dir lives (default `./data`).
     pub root: Option<String>,
@@ -49,6 +208,7 @@ impl TenantConfig {
 /// source `forgedb serve` translates into that env.  **Never** read from a
 /// `.forge` schema — auth is deployment config, the schema is data shape.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     /// Turn the JWT tenant guard on for the generated server.
     #[serde(default)]
@@ -122,6 +282,7 @@ impl AuthConfig {
 /// schema. Absent values reproduce today's output byte-for-byte, except
 /// `replication` (default OFF — the #130 sanctioned exception).
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     /// Attach the durable replication broker (#130, Tier A). Default `false`:
     /// an unused broker's second `F_FULLFSYNC` per write is pure waste. Turn on
@@ -143,6 +304,7 @@ pub struct RuntimeConfig {
 /// Schema-blind, baked at generate time (Tier A/B). Defaults are byte-identical
 /// to today's output.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     /// WAL fsync policy (#129): `"always"` (default, crash-safe) or `"never"`
     /// (durability-weakening opt-in — a real data-loss window on power loss).
@@ -162,6 +324,7 @@ pub struct StorageConfig {
 /// Schema-blind, baked at generate time (Tier B). Defaults are byte-identical
 /// to today's output.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TransactionConfig {
     /// Default retry count for `transaction_optimistic` (#146). Default 3.
     /// Per-call control stays available via `transaction_retrying(retries, f)`.
@@ -173,6 +336,7 @@ pub struct TransactionConfig {
 /// to today's output. (The generated server's host/port and shutdown drain are
 /// separate DEPLOY-environment knobs read from env at process start, not baked.)
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// List-endpoint page size when the client omits `?limit` (#141). Default 50.
     pub page_default_limit: Option<usize>,
@@ -188,6 +352,7 @@ pub struct ServerConfig {
 /// Schema-blind, substituted into the static Worker bootstrap at generate time
 /// (Tier B). Defaults are byte-identical to today's output.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct WasmConfig {
     /// Browser read-replica auto-commit debounce, ms (#148). Default 250.
     pub commit_debounce_ms: Option<u64>,
@@ -195,9 +360,108 @@ pub struct WasmConfig {
     pub commit_max_frames: Option<u64>,
 }
 
-/// Top-level config struct.  Unknown top-level TOML tables are ignored.
+/// Where an already-generated artifact is **placed** (`[placement]` table) —
+/// epic #332's C14, and its first real knob (#338).
+///
+/// Separate from `[generate]` on purpose, and the line is sharp: `[generate]`'s
+/// knobs change generated **bytes** (`targets` changes what exists, the
+/// `[runtime]`/`[storage]` knobs change what `database.rs` says).  This table
+/// changes only **where a byte-identical artifact lands**.  Folding it into
+/// `[generate]` would put a knob that cannot change output beside nine that can.
+///
+/// **The table name is a one-way door.**  [`ForgeConfig`] is
+/// `deny_unknown_fields` at every level, so every already-released CLI rejects
+/// outright any config carrying `[placement]`, and every future CLI must accept
+/// this spelling forever.  There is no deprecation path for a table name: an
+/// alias would be a second name for one thing, in a parser whose entire premise
+/// is that an unrecognized name is an error.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PlacementConfig {
+    /// Where the in-tree Rust package is emitted, resolved against the
+    /// **schema's** directory exactly as `[generate].output` is.
+    ///
+    /// **Absent means no package is emitted.**  The opt-out is the key's
+    /// absence, not a second negative flag — writing a cargo package into a tree
+    /// ForgeDB does not own is opt-in, and one key is the whole of that opt-in.
+    ///
+    /// Read in exactly one place, [`crate::project::Governing::rust_package`].
+    pub rust_package: Option<String>,
+}
+
+/// Top-level config struct.  An unknown top-level table is an error (#333) —
+/// a misspelled `[projekt]` would otherwise be ignored, identity would fall
+/// through to manifest detection or the path hash, and two projects could
+/// Where the interpreters ForgeDB *links to* live, and which versions are
+/// acceptable (#374 direction C).
+///
+/// # ForgeDB embeds no runtime
+///
+/// A migration transform written in TypeScript or Python runs on the runtime
+/// **the author already has installed** — no QuickJS, no CPython, no bundled
+/// interpreter. That makes locating it a config concern, and this is the table.
+///
+/// # It holds LOCATION AND VERSION ONLY
+///
+/// Which language a transform is written in is **derived from
+/// `[generate].targets`** and is never declared here (gate 1 decision 2): a
+/// project that generates a TypeScript SDK writes its transforms in TypeScript
+/// because that is the language it already chose, and a second declaration
+/// could only disagree with the first.
+///
+/// # `[toolchain]`, and why the name is a one-way door
+///
+/// `[runtime]` was taken and means something else entirely — replication,
+/// change-feed capacity, cascade depth. And because config parsing is
+/// `deny_unknown_fields`, **every already-released `forgedb` rejects a config
+/// carrying a table it does not know**. So this spelling ships once and forever:
+/// a project that adopts `[toolchain]` can no longer be built by an older CLI,
+/// and a rename later would strand every config that had adopted the first name.
+///
+/// ```toml
+/// [toolchain]
+/// bun    = { path = "/opt/homebrew/bin/bun", min_version = "1.1" }
+/// node   = { path = "/usr/local/bin/node",   min_version = "20" }
+/// python = { path = ".venv/bin/python",      min_version = "3.11" }
+/// ```
+///
+/// # Three explicit fields, not a map
+///
+/// A `HashMap<String, InterpreterConfig>` accepts **every** key even under
+/// `deny_unknown_fields`, so `pythn = { ... }` would parse and be silently
+/// ignored — a configuration that reads as applied and is not. Adding a fourth
+/// runtime later is an additive optional field.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ToolchainConfig {
+    pub bun: Option<InterpreterConfig>,
+    pub node: Option<InterpreterConfig>,
+    pub python: Option<InterpreterConfig>,
+}
+
+/// One interpreter: where it is, and the oldest version that will do.
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct InterpreterConfig {
+    /// Absolute, or relative to the **project root** — not the CWD, per the
+    /// #333/#361 rule that a relative path in a config resolves against the
+    /// tree the config governs. Absent means "resolve the bare name on `PATH`".
+    pub path: Option<String>,
+    /// The oldest acceptable `--version`, as a dotted prefix (`"1.1"`, `"20"`,
+    /// `"3.11"`). Absent means any version.
+    pub min_version: Option<String>,
+}
+
+/// silently merge through the very mechanism meant to be a compatibility
+/// feature.
+///
+/// Every table `forgedb init` emits must appear here, or the scaffold fails
+/// against its own CLI; `scaffolded_config_parses_strictly` is that guard.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ForgeConfig {
+    #[serde(default)]
+    pub project: ProjectConfig,
     #[serde(default)]
     pub generate: GenerateConfig,
     #[serde(default)]
@@ -214,6 +478,12 @@ pub struct ForgeConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub wasm: WasmConfig,
+    #[serde(default)]
+    pub placement: PlacementConfig,
+    /// Where the interpreters a non-Rust migration transform runs on live
+    /// (#374). See [`ToolchainConfig`] — the name is a **one-way door**.
+    #[serde(default)]
+    pub toolchain: ToolchainConfig,
 }
 
 impl ForgeConfig {
@@ -233,8 +503,20 @@ impl ForgeConfig {
                 )));
             }
         };
+        // #335 §10. Decided from the app's DECLARED target set, never from what a
+        // single invocation emitted — otherwise `generate rust` and `generate all`
+        // would bake different `database.rs` for the same project. Resolution
+        // failures fall back to ON, which is today's behavior: a spurious utoipa
+        // dependency is inert, while a missing derive is a compile error in
+        // `server` that the orphan rule makes unfixable downstream.
+        let web = self
+            .resolved_targets()
+            .map(|(targets, _)| targets.iter().any(|t| t == "api"))
+            .unwrap_or(true);
+
         Ok(forgedb_codegen::GenConfig {
             replication: self.runtime.replication,
+            web,
             fsync,
             wal_checkpoint_interval: self
                 .storage
@@ -273,39 +555,193 @@ impl ForgeConfig {
     }
 }
 
-/// Load generator configuration.
+/// The file name a config is always stored under.
+pub const CONFIG_FILE: &str = "forgedb.toml";
+
+/// 1-based line and column of a byte offset in `content`.
 ///
-/// * `path = Some(p)` — load from the explicit path; error if the file is
-///   missing or contains invalid TOML.
-/// * `path = None` — look for `forgedb.toml` in the current working directory;
-///   return the default config silently if the file does not exist.
-pub fn load_config(path: Option<&str>) -> Result<ForgeConfig> {
-    match path {
-        Some(explicit_path) => {
-            let content = std::fs::read_to_string(explicit_path).map_err(|e| {
-                CliError::Config(format!(
-                    "Cannot read config file '{}': {}",
-                    explicit_path, e
-                ))
-            })?;
-            toml::from_str(&content).map_err(|e| {
-                CliError::Config(format!(
-                    "Invalid config file '{}': {}",
-                    explicit_path, e
-                ))
-            })
-        }
-        None => {
-            if Path::new("forgedb.toml").exists() {
-                let content = std::fs::read_to_string("forgedb.toml")
-                    .map_err(|e| CliError::Config(format!("Cannot read forgedb.toml: {}", e)))?;
-                toml::from_str(&content)
-                    .map_err(|e| CliError::Config(format!("Invalid forgedb.toml: {}", e)))
-            } else {
-                Ok(ForgeConfig::default())
-            }
+/// `toml` reports spans as byte offsets; every positioned diagnostic in this
+/// crate goes through here so they all count lines the same way.
+pub fn line_col(content: &str, offset: usize) -> (usize, usize) {
+    let clamped = offset.min(content.len());
+    let before = &content[..clamped];
+    let line = before.matches('\n').count() + 1;
+    let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+    (line, column)
+}
+
+/// The position of the **key** on the line a value's span points into.
+///
+/// `Spanned` reports where the *value* starts, so `id = "api"` positions at
+/// column 8 — past the thing the reader has to change. Every diagnostic here is
+/// about a key, so they all point at the start of its line instead.
+pub fn key_position(content: &str, value_offset: usize) -> (usize, usize) {
+    let (line, _) = line_col(content, value_offset);
+    let indent = content
+        .lines()
+        .nth(line.saturating_sub(1))
+        .map_or(0, |l| l.chars().take_while(|c| c.is_whitespace()).count());
+    (line, indent + 1)
+}
+
+/// Parse a `forgedb.toml` from its text, applying the diagnostics that
+/// `deny_unknown_fields` alone cannot produce.
+///
+/// `path` is used only for the message; nothing is read from disk here, which is
+/// what lets the strict-parsing tests run without fixtures.
+pub fn parse_config(content: &str, path: &std::path::Path) -> Result<ForgeConfig> {
+    let config: ForgeConfig = toml::from_str(content).map_err(|e| {
+        // The library already emits `TOML parse error at line L, column C`, a
+        // caret snippet, the offending key AND the expected set.  Wrapping that
+        // in `Configuration error:` would only bury it, so it is rendered
+        // verbatim under the file it came from.
+        CliError::ConfigDiagnostic(format!("{}:\n{}", path.display(), e))
+    })?;
+
+    if let Some(removed) = &config.generate.schema {
+        return Err(removal_error(content, path, removed.span().start));
+    }
+
+    // `[generate].targets` is REQUIRED in a config file (#335 §12, decision 2).
+    //
+    // It used to be optional, where ABSENT MEANT EVERY TARGET — the inverse of
+    // what an empty list normally reads as, and the same class of defect as
+    // #333's `ProjectConfig::default()`.  #335 defines the package prune against
+    // the *declared* set, so an absent value would collapse that set to whatever
+    // a single invocation happened to select: `forgedb generate rust` on a
+    // default project would prune away the server, the bindings and the replica.
+    //
+    // A project with NO config file at all is a different case and is not an
+    // error — it takes the built-in `["all"]`, which is a value like any other
+    // (see `crate::targets::DEFAULT_TARGETS`).  What is refused is a config file
+    // that declares some of `[generate]` and leaves this key to be guessed.
+    if config.generate.targets.is_none() {
+        return Err(missing_targets_error(content, path));
+    }
+
+    Ok(config)
+}
+
+impl ForgeConfig {
+    /// The declared target set, as canonical internal names, plus any
+    /// deprecation warnings the caller should print.
+    ///
+    /// The one door onto `[generate].targets` — both `generate` and `build` come
+    /// through here, so neither can see the raw user spellings and neither can
+    /// invent its own reading of an absent value. `build` used to pass
+    /// `config_targets: None` outright (#335 §12), which made every opt-in arm
+    /// of `generate_all` unreachable from `forgedb build`.
+    pub fn resolved_targets(&self) -> Result<(Vec<String>, Vec<String>)> {
+        let declared = self.generate.targets.as_deref().unwrap_or(&[]);
+        crate::targets::resolve_all(declared)
+    }
+}
+
+/// The diagnostic for an absent `[generate].targets` (#335 §12).
+///
+/// Anchored on the `[generate]` table header when there is one, so the caret
+/// lands where the key belongs rather than at the top of the file.
+fn missing_targets_error(content: &str, path: &std::path::Path) -> CliError {
+    let (line, column) = content
+        .find("[generate]")
+        .map(|offset| key_position(content, offset))
+        .unwrap_or((1, 1));
+
+    CliError::ConfigDiagnostic(format!(
+        "{}:{}:{}: `[generate].targets` is required.\n\n\
+         An absent value used to mean \"every target\", which is the opposite of \
+         what an absent list normally means — and it leaves the set of packages \
+         to build undefined.\n\n\
+         To keep exactly today's behavior, write:\n\n\
+         \x20   [generate]\n\
+         \x20   targets = [\"all\"]\n\n\
+         Legal values:\n{}",
+        path.display(),
+        line,
+        column,
+        crate::targets::legal_list()
+    ))
+}
+
+/// The bespoke diagnostic for the removed `[generate].schema` key (#333 §10).
+///
+/// `deny_unknown_fields` would report `unknown field 'schema'` — true, and
+/// useless.  A removal the user cannot act on is a worse break than the removal
+/// itself, so the key stays recognized and this names what replaced it.
+fn removal_error(content: &str, path: &std::path::Path, offset: usize) -> CliError {
+    let (line, column) = key_position(content, offset);
+    CliError::ConfigDiagnostic(format!(
+        "{}:{}:{}: `[generate].schema` was removed.\n\n\
+         A config governs every schema beneath it, so it cannot name one: the \
+         same file may be the nearest ancestor of several apps. It also admitted \
+         a loop — the config that named a schema need not be the config that \
+         governs it.\n\n\
+         The schema is named by the invocation or found beside you: pass \
+         `--schema <path>`, or leave it out and keep the schema next to this file.",
+        path.display(),
+        line,
+        column
+    ))
+}
+
+/// Read and parse a config file from an explicit path.
+///
+/// Every config read in the CLI comes through here or [`parse_config`], and both
+/// are reached only from [`crate::project`].  That is a greppable property, and
+/// it is the invariant #361 established: two loaders means two identities, and a
+/// single invocation served by two of them mis-keys the build cache silently.
+pub fn load_config_file(path: &std::path::Path) -> Result<ForgeConfig> {
+    let content = std::fs::read_to_string(path).map_err(|e| {
+        CliError::Config(format!("Cannot read config file '{}': {}", path.display(), e))
+    })?;
+    parse_config(&content, path)
+}
+
+// ---------------------------------------------------------------------------
+// Writing a config (#367, narrowed by #479)
+// ---------------------------------------------------------------------------
+//
+// This is a write, and it lives in the module that owns the READS on purpose.
+// #361's one-loader invariant is about config I/O, and splitting the writer into
+// its own module would make it two modules again — the same drift with a new
+// file name.
+//
+// #479 left exactly ONE writer: the `forgedb.toml` that `forgedb init`
+// scaffolds.  The create/edit pair that recorded a chosen `[project].name` went
+// with the decision it recorded — an id is now minted at `init`, so there is no
+// later invocation that has to write one into a config ForgeDB did not author.
+
+/// Write a config through a sibling temp file, **re-parsing before the rename**.
+///
+/// Two hazards, one mechanism.  `deny_unknown_fields` means an edit that creates
+/// a key the parser rejects would corrupt a working config — so the result is
+/// parsed by [`parse_config`] (the same function every read uses, never a second
+/// one) and a document that no longer parses is simply not applied.  And the
+/// rename is atomic, so a half-written `forgedb.toml` can never be observed in
+/// the user's repository.
+pub fn write_checked(path: &std::path::Path, content: &str) -> Result<()> {
+    parse_config(content, path)?;
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let temp = dir.join(format!(
+        ".{}.forgedb-tmp",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("config")
+    ));
+    std::fs::write(&temp, content)?;
+    match std::fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(e.into())
         }
     }
+}
+
+/// A TOML basic string. Project ids are validated before they reach here
+/// (no control characters, no separators), so this only has to handle the
+/// two characters TOML itself reserves.
+pub fn quoted(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 #[cfg(test)]
@@ -317,7 +753,7 @@ mod tests {
     fn empty_config_maps_to_default_gen_config() {
         // No [runtime]/[storage] tables → GenConfig::DEFAULT (byte-identical
         // output, replication OFF).
-        let cfg: ForgeConfig = toml::from_str("[project]\nname = \"x\"\n").unwrap();
+        let cfg: ForgeConfig = toml::from_str("[project]\nid = \"x\"\n").unwrap();
         assert_eq!(cfg.gen_config().unwrap(), GenConfig::DEFAULT);
         assert!(!cfg.runtime.replication);
     }
@@ -368,6 +804,9 @@ commit_max_frames = 40
                 wasm_commit_debounce_ms: 500,
                 wasm_commit_max_frames: 40,
                 replication_log_retention: 4096,
+                // No `[generate]` table in this fixture, so the built-in
+                // `["all"]` applies and `all` expands to include `api` (#335 §12).
+                web: true,
             }
         );
     }

@@ -791,6 +791,38 @@ async fn main() {
         &format!("expected a sorted json object for `payload`; got: {body}"),
     );
 
+    // --- #389: a timestamp filter param is floored to the field's quantum ---
+    //
+    // `made_at` is `timestamp(ms)` and is NOT indexed, so `?made_at=` takes the
+    // predicate path alone (`__widget_scan_matches`) with no index pushdown. That
+    // isolates the REST half of #389 from the index-key half, which `index_test`
+    // covers — the two are separate fixes and the REST list path needs both, since
+    // the pushdown selects candidates and the predicate then re-checks them.
+    //
+    // The param carries MICROSECOND precision (`…678999Z`); row A is stored at
+    // `…678Z`. `Timestamp`'s `PartialEq` is over the raw i64 micros and does not
+    // self-correct, so before #389 this compared 1767323045678999 against
+    // 1767323045678000 and returned an empty page. A whole-millisecond param would
+    // pass either way and prove nothing — that is the point of the extra digits.
+    let uri = "/api/widget?made_at=2026-01-02T03:04:05.678999Z";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        &format!(r#"{{"data":[{widget_a}],"total":1,"limit":50,"offset":0}}"#),
+    );
+
+    // The same instant spelled exactly, to the millisecond. Flooring is idempotent,
+    // so both spellings must select the same row; if only one passes, the param and
+    // the stored value have been reconciled in the wrong direction.
+    let uri = "/api/widget?made_at=2026-01-02T03:04:05.678Z";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        &format!(r#"{{"data":[{widget_a}],"total":1,"limit":50,"offset":0}}"#),
+    );
+
     // --- Scenario 4: a filter that eliminates every row ---
     // Pushdown half: `Some([])` → the gather runs on an empty selection.
     let uri = "/api/widget?serial=999";

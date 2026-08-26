@@ -399,7 +399,7 @@ export interface ListOptions {\n\
     }
 
     /// Map ForgeDB field type to TypeScript type
-    fn map_field_type(field_type: &forgedb_parser::FieldType) -> String {
+    pub(crate) fn map_field_type(field_type: &forgedb_parser::FieldType) -> String {
         match field_type {
             // M1: U32/U64 should map to number, not any
             forgedb_parser::FieldType::U32

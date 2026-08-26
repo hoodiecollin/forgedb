@@ -1,16 +1,22 @@
 ---
 title: "forgedb build"
-description: "Validate, regenerate, and compile production-ready ForgeDB artifacts for native or WASM targets."
+description: "Validate, regenerate, and compile the generated code in ForgeDB's own build cache, then report the artifact paths."
 purpose: "reference"
 ---
 Produce production artifacts end to end: validate the schema, regenerate the code (baking
-the `[runtime]`/`[storage]` config from `forgedb.toml` into the output), then compile.
-`build` always regenerates with force, so a repeated build never fails on existing files.
+the `[runtime]`/`[storage]` config from `forgedb.toml` into it), then compile. Regeneration
+overwrites what ForgeDB wrote last time, so a repeated build never fails on existing files.
+
+**Compilation happens in ForgeDB's build cache, not in your project.** Your project
+contains no `Cargo.toml`; `~/.forgedb/projects/<project>/` is a ForgeDB-owned cargo
+workspace holding one package per generated target, sharing one `Cargo.lock` and one
+`target/` across every app in the project. `build` prints where each artifact landed.
 
 ## Synopsis
 
 ```bash
-forgedb build [--release] [--target <native|wasm|both>] [--output <DIR>] [--schema <PATH>] [--no-api]
+forgedb build [--release] [--output <DIR>] [--schema <PATH>] [--no-api]
+              [--plan] [--report <PATH>] [--print-artifact <KIND>]
 ```
 
 ## Flags
@@ -18,33 +24,116 @@ forgedb build [--release] [--target <native|wasm|both>] [--output <DIR>] [--sche
 | Flag | Type / default | Meaning |
 |---|---|---|
 | `--release` | bool (**true**) | Build with optimizations. On by default. |
-| `-t`, `--target <T>` | string (`native`) | Compile target: `native`, `wasm`, or `both`. |
-| `-o`, `--output <DIR>` | string (`[generate].output`, else `generated`) | Output directory for generated code. |
+| `-o`, `--output <DIR>` | string (`[generate].output`, else `generated`) | Output directory for generated code. The flag is used verbatim; the other two resolve against **the schema's** directory. |
 | `--schema <PATH>` | string (auto-discover) | Schema file path. |
-| `--no-api` | bool (false) | Skip API generation — generate only `rust`, the `node --sdk` TypeScript SDK, and `stubs`. |
+| `--no-api` | bool (false) | Narrow the declared target set: drop `api` and `openapi`. |
+| `--plan` | bool (false) | Print the package set and the exact cargo invocations, and compile nothing. |
+| `--report <PATH>` | path | Write the machine-readable JSON artifact report to `PATH` (`-` = stdout). |
+| `--print-artifact <KIND>` | `core`\|`server`\|`ffi`\|`napi`\|`pyo3`\|`wasm` | Print exactly one absolute artifact path. |
 
-<Callout type="note" title="build = validate + generate + compile">
-`build` first runs a syntax-only validation, then generates (`all`, or the reduced set
-with `--no-api`), then compiles the chosen target. The generate step honors the same
-config knobs as [`generate`](/docs/cli/generate/).
+<Callout type="note" title="What gets compiled is what you declared">
+`build` compiles the intersection of `[generate].targets` and what generation actually
+emitted — there is no build-time target flag. To build the browser read-replica, declare
+`browser-replica` in `[generate].targets`; `build` then compiles it for
+`wasm32-unknown-unknown` in its own cargo invocation, automatically. The removed
+`--target wasm` errors and names this.
+</Callout>
+
+## Where the artifacts go
+
+Every path is the one **cargo reported**, existence-checked before it is printed — never a
+path composed by ForgeDB. That matters because cargo resolves its target directory from
+`CARGO_TARGET_DIR` and from `[build] target-dir` in every `config.toml` on its discovery
+chain, including the machine-wide one.
+
+```bash
+forgedb build
+# ✓ Build complete!
+# ℹ core (rlib):        ~/.forgedb/projects/blog/target/release/libblog_….rlib
+# ℹ server (bin):       ~/.forgedb/projects/blog/target/release/blog_…-server
+# ℹ ffi (staticlib):    ~/.forgedb/projects/blog/target/release/libblog_….a
+# ℹ wasm (cdylib):      ~/.forgedb/projects/blog/target/wasm32-unknown-unknown/release/….wasm
+```
+
+Two machine-readable surfaces are projections of that same value:
+
+```bash
+forgedb build --print-artifact server      # one absolute path, for $(…)
+forgedb build --report artifacts.json      # the whole report, for a Dockerfile
+```
+
+The `deploy/` files `init` writes use `--print-artifact` rather than copying from a
+hard-coded path.
+
+## What it delivers
+
+For every native target your project declares, `build` copies the compiled artifact out of
+the cache and into that app's output directory, beside the generated text that describes it,
+and prints where each one landed.
+
+| Target | Delivered to | As |
+|---|---|---|
+| `node-runtime` / `bun-runtime` | `<output>/napi/` | `forgedb.node` |
+| `python-runtime` | `<output>/pyo3/` | `_forgedb_native.abi3.so` |
+| `ffi` | `<output>/ffi/` | `libforgedb.a` |
+| `go-runtime` | `<output>/go/` | `libforgedb.a` |
+
+Nothing else is copied. The server binary is *reported* rather than delivered — the
+`deploy/` files read its path from `--print-artifact` in the same invocation that produced
+it — and the browser replica's `.wasm` is out of scope.
+
+<Callout type="note" title="Why C and Go get an archive and not a shared library">
+A shared library records an **absolute** path to where it was built, and copying it does not
+rewrite that path. A consumer that linked one would record a path into the ForgeDB build
+cache — and the cache is a cache, deletable at any time. An archive's contents are linked
+into your binary, so there is nothing left to dangle.
+
+Node and Python are unaffected: both load their extension by path at runtime and record no
+dependency on it.
+</Callout>
+
+<Callout type="warning" title="A stale artifact fails loudly">
+Generated code and the artifact built from it each carry a fingerprint of the source they
+came from. Change your schema, run `generate` but not `build`, and `require`/`import` throws
+— or a Go binary panics at start — naming the mismatch and telling you to run `forgedb
+build`. It is not a version: upgrading ForgeDB without changing your generated output
+invalidates nothing.
+
+For C the check is **advisory** — ForgeDB generates no C that runs, so `forgedb.h` offers
+`forgedb_fingerprint_ok()` and nothing can force you to call it.
+
+`forgedb dev` regenerates and never compiles, so an in-process Node or Python consumer will
+fail this check continuously during a watch session. The report is honest — the artifact
+really is stale — but you will want `forgedb build` in that loop.
+</Callout>
+
+<Callout type="note" title="CI needs a Rust toolchain">
+Compiled artifacts are ignored by git, so each machine builds its own from your schema. A CI
+job that tests an in-process binding has to run `forgedb build` first.
 </Callout>
 
 ## Examples
 
-Build the native release artifacts:
+Build everything the project declares:
 
 ```bash
 forgedb build
 ```
 
-Build both native and WASM:
+See what it would run, without compiling:
 
 ```bash
-forgedb build --target both
+forgedb build --plan
 ```
 
 Build without the REST API server:
 
 ```bash
 forgedb build --no-api
+```
+
+Copy the server binary somewhere:
+
+```bash
+install -m 0755 "$(forgedb build --print-artifact server)" /usr/local/bin/myapp
 ```

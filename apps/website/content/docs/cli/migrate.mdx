@@ -1,6 +1,6 @@
 ---
 title: "forgedb migrate"
-description: "Record, build, and run schema migrations that rewrite data-at-rest across format versions."
+description: "Record, build, and run schema migrations that rewrite data-at-rest, and carry a data dir across an engine generation."
 purpose: "reference"
 ---
 Schema evolution follows the generate-then-compile model: edit `schema.forge`, regenerate,
@@ -9,81 +9,111 @@ reopen. Everything else rewrites data-at-rest, and `forgedb migrate` drives that
 generated offline transformer. The [migrations feature guide](/docs/features/migrations/)
 has the full workflow.
 
+**Every subcommand requires `--schema`, and none of them discovers anything.** The schema
+names the *app*: `migrations/` is read beside it, and the build cache is keyed by it.
+Nothing is inferred from your working directory.
+
 ## Subcommands
 
 | Command | Purpose |
 |---|---|
-| `create <description>` | Record a migration; with `--auto`, diff the schema and classify/scaffold the change. |
-| `status` | Show migration status. |
-| `build --from F --to T` | Generate + compile the offline transformer bin for a version range. |
-| `run --src S --dest D` | Run a built transformer over a source → destination data directory. |
-| `up` | One-CLI migration: build the transformer + run it over a data dir (or every tenant). |
+| `create <description>` | Diff the schema against the recorded snapshot, record + classify the change, and ask about anything it cannot prove. |
+| `status` | Report an app's lineage. |
+| `build --from F --to T` | Generate + compile the offline transformer for a version range. |
+| `run --from F --to T --src S --dest D` | Run a built transformer over a source → destination data directory. |
+| `engine --src S --dest D` | Carry a data dir across a ForgeDB **byte-format generation**. |
 
 ### create
 
 ```bash
-forgedb migrate create <description> [--auto] [--schema <PATH>]
+forgedb migrate create <description> --schema <PATH> [--no-auto]
 ```
 
 | Flag | Type / default | Meaning |
 |---|---|---|
 | `<description>` | string (required) | Human description of the migration. |
-| `-a`, `--auto` | bool (false) | Auto-detect schema changes by diffing against the recorded snapshot; record, classify (`Auto`/`Authored`), and scaffold any authored body. |
-| `-s`, `--schema <PATH>` | path | Schema file to diff against the snapshot (for `--auto`). |
+| `-s`, `--schema <PATH>` | path (**required**) | The app this migration belongs to. `migrations/` is read beside it. |
+| `--no-auto` | bool (false) | Opt out of the interactive **prompt**, not of detection. The diff is identical either way; what this decides is whether a change ForgeDB cannot prove a value for stops the run with a hard error naming it, or asks you a question. A session with no terminal behaves as if this were passed. |
+
+Detection is what `create` does, so there is no flag for it — `--auto` was removed in 0.5.0 and
+errors, naming `--no-auto`. There is also no way to create a migration ForgeDB did not detect: a
+record's `changes` array is derived from a schema diff, so it cannot disagree with
+`migrations/schemas/vN.forge`.
+
+A change ForgeDB **can** prove needs no input: a nullable add, a drop, a value-preserving
+widening, or an add whose field carries a resolvable `@default`. Anything else is asked about at
+`create` time — a constant, a copy of another field, or "I'll write the transform" — and your
+answer is recorded as data in the migration record, which `migrate build` then lowers into the
+generated transformer.
 
 ### status
 
 ```bash
-forgedb migrate status
+forgedb migrate status --schema <PATH>
 ```
-
-Show applied and pending migrations. Takes no flags.
 
 ### build
 
 ```bash
-forgedb migrate build --from <F> --to <T> [--output <DIR>]
+forgedb migrate build --schema <PATH> --from <F> --to <T>
 ```
 
 | Flag | Type / default | Meaning |
 |---|---|---|
+| `-s`, `--schema <PATH>` | path (**required**) | The app to build the transformer for. |
 | `--from <F>` | u32 (required) | Origin (current on-disk) format version. |
 | `--to <T>` | u32 (required) | Destination format version. |
-| `-o`, `--output <DIR>` | path (`migrations/transform`) | Where to emit + build the transformer crate. |
+
+The transformer is emitted into the app's build-cache container as
+`transform-<from>-<to>/` and compiled as a member of the project's cargo workspace. The
+command prints the binary's path — the one **cargo reported**, existence-checked.
+
+<Callout type="note" title="--schema selects the app, and nothing else">
+The transformer is generated from the committed per-version schemas under the app's
+`migrations/`, so a drifted current schema cannot change a historical hop.
+</Callout>
 
 ### run
 
 ```bash
-forgedb migrate run --src <DATA> --dest <MIGRATED> [--bin-dir <DIR>]
+forgedb migrate run --schema <PATH> --from <F> --to <T> --src <DATA> --dest <MIGRATED>
 ```
 
 | Flag | Type / default | Meaning |
 |---|---|---|
+| `-s`, `--schema <PATH>` | path (**required**) | The app whose transformer to run. |
+| `--from <F>` / `--to <T>` | u32 (**required**) | The range. Together with `--schema` these name the exact cache member `build` produced. |
 | `--src <DATA>` | path (required) | Source data directory at the origin format version. |
 | `--dest <MIGRATED>` | path (required) | Destination directory to materialize (must be absent/empty). |
-| `--bin-dir <DIR>` | path (`migrations/transform`) | The built transformer crate directory. |
 
-### up
+`run` compiles nothing. If the binary is missing it hard-errors naming the cache path and
+tells you to run `migrate build` — there is no fallback that quietly rebuilds somewhere
+else.
+
+### engine
 
 ```bash
-forgedb migrate up [--from F] [--to T] [--src S --dest D] [--tenant-root R] [--output O] [--dest-suffix SUF]
+forgedb migrate engine --schema <PATH> --src <DATA> --dest <MIGRATED>
 ```
 
 | Flag | Type / default | Meaning |
 |---|---|---|
-| `--from <F>` | u32 (detected from source manifests) | Origin format version. |
-| `--to <T>` | u32 (lineage's current version) | Destination format version. |
-| `--src <S>` | path | Source data directory (single-dir mode). |
-| `--dest <D>` | path | Destination directory to materialize (single-dir mode). |
-| `-o`, `--output <O>` | path (`migrations/transform`) | Transformer crate directory. |
-| `--tenant-root <R>` | path | Migrate every data dir directly under this root (per-tenant sweep). |
-| `--dest-suffix <SUF>` | string (`-migrated-v<to>`) | Per-tenant destination suffix. |
+| `-s`, `--schema <PATH>` | path (**required**) | The app. The same schema is baked on both sides of the hop. |
+| `--src <DATA>` | path (required) | Source data directory at the old engine generation. |
+| `--dest <MIGRATED>` | path (required) | Destination directory to materialize (must be absent/empty). |
 
-<Callout type="note" title="up writes a fresh destination">
-`migrate up` builds the transformer, `cargo build`s it, and runs it, writing a **fresh**
-destination and leaving the source untouched, so the original is your rollback. The app must
-be stopped (offline / exclusive-writer). `build`, `run`, and `generate transform` are the
-lower-level primitives `up` composes.
+Orthogonal to the schema-version transformer, and it needs its own command for that
+reason: an engine bump changes no `.forge`, so it produces no lineage hop and
+`build`/`run` would replay nothing. Versions are read from the data directory's own
+manifests; migrating backwards is refused and tells you to upgrade the CLI instead.
+
+<Callout type="warning" title="Removed: `migrate up`, `-o/--output`, `--bin-dir`">
+`migrate up` was a wrapper over `build` + `run`; run the two commands. `-o/--output`
+(on `build` and `engine`) and `--bin-dir` (on `run`) chose where the transformer was
+built — ForgeDB owns that now, and it is a member of the project's cache workspace
+rather than a `[package]` dropped under whatever cargo root you were standing in. All
+three still parse, and all three error naming their replacement. The per-tenant sweep
+and `--from` auto-detection that left with `up` are tracked for restoration as #373.
 </Callout>
 
 ## Examples
@@ -91,18 +121,20 @@ lower-level primitives `up` composes.
 Record an additive change and regenerate:
 
 ```bash
-forgedb migrate create "add note field" --auto --schema schema.forge
+forgedb migrate create "add note field" --schema schema.forge
 forgedb generate
 ```
 
-Migrate one data directory in a single step:
+Build a transformer and run it over one data directory:
 
 ```bash
-forgedb migrate up --from 1 --to 2 --src ./data --dest ./data-migrated
+forgedb migrate build --schema schema.forge --from 1 --to 2
+forgedb migrate run   --schema schema.forge --from 1 --to 2 \
+  --src ./data --dest ./data-migrated
 ```
 
-Sweep every tenant under a root:
+Carry a data dir across an engine generation:
 
 ```bash
-forgedb migrate up --tenant-root ./tenants --to 2
+forgedb migrate engine --schema schema.forge --src ./data --dest ./data-v2
 ```

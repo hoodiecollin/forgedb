@@ -6,29 +6,74 @@
 # full outside-repo chain actually **builds, links, and runs**:
 #
 #   1. Build the `forgedb` CLI from this checkout (`cargo build --release`).
-#   2. `forgedb init` a temp project OUTSIDE the checkout + a multi-model schema
-#      (so the emitted `ffi/Cargo.toml` resolves the substrate crates from
-#      crates.io, not the workspace — the true installed-user path).
-#   3. `forgedb generate go --runtime` → emits `ffi/` (cdylib) + `go/` (cgo pkg).
-#   4. `cargo build --release` the sibling `ffi/` cdylib (the generated cgo
-#      `LDFLAGS` hardcodes `../ffi/target/release`, so release is mandatory).
+#   2. `forgedb init` a temp project OUTSIDE the checkout + a multi-model schema,
+#      with FORGEDB_HOME outside it too (so every substrate crate resolves from
+#      crates.io, not from this workspace — the true installed-user path).
+#   3. `forgedb generate go --runtime` → emits the `go/` cgo package into the
+#      output directory, and the `ffi` package into the build cache.
+#   4. `forgedb build` → compiles the cache workspace AND delivers the ffi
+#      **staticlib** to `generated/go/libforgedb.a`.
 #   5. `go mod tidy` (pulls `arrow-go/v18`) + `CGO_ENABLED=1 go build ./...`.
 #   6. Round-trip smoke `go run`: open → insert → get → assert.
+#   7. Delete the cargo target directory, then run the smoke binary AGAIN.
+#
+# WHY STEP 4 IS `forgedb build` AND WHY THE ARCHIVE, NOT THE DYLIB (#335)
+#
+# This file used to say: "`cargo build --release` the sibling `ffi/` cdylib (the
+# generated cgo LDFLAGS hardcodes `../ffi/target/release`, so release is
+# mandatory)". Both halves of that are gone.
+#
+# There is no sibling `generated/ffi/` any more — the ffi package is a member of
+# ForgeDB's own cache workspace, and `forgedb build` is what compiles it. And the
+# cgo preamble no longer points into a cargo target directory at all: it is
+# `-L${SRCDIR} -lforgedb`, resolved against a `libforgedb.a` sitting beside the
+# Go source, which `forgedb build` copies there.
+#
+# The archive rather than the dylib is the whole point. rustc stamps an ABSOLUTE
+# `LC_ID_DYLIB` into a cdylib, so a Go binary that linked one records the cache
+# path — and the cache is a cache, deletable at any time (C8). The binary then
+# dies `dyld: Library not loaded`, and CI never sees it, because the cache still
+# exists while the workflow runs. Step 7 exists precisely to remove that blind
+# spot: it deletes the target directory and re-runs the binary.
 #
 # Toolchain matrix mirrors pypi.yml's same-arch convention: Rust (pinned 1.96 via
 # rust-toolchain.toml) + Go + `CGO_ENABLED=1` + a C compiler, Unix-only (Windows
 # is excluded across every channel — storage-native positional I/O + coordinator
-# Unix sockets; tracked in #209). Triggers only on PRs that touch the Go/FFI
-# generators (or this file) + manual dispatch — the generated binding can only
-# drift when those change.
+# Unix sockets; tracked in #209). For the trigger, see the next section: #402 made
+# this `main`-only and dropped the paths filter, and this paragraph used to claim
+# otherwise twenty lines above the rule that contradicts it.
 name: Go reclose
 
+# WHY THIS IS `main`-ONLY, AND WHY IT WAS RED FOR TWO WEEKS BEFORE ANYONE NOTICED (#402)
+#
+# This job builds a generated project OUTSIDE the checkout, so every `forgedb-*` dep
+# resolves from crates.io. That makes it the same class of check as substrate-reclose —
+# and it needs the same branch restriction, which it never had.
+#
+# It used to run on `pull_request` with no branch filter, so it ran on PRs into `develop`.
+# `develop` is *allowed* to carry a publish gap; that is the entire point of holding the gap
+# off the default branch. A job resolving from the registry therefore fails there BY DESIGN,
+# and it did: the 2026-08-07/08 runs failed with `no field `auto_sequences` on type
+# `Manifest`` — #187 had added that field to `forgedb-storage` and generated code used it
+# before the crate was published. Correct behaviour from the job, on the one branch where it
+# means nothing.
+#
+# Nine runs, nine failures, six branches, and nobody read it — because everyone who saw it
+# red saw it red on a branch that had not caused it. A job that is always red is not a
+# control; its signal is indistinguishable from noise, so a REAL Go/FFI reclose break would
+# have landed unnoticed, which is exactly what this job exists to prevent.
+#
+# The paths filter went with it. On `main` the meaningful event is a release merge, and
+# whether that merge happens to touch `go.rs` is unrelated to whether the Go reclose still
+# closes. substrate-reclose has no paths filter for the same reason.
+#
+# Changing the Go generator on `develop` and want this run against it? `workflow_dispatch`
+# against the branch — the same escape hatch substrate-reclose documents.
 on:
+  push:
+    branches: [main]
   pull_request:
-    paths:
-      - crates/codegen/src/go.rs
-      - crates/codegen/src/ffi.rs
-      - .github/workflows/go-reclose.yml
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -74,10 +119,27 @@ jobs:
           WORK="$(mktemp -d "${RUNNER_TEMP}/go-reclose.XXXXXX")"
           cd "$WORK"
 
+          # The build cache must live outside the checkout, and this is an
+          # assertion rather than a comment: the repo root Cargo.toml has
+          # `members` and no `exclude`, so a cache under $GITHUB_WORKSPACE would
+          # join this repo's cargo workspace and resolve every forgedb-* crate by
+          # PATH — the reclose would then be measuring the checkout, silently,
+          # while passing.
+          export FORGEDB_HOME="$WORK/forgedb-home"
+          case "$FORGEDB_HOME" in
+            "${GITHUB_WORKSPACE}"*)
+              echo "FAIL: FORGEDB_HOME ($FORGEDB_HOME) is inside the checkout" >&2
+              exit 1;;
+          esac
+
           # 2. Fresh project + a multi-model schema (relations exercise the
           #    relation-op codegen the single-model init default does not).
           "$FORGEDB" init app
           cd app
+          # `init` scaffolds no cargo package (#335); `forgedb build` compiles in
+          # the cache. If one ever comes back, step 4 is no longer what is
+          # under test.
+          test ! -e Cargo.toml
           cat > schema.forge <<'SCHEMA'
           Author {
             id: +uuid
@@ -95,12 +157,47 @@ jobs:
           SCHEMA
           "$FORGEDB" validate
 
-          # 3. Emit the FFI engine crate + the Go cgo package.
+          # 3. Emit the Go cgo package (and, in the cache, the ffi package it
+          #    links). Nothing is written outside `generated/` and the cache.
           "$FORGEDB" generate go --runtime
 
-          # 4. Build the sibling cdylib in RELEASE (the cgo LDFLAGS point at
-          #    ../ffi/target/release). Deps resolve from crates.io.
-          (cd generated/ffi && cargo build --release)
+          # The generated cgo preamble must link the archive beside the source,
+          # not a path into a cargo target directory. Asserted on the emitted
+          # source, because this is the line whose earlier form made a Go binary
+          # depend on a directory ForgeDB is free to delete.
+          grep -q -- '-L\${SRCDIR} -lforgedb' generated/go/forgedb.go
+          ! grep -q 'ffi/target/release' generated/go/forgedb.go
+
+          # 4a. wasm32 std, installed where CARGO will run (#402).
+          #
+          # `forgedb build` compiles the cache WORKSPACE, and #335 emits six packages per
+          # app — core, server, ffi, napi, pyo3 and **wasm**. The workspace root lists all
+          # of them as members, so building it reaches the wasm member even though this
+          # reclose only cares about the Go/FFI path. Without the target that surfaces as
+          # `error[E0463]: can't find crate for \`core\``, which reads as a broken
+          # generator rather than a missing rustup component.
+          #
+          # `cd` into the cache first, and that is not tidiness. substrate-reclose learned
+          # it the hard way: `rustup target add` inside the CHECKOUT installs wasm32 std for
+          # the `rust-toolchain.toml` pin only, the scaffold build runs under the runner's
+          # default toolchain, and the build then fails with the same "can't find crate for
+          # core" WHILE THE ADD STEP REPORTS SUCCESS. The toolchain split is deliberate — an
+          # installed user has their own toolchain, not our pin — so rustup has to be run
+          # from where cargo will be.
+          (cd "$FORGEDB_HOME" && rustup target add wasm32-unknown-unknown)
+
+          # 4. `forgedb build` compiles the cache workspace and DELIVERS the ffi
+          #    staticlib to generated/go/libforgedb.a. Every substrate dep
+          #    resolves from crates.io, because the cache is outside the checkout.
+          "$FORGEDB" build
+          test -f generated/go/libforgedb.a
+          # The delivered file is an archive, not a shared object — the one
+          # distinction the C8 GC turns into a crash.
+          case "$(file -b generated/go/libforgedb.a)" in
+            *archive*) ;;
+            *) echo "FAIL: generated/go/libforgedb.a is not an archive" >&2;
+               file -b generated/go/libforgedb.a >&2; exit 1;;
+          esac
 
           # 5. Tidy (pulls arrow-go/v18) + compile the package with cgo.
           (cd generated/go && CGO_ENABLED=1 go mod tidy && CGO_ENABLED=1 go build ./...)
@@ -161,4 +258,64 @@ jobs:
           	fmt.Printf("OK round-trip: id=%s email=%s name=%s\n", got.Id, got.Email, got.Name)
           }
           MAIN
-          (cd generated/smoke && CGO_ENABLED=1 go mod tidy && CGO_ENABLED=1 go run .)
+          # Built to a FILE rather than `go run`, because step 7 has to run the
+          # same binary again after the cargo target directory is gone.
+          (cd generated/smoke && CGO_ENABLED=1 go mod tidy && CGO_ENABLED=1 go build -o smoke . && ./smoke)
+
+          # 7. THE C8 GUARD. Delete the entire cargo target directory — the build
+          #    cache GC, in full — and run the binary again.
+          #
+          #    This is the check that would have caught the dylib mistake, and it
+          #    is invisible without it: the cache still exists while CI runs, so a
+          #    binary carrying an absolute LC_ID_DYLIB passes every step above and
+          #    dies on the user's machine after the first `forgedb` cleanup. A
+          #    statically linked archive has its contents inside the binary, so
+          #    there is nothing left to dangle.
+          rm -rf "$FORGEDB_HOME/projects"
+          (cd generated/smoke && ./smoke)
+
+          #    And corroborate it: nothing outside the system is resolved at load
+          #    time. The successful re-run above is the primary evidence; this
+          #    says WHY, so a future regression reads as a dangling reference
+          #    rather than as a mystery crash.
+          case "$(uname -s)" in
+            Darwin)
+              otool -L generated/smoke/smoke
+              # Every dependency must live in a system prefix. Anything else is a
+              # path baked in at link time, which is exactly the LC_ID_DYLIB
+              # failure. `tail -n +2` drops the "<binary>:" header line.
+              ! otool -L generated/smoke/smoke | tail -n +2 | awk '{print $1}' \
+                | grep -qv -e '^/usr/lib/' -e '^/System/Library/';;
+            *)
+              ldd generated/smoke/smoke || true
+              # `not found` is what a deleted cache looks like to the dynamic
+              # loader, and the cache directory must not be named at all.
+              ! ldd generated/smoke/smoke 2>/dev/null | grep -q 'not found'
+              ! ldd generated/smoke/smoke 2>/dev/null | grep -q "$FORGEDB_HOME";;
+          esac
+
+          # 8. THE init() GUARD (#337). Steps 6 and 7 prove a MATCHING pair runs;
+          #    they say nothing about whether the check that catches a mismatched
+          #    pair ever executes. This is the call-site half.
+          #
+          #    A `[storage]` knob changes durability semantics and NOT ONE
+          #    exported symbol, so `go build` still succeeds — which is precisely
+          #    the case the linker's undefined-symbol error cannot reach, and the
+          #    honest description of what the init() check adds over it.
+          cat >> forgedb.toml <<'CFG'
+
+          [storage]
+          fsync = "always"
+          CFG
+          "$FORGEDB" generate go --runtime --force
+          # Rebuild the Go package ONLY. `forgedb build` is deliberately NOT run:
+          # the point is a stale archive beside fresh source.
+          (cd generated/smoke && CGO_ENABLED=1 go build -o smoke .)
+          if (cd generated/smoke && ./smoke); then
+            echo "FAIL: the Go binary ran against an archive built from different source." >&2
+            echo "The init() fingerprint check did not execute." >&2
+            exit 1
+          fi
+          (cd generated/smoke && ./smoke 2>&1 || true) | tee init-check.log
+          grep -q 'different schema' init-check.log
+          grep -q 'forgedb build' init-check.log

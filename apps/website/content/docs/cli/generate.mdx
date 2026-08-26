@@ -20,7 +20,7 @@ The target defaults to `all`.
 
 | Target | Kind | Produces |
 |---|---|---|
-| `all` | standalone | Every default artifact (`rust`, `typescript`, `api`, `openapi`, `stubs`) — plus the opt-in `wasm`/`ffi` when listed in `[generate].targets`. |
+| `all` | standalone | **Every** target `[generate].targets` declares — the five always-on artifacts (`rust`, TypeScript SDK, `api`, `openapi`, `stubs`) *and* the opt-in ones: `ffi`, the browser replica, the Python/Rust/Go REST SDKs, and the Node/Bun/Python/Go native runtime bindings. |
 | `rust` | standalone | `database.rs` — the tailored Rust database. |
 | `api` | standalone | `api.rs` — the REST API + OpenAPI document. |
 | `openapi` | standalone | `openapi.json` — the OpenAPI 3.1 document (offline). |
@@ -33,7 +33,7 @@ The target defaults to `all`.
 | `go --sdk` | runtime | Go REST client package (stdlib `net/http`). |
 | `python --runtime` | runtime | PyO3 in-process native binding. |
 | `node --runtime` / `bun --runtime` | runtime | NAPI-RS in-process native binding. |
-| `go --runtime` | runtime | cgo in-process binding over the FFI cdylib. |
+| `go --runtime` | runtime | cgo in-process binding over the FFI **static archive**. |
 | `browser --replica` | runtime | WASM in-process read-replica follower. |
 
 <Callout type="warning" title="Standalone targets take no mode">
@@ -54,11 +54,26 @@ implemented and errors explicitly. The old flat verbs `generate typescript` /
 | `--runtime` | bool | Mode (runtime targets): in-process native FFI binding. |
 | `--replica` | bool | Mode (runtime targets): in-process read-replica follower. |
 | `--check` | bool (false) | Verify nothing needs regeneration (CI mode); do not write. |
-| `-o`, `--output <DIR>` | string (`[generate].output`, else `generated`) | Output directory. |
-| `-s`, `--schema <PATH>` | string (auto-discover) | Schema file path. Auto-discovery looks for `schema.forge`, `schema.lang`, `schema.forgedb`. |
-| `-f`, `--force` | bool (false) | Regenerate even if up-to-date; overwrite existing output. |
+| `-o`, `--output <DIR>` | string (`[generate].output`, else `generated`) | Output directory. The flag is used verbatim; the other two resolve against **the schema's** directory. |
+| `-s`, `--schema <PATH>` | string (auto-discover) | Schema file path. Auto-discovery looks for `schema.forge`, `schema.lang`, `schema.forgedb`. **No config names the schema** — the config that applies is found by walking up from it. |
+| `-f`, `--force` | bool (false) | **Accepted and ignored.** Regeneration always overwrites what ForgeDB authored; there is nothing left to force. Kept because scripts and Dockerfiles pass it. |
 | `--from <N>` | u32 | Origin format version — `transform` target only. |
 | `--to <N>` | u32 | Destination format version — `transform` target only. |
+
+<Callout type="note" title="`ffi` now writes a header, and the native bindings write shims">
+`generate ffi` emits `<output>/ffi/forgedb.h` — before, the header was written only on the
+Go path and a C consumer had no declarations at all.
+
+`node --runtime` and `python --runtime` emit the consumer-facing half of their binding into
+`<output>/napi/` and `<output>/pyo3/`: an `index.js` + `index.d.ts`, and a `forgedb.py` +
+`forgedb.pyi`. These are generated text like `types.ts` — commit them, and `--check` covers
+them. They load the artifact `forgedb build` delivers beside them and refuse it if it was
+built from different generated source, so a stale binding is a named error rather than a
+method set that silently no longer matches.
+
+`generate` also writes `<output>/.gitignore`, which ignores the compiled artifacts and
+re-includes the shims. The compiled halves are not committed; each machine builds its own.
+</Callout>
 
 <Callout type="note" title="Generate-time config is baked in">
 The schema-blind `[runtime]`/`[storage]` knobs in `forgedb.toml` are baked into

@@ -218,6 +218,43 @@ impl RustGenerator {
 
     /// The generate-time runtime-behavior config (#126) active for the current
     /// `generate*` call. Read at each config-dependent emission site.
+    /// A `#[schema(..)]` attribute, or nothing when there is no web surface.
+    ///
+    /// `schema` is utoipa's attribute and only exists where `ToSchema` is
+    /// derived — leaving one behind when the derive is gated out is
+    /// `cannot find attribute 'schema' in this scope`, not a harmless no-op.
+    /// Every production of one routes through here so the two cannot disagree.
+    fn schema_attr(attr: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+        if Self::active_cfg().needs_utoipa() {
+            attr
+        } else {
+            quote! {}
+        }
+    }
+
+    /// The `, ToSchema` fragment of a derive list, or nothing (#335 §10).
+    ///
+    /// Reads [`crate::GenConfig::needs_utoipa`] — the ONE condition (#445). The
+    /// `utoipa` pin in `core/Cargo.toml` reads that same one, and it has to:
+    /// this derive is what makes the pin necessary, and a manifest deciding it
+    /// separately is `error[E0432]: unresolved import 'utoipa'`.
+    ///
+    /// Gated on the app declaring a web surface, because once `database.rs` and
+    /// `api.rs` are separate crates the derive lands in `core` while its
+    /// `#[openapi(components(schemas(...)))]` consumer lands in `server` — and
+    /// the ORPHAN RULE means `server` cannot supply the impl, both trait and type
+    /// being foreign to it. So it must be decided at generate time or not at all.
+    ///
+    /// Emitted as a leading-comma fragment so the derive lists it joins stay
+    /// readable at their call sites.
+    fn to_schema_derive() -> proc_macro2::TokenStream {
+        if Self::active_cfg().needs_utoipa() {
+            quote! { , ToSchema }
+        } else {
+            quote! {}
+        }
+    }
+
     fn active_cfg() -> GenConfig {
         ACTIVE_CONFIG.with(|c| c.get())
     }
@@ -369,6 +406,19 @@ impl RustGenerator {
 
         // Attributes and imports
         let inline_str_import = Self::inline_str_import(schema);
+        // #335 §10 / #445: the utoipa import and every `ToSchema` derive read
+        // `GenConfig::needs_utoipa` — the same one condition
+        // `CorePackage::cargo_toml` reads for the pin, because this import is
+        // precisely what makes that pin necessary. Once `database.rs` and
+        // `api.rs` are separate crates the derive and its consumer are in
+        // different crates and the ORPHAN RULE blocks supplying the impl from
+        // `server`, so this cannot be decided later. Default is ON, so existing
+        // output is byte-identical.
+        let utoipa_import = if Self::active_cfg().needs_utoipa() {
+            quote! { use utoipa::ToSchema; }
+        } else {
+            quote! {}
+        };
         let imports = quote! {
             // `irrefutable_let_patterns`: the WAL recovery path matches
             // `WalOperation::Raw` via `if let` — currently the only variant, so
@@ -385,7 +435,7 @@ impl RustGenerator {
             #inline_str_import
             use forgedb_types::{Uuid, Timestamp, Value};
             use serde::{Deserialize, Serialize};
-            use utoipa::ToSchema;
+            #utoipa_import
         };
         tokens.extend(imports);
 
@@ -1380,10 +1430,11 @@ impl RustGenerator {
         );
 
         // Generate the model struct, storage struct, and implementation
+        let to_schema_derive = Self::to_schema_derive();
         let tokens = quote! {
             #[doc = #model_doc]
             #[repr(C)]
-            #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+            #[derive(Debug, Clone, Serialize, Deserialize #to_schema_derive)]
             pub struct #model_name {
                 #(#fields),*
             }
@@ -1619,9 +1670,10 @@ impl RustGenerator {
 
         let structs = variants.iter().map(|(suffix, doc)| {
             let event_name = format_ident!("{}{}", model.name, suffix);
+            let to_schema_derive = Self::to_schema_derive();
             quote! {
                 #[doc = #doc]
-                #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+                #[derive(Debug, Clone, Serialize, Deserialize #to_schema_derive)]
                 pub struct #event_name {
                     pub #field_name: #model_name,
                 }
@@ -1650,16 +1702,17 @@ impl RustGenerator {
         // than assuming the id is uuid- or integer-shaped.
         let id_schema_attr = model.identity_field()
             .and_then(|f| Self::schema_value_type(schema, &f.field_type, true))
-            .map(|vt| quote! { #[schema(value_type = #vt)] })
+            .map(|vt| Self::schema_attr(quote! { #[schema(value_type = #vt)] }))
             .unwrap_or_default();
         let doc = format!(
             "Live-query result-set delta for `{}` (#62 Direction B): removal-aware \
              membership changes over a generated closed-set query.",
             model.name
         );
+        let to_schema_derive = Self::to_schema_derive();
         quote! {
             #[doc = #doc]
-            #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+            #[derive(Debug, Clone, Serialize, Deserialize #to_schema_derive)]
             #[serde(tag = "kind", rename_all = "lowercase")]
             pub enum #delta_name {
                 /// The full matching set at subscription time.
@@ -1722,15 +1775,30 @@ impl RustGenerator {
                 /// #159: resolve each id via its version list (O(distinct_ids × log v))
                 /// instead of two O(watermark) passes; a tombstoned newest is filtered
                 /// by `read_at`.
+                ///
+                /// #457: rows come back in **ascending physical row order**, which for
+                /// an append-only store is insertion order — the same order the live
+                /// list endpoint returns, and the same order the no-id `all_at` below
+                /// gets for free from `0..watermark`.  The sort is what makes
+                /// `?as_of=` pageable: `id_versions` is a `HashMap`, its iteration
+                /// order is seeded per process, and without this the row order of a
+                /// snapshot read is a different random permutation in every process.
+                /// Paging then silently skips and repeats rows across a restart or a
+                /// second replica while each page is individually well-formed.
                 pub fn all_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<#model_name> {
                     let watermark = snap.watermark();
-                    let mut records = Vec::new();
+                    let mut rows = Vec::new();
                     for versions in self.id_versions.values() {
                         let pos = versions.partition_point(|&r| r < watermark);
                         if pos == 0 {
                             continue; // id not yet present as of `snap`
                         }
-                        if let Some(record) = self.read_at(versions[pos - 1]) {
+                        rows.push(versions[pos - 1]);
+                    }
+                    rows.sort_unstable();
+                    let mut records = Vec::new();
+                    for row in rows {
+                        if let Some(record) = self.read_at(row) {
                             records.push(record);
                         }
                     }
@@ -2310,7 +2378,7 @@ impl RustGenerator {
                 let (schema_attr, serde_attr) = if let Some(vt) =
                     Self::timestamp_schema_value_type(schema, &field.field_type)
                 {
-                    (quote! { #[schema(value_type = #vt)] }, quote! {})
+                    (Self::schema_attr(quote! { #[schema(value_type = #vt)] }), quote! {})
                 } else if let Some(attrs) = Self::big_array_attrs(&field.field_type) {
                     attrs
                 } else {
@@ -2325,12 +2393,13 @@ impl RustGenerator {
             })
             .collect();
 
+        let to_schema_derive = Self::to_schema_derive();
         quote! {
             #[doc = #struct_doc]
             #[repr(C)]
             // `PartialEq` (not `Eq` — a struct may hold `f64`) so a struct-typed
             // field participates in the live-query typed change detector (#84).
-            #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+            #[derive(Debug, Clone, PartialEq, Serialize, Deserialize #to_schema_derive)]
             pub struct #struct_name {
                 #(#fields),*
             }
@@ -2401,9 +2470,10 @@ impl RustGenerator {
 
         let name_str = &enum_def.name;
 
+        let to_schema_derive = Self::to_schema_derive();
         Ok(quote! {
             #[doc = #enum_doc]
-            #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, ToSchema)]
+            #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize #to_schema_derive)]
             pub enum #enum_name {
                 #(#variant_idents),*
             }
@@ -3389,13 +3459,71 @@ impl RustGenerator {
     /// scale, so normalizing both the stored value and the probe argument keys them
     /// identically.  Nullable decimal normalizes through `.map(...)`; every other
     /// field type is returned unchanged.
+    /// The quantum a `timestamp` field's values are floored to, when flooring is not
+    /// the identity (#389).
+    ///
+    /// ONE definition, because the quantum is needed by three sites that must agree:
+    /// `index_value_expr` (hash-index key), `ordered_key_expr` (ordered-index key and
+    /// range bounds), and — mirrored, not shared, since it is a different crate —
+    /// `ApiGenerator::generate_filter_check`. Three copies of "what does this field
+    /// floor to" is exactly how the record side and the probe side came to disagree
+    /// in the first place.
+    ///
+    /// `None` for a non-timestamp, and for `timestamp(us)`, whose quantum is 1:
+    /// `floor_to_micros(1)` is a no-op, and the write gate emits no statement for it
+    /// either, so emitting one here would be noise that reads as meaningful.
+    ///
+    /// Unwraps `Nullable` so an optional timestamp gets the same treatment; the
+    /// caller decides whether to apply it through `.map`.
+    fn timestamp_floor_quantum(field_type: &forgedb_parser::FieldType) -> Option<i64> {
+        let precision = match field_type {
+            forgedb_parser::FieldType::Timestamp(p) => p,
+            forgedb_parser::FieldType::Nullable(inner) => match &**inner {
+                forgedb_parser::FieldType::Timestamp(p) => p,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let quantum = precision.quantum_micros();
+        (quantum > 1).then_some(quantum)
+    }
+
+    /// Apply [`Self::timestamp_floor_quantum`] to a value expression, threading
+    /// through `Option` when the field is nullable.
+    fn timestamp_floored(
+        field_type: &forgedb_parser::FieldType,
+        value_expr: TokenStream,
+    ) -> Option<TokenStream> {
+        let quantum = Self::timestamp_floor_quantum(field_type)?;
+        Some(
+            if matches!(field_type, forgedb_parser::FieldType::Nullable(_)) {
+                quote! { (#value_expr).map(|__ts| __ts.floor_to_micros(#quantum)) }
+            } else {
+                quote! { (#value_expr).floor_to_micros(#quantum) }
+            },
+        )
+    }
+
     fn index_value_expr(field_type: &forgedb_parser::FieldType, value_expr: TokenStream) -> TokenStream {
         match field_type {
             forgedb_parser::FieldType::Decimal => quote! { (#value_expr).normalize() },
             forgedb_parser::FieldType::Nullable(inner) if Self::is_decimal_type(inner) => {
                 quote! { (#value_expr).map(|__d| __d.normalize()) }
             }
-            _ => value_expr,
+            // #389: a `timestamp` field's stored value is floored to its declared
+            // quantum by the write gate, but the PROBE argument was not — so a row
+            // written at 1_234_567_890us was filed under 1_234_567_000 and looked up
+            // as 1_234_567_890, and `find_by_*` returned `[]` for the very value that
+            // had just been written. Silently, which is what made it a data bug rather
+            // than an error.
+            //
+            // Flooring here rather than beside the write gate is what fixes it once:
+            // this hook is applied to the record side AND the probe side of every hash
+            // index, so the two are self-consistent by construction. On the record side
+            // it is a no-op — the value is already aligned and `floor_to_micros` is
+            // idempotent — which is the same reason the `Decimal::normalize` arm above
+            // is safe on both sides.
+            _ => Self::timestamp_floored(field_type, value_expr.clone()).unwrap_or(value_expr),
         }
     }
 
@@ -3421,7 +3549,10 @@ impl RustGenerator {
     /// produce a key whose tag was decided at generate time — a runtime match over
     /// `Value` variants inside *generated* code, which is the shape this project
     /// exists to avoid.  The emission is now chosen per field type; the key bytes
-    /// are unchanged (guarded by `tests/index_key_parity_test.rs`).
+    /// were unchanged by that switch, which `tests/index_key_parity_test.rs` proved
+    /// at the time.  That comparison has since been retired (#381) — the keys are
+    /// in-memory and rebuilt at open, so nothing depends on their bytes matching a
+    /// superseded form.
     ///
     /// Two arms of the old match were not what they looked like:
     ///
@@ -3482,11 +3613,13 @@ impl RustGenerator {
     /// bound to a reference to the value.  Split out of [`index_key_expr`] so the
     /// nullable path reuses it verbatim for its `Some` arm.
     ///
-    /// Each arm reproduces byte-for-byte what `serde_json` produced for that type
-    /// through the pre-#230 expression; `tests/index_key_parity_test.rs` holds the
-    /// frozen legacy implementation and asserts the equality, and the shape
-    /// assertions in `codegen_snapshots.rs` pin what is emitted here.  Change one
-    /// and both must move.
+    /// Each arm originally reproduced byte-for-byte what `serde_json` produced for
+    /// that type through the pre-#230 expression.  That is history, not a live
+    /// constraint (#381): these keys are in-memory and rebuilt at open, so an arm may
+    /// change shape freely as long as the record side and the probe side keep
+    /// agreeing.  What holds it in place now is the shape assertions in
+    /// `codegen_snapshots.rs` (what is emitted) plus `tests/index_test.rs` (that a
+    /// stored row is still found through the generated `find_by_*`).
     fn index_key_body(schema: &Schema, field_type: &forgedb_parser::FieldType) -> TokenStream {
         use forgedb_parser::FieldType;
         let field_type = &Self::resolved_type(schema, field_type);
@@ -3800,7 +3933,14 @@ impl RustGenerator {
         match field_type {
             forgedb_parser::FieldType::Decimal => quote! { (#value_expr).normalize() },
             forgedb_parser::FieldType::F64 => quote! { __forgedb_f64_key(#value_expr) },
-            _ => value_expr,
+            // #389, the ordered peer. Only the `min` bound actually moves: stored keys
+            // are all multiples of the quantum, so `Included(t)` and `Included(floor(t))`
+            // admit exactly the same multiples at the `max` end. At the `min` end they do
+            // not — `Included(t)` excludes the bucket `floor(t)` sits in — which is why
+            // `find_by_t_at_range(Some(t), Some(t), ..)` returned `[]` for the same value
+            // `find_by_t_at(t)` missed. Applied to the stored value and to each bound, so
+            // a bound stays comparable to what it is bounding.
+            _ => Self::timestamp_floored(field_type, value_expr.clone()).unwrap_or(value_expr),
         }
     }
 
@@ -5237,18 +5377,90 @@ impl RustGenerator {
         }
     }
 
+    /// The column append for a resolved `@default` (#374 step 4) — the second
+    /// of [`crate::default_fill`]'s two lowerings.
+    ///
+    /// Every arm mirrors the encoding `generate_append_statements` uses for a
+    /// real record value of the same type, because a backfilled row and an
+    /// inserted row are read by the same decoder. `FillValue` only exists for
+    /// non-nullable fields whose encoding is settled, which is why there is no
+    /// presence-tag branch here.
+    fn backfill_append_of(
+        schema: &Schema,
+        field: &forgedb_parser::Field,
+        fill: &crate::default_fill::FillValue,
+    ) -> TokenStream {
+        use crate::default_fill::FillValue;
+        let col = format_ident!("{}_col", field.name);
+        let append_method = Self::get_append_method(schema, &field.field_type);
+        match fill {
+            FillValue::Bool(b) => quote! {
+                self.#col.#append_method(#b).expect("Failed to backfill column default");
+            },
+            FillValue::Int(n) => {
+                // Unsuffixed so it infers to the column's own integer type,
+                // exactly as the `0` literal in the type-zero arm does.
+                let lit = proc_macro2::Literal::i64_unsuffixed(*n);
+                quote! {
+                    self.#col.#append_method(#lit).expect("Failed to backfill column default");
+                }
+            }
+            FillValue::Float(f) => quote! {
+                self.#col.#append_method(#f).expect("Failed to backfill column default");
+            },
+            FillValue::Str(s) => quote! {
+                self.#col.append_string(#s).expect("Failed to backfill column default");
+            },
+            FillValue::Json(raw) => quote! {
+                self.#col.append_string(#raw).expect("Failed to backfill column default");
+            },
+            FillValue::Enum { discriminant, .. } => quote! {
+                self.#col.append_bytes(&[#discriminant]).expect("Failed to backfill column default");
+            },
+            FillValue::Decimal(lexeme) => quote! {
+                self.#col
+                    .append_uuid(
+                        <rust_decimal::Decimal as std::str::FromStr>::from_str(#lexeme)
+                            .expect("schema @default is not a decimal")
+                            .serialize(),
+                    )
+                    .expect("Failed to backfill column default");
+            },
+        }
+    }
+
     /// Emit one "append a default entry" statement per storage-backed field —
     /// the same column encoding as `generate_append_statements`, but with the
     /// field's type default instead of a record value.  Used to backfill a newly
     /// added column so existing rows keep a well-formed value (#92 Phase 4 additive
-    /// migration).  Defaults are type-zero / null (nullable → None, string → "",
-    /// numeric → 0, uuid/FK → nil); the schema `@default` is not yet honored here
-    /// (a follow-up), which is why additive fields should be nullable or carry a
-    /// meaningful zero.
+    /// migration).
+    ///
+    /// A field carrying a `@default` the differ can resolve
+    /// ([`crate::default_fill`]) backfills **that value**; every other field
+    /// backfills its type zero (nullable → None, string → "", numeric → 0,
+    /// uuid/FK → nil).
+    ///
+    /// # Why the `@default` arm is here and not only in the transformer (#374)
+    ///
+    /// A newly-added required field reaches existing rows two ways — this
+    /// backfill on reopen, and the offline transformer's hop — and they used to
+    /// disagree, because this one wrote the type zero unconditionally while the
+    /// hop wrote the recorded default. `status: string @default("pending")`
+    /// therefore produced `""` in one dir and `"pending"` in the other for the
+    /// same schema edit, decided by which command the operator ran.
+    /// `default_fill` is the ONE definition both lowerings derive from; this is
+    /// the second lowering and `FillValue::json_literal` is the first.
     fn generate_backfill_appends(schema: &Schema, model: &forgedb_parser::Model) -> Vec<(proc_macro2::Ident, TokenStream)> {
         let mut out = Vec::new();
         for field in &model.fields {
             let col = format_ident!("{}_col", field.name);
+            // #374: a resolvable `@default` wins over the type zero, and does so
+            // BEFORE the per-type branches below so there is exactly one place
+            // the decision is made.
+            if let Some(fill) = crate::default_fill::default_fill(schema, field) {
+                out.push((col, Self::backfill_append_of(schema, field, &fill)));
+                continue;
+            }
             if Self::is_json_type(&field.field_type) {
                 let one = if field.is_nullable() {
                     // Nullable json: the 1-byte presence tag `0x00` = None (#231 —
@@ -7572,16 +7784,16 @@ impl RustGenerator {
         is_key: bool,
     ) -> (TokenStream, TokenStream) {
         if let Some(vt) = Self::schema_value_type(schema, &field.field_type, is_key) {
-            (quote! { #[schema(value_type = #vt)] }, quote! {})
+            (Self::schema_attr(quote! { #[schema(value_type = #vt)] }), quote! {})
         } else if Self::is_decimal_type(&field.field_type) {
             if field.is_nullable() {
                 (
-                    quote! { #[schema(value_type = Option<String>)] },
+                    Self::schema_attr(quote! { #[schema(value_type = Option<String>)] }),
                     quote! { #[serde(with = "rust_decimal::serde::str_option")] },
                 )
             } else {
                 (
-                    quote! { #[schema(value_type = String)] },
+                    Self::schema_attr(quote! { #[schema(value_type = String)] }),
                     quote! { #[serde(with = "rust_decimal::serde::str")] },
                 )
             }
@@ -9196,6 +9408,10 @@ impl RustGenerator {
                         }
                         rows.push(versions[pos - 1]);
                     }
+                    // #457: ascending physical row order, matching the model-level
+                    // `all_at` and the `0..watermark` the no-id branch below returns.
+                    // `id_versions` iterates in a per-process-seeded order.
+                    rows.sort_unstable();
                     rows
                 }
             },
@@ -9264,9 +9480,10 @@ impl RustGenerator {
                     Self::identity_field_name(model),
                 );
 
+            let to_schema_derive = Self::to_schema_derive();
             structs.push(quote! {
                 #[doc = #doc]
-                #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+                #[derive(Debug, Clone, Serialize, Deserialize #to_schema_derive)]
                 pub struct #proj_ident {
                     #(#struct_field_defs),*
                 }
@@ -9538,9 +9755,9 @@ impl RustGenerator {
             quote! { Vec<serde_json::Value> }
         };
         let schema_attr = if nullable {
-            quote! { #[schema(value_type = Option<#inner_schema>)] }
+            Self::schema_attr(quote! { #[schema(value_type = Option<#inner_schema>)] })
         } else {
-            quote! { #[schema(value_type = #inner_schema)] }
+            Self::schema_attr(quote! { #[schema(value_type = #inner_schema)] })
         };
         Some((schema_attr, quote! { #[serde(with = #path)] }))
     }
@@ -13563,9 +13780,10 @@ impl RustGenerator {
                 resolved_idents.push(resolved_ident);
             }
 
+            let to_schema_derive = Self::to_schema_derive();
             items.push(quote! {
                 #[doc = #struct_doc]
-                #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+                #[derive(Debug, Clone, Serialize, Deserialize #to_schema_derive)]
                 pub struct #struct_ident {
                     pub #base_ident: #model_ident,
                     #(#struct_fields,)*

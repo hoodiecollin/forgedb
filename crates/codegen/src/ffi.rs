@@ -1,18 +1,39 @@
 //! Native FFI generator — the Layer-0 C-ABI (language-bindings #51/#52/#117).
 //!
 //! Emits, per schema, the fat generated C-ABI for the language bindings
-//! (#51/#52/#117); ABI symbol naming is pinned. Two
-//! halves land in the SAME generated `ffi/src/lib.rs`:
+//! (#51/#52/#117). Two halves land in the SAME generated `ffi/src/lib.rs`:
 //!
 //! * the schema-**invariant** *lifecycle + error* spine (Phase 2) every binding
-//!   (PyO3 / NAPI-RS) hangs off: `forgedb_open`/`forgedb_close`,
-//!   `forgedb_commit`/`forgedb_checkpoint`/`forgedb_compact`, the error trio
-//!   (`forgedb_error_code`/`_message`/`_free`), `forgedb_free_buffer`,
-//!   `forgedb_version`;
+//!   (PyO3 / NAPI-RS) hangs off: `open`/`close`, `commit`/`checkpoint`/
+//!   `compact`, the error trio (`error_code`/`error_message`/`error_free`),
+//!   `free_buffer`, `version`;
 //! * the schema-**tailored** per-model OLTP row ops (Phase 3): for each identity
-//!   model `M` (snake name `m`), `forgedb_<m>_insert`/`_get`/`_count`/`_all`/
+//!   model `M` (snake name `m`), `<m>_insert`/`_get`/`_count`/`_all`/
 //!   `_update`/`_delete`, calling the generated `Database::create_<m>` /
 //!   `update_<m>` / `delete_<m>` integrity wrappers + `<m>` storage reads.
+//!
+//! # Every exported symbol carries a per-app prefix (#335 §2, decision 9)
+//!
+//! The names above are **stems**, not symbols. The linkable name is
+//! `<prefix><stem>`, where `<prefix>` comes from `forgedb::naming::symbol_prefix`
+//! and is passed in — this file never re-derives it. The prefix used to be the
+//! constant `forgedb_`, so two apps in one project that each declare a `Post`
+//! exported byte-identical `forgedb_post_insert`. Cargo never sees that: it is
+//! not a package-name collision, and under a `cdylib` it only bites if one
+//! process loads both. **Static linking (the Go binding's `staticlib`) makes it a
+//! link-time collision** in a single Go binary importing two ForgeDB packages —
+//! reachable, and silent until late. `go.rs` emits the calling side and the
+//! `forgedb.h` prototypes from the same prefix; all three move together or the
+//! Go binding does not link.
+//!
+//! # This crate links `core` and pins ZERO substrate
+//!
+//! The generated database arrives as the cache's `core` package, renamed to
+//! `forgedb_core` by the manifest so no generated `.rs` byte carries the app
+//! hash. Substrate types are reached through `core`'s re-exports
+//! (`forgedb_core::forgedb_storage`, `::forgedb_types`) so they **unify** with
+//! `core`'s rather than merely resolving to the same version by lockfile
+//! coincidence.
 //!
 //! **Identity (class-2 transport glue — the spirit of the old `crates/ffi`):**
 //! like the wasm `Replica`, this file is *generated per schema*. The spine's
@@ -49,19 +70,85 @@ use forgedb_parser::Schema;
 use quote::{format_ident, quote};
 
 /// Generates the native FFI spine (`ffi.rs`) for a schema.
+/// The fingerprint macro and the advisory check, emitted into `forgedb.h`.
+///
+/// ForgeDB generates no C that runs, so this **cannot be enforced** — the header
+/// offers the comparison and nothing can require it. Saying so in the header is
+/// the honest form; implying a guarantee that does not exist is worse than
+/// offering nothing.
+fn fingerprint_block(pfx: &str, fingerprint: &str) -> String {
+    format!(
+        r#"
+/* --- source fingerprint (#337) ---------------------------------------------
+ *
+ * The fingerprint of the generated source this header was emitted from. The
+ * archive beside it exposes the same value through {pfx}fingerprint(); if the
+ * two disagree, the library was built from a different schema than these
+ * declarations describe and every prototype below is a guess.
+ *
+ * This is NOT a version. A ForgeDB upgrade that changes nothing about the
+ * emitted source leaves it untouched.
+ *
+ * ADVISORY. ForgeDB generates no C that executes, so nothing here can force the
+ * check to run — call it yourself at startup.
+ */
+#define FORGEDB_FINGERPRINT "{fingerprint}"
+
+const char* {pfx}fingerprint(void);
+
+/* Non-zero when the linked archive was generated together with this header. */
+static inline int forgedb_fingerprint_ok(void) {{
+  const char* built = {pfx}fingerprint();
+  const char* want = FORGEDB_FINGERPRINT;
+  while (*built && *want && *built == *want) {{ built++; want++; }}
+  return *built == *want;
+}}
+"#
+    )
+}
+
 pub struct FfiGenerator;
 
 impl FfiGenerator {
     /// Generate the Layer-0 C-ABI lifecycle/error spine.
     ///
-    /// The `schema` is taken for parity with the other generators (and so the
-    /// per-model ops phase can extend this same entry point), but the spine's
-    /// emitted symbols are schema-invariant.
-    pub fn generate(schema: &Schema) -> Result<GeneratedCode> {
-        let model_ops = Self::generate_model_ops(schema);
-        let async_ops = Self::generate_async_ops(schema);
-        let relation_ops = Self::generate_relation_ops(schema);
-        let arrow_ops = Self::generate_arrow_ops(schema);
+    /// `symbol_prefix` is the app's per-app C-symbol prefix, from
+    /// `forgedb::naming::symbol_prefix` — the ONE definition. Every
+    /// `#[unsafe(no_mangle)]` symbol emitted here is `<symbol_prefix><stem>`;
+    /// the spine's stems are schema-invariant but its *symbols* are not, which
+    /// is the whole point (two apps in one project must not export the same
+    /// name, and `staticlib` delivery makes a duplicate a link-time error).
+    ///
+    /// `crates/codegen/src/go.rs` emits the calling side (`forgedb.go`) and the
+    /// prototypes (`forgedb.h`) from the *same* prefix. The three move together
+    /// or the Go binding does not link.
+    pub fn generate(schema: &Schema, symbol_prefix: &str) -> Result<GeneratedCode> {
+        let p = symbol_prefix;
+        let model_ops = Self::generate_model_ops(schema, p);
+        let async_ops = Self::generate_async_ops(schema, p);
+        let relation_ops = Self::generate_relation_ops(schema, p);
+        let arrow_ops = Self::generate_arrow_ops(schema, p);
+
+        // The schema-INVARIANT spine symbols. Their *names* were the last
+        // constants in the emitted C-ABI (#335 §2, decision 9): two apps in one
+        // project exported byte-identical `forgedb_open`, which cargo never sees
+        // and which static linking turns into a link-time collision inside one
+        // Go binary. `symbol_prefix` is the ONE definition of the prefix
+        // (`forgedb::naming::symbol_prefix`) — it is never re-derived here.
+        let sym_version = format_ident!("{}version", p);
+        let sym_fingerprint = format_ident!("{}fingerprint", p);
+        let sym_open = format_ident!("{}open", p);
+        let sym_close = format_ident!("{}close", p);
+        let sym_commit = format_ident!("{}commit", p);
+        let sym_checkpoint = format_ident!("{}checkpoint", p);
+        let sym_compact = format_ident!("{}compact", p);
+        let sym_error_code = format_ident!("{}error_code", p);
+        let sym_error_message = format_ident!("{}error_message", p);
+        let sym_error_free = format_ident!("{}error_free", p);
+        let sym_free_buffer = format_ident!("{}free_buffer", p);
+        let sym_snapshot = format_ident!("{}snapshot", p);
+        let sym_snapshot_free = format_ident!("{}snapshot_free", p);
+        let sym_set_completion_callback = format_ident!("{}set_completion_callback", p);
         let tokens = quote! {
             //! Generated by ForgeDB — native FFI, Layer-0 C-ABI spine.
             //! DO NOT EDIT - This file is auto-generated.
@@ -72,9 +159,18 @@ impl FfiGenerator {
             //! `Database`. The tailored data logic lives in the generated
             //! `database.rs`; this file is the boundary the per-runtime wrappers
             //! bind. It invents no query API (the identity red line).
+            //!
+            //! **Every exported symbol carries this app's C-symbol prefix.** The
+            //! doc comments below name each entry point by its unprefixed stem
+            //! (`open`, `error_free`, `<m>_insert`, …); the linkable name is that
+            //! stem behind the prefix. Two apps in one project therefore export
+            //! disjoint symbol sets and can be linked into one binary.
             #![allow(warnings)]
 
-            mod database;
+            // The one generated database for this app, reached as a cargo
+            // dependency. The MANIFEST renames it to `forgedb_core`, so no
+            // generated `.rs` byte carries this app's package name.
+            use forgedb_core as database;
 
             use std::ffi::{CStr, CString, c_char, c_void};
             use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -88,7 +184,7 @@ impl FfiGenerator {
             use database::Database;
             // `Uuid` names the primary-key type of UUID-keyed models in the
             // per-model row ops below (integer-PK models use a primitive id type).
-            use forgedb_types::Uuid;
+            use forgedb_core::forgedb_types::Uuid;
 
             /// Opaque database handle passed across the C-ABI as `*mut Db`. Owns
             /// the generated `Database` (including its single-writer `DirLock`);
@@ -195,17 +291,46 @@ impl FfiGenerator {
                 *out_len = len;
             }
 
+            // #337: the source fingerprint of this package, written beside this
+            // file by `forgedb generate` and excluded from its own hash input by
+            // name. The generated `forgedb.h` carries the same value as a macro,
+            // and the generated Go package compares it in `init()`.
+            mod fingerprint;
+
+            /// The fingerprint of the generated source this engine was compiled
+            /// from, as a stable NUL-terminated C string. Owned by the process —
+            /// the caller must NOT free it.
+            ///
+            /// This is NOT a version. A CLI upgrade that changes nothing about the
+            /// emitted source leaves it untouched, which is the property that keeps
+            /// the mismatch error worth reading.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn #sym_fingerprint() -> *const c_char {
+                static FINGERPRINT: OnceLock<CString> = OnceLock::new();
+                FINGERPRINT
+                    .get_or_init(|| {
+                        CString::new(fingerprint::FINGERPRINT)
+                            .unwrap_or_else(|_| CString::new("").unwrap())
+                    })
+                    .as_ptr()
+            }
+
             /// The generated engine crate's version (`CARGO_PKG_VERSION`), as a
             /// stable NUL-terminated C string. Owned by the process — the caller
             /// must NOT free it.
             #[unsafe(no_mangle)]
-            pub extern "C" fn forgedb_version() -> *const c_char {
+            pub extern "C" fn #sym_version() -> *const c_char {
                 static VERSION: OnceLock<CString> = OnceLock::new();
                 VERSION
                     .get_or_init(|| {
-                        CString::new(env!("CARGO_PKG_VERSION")).unwrap_or_else(|_| {
-                            CString::new("0.0.0").unwrap()
-                        })
+                        // `CString::default()`, not a `"0.0.0"` literal. The
+                        // branch is unreachable (a cargo version holds no NUL),
+                        // and a hardcoded version literal in generated code is
+                        // exactly the token the #337 guard scans for — an empty
+                        // string also reads as "unknown" rather than as a real
+                        // version that happens to be zero.
+                        CString::new(env!("CARGO_PKG_VERSION"))
+                            .unwrap_or_else(|_| CString::default())
                     })
                     .as_ptr()
             }
@@ -217,7 +342,7 @@ impl FfiGenerator {
             /// `root` must be a valid NUL-terminated C string; `err_out`, if
             /// non-null, must point to writable storage for one `*mut ForgeError`.
             #[unsafe(no_mangle)]
-            pub unsafe extern "C" fn forgedb_open(
+            pub unsafe extern "C" fn #sym_open(
                 root: *const c_char,
                 _flags: u32,
                 err_out: *mut *mut ForgeError,
@@ -258,7 +383,7 @@ impl FfiGenerator {
             /// # Safety
             /// `db` must be a handle from `forgedb_open` not already closed.
             #[unsafe(no_mangle)]
-            pub unsafe extern "C" fn forgedb_close(db: *mut Db) {
+            pub unsafe extern "C" fn #sym_close(db: *mut Db) {
                 if db.is_null() {
                     return;
                 }
@@ -271,7 +396,7 @@ impl FfiGenerator {
             /// # Safety
             /// `db` must be a live handle from `forgedb_open`.
             #[unsafe(no_mangle)]
-            pub unsafe extern "C" fn forgedb_commit(
+            pub unsafe extern "C" fn #sym_commit(
                 db: *mut Db,
                 err_out: *mut *mut ForgeError,
             ) -> bool {
@@ -301,7 +426,7 @@ impl FfiGenerator {
             /// # Safety
             /// `db` must be a live handle from `forgedb_open`.
             #[unsafe(no_mangle)]
-            pub unsafe extern "C" fn forgedb_checkpoint(
+            pub unsafe extern "C" fn #sym_checkpoint(
                 db: *mut Db,
                 err_out: *mut *mut ForgeError,
             ) -> bool {
@@ -329,7 +454,7 @@ impl FfiGenerator {
             /// # Safety
             /// `db` must be a live handle from `forgedb_open`.
             #[unsafe(no_mangle)]
-            pub unsafe extern "C" fn forgedb_compact(
+            pub unsafe extern "C" fn #sym_compact(
                 db: *mut Db,
                 err_out: *mut *mut ForgeError,
             ) -> bool {
@@ -355,7 +480,7 @@ impl FfiGenerator {
             /// # Safety
             /// `err`, if non-null, must be a `ForgeError` not yet freed.
             #[unsafe(no_mangle)]
-            pub unsafe extern "C" fn forgedb_error_code(err: *const ForgeError) -> i32 {
+            pub unsafe extern "C" fn #sym_error_code(err: *const ForgeError) -> i32 {
                 match err.as_ref() {
                     Some(e) => e.code,
                     None => 0,
@@ -368,7 +493,7 @@ impl FfiGenerator {
             /// # Safety
             /// `err`, if non-null, must be a `ForgeError` not yet freed.
             #[unsafe(no_mangle)]
-            pub unsafe extern "C" fn forgedb_error_message(err: *const ForgeError) -> *const c_char {
+            pub unsafe extern "C" fn #sym_error_message(err: *const ForgeError) -> *const c_char {
                 match err.as_ref() {
                     Some(e) => e.message.as_ptr(),
                     None => ptr::null(),
@@ -380,7 +505,7 @@ impl FfiGenerator {
             /// # Safety
             /// `err` must be a `ForgeError` from an engine out-param, freed once.
             #[unsafe(no_mangle)]
-            pub unsafe extern "C" fn forgedb_error_free(err: *mut ForgeError) {
+            pub unsafe extern "C" fn #sym_error_free(err: *mut ForgeError) {
                 if err.is_null() {
                     return;
                 }
@@ -397,7 +522,7 @@ impl FfiGenerator {
             /// whose contract names `forgedb_free_buffer` as its releaser (length
             /// == capacity), freed once.
             #[unsafe(no_mangle)]
-            pub unsafe extern "C" fn forgedb_free_buffer(ptr: *mut u8, len: usize) {
+            pub unsafe extern "C" fn #sym_free_buffer(ptr: *mut u8, len: usize) {
                 if ptr.is_null() {
                     return;
                 }
@@ -417,7 +542,7 @@ impl FfiGenerator {
             /// `db` must be a live handle from `forgedb_open`; `err_out`, when
             /// non-null, must point to writable storage for one `*mut ForgeError`.
             #[unsafe(no_mangle)]
-            pub unsafe extern "C" fn forgedb_snapshot(
+            pub unsafe extern "C" fn #sym_snapshot(
                 db: *mut Db,
                 err_out: *mut *mut ForgeError,
             ) -> *mut Snapshot {
@@ -441,7 +566,7 @@ impl FfiGenerator {
             /// # Safety
             /// `snap` must be a handle from `forgedb_snapshot`, freed once.
             #[unsafe(no_mangle)]
-            pub unsafe extern "C" fn forgedb_snapshot_free(snap: *mut Snapshot) {
+            pub unsafe extern "C" fn #sym_snapshot_free(snap: *mut Snapshot) {
                 if snap.is_null() {
                     return;
                 }
@@ -531,7 +656,7 @@ impl FfiGenerator {
             /// `cb`, when non-null, must be a valid `extern "C"` function pointer
             /// that stays valid as long as async ops may complete.
             #[unsafe(no_mangle)]
-            pub unsafe extern "C" fn forgedb_set_completion_callback(cb: Option<ForgeCompletion>) {
+            pub unsafe extern "C" fn #sym_set_completion_callback(cb: Option<ForgeCompletion>) {
                 let addr = match cb {
                     Some(f) => f as usize,
                     None => 0,
@@ -646,7 +771,7 @@ impl FfiGenerator {
             /// `release` callback reclaims this box and drops it — dropping the
             /// `ColumnExport` frees the copy *or* `munmap`s the alias, as needed.
             struct ArrowArrayOwner {
-                _export: forgedb_storage::ColumnExport,
+                _export: forgedb_core::forgedb_storage::ColumnExport,
                 _buffers: Vec<*const c_void>,
             }
 
@@ -688,7 +813,7 @@ impl FfiGenerator {
                 out_schema: *mut ArrowSchema,
                 out_array: *mut ArrowArray,
                 format: *const c_char,
-                export: forgedb_storage::ColumnExport,
+                export: forgedb_core::forgedb_storage::ColumnExport,
                 length: usize,
             ) {
                 // The export's pointer (mmap address or `Vec` heap allocation) is
@@ -788,7 +913,7 @@ impl FfiGenerator {
     /// never a runtime schema read.  Every engine call is `catch_unwind`-guarded
     /// (an unwind across `extern "C"` is UB), and a rejected write becomes a
     /// `FORGEDB_ERR_VALIDATION` error rather than a panic.
-    fn generate_model_ops(schema: &Schema) -> Vec<proc_macro2::TokenStream> {
+    fn generate_model_ops(schema: &Schema, p: &str) -> Vec<proc_macro2::TokenStream> {
         schema
             .models
             .iter()
@@ -802,14 +927,14 @@ impl FfiGenerator {
                 let update_fn = format_ident!("update_{}", snake);
                 let delete_fn = format_ident!("delete_{}", snake);
 
-                let insert_sym = format_ident!("forgedb_{}_insert", snake);
-                let get_sym = format_ident!("forgedb_{}_get", snake);
-                let count_sym = format_ident!("forgedb_{}_count", snake);
-                let all_sym = format_ident!("forgedb_{}_all", snake);
-                let update_sym = format_ident!("forgedb_{}_update", snake);
-                let delete_sym = format_ident!("forgedb_{}_delete", snake);
-                let get_at_sym = format_ident!("forgedb_{}_get_at", snake);
-                let all_at_sym = format_ident!("forgedb_{}_all_at", snake);
+                let insert_sym = format_ident!("{}{}_insert", p, snake);
+                let get_sym = format_ident!("{}{}_get", p, snake);
+                let count_sym = format_ident!("{}{}_count", p, snake);
+                let all_sym = format_ident!("{}{}_all", p, snake);
+                let update_sym = format_ident!("{}{}_update", p, snake);
+                let delete_sym = format_ident!("{}{}_delete", p, snake);
+                let get_at_sym = format_ident!("{}{}_get_at", p, snake);
+                let all_at_sym = format_ident!("{}{}_all_at", p, snake);
                 // The `DatabaseSnapshot` field for this model is named by its
                 // snake name (same as the storage field), so `snap.inner.<snake>`
                 // is this collection's captured watermark.
@@ -1227,7 +1352,7 @@ impl FfiGenerator {
     /// status, as `forgedb_error_code` uses), not a panic;
     /// the engine call itself stays `catch_unwind`-guarded so a panic keeps the
     /// worker alive and becomes a completion instead of killing the thread.
-    fn generate_async_ops(schema: &Schema) -> Vec<proc_macro2::TokenStream> {
+    fn generate_async_ops(schema: &Schema, p: &str) -> Vec<proc_macro2::TokenStream> {
         schema
             .models
             .iter()
@@ -1241,12 +1366,12 @@ impl FfiGenerator {
                 let update_fn = format_ident!("update_{}", snake);
                 let delete_fn = format_ident!("delete_{}", snake);
 
-                let get_sym = format_ident!("forgedb_{}_get_async", snake);
-                let all_sym = format_ident!("forgedb_{}_all_async", snake);
-                let count_sym = format_ident!("forgedb_{}_count_async", snake);
-                let insert_sym = format_ident!("forgedb_{}_insert_async", snake);
-                let update_sym = format_ident!("forgedb_{}_update_async", snake);
-                let delete_sym = format_ident!("forgedb_{}_delete_async", snake);
+                let get_sym = format_ident!("{}{}_get_async", p, snake);
+                let all_sym = format_ident!("{}{}_all_async", p, snake);
+                let count_sym = format_ident!("{}{}_count_async", p, snake);
+                let insert_sym = format_ident!("{}{}_insert_async", p, snake);
+                let update_sym = format_ident!("{}{}_update_async", p, snake);
+                let delete_sym = format_ident!("{}{}_delete_async", p, snake);
 
                 let get_doc = format!("Async fetch a `{}` by id — completion payload = record JSON (null = absent).", model.name);
                 let all_doc = format!("Async fetch every live `{}` — completion payload = JSON array.", model.name);
@@ -1527,7 +1652,7 @@ impl FfiGenerator {
     ///
     /// The eager-load bundles (`*_with_relations`) are deferred to a later phase
     /// (they land here too).
-    fn generate_relation_ops(schema: &Schema) -> Vec<proc_macro2::TokenStream> {
+    fn generate_relation_ops(schema: &Schema, p: &str) -> Vec<proc_macro2::TokenStream> {
         use std::collections::{HashMap, HashSet};
 
         let mut ops = Vec::new();
@@ -1686,7 +1811,7 @@ impl FfiGenerator {
                     continue;
                 }
                 let method_ident = format_ident!("{}", method_name);
-                let sym = format_ident!("forgedb_{}", method_name);
+                let sym = format_ident!("{}{}", p, method_name);
                 let doc = format!(
                     "Resolve the `{}` foreign key of a `{}` (by id) to its record (JSON `Option`).",
                     field.name, model.name
@@ -1754,36 +1879,36 @@ impl FfiGenerator {
         // --- B. Reverse one-to-many collection getters ------------------------
         let pairs = schema.detect_relations();
         let mut group_counts: HashMap<(String, String), usize> = HashMap::new();
-        for p in &pairs {
+        for pair in &pairs {
             *group_counts
-                .entry((p.parent_model.clone(), p.parent_field.clone()))
+                .entry((pair.parent_model.clone(), pair.parent_field.clone()))
                 .or_default() += 1;
         }
-        for p in &pairs {
-            let Some(parent) = schema.find_model(&p.parent_model) else { continue };
+        for pair in &pairs {
+            let Some(parent) = schema.find_model(&pair.parent_model) else { continue };
             let ambiguous = group_counts
-                .get(&(p.parent_model.clone(), p.parent_field.clone()))
+                .get(&(pair.parent_model.clone(), pair.parent_field.clone()))
                 .is_some_and(|&c| c > 1);
             let method_name = if ambiguous {
                 format!(
                     "{}_{}_by_{}",
-                    RustGenerator::to_snake_case(&p.parent_model),
-                    p.parent_field,
-                    p.child_field
+                    RustGenerator::to_snake_case(&pair.parent_model),
+                    pair.parent_field,
+                    pair.child_field
                 )
             } else {
-                format!("{}_{}", RustGenerator::to_snake_case(&p.parent_model), p.parent_field)
+                format!("{}_{}", RustGenerator::to_snake_case(&pair.parent_model), pair.parent_field)
             };
             if !seen.insert(method_name.clone()) {
                 continue;
             }
             let method_ident = format_ident!("{}", method_name);
-            let sym = format_ident!("forgedb_{}", method_name);
+            let sym = format_ident!("{}{}", p, method_name);
             // #266: the C-ABI id buffer decodes as the PARENT's own key type.
             let id_ty = RustGenerator::id_type_tokens(schema, parent);
             let doc = format!(
                 "All `{}` whose `{}` references the given `{}` id (JSON array).",
-                p.child_model, p.child_field, p.parent_model
+                pair.child_model, pair.child_field, pair.parent_model
             );
             ops.push(vec_getter(&sym, &id_ty, quote! { db.inner.#method_ident(id) }, &doc));
         }
@@ -1799,7 +1924,7 @@ impl FfiGenerator {
             let link_name = format!("link_{snake1}_{snake2}");
             if seen.insert(link_name.clone()) {
                 let link_ident = format_ident!("{}", link_name);
-                let sym = format_ident!("forgedb_{}", link_name);
+                let sym = format_ident!("{}{}", p, link_name);
                 let doc = format!("Link a `{}` (left) and a `{}` (right) in the junction.", m.model1, m.model2);
                 ops.push(quote! {
                     #[doc = #doc]
@@ -1847,7 +1972,7 @@ impl FfiGenerator {
             let unlink_name = format!("unlink_{snake1}_{snake2}");
             if seen.insert(unlink_name.clone()) {
                 let unlink_ident = format_ident!("{}", unlink_name);
-                let sym = format_ident!("forgedb_{}", unlink_name);
+                let sym = format_ident!("{}{}", p, unlink_name);
                 let doc = format!("Unlink a `{}` (left) / `{}` (right): 1 removed / 0 no-op / -1 error.", m.model1, m.model2);
                 ops.push(quote! {
                     #[doc = #doc]
@@ -1896,7 +2021,7 @@ impl FfiGenerator {
             let fwd_name = format!("{snake1}_{}", m.field1);
             if seen.insert(fwd_name.clone()) {
                 let fwd_ident = format_ident!("{}", fwd_name);
-                let sym = format_ident!("forgedb_{}", fwd_name);
+                let sym = format_ident!("{}{}", p, fwd_name);
                 let id_ty = lk.clone();
                 let doc = format!("All linked `{}` for the given `{}` id (JSON array).", m.model2, m.model1);
                 ops.push(vec_getter(&sym, &id_ty, quote! { db.inner.#fwd_ident(id) }, &doc));
@@ -1910,7 +2035,7 @@ impl FfiGenerator {
                 let fwd_at_name = format!("{snake1}_{}_at", m.field1);
                 if seen.insert(fwd_at_name.clone()) {
                     let fwd_at_ident = format_ident!("{}", fwd_at_name);
-                    let at_sym = format_ident!("forgedb_{}", fwd_at_name);
+                    let at_sym = format_ident!("{}{}", p, fwd_at_name);
                     let at_doc = format!(
                         "All linked `{}` for the given `{}` id, consistent as of `snap` (JSON array).",
                         m.model2, m.model1
@@ -1928,7 +2053,7 @@ impl FfiGenerator {
             let rev_name = format!("{snake2}_{}", m.field2);
             if seen.insert(rev_name.clone()) {
                 let rev_ident = format_ident!("{}", rev_name);
-                let sym = format_ident!("forgedb_{}", rev_name);
+                let sym = format_ident!("{}{}", p, rev_name);
                 let id_ty = rk.clone();
                 let doc = format!("All linked `{}` for the given `{}` id (JSON array).", m.model1, m.model2);
                 ops.push(vec_getter(&sym, &id_ty, quote! { db.inner.#rev_ident(id) }, &doc));
@@ -1957,7 +2082,7 @@ impl FfiGenerator {
     /// The export is a **zero-copy `mmap` alias** of the on-disk column when the
     /// live rows are a dense prefix and a gathered copy otherwise — same ABI +
     /// release contract either way (`fill_arrow_primitive` / `ColumnExport`).
-    fn generate_arrow_ops(schema: &Schema) -> Vec<proc_macro2::TokenStream> {
+    fn generate_arrow_ops(schema: &Schema, p: &str) -> Vec<proc_macro2::TokenStream> {
         let mut ops = Vec::new();
         for model in schema
             .models
@@ -1970,7 +2095,7 @@ impl FfiGenerator {
                 let Some(fmt) = RustGenerator::arrow_export_format(schema, &field.field_type) else {
                     continue;
                 };
-                let sym = format_ident!("forgedb_{}_{}_export_arrow", snake, field.name);
+                let sym = format_ident!("{}{}_{}_export_arrow", p, snake, field.name);
                 let export_method = format_ident!("export_col_{}", field.name);
                 // A nul-terminated Arrow format C-string (`b"l\0"` → `*const c_char`).
                 let fmt_bytes = proc_macro2::Literal::byte_string(format!("{fmt}\0").as_bytes());
@@ -2042,45 +2167,161 @@ impl FfiGenerator {
         ops
     }
 
-    /// The `Cargo.toml` for the generated native FFI engine crate. User-editable
-    /// config, so the CLI writes it ONLY when absent (like the wasm replica's
-    /// `Cargo.toml` and the TS SDK's `package.json`).
+    /// Render `ffi/Cargo.toml` for the cache package.
     ///
-    /// A `cdylib` (for the C-ABI `.so`/`.dylib`/`.dll` a binding `dlopen`s) plus
-    /// an `rlib` (so a NAPI-RS/PyO3 wrapper crate can depend on it directly).
-    /// `panic = "unwind"` is load-bearing: the entry points `catch_unwind` engine
-    /// panics, so the profile must not be `panic = "abort"`.
-    pub fn cargo_toml_scaffold(crate_name: &str) -> String {
+    /// `core_package` is the app's `core` package name; the dependency is
+    /// **renamed** to `forgedb_core` so the generated source never carries the
+    /// app hash.
+    ///
+    /// # Three crate types, and why `staticlib` is the load-bearing one
+    ///
+    /// * `cdylib` — the C-ABI shared object a Python/Node/Bun binding loads;
+    /// * `rlib` — so this crate is usable as a plain Rust dependency. Its old
+    ///   rationale ("so a NAPI-RS / PyO3 wrapper crate can link the engine
+    ///   directly") was already false and is deleted: those wrappers link the
+    ///   generated database, and as of #335 they link `core` for it, not this
+    ///   crate;
+    /// * `staticlib` — the `libforgedb.a` the Go binding links (#335 §6). Go
+    ///   delivery is static, which is also what makes the per-app C-symbol
+    ///   prefix mandatory rather than tidy: a duplicate `no_mangle` symbol is a
+    ///   load-time problem for a `cdylib` only if one process loads both, but a
+    ///   hard **link-time** collision for a single Go binary importing two
+    ///   ForgeDB packages.
+    ///
+    /// # Zero substrate pins
+    ///
+    /// Every substrate type this crate names reaches it through `core`'s
+    /// re-exports (`forgedb_core::forgedb_storage`, `::forgedb_types`), which is
+    /// what makes those types **unify** with `core`'s rather than merely resolve
+    /// to the same version by lockfile coincidence. A pin here would be a second
+    /// place a version can drift.
+    ///
+    /// # No `[profile.*]` table
+    ///
+    /// The deleted `[profile.release] panic = "unwind"` was not tidy-up. This
+    /// crate is now a workspace **member**, and a profile in a member is
+    /// *silently ignored* (`warning: profiles for the non root package will be
+    /// ignored`) — so a block whose comment called it load-bearing for the
+    /// `catch_unwind` boundary read as applied while doing nothing. The unwind
+    /// floor is applied by the build driver on the cargo invocation, where a
+    /// hostile `$CARGO_HOME/config.toml` cannot beat it.
+    /// Generate the `forgedb.h` C header declaring every prototype this
+    /// package defines (the schema-invariant spine + the per-model + relation
+    /// symbols), plus the fingerprint macro and the advisory check.
+    ///
+    /// **It lives here, not in `GoGenerator`, because the symbols it declares
+    /// are DEFINED here.** It was written on the Go path only because Go was the
+    /// first consumer to need it; a C consumer of ForgeDB had no declarations at
+    /// all. It still reads go.rs's model/relation walks — unifying those two
+    /// walks, which today agree only by review, is a separate change.
+    ///
+    /// `symbol_prefix` MUST be the same value handed to `FfiGenerator::generate`
+    /// for this app. A mismatch is not a compile error on either side — it is an
+    /// undefined-symbol error at link time.
+    pub fn generate_header(
+        schema: &Schema,
+        symbol_prefix: &str,
+        fingerprint: &str,
+    ) -> Result<GeneratedCode> {
+        use crate::go::{GoGenerator, GoRelOp, HEADER_PREAMBLE, subst};
+        let pfx = symbol_prefix;
+        let models = GoGenerator::crud_models(schema);
+        let rel_ops = GoGenerator::relation_ops(schema);
+
+        let mut h = String::new();
+        h.push_str(&subst(HEADER_PREAMBLE, pfx));
+        h.push_str(&fingerprint_block(pfx, fingerprint));
+
+        for m in &models {
+            let s = &m.snake;
+            h.push_str(&format!(
+                "\n/* --- {name} --- */\n\
+                 bool {pfx}{s}_insert(Db* db, const uint8_t* record, size_t record_len, uint8_t** id_out, size_t* id_len_out, ForgeError** err_out);\n\
+                 bool {pfx}{s}_get(Db* db, const uint8_t* id, size_t id_len, uint8_t** out, size_t* out_len, ForgeError** err_out);\n\
+                 int64_t {pfx}{s}_count(Db* db, ForgeError** err_out);\n\
+                 bool {pfx}{s}_all(Db* db, uint8_t** out, size_t* out_len, ForgeError** err_out);\n\
+                 int32_t {pfx}{s}_update(Db* db, const uint8_t* id, size_t id_len, const uint8_t* record, size_t record_len, ForgeError** err_out);\n\
+                 int32_t {pfx}{s}_delete(Db* db, const uint8_t* id, size_t id_len, ForgeError** err_out);\n\
+                 bool {pfx}{s}_get_at(Db* db, const Snapshot* snap, const uint8_t* id, size_t id_len, uint8_t** out, size_t* out_len, ForgeError** err_out);\n\
+                 bool {pfx}{s}_all_at(Db* db, const Snapshot* snap, uint8_t** out, size_t* out_len, ForgeError** err_out);\n\
+                 void {pfx}{s}_insert_async(Db* db, const uint8_t* record, size_t record_len, uint64_t token);\n\
+                 void {pfx}{s}_get_async(Db* db, const uint8_t* id, size_t id_len, uint64_t token);\n\
+                 void {pfx}{s}_count_async(Db* db, uint64_t token);\n\
+                 void {pfx}{s}_all_async(Db* db, uint64_t token);\n\
+                 void {pfx}{s}_update_async(Db* db, const uint8_t* id, size_t id_len, const uint8_t* record, size_t record_len, uint64_t token);\n\
+                 void {pfx}{s}_delete_async(Db* db, const uint8_t* id, size_t id_len, uint64_t token);\n",
+                name = m.name,
+                s = s,
+            ));
+        }
+
+        if !rel_ops.is_empty() {
+            h.push_str("\n/* --- relations --- */\n");
+            for op in &rel_ops {
+                h.push_str(&match op {
+                    GoRelOp::ForwardFk { sym, .. } | GoRelOp::Vec { sym, .. } => format!(
+                        "bool {pfx}{sym}(Db* db, const uint8_t* id, size_t id_len, uint8_t** out, size_t* out_len, ForgeError** err_out);\n"
+                    ),
+                    GoRelOp::VecAt { sym, .. } => format!(
+                        "bool {pfx}{sym}(Db* db, const Snapshot* snap, const uint8_t* id, size_t id_len, uint8_t** out, size_t* out_len, ForgeError** err_out);\n"
+                    ),
+                    GoRelOp::Link { sym, .. } => format!(
+                        "bool {pfx}{sym}(Db* db, const uint8_t* left, size_t left_len, const uint8_t* right, size_t right_len, ForgeError** err_out);\n"
+                    ),
+                    GoRelOp::Unlink { sym, .. } => format!(
+                        "int32_t {pfx}{sym}(Db* db, const uint8_t* left, size_t left_len, const uint8_t* right, size_t right_len, ForgeError** err_out);\n"
+                    ),
+                });
+            }
+        }
+
+        let arrow = GoGenerator::arrow_columns(schema);
+        if !arrow.is_empty() {
+            h.push_str("\n/* --- Arrow columnar export --- */\n");
+            for c in &arrow {
+                h.push_str(&format!(
+                    "bool {}{}(Db* db, struct ArrowSchema* out_schema, struct ArrowArray* out_array, ForgeError** err_out);\n",
+                    pfx, c.sym
+                ));
+            }
+        }
+
+        h.push_str("\n#endif /* FORGEDB_H */\n");
+        Ok(GeneratedCode {
+            description: format!("C header ({} models)", models.len()),
+            code: h,
+        })
+    }
+
+    pub fn cargo_toml(crate_name: &str, core_package: &str) -> String {
         format!(
-            r#"[package]
+            r#"# Generated by ForgeDB. Do not edit — rewritten in full on every generate.
+[package]
 name = "{crate_name}"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-# cdylib: the C-ABI shared object a Python/Node/Bun binding loads.
-# rlib:   so a NAPI-RS / PyO3 wrapper crate can link the engine directly.
-crate-type = ["cdylib", "rlib"]
+# cdylib:    the C-ABI shared object a Python/Node/Bun binding loads.
+# rlib:      this crate as a plain Rust dependency.
+# staticlib: the archive the Go binding links (#335 §6) — the reason every
+#            exported symbol carries this app's prefix, since a duplicate is a
+#            link-time error rather than a load-time one.
+crate-type = ["cdylib", "rlib", "staticlib"]
 
 [dependencies]
-forgedb-storage = "0.3"
-forgedb-types = "0.3"
-forgedb-changefeed = "0.2"
-forgedb-wal = "0.2"
-forgedb-compaction = "0.1"
-forgedb-txn = "0.1"
-forgedb-coordinator = "0.2"
-forgedb-query-params = "0.1"
-regex = "1"
-rust_decimal = {{ version = "1", features = ["serde-with-str"] }}
-serde = {{ version = "1", features = ["derive"] }}
-serde_json = "1"
-utoipa = {{ version = "5", features = ["uuid"] }}
+# The one generated database for this app, and the ONLY dependency. Every
+# substrate type this crate names is reached through `core`'s re-exports, so
+# their types UNIFY with `core`'s instead of merely resolving to the same
+# version by lockfile coincidence. This crate pins ZERO substrate of its own.
+forgedb_core = {{ package = "{core_package}", path = "../core" }}
 
-[profile.release]
-# Load-bearing: the C-ABI entry points catch_unwind engine panics, so the
-# release profile must unwind (not abort) for that boundary to hold.
-panic = "unwind"
+# NOT substrate, and therefore not routed through `core`: the C-ABI marshals
+# every payload as JSON bytes, so this crate names `serde_json` in its own body
+# (140 `E0433`s without it — caught by compiling the emitted cache workspace,
+# never by a snapshot). "Zero substrate pins" is a statement about ForgeDB
+# crates; a third-party dep the wrapper itself calls still belongs here.
+serde_json = "1"
 "#
         )
     }

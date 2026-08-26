@@ -42,7 +42,7 @@ forgedb-codegen       one generator per artifact:
    ├─ StubGenerator        → stubs/README  (placeholder for hand-written impls; no UI codegen)
    ├─ OpenApiGenerator     → openapi.json  (offline OpenAPI 3.1 document)
    ├─ WasmGenerator        → replica/*     (browser read-replica; opt-in)
-   └─ TransformGenerator   → migrations/transform/*  (offline data migration bin)
+   └─ TransformGenerator   → transform-<F>-<T>/*     (offline data migration bin)
 ```
 
 `forgedb-parser` lexes and parses to the AST in `crates/parser/src/ast.rs`; `forgedb-validation` runs semantic checks; `forgedb-codegen` holds one generator per artifact, each a `::generate(&schema) -> GeneratedCode`.

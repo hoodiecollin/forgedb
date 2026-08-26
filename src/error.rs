@@ -22,6 +22,15 @@ pub enum CliError {
     #[error("Configuration error: {0}")]
     Config(String),
 
+    /// A config diagnostic that already names its own file and position.
+    ///
+    /// Rendered verbatim: strict parsing (#333) makes multi-line `toml` errors a
+    /// primary diagnostic rather than a rare one, and a `Configuration error:`
+    /// prefix above a message that begins `TOML parse error at line 1, column 2`
+    /// buries the part the user needs.
+    #[error("{0}")]
+    ConfigDiagnostic(String),
+
     #[error("Project already exists: {0}")]
     ProjectExists(String),
 
@@ -50,6 +59,7 @@ impl CliError {
             CliError::CodeGeneration(_) => 3,
             CliError::Build(_) => 4,
             CliError::Config(_) => 10,
+            CliError::ConfigDiagnostic(_) => 10,
             CliError::ProjectExists(_) => 11,
             CliError::SchemaNotFound(_) => 11,
             CliError::Migration(_) => 5,
