@@ -28,12 +28,18 @@ use crate::error::{CliError, Result};
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectConfig {
-    /// Explicit project id.  Only meaningful at the project root — declaring it
-    /// at a nested, non-isolated config is a positioned error, because it reads
-    /// as authoritative and is not.  Spanned so that error can name its line.
-    pub name: Option<Spanned<String>>,
+    /// The project id, **minted by `forgedb init`** and committed with the
+    /// config (#479).  Only meaningful at the project root — declaring it at a
+    /// nested, non-isolated config is a positioned error, because it reads as
+    /// authoritative and is not.  Spanned so that error can name its line.
+    ///
+    /// Minted rather than derived, which is what makes it collision-free: an id
+    /// read off a package name is one two unrelated projects can both produce.
+    /// Nothing but `init` writes it, and a project without one is keyed on a
+    /// hash of its root path instead.
+    pub id: Option<Spanned<String>>,
     /// Inert metadata.  Deliberately has **no** effect on generation or on
-    /// identity: identity is `name` + root path, and giving a version a role
+    /// identity: identity is `id` + root path, and giving a version a role
     /// would create a second axis on which two roots could collide.
     pub version: Option<String>,
     /// Whether the schemas beneath this config form their own project.
@@ -79,7 +85,7 @@ fn isolated_default() -> bool {
 impl Default for ProjectConfig {
     fn default() -> Self {
         ProjectConfig {
-            name: None,
+            id: None,
             version: None,
             isolated: isolated_default(),
             symbol_naming: crate::naming::SymbolNaming::default(),
@@ -88,9 +94,9 @@ impl Default for ProjectConfig {
 }
 
 impl ProjectConfig {
-    /// The declared project name, if any.
-    pub fn name(&self) -> Option<&str> {
-        self.name.as_ref().map(|n| n.as_ref().as_str())
+    /// The declared project id, if any.
+    pub fn id(&self) -> Option<&str> {
+        self.id.as_ref().map(|n| n.as_ref().as_str())
     }
 }
 
@@ -566,7 +572,7 @@ pub fn line_col(content: &str, offset: usize) -> (usize, usize) {
 
 /// The position of the **key** on the line a value's span points into.
 ///
-/// `Spanned` reports where the *value* starts, so `name = "api"` positions at
+/// `Spanned` reports where the *value* starts, so `id = "api"` positions at
 /// column 8 — past the thing the reader has to change. Every diagnostic here is
 /// about a key, so they all point at the start of its line instead.
 pub fn key_position(content: &str, value_offset: usize) -> (usize, usize) {
@@ -692,97 +698,18 @@ pub fn load_config_file(path: &std::path::Path) -> Result<ForgeConfig> {
 }
 
 // ---------------------------------------------------------------------------
-// Writing a config (#367)
+// Writing a config (#367, narrowed by #479)
 // ---------------------------------------------------------------------------
 //
-// These are writes, and they live in the module that owns the READS on purpose.
+// This is a write, and it lives in the module that owns the READS on purpose.
 // #361's one-loader invariant is about config I/O, and splitting the writer into
 // its own module would make it two modules again — the same drift with a new
-// file name.  Both go through [`write_checked`], so a `forgedb.toml` that would
-// no longer parse is never applied and a half-written one can never exist in the
-// user's repository.
-
-/// The line ForgeDB leaves at the top of a `forgedb.toml` it created.
-///
-/// The difference between a mystery file appearing in `git status` and a legible
-/// one.  An adopted repository is exactly the kind of project that reaches these
-/// decisions, so this line is the first thing many users will read about
-/// ForgeDB's config.
-const PROVENANCE: &str = "\
-# Created by `forgedb project name`. ForgeDB keys this project's build cache,
-# lockfile and target directory on the id below; recording it HERE rather than in
-# the cache is what makes it survive `rm -rf ~/.forgedb`.
-";
-
-/// Create a minimal `forgedb.toml` at `root` declaring `name`.
-///
-/// **Deliberately minimal — no `[generate]` table.**  `parse_config` refuses a
-/// config whose `generate.targets` is `None`, which reads like "a `[project]`-only
-/// file will hard-error".  It will not: `ForgeConfig.generate` carries
-/// `#[serde(default)]` and `GenerateConfig::default()` states
-/// `targets = ["all"]`, so a file with no `[generate]` table takes the built-in
-/// and parses.  Writing `targets` "to be safe" would be identical today and is
-/// the wrong instinct when ForgeDB is authoring a file in someone else's repo.
-///
-/// `isolated` is likewise absent: it defaults to `true`, and a create is only
-/// ever reached when the chain holds no config at all, so there is nothing this
-/// file could regroup.
-pub fn create_project_config(root: &std::path::Path, name: &str) -> Result<std::path::PathBuf> {
-    let path = root.join(CONFIG_FILE);
-    if path.exists() {
-        return Err(CliError::Config(format!(
-            "{} already exists — this is an edit, not a create.",
-            path.display()
-        )));
-    }
-    write_checked(&path, &format!("{PROVENANCE}\n[project]\nname = {}\n", quoted(name)))?;
-    Ok(path)
-}
-
-/// Set `[project].name` in an existing config, **preserving its formatting**.
-///
-/// Comments, blank lines, key order and every other table survive: the user owns
-/// this file, and a round-trip through `toml` would silently rewrite all of it.
-/// An existing name is never replaced unless `overwrite`.
-pub fn set_project_name(path: &std::path::Path, name: &str, overwrite: bool) -> Result<()> {
-    let content = std::fs::read_to_string(path).map_err(|e| {
-        CliError::Config(format!("Cannot read config file '{}': {}", path.display(), e))
-    })?;
-    let mut doc = content.parse::<toml_edit::DocumentMut>().map_err(|e| {
-        CliError::ConfigDiagnostic(format!("{}:\n{}", path.display(), e))
-    })?;
-
-    if let Some(existing) = doc
-        .get("project")
-        .and_then(|p| p.get("name"))
-        .and_then(|n| n.as_str())
-        && !overwrite
-    {
-        return Err(CliError::ConfigDiagnostic(format!(
-            "{} already declares `[project].name = {}`.\n\n\
-             A project id keys its build cache directory, so changing it orphans \
-             the one the current id points at. Pass --force to change it anyway.",
-            path.display(),
-            quoted(existing),
-        )));
-    }
-
-    // `or_insert` on a missing `[project]` creates an implicit table, which
-    // renders as `[project]` in a document that has no other tables and inlines
-    // nowhere — the shape a hand-written config already has.
-    let project = doc
-        .entry("project")
-        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
-    let table = project.as_table_mut().ok_or_else(|| {
-        CliError::ConfigDiagnostic(format!(
-            "{}: `project` is not a table, so `[project].name` cannot be recorded there.",
-            path.display()
-        ))
-    })?;
-    table["name"] = toml_edit::value(name);
-
-    write_checked(path, &doc.to_string())
-}
+// file name.
+//
+// #479 left exactly ONE writer: the `forgedb.toml` that `forgedb init`
+// scaffolds.  The create/edit pair that recorded a chosen `[project].name` went
+// with the decision it recorded — an id is now minted at `init`, so there is no
+// later invocation that has to write one into a config ForgeDB did not author.
 
 /// Write a config through a sibling temp file, **re-parsing before the rename**.
 ///
@@ -792,7 +719,7 @@ pub fn set_project_name(path: &std::path::Path, name: &str, overwrite: bool) -> 
 /// one) and a document that no longer parses is simply not applied.  And the
 /// rename is atomic, so a half-written `forgedb.toml` can never be observed in
 /// the user's repository.
-fn write_checked(path: &std::path::Path, content: &str) -> Result<()> {
+pub fn write_checked(path: &std::path::Path, content: &str) -> Result<()> {
     parse_config(content, path)?;
     let dir = path.parent().unwrap_or(std::path::Path::new("."));
     std::fs::create_dir_all(dir)?;
@@ -810,10 +737,10 @@ fn write_checked(path: &std::path::Path, content: &str) -> Result<()> {
     }
 }
 
-/// A TOML basic string. Project names are validated before they reach here
+/// A TOML basic string. Project ids are validated before they reach here
 /// (no control characters, no separators), so this only has to handle the
 /// two characters TOML itself reserves.
-fn quoted(value: &str) -> String {
+pub fn quoted(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
@@ -826,7 +753,7 @@ mod tests {
     fn empty_config_maps_to_default_gen_config() {
         // No [runtime]/[storage] tables → GenConfig::DEFAULT (byte-identical
         // output, replication OFF).
-        let cfg: ForgeConfig = toml::from_str("[project]\nname = \"x\"\n").unwrap();
+        let cfg: ForgeConfig = toml::from_str("[project]\nid = \"x\"\n").unwrap();
         assert_eq!(cfg.gen_config().unwrap(), GenConfig::DEFAULT);
         assert!(!cfg.runtime.replication);
     }

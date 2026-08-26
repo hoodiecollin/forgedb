@@ -68,7 +68,7 @@ const V3: &str =
 /// claiming the same name never meet.
 const PROJECT: &str = "migrate-scenarios";
 
-const CONFIG: &str = "[project]\nname = \"migrate-scenarios\"\n\n[generate]\ntargets = [\"all\"]\n";
+const CONFIG: &str = "[project]\nid = \"migrate-scenarios\"\n\n[generate]\ntargets = [\"all\"]\n";
 
 /// A `forgedb` invocation scoped to `dir`.
 ///

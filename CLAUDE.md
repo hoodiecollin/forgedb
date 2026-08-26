@@ -60,9 +60,8 @@ cargo clippy --workspace             # no dead-code warnings (style lints remain
 ```
 
 CLI commands: `init`, `generate`, `validate`, `build`, `dev`, `migrate`, `compact`, `backup`,
-`project` (`name|claim|release|show` — #367; records the two identity decisions a flag cannot
-make *stick*, since the id keys the cache directory and the invocations that would carry a flag
-are ones ForgeDB itself scaffolds),
+`project` (`show` — #367/#479; reports identity and decides nothing. The three sibling verbs that
+recorded identity decisions were deleted when the id became something `init` mints),
 `tenant` (`create|list|drop` — #59 multi-tenancy dir management),
 `coordinate <root>` (#75/#84 MVCC Tier 3 — run the multi-process write coordinator for a data dir).
 Example: `cargo run -- generate all --output ./generated`.
@@ -140,23 +139,27 @@ they own (epic #332) — do not re-derive either inline:
   directories: knobs from `Chain::nearest()`, identity from `Chain::project_root()` (nearest
   `[project].isolated`, else outermost). Also the **single entry point for reading config** —
   `config::{parse_config, load_config_file}` are reached from here and nowhere else, which is
-  the greppable form of #361's one-loader invariant. Id order: `[project].name` → exactly one
-  ecosystem manifest → hash of the root's **absolute** path. The claim ledger under
-  `~/.forgedb/ledger/` **detects** collisions; a resolution is recorded in the project's own
-  `forgedb.toml`, never in the cache. The ledger is **append-only** — nothing removes a
-  `.claim` — so a moved project collides with its own ghost; that case has its own
-  diagnostic and its own remedy (`forgedb project claim --take-over`), and a *live* holder
-  is never displaced without `--force`.
+  the greppable form of #361's one-loader invariant. **Id order (#479): `[project].id` → hash of
+  the root's **absolute** path.** Two branches, both collision-free by construction — the id is
+  **minted by `forgedb init`** (`mint_id`: a directory slug plus `RandomState` entropy, no new
+  dep) and committed, never derived from a package name. The manifest-name branch, the ambiguity
+  case and every remedy built on them were deleted together, because each existed only because
+  a derived id could collide. The claim ledger under `~/.forgedb/ledger/` survives as a **pure
+  detector** with ONE cause — a copied project directory whose copy inherited the original's
+  `[project].id` — and its diagnostic names the file and key to change rather than a command:
+  there is no take-over, no release, and nothing that edits a config on the user's behalf.
 - `src/ask.rs` (#367) — **may ForgeDB ask a question, and who answers it.** The ONE
   `IsTerminal` call in the tree, behind `Askability` — a pure predicate over four booleans
   (stdin tty, stderr tty, `--quiet`, `forbid()`), each a veto for a different reason. Prompts
   render to **stderr**, unlike `ui.rs`. `ask::forbid()` latches the contexts that must never
   ask however the process was started: `build`'s machine-readable modes and `dev`'s watch
-  loop. The `Asker` trait is the seam that makes the interactive path testable with no pty —
-  the decision and the persisting act are on this side of it, the widget on the far side, and
-  **the widget must stay the last and smallest layer**. `FORGEDB_ASK_TRACE=<path>` appends
-  the boundary's reason, which is the only way a piped harness can tell "did not ask because
-  forbidden" from "did not ask because piped".
+  loop. The `Prompt` trait is the seam that makes the interactive path testable with no pty —
+  the decision is on this side of it, the widget on the far side, and **the widget must stay the
+  last and smallest layer**. `FORGEDB_ASK_TRACE=<path>` appends the boundary's reason, which is
+  how a piped harness tells "did not ask because forbidden" from "did not ask because piped".
+  **Since #479 `migrate create` is the ONLY consumer**: identity asked the other two questions,
+  and `generate`/`build` now reach no asking boundary at all — so a build's trace is *empty*
+  rather than carrying a reason, and `forbid()` traces its own call so the latch stays visible.
 - `src/cache.rs` (#334) — **where generated code is built.** `~/.forgedb/projects/<id>/` as a
   ForgeDB-owned cargo workspace: virtual manifest pinning `resolver = "3"`, one `Cargo.lock`
   and one `target/` shared by every member, `apps/<member-hash>/` per app. The member hash is

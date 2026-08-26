@@ -62,7 +62,7 @@ fn scaffold(root: &Path) {
     fs::write(root.join("schema.forge"), SCHEMA).expect("write schema");
     fs::write(
         root.join("forgedb.toml"),
-        "[project]\nname = \"dev-scenario-35\"\n\n\
+        "[project]\nid = \"dev-scenario-35\"\n\n\
          [generate]\ntargets = [\"rust\"]\n\n\
          [storage]\nfsync = \"never\"\n",
     )

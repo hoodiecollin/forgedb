@@ -33,21 +33,15 @@ struct Cli {
 enum Commands {
     /// Initialize a new ForgeDB project
     Init {
-        /// Directory to scaffold (its last path component is the default id)
-        project_name: String,
-
-        /// Project id, decoupled from the directory name
-        ///
-        /// `forgedb init apps/api --project-name storefront` scaffolds `apps/api`
-        /// and names the project `storefront`. The non-interactive twin of the
-        /// prompt: a scaffold whose directory name is already claimed needs a
-        /// different id, and CI cannot answer a question.
+        /// Directory to scaffold
         //
-        // Spelled explicitly because the field cannot BE `project_name` — that
-        // is the positional. The user-facing name is what the diagnostics print,
-        // and it is the one that matters.
-        #[arg(long = "project-name", value_name = "NAME")]
-        project_name_override: Option<String>,
+        // `value_name` is spelled because the field cannot be renamed without
+        // touching every construction site, and clap would otherwise render it
+        // `<PROJECT_NAME>` — which is what it used to do, one line above a
+        // `--project-name` that meant the *id*. Two different things under one
+        // name in one help screen (#479).
+        #[arg(value_name = "DIR")]
+        project_name: String,
 
         /// Use a template (blog, ecommerce, todo, blank)
         #[arg(short, long)]
@@ -227,16 +221,13 @@ enum Commands {
     #[command(subcommand)]
     Tenant(TenantCommands),
 
-    /// Record this project's identity decisions (#367)
+    /// Report this project's identity (#367, #479)
     ///
-    /// Two identity decisions cannot be settled by a flag *and made to stick*:
-    /// which ecosystem manifest names an ambiguous project root, and what to do
-    /// when the resolved id is already claimed. A flag could express either —
-    /// but the id keys `~/.forgedb/projects/<id>/`, so an answer living in one
-    /// `argv` is a different project on the next invocation that omits it, and
-    /// the invocations that omit it are the ones ForgeDB scaffolds. This
-    /// subcommand persists the answer, and is the command the non-interactive
-    /// diagnostics name.
+    /// The id keys `~/.forgedb/projects/<id>/` — one build cache, one lockfile,
+    /// one target directory. `forgedb init` generates it once and writes it to
+    /// `forgedb.toml`, where it is committed, so nothing here records or changes
+    /// it. This reports what identity resolved to, and is deliberately able to
+    /// run in the cases where resolution itself cannot.
     Project {
         #[command(subcommand)]
         command: ProjectCommands,
@@ -300,40 +291,6 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ProjectCommands {
-    /// Persist `[project].name` at this project's root
-    ///
-    /// Creates a `forgedb.toml` when the chain holds none; otherwise edits the
-    /// existing one, preserving its comments and formatting.
-    Name {
-        /// The project id to record
-        name: String,
-
-        /// Replace an existing `[project].name`
-        ///
-        /// A rename re-keys the build cache, so the directory the old id points
-        /// at is reported as orphaned rather than moved or deleted.
-        #[arg(long)]
-        force: bool,
-    },
-
-    /// Take this project's id over from the root the ledger names
-    ///
-    /// Nothing removes a claim, so a project that was moved or renamed collides
-    /// with its own record. This releases that record and keeps the name.
-    Claim {
-        /// Required. Claiming happens on its own during `generate`/`build`;
-        /// this command exists only to displace a stale holder.
-        #[arg(long)]
-        take_over: bool,
-
-        /// Take over even though the holding root still exists
-        #[arg(long)]
-        force: bool,
-    },
-
-    /// Drop this project's own claim on its id
-    Release,
-
     /// Report every fact identity is derived from, deciding nothing
     ///
     /// Works in exactly the cases `generate` refuses to: an ambiguous root is
@@ -743,7 +700,6 @@ fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Init {
             project_name,
-            project_name_override,
             template,
             rust,
             api_only,
@@ -751,7 +707,6 @@ fn run(cli: Cli) -> Result<()> {
             no_isolated,
         } => commands::init::run(commands::init::InitOptions {
             project_name,
-            project_name_override,
             template,
             rust,
             api_only,
@@ -782,7 +737,7 @@ fn run(cli: Cli) -> Result<()> {
             // Resolved (and claimed) here rather than lazily: a project id is a
             // precondition of generating, so a collision must be refused before
             // any bytes are written, not after.
-            let project = governing.identify_reported(&*ask::asker())?;
+            let project = governing.identify_reported()?;
             // Reserve BEFORE emission (it needs the path); re-derive the
             // workspace root AFTER, once this app's packages exist (#335 §3).
             let reserved = reserve_in_cache(&project, &schema_path, governing.symbol_naming())?;
@@ -909,7 +864,7 @@ fn run(cli: Cli) -> Result<()> {
             // must bake what `generate` would (#361, extended to identity by #333).
             let schema_path = project::find_schema(schema.as_deref())?;
             let governing = project::govern_for_schema(explicit_config, &schema_path)?;
-            let project = governing.identify_reported(&*ask::asker())?;
+            let project = governing.identify_reported()?;
             let reserved = reserve_in_cache(&project, &schema_path, governing.symbol_naming())?;
             let forge_config = governing.config();
             let resolved_output = Some(governing.output(output.as_deref()));
@@ -976,7 +931,7 @@ fn run(cli: Cli) -> Result<()> {
             // terminal is not yet showing watch output, and a `dev` that cannot
             // name its project has nothing to watch for. `dev::run` forbids
             // immediately before entering the loop (#367).
-            let project = governing.identify_reported(&*ask::asker())?;
+            let project = governing.identify_reported()?;
             let reserved = reserve_in_cache(&project, &schema_path, governing.symbol_naming())?;
             let forge_config = governing.config();
             let resolved_output = governing.output(output.as_deref());
@@ -1073,13 +1028,6 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Project { command, schema } => {
             commands::project::run(commands::project::ProjectOptions {
                 command: match command {
-                    ProjectCommands::Name { name, force } => {
-                        commands::project::ProjectCommand::Name { name, force }
-                    }
-                    ProjectCommands::Claim { take_over, force } => {
-                        commands::project::ProjectCommand::Claim { take_over, force }
-                    }
-                    ProjectCommands::Release => commands::project::ProjectCommand::Release,
                     ProjectCommands::Show => commands::project::ProjectCommand::Show,
                 },
                 schema,

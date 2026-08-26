@@ -51,7 +51,7 @@ fn write(path: &Path, body: &str) {
 
 fn config(name: &str, targets: &str) -> String {
     format!(
-        "[project]\nname = \"{name}\"\n\n[generate]\ntargets = [{targets}]\n\n[storage]\nfsync = \"never\"\n"
+        "[project]\nid = \"{name}\"\n\n[generate]\ntargets = [{targets}]\n\n[storage]\nfsync = \"never\"\n"
     )
 }
 
@@ -183,7 +183,9 @@ fn scenario_8_ignoring_lives_in_exactly_one_place() {
     let parent = std::env::temp_dir().join(format!("forgedb-deliver-s8-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&parent);
     std::fs::create_dir_all(&parent).unwrap();
-    ok(&forgedb(&parent, &["init", "s8app", "--project-name", "s8-init"]), "init");
+    // No `--project-name`: it was always redundant here — the `forgedb.toml`
+    // written two lines down is what pins the id — and #479 removed the flag.
+    ok(&forgedb(&parent, &["init", "s8app"]), "init");
     let dir = parent.join("s8app");
     write(&dir.join("schema.forge"), SCHEMA);
     write(&dir.join("forgedb.toml"), &config("s8-init", "\"rust\", \"node-runtime\""));

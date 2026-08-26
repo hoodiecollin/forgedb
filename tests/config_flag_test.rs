@@ -48,7 +48,7 @@ fn write_config(path: &Path, interval: u64, fsync: &str) {
     fs::write(
         path,
         format!(
-            "[project]\nname = \"discriminator\"\n\n\
+            "[project]\nid = \"discriminator\"\n\n\
              [storage]\nwal_checkpoint_interval = {interval}\nfsync = \"{fsync}\"\n"
         ),
     )

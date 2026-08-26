@@ -171,7 +171,7 @@ fn project(tag: &str, targets: &str) -> PathBuf {
     write(
         &dir.join("forgedb.toml"),
         &format!(
-            "[project]\nname = \"{tag}\"\n\n[generate]\ntargets = [{targets}]\n\n[storage]\nfsync = \"never\"\n"
+            "[project]\nid = \"{tag}\"\n\n[generate]\ntargets = [{targets}]\n\n[storage]\nfsync = \"never\"\n"
         ),
     );
     dir
@@ -243,7 +243,7 @@ fn scenario_5_declaring_another_target_does_not_change_a_sibling_fingerprint() {
 
     write(
         &dir.join("forgedb.toml"),
-        "[project]\nname = \"s5\"\n\n[generate]\ntargets = [\"rust\", \"node-runtime\", \"python-runtime\"]\n\n[storage]\nfsync = \"never\"\n",
+        "[project]\nid = \"s5\"\n\n[generate]\ntargets = [\"rust\", \"node-runtime\", \"python-runtime\"]\n\n[storage]\nfsync = \"never\"\n",
     );
     ok(
         &forgedb(&dir, &["generate", "all", "--force"]),

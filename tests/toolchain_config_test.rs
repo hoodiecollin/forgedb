@@ -39,7 +39,7 @@ fn project(config: &str) -> TempDir {
     t
 }
 
-const BASE: &str = "[project]\nname = \"toolchain-fixture\"\n\n[generate]\ntargets = [\"all\"]\n";
+const BASE: &str = "[project]\nid = \"toolchain-fixture\"\n\n[generate]\ntargets = [\"all\"]\n";
 
 /// The table parses, with every key and every sub-key.
 #[test]
