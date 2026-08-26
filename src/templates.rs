@@ -118,16 +118,20 @@ Todo {
 /// separate projects" is a declaration rather than an absence. An absence is
 /// fragile: someone adds a config above this one for an unrelated reason and
 /// every app beneath it silently regroups into one build cache.
-pub fn default_config(project_name: &str, isolated: bool) -> String {
-    // `name` is written ONLY when this config is a project root. A nested,
-    // non-isolated config that declares a name is a contradiction ForgeDB rejects
+pub fn default_config(project_id: &str, isolated: bool) -> String {
+    // `id` is written ONLY when this config is a project root. A nested,
+    // non-isolated config that declares one is a contradiction ForgeDB rejects
     // (#333 §6) — it reads as authoritative and is not — so scaffolding one would
     // make `init` emit a config that fails on the very next `generate`.
-    let name = if isolated {
-        format!("name = \"{project_name}\"\n")
+    let id = if isolated {
+        format!(
+            "# Generated once, here. COMMIT IT: this id keys the build cache, and a\n\
+             # teammate or CI resolving a different one is a different project.\n\
+             id = \"{project_id}\"\n"
+        )
     } else {
-        "# No `name`: this config joins the enclosing project, and only a project root\n\
-         # may name one. Set `isolated = true` below to make this a project of its own.\n"
+        "# No `id`: this config joins the enclosing project, and only a project root\n\
+         # carries one. Set `isolated = true` below to make this a project of its own.\n"
             .to_string()
     };
     format!(
@@ -245,7 +249,7 @@ enabled = false
 #                                  # e.g. ["RS256", "ES256"] (default ["RS256"])
 # leeway_secs = 60                 # clock-skew leeway seconds (default)
 "#,
-        name, isolated
+        id, isolated
     )
 }
 

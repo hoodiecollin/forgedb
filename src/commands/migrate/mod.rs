@@ -163,7 +163,7 @@ fn resolve_app(app: &AppRef) -> Result<ResolvedApp> {
     }
 
     let governing_chain = crate::project::govern_for_schema(app.config.as_deref(), schema)?;
-    let project = governing_chain.identify_reported(&*crate::ask::asker())?;
+    let project = governing_chain.identify_reported()?;
     let symbol_naming = governing_chain.symbol_naming();
     // Taken by value: `migrate build` reads `[toolchain]` much later, and
     // re-walking the chain there could answer a different question than the one
