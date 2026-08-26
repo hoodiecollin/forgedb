@@ -335,7 +335,7 @@ fn flat_contains(haystack: &str, needle: &str) -> bool {
 }
 
 const FULL_TARGETS: &str = r#"[project]
-name = "s335-cache"
+id = "s335-cache"
 isolated = true
 
 [generate]
@@ -492,7 +492,7 @@ fn scenario_21_the_bare_name_assertion_would_be_vacuous() {
 // ---------------------------------------------------------------------------
 
 const RUST_ONLY: &str = r#"[project]
-name = "s335-rust-only"
+id = "s335-rust-only"
 isolated = true
 
 [generate]
@@ -568,7 +568,7 @@ fn scenario_22_a_server_app_carries_utoipa_in_core_not_in_server() {
 // ---------------------------------------------------------------------------
 
 const TWO_APPS: &str = r#"[project]
-name = "s335-two-apps"
+id = "s335-two-apps"
 isolated = true
 
 [generate]
