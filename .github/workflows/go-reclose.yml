@@ -294,20 +294,47 @@ jobs:
               ! ldd generated/smoke/smoke 2>/dev/null | grep -q "$FORGEDB_HOME";;
           esac
 
-          # 8. THE init() GUARD (#337). Steps 6 and 7 prove a MATCHING pair runs;
-          #    they say nothing about whether the check that catches a mismatched
-          #    pair ever executes. This is the call-site half.
+          # 8. THE init() GUARD (#337; repaired in #486). Steps 6 and 7 prove a
+          #    MATCHING pair runs; they say nothing about whether the check that
+          #    catches a mismatched pair ever executes. This is the call-site half.
           #
-          #    A `[storage]` knob changes durability semantics and NOT ONE
-          #    exported symbol, so `go build` still succeeds — which is precisely
-          #    the case the linker's undefined-symbol error cannot reach, and the
-          #    honest description of what the init() check adds over it.
-          cat >> forgedb.toml <<'CFG'
-
-          [storage]
-          fsync = "always"
-          CFG
+          #    A [storage] knob changes durability semantics and NOT ONE exported
+          #    symbol, so `go build` still succeeds — which is precisely the case
+          #    the linker's undefined-symbol error cannot reach, and the honest
+          #    description of what the init() check adds over it.
+          #
+          #    TWO DETAILS BELOW ARE LOAD-BEARING, AND BOTH WERE WRONG UNTIL #486
+          #    — for which entire period this step never executed once.
+          #
+          #    (a) The key is set IN PLACE. `forgedb init` has scaffolded a
+          #        [storage] table since v0.4.1, so appending a second header is
+          #        invalid TOML: "duplicate key storage in document root", exit 10,
+          #        reached before a single assertion below.
+          #
+          #    (b) The value is "never", not the "always" that reads as the obvious
+          #        choice. "always" is the scaffold's own documented default, so
+          #        setting it explicitly emits BYTE-IDENTICAL source — the archive
+          #        is not stale, the smoke binary runs, and this step then fails
+          #        reporting that init() did not execute, which is true only in the
+          #        sense that there was nothing for it to catch. Red for a reason
+          #        that sends the reader to the wrong file.
+          #
+          #    The fingerprint comparison is what stops (b) from recurring. The step
+          #    must PROVE it induced a mismatch before it is entitled to conclude
+          #    anything from whether the binary ran — otherwise the next default
+          #    that shifts underneath it makes this guard vacuous in silence.
+          before_fp="$(grep -o 'const forgedbFingerprint = "[^"]*"' generated/go/forgedb.go | cut -d'"' -f2)"
+          test -n "$before_fp"
+          sed -i.bak 's|^# fsync = "always"$|fsync = "never"|' forgedb.toml
+          grep -q '^fsync = "never"$' forgedb.toml
           "$FORGEDB" generate go --runtime --force
+          after_fp="$(grep -o 'const forgedbFingerprint = "[^"]*"' generated/go/forgedb.go | cut -d'"' -f2)"
+          if [ "$before_fp" = "$after_fp" ]; then
+            echo "FAIL: the [storage] edit did not change the generated source." >&2
+            echo "Fingerprint is still $after_fp, so there is no mismatch to induce," >&2
+            echo "and every assertion below would pass without proving anything." >&2
+            exit 1
+          fi
           # Rebuild the Go package ONLY. `forgedb build` is deliberately NOT run:
           # the point is a stale archive beside fresh source.
           (cd generated/smoke && CGO_ENABLED=1 go build -o smoke .)
