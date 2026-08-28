@@ -37,14 +37,10 @@ fn main() {
     }
 }
 
-/// Commit `PER_WRITER` rows through the coordinator, printing each allocated id on
-/// its own line for the parent to collect.
 fn writer(dir: PathBuf) {
     let socket = dir.join("_coord.sock");
     let db = Database::connect(dir, socket).expect("connect to coordinator");
     for i in 0..PER_WRITER {
-        // Generous retries: a `Nack` is the EXPECTED outcome of a collision here,
-        // not a failure. Exhausting them would mean the retry never converges.
         let id = db
             .transaction_coordinated(256, |tx| {
                 tx.create_ticket(Ticket { id: 0, title: format!("row-{i}") })
@@ -65,7 +61,6 @@ fn parent(dir: PathBuf, forgedb: PathBuf) {
         .spawn()
         .expect("spawn forgedb coordinate");
 
-    // Wait for the socket rather than sleeping a guessed interval.
     let socket = dir.join("_coord.sock");
     let mut waited = 0;
     while !socket.exists() && waited < 200 {
@@ -130,9 +125,6 @@ fn parent(dir: PathBuf, forgedb: PathBuf) {
         eprintln!("FAIL every coordinated create committed: got {issued}, want {expected}");
         bad += 1;
     }
-    // THE assertion. A duplicate here means two processes both committed the same
-    // number and the coordinator did not see the collision — which is exactly what
-    // decision 6's identity-or-`&unique` rule exists to make impossible.
     if sorted.len() != issued {
         eprintln!(
             "FAIL every allocation is distinct ACROSS PROCESSES: {} unique of {issued}",
@@ -140,8 +132,6 @@ fn parent(dir: PathBuf, forgedb: PathBuf) {
         );
         bad += 1;
     }
-    // Gaps are allowed and expected (a `Nack`ed attempt burns its number), so the
-    // set is deliberately NOT asserted to be contiguous — only distinct.
     if sorted.iter().any(|&n| n == 0) {
         eprintln!("FAIL no row was given the allocate sentinel");
         bad += 1;

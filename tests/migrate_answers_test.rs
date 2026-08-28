@@ -171,8 +171,6 @@ fn main() {
 
     let mut db = Database::open_at(dir);
     for mut j in rows {
-        // `build_model_ops` emits exactly this for a defaulted add: insert the
-        // recorded JSON literal under the field's name, then decode.
         if let Some(o) = j.as_object_mut() {
             o.insert("status".to_string(), serde_json::from_str("\"pending\"").unwrap());
         }

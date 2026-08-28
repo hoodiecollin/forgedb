@@ -91,8 +91,6 @@ async fn main() {
     })
     .expect("create author");
 
-    // Row A exercises the escape-sensitive string, a null optional, and a json
-    // object whose OWN keys are out of declaration order.
     db.create_post(Post {
         id: uuid(POST_A),
         title: "quote \" backslash \\ tab \t unicode ✓".to_string(),
@@ -107,8 +105,6 @@ async fn main() {
     })
     .expect("create post a");
 
-    // Row B exercises the populated optional, a set optional FK, and a float that
-    // only the JSON number formatter renders this way.
     db.create_post(Post {
         id: uuid(POST_B),
         title: "second".to_string(),
@@ -128,9 +124,6 @@ async fn main() {
     let db = Arc::new(RwLock::new(db));
     let router = || api::create_router(db.clone());
 
-    // Records are emitted in SCHEMA DECLARATION ORDER (id first), not the
-    // alphabetical order the intermediate `serde_json::Value` used to impose.
-    // `meta`'s own keys stay sorted — that payload is a `Value` either way.
     let row_a = concat!(
         r#"{"id":"22222222-2222-2222-2222-222222222222","#,
         r#""title":"quote \" backslash \\ tab \t unicode ✓","#,
@@ -146,8 +139,6 @@ async fn main() {
         r#""editor":"11111111-1111-1111-1111-111111111111"}"#
     );
 
-    // Envelope key order is `data`, `total`, `limit`, `offset` — declaration
-    // order of the generated `__ListEnvelope`, not alphabetical.
     let uri = "/api/post?sort=views";
     check(
         uri,
@@ -172,8 +163,6 @@ async fn main() {
         r#"{"data":[],"total":0,"limit":50,"offset":0}"#,
     );
 
-    // The projection list arm builds a typed `Vec` and borrows it into the SAME
-    // envelope — same key order, projected columns in declaration order.
     let uri = "/api/post?sort=views&projection=card";
     check(
         uri,
@@ -188,7 +177,6 @@ async fn main() {
         ),
     );
 
-    // Point reads: the record alone, same declaration order as inside the page.
     let uri = &format!("/api/post/{POST_A}");
     check(uri, call(router(), uri).await, 200, row_a);
 
@@ -206,7 +194,6 @@ async fn main() {
         ),
     );
 
-    // Error bodies deliberately stayed ad-hoc `json!` objects (#229 non-goal).
     let uri = &format!("/api/post/{MISSING}");
     check(uri, call(router(), uri).await, 404, r#"{"error":"not found"}"#);
 
@@ -232,8 +219,6 @@ async fn main() {
         r#"{"error":"as_of must be a non-negative integer watermark"}"#,
     );
 
-    // The `?as_of=` snapshot path is a separate branch of the same handler and
-    // must reach the same envelope.
     let uri = "/api/post?as_of=2&sort=views";
     check(
         uri,
@@ -370,15 +355,8 @@ const ITEM_B: &str = "88888888-1111-1111-1111-111111111111";
 const GAUGE_A: &str = "99999999-0000-0000-0000-000000000000";
 const GAUGE_B: &str = "99999999-1111-1111-1111-111111111111";
 
-/// Superseding versions appended to `CHURN_2`. Each `update` appends a physical
-/// row, so the live set ends up `{0, 1, 2 + CHURN_UPDATES}` — a span of
-/// `3 + CHURN_UPDATES` over 3 rows, which is below
-/// `SPARSE_OFFSETS_SPAN_FACTOR` (128) density with room to spare. `sparse_ok`
-/// below asserts that rather than trusting this constant.
 const CHURN_UPDATES: usize = 500;
 
-/// Mirrors `SPARSE_OFFSETS_SPAN_FACTOR` in `crates/storage-native/src/lib.rs`.
-/// If the substrate constant moves, this assertion is what says so.
 const SPARSE_SPAN_FACTOR: usize = 128;
 
 static mut FAILURES: u32 = 0;
@@ -395,7 +373,6 @@ fn check(uri: &str, got: (u16, String), want_status: u16, want_body: &str) {
     unsafe { FAILURES += 1 }
 }
 
-/// A non-byte assertion: that a scenario is still exercising the branch it names.
 fn require(what: &str, cond: bool, detail: &str) {
     if cond {
         println!("  ok   {what}");
@@ -443,9 +420,6 @@ async fn main() {
     })
     .expect("create maker");
 
-    // Row A: the null optional, a scale-bearing decimal, the first enum variant,
-    // a positive instant, high/low bytes, a negative array element, and a json
-    // object whose OWN keys (and nested keys) are out of sorted order.
     db.create_widget(Widget {
         id: uuid(WIDGET_A),
         label: None,
@@ -462,8 +436,6 @@ async fn main() {
     })
     .expect("create widget a");
 
-    // Row B: the populated optional carrying escape-sensitive text, a negative
-    // sub-unit decimal, the last enum variant, a pre-2000 instant, and a null json.
     db.create_widget(Widget {
         id: uuid(WIDGET_B),
         label: Some("quote \" tab \t ✓".to_string()),
@@ -480,7 +452,6 @@ async fn main() {
     })
     .expect("create widget b");
 
-    // Makes `Widget.parts` a populated one-to-many rather than a vacuous one.
     db.create_part(Part {
         id: uuid(PART),
         name: "bolt".to_string(),
@@ -513,8 +484,6 @@ async fn main() {
         })
         .expect("create churn");
     }
-    // #281 S9. One vendor, two items: `Item.vendor` is the non-scan inline-string FK
-    // whose `borrowed` flag flips between the two page construction sites.
     db.create_vendor(Vendor {
         id: forgedb_types::InlineStr::try_from("acme").expect("vendor key is 4 chars"),
         name: "Acme".to_string(),
@@ -530,11 +499,6 @@ async fn main() {
         .expect("create item");
     }
 
-    // #281 S11. TWO gauges, and the `>= 2` is load-bearing: with a single row the
-    // negative-form predicate would take the fast path and return that same row with
-    // `total: 1` — byte-identical to the filtered answer, so the scenario would stay
-    // green under its own discriminating mutation. A second, non-matching row makes
-    // the mutation change both `total` and the `data` array.
     for (id, lim) in [(GAUGE_A, 1u32), (GAUGE_B, 7)] {
         db.create_gauge(Gauge {
             id: uuid(id),
@@ -546,8 +510,6 @@ async fn main() {
         .expect("create gauge");
     }
 
-    // Same values every time: the churn is about *physical row placement*, so the
-    // wire bytes must not move with it.
     for _ in 0..CHURN_UPDATES {
         db.update_churn(
             uuid(CHURN_2),
@@ -562,13 +524,6 @@ async fn main() {
 
     db.commit().expect("commit");
 
-    // ---- branch-reached assertions, taken before `db` is shared ----
-    //
-    // Scenario 6 claims the page's rows are scattered enough for
-    // `VariableColumn::gather_buffered` to take `gather_sparse`. That is a density
-    // predicate over the physical row indices, so assert the predicate itself —
-    // a corpus that quietly stopped being sparse would leave the scenario passing
-    // while exercising the dense path.
     let churn_live = db.churn.export_live_indices();
     let churn_span = churn_live.iter().max().unwrap() + 1 - churn_live.iter().min().unwrap();
     require(
@@ -581,31 +536,22 @@ async fn main() {
         ),
     );
 
-    // Scenario 8 claims `?serial=` takes the #160 pushdown arm (`sel = Some(..)`).
-    // `__rows_by_serial` is exactly what the generated handler calls to build it.
     require(
         "?serial=1 resolves through the index pushdown",
         db.widget.__rows_by_serial("1").is_some(),
         "expected Some(candidate rows) — a None falls through to the full scan",
     );
-    // Scenario 4's pushdown half: a parseable value with no matches yields an
-    // EMPTY candidate set, so the gather runs on `&[]` (gotcha 7).
     require(
         "?serial=999 resolves to an empty pushdown selection",
         db.widget.__rows_by_serial("999") == Some(Vec::new()),
         "expected Some([]) — the empty-selection gather is what this covers",
     );
 
-    // `as_of` is an opaque row-count watermark; at the live row count the snapshot
-    // read must return exactly what the live read does (scenario 9).
     let widget_rows = db.widget.row_count();
 
     let db = Arc::new(RwLock::new(db));
     let router = || api::create_router(db.clone());
 
-    // Declaration order, NOT identity-first and NOT scan-set order: `scores`,
-    // `dims`, `owner`, `parts` and `payload` all sit between `checksum` and
-    // `serial`, and `parts` (a virtual `[Model]`, `()` in the record) is `null`.
     let widget_a = concat!(
         r#"{"id":"22222222-2222-2222-2222-222222222222","label":null,"price":"10.50","#,
         r#""tier":"Free","made_at":"2026-01-02T03:04:05.678000Z","#,
@@ -621,19 +567,16 @@ async fn main() {
         r#""owner":"11111111-1111-1111-1111-111111111111","parts":null,"#,
         r#""payload":null,"serial":2}"#
     );
-    // `id` is declared SECOND in `Note`, and the wire follows the declaration.
     let note_a = r#"{"body":"first","id":"55555555-5555-5555-5555-555555555555","weight":1}"#;
     let note_b = r#"{"body":"second","id":"66666666-6666-6666-6666-666666666666","weight":2}"#;
     let churn_0 = r#"{"id":"77777777-0000-0000-0000-000000000000","note":"c-zero","seq":10}"#;
     let churn_1 = r#"{"id":"77777777-1111-1111-1111-111111111111","note":"c-one","seq":20}"#;
     let churn_2 = r#"{"id":"77777777-2222-2222-2222-222222222222","note":"c-two","seq":30}"#;
 
-    // --- Scenario 1: the wide model, every field class, key order included ---
     let uri = "/api/widget?sort=serial";
     let live_page = format!(r#"{{"data":[{widget_a},{widget_b}],"total":2,"limit":50,"offset":0}}"#);
     check(uri, call(router(), uri).await, 200, &live_page);
 
-    // --- Scenario 2: identity field declared SECOND — no identity-first reorder ---
     let uri = "/api/note?sort=weight";
     check(
         uri,
@@ -642,10 +585,6 @@ async fn main() {
         &format!(r#"{{"data":[{note_a},{note_b}],"total":2,"limit":50,"offset":0}}"#),
     );
 
-    // --- Scenario 3: a json object stored with non-sorted keys ---
-    // Today's path is `read the stored text` → `from_str` → `Value` (BTreeMap) →
-    // re-serialize, which SORTS. `sort=made_at` is a non-pushdown sort, so this is
-    // a different arm from scenario 1's.
     let uri = "/api/widget?sort=made_at";
     let (status, body) = call(router(), uri).await;
     check(
@@ -661,19 +600,6 @@ async fn main() {
         &format!("expected a sorted json object for `payload`; got: {body}"),
     );
 
-    // --- #389: a timestamp filter param is floored to the field's quantum ---
-    //
-    // `made_at` is `timestamp(ms)` and is NOT indexed, so `?made_at=` takes the
-    // predicate path alone (`__widget_scan_matches`) with no index pushdown. That
-    // isolates the REST half of #389 from the index-key half, which `index_test`
-    // covers — the two are separate fixes and the REST list path needs both, since
-    // the pushdown selects candidates and the predicate then re-checks them.
-    //
-    // The param carries MICROSECOND precision (`…678999Z`); row A is stored at
-    // `…678Z`. `Timestamp`'s `PartialEq` is over the raw i64 micros and does not
-    // self-correct, so before #389 this compared 1767323045678999 against
-    // 1767323045678000 and returned an empty page. A whole-millisecond param would
-    // pass either way and prove nothing — that is the point of the extra digits.
     let uri = "/api/widget?made_at=2026-01-02T03:04:05.678999Z";
     check(
         uri,
@@ -682,9 +608,6 @@ async fn main() {
         &format!(r#"{{"data":[{widget_a}],"total":1,"limit":50,"offset":0}}"#),
     );
 
-    // The same instant spelled exactly, to the millisecond. Flooring is idempotent,
-    // so both spellings must select the same row; if only one passes, the param and
-    // the stored value have been reconciled in the wrong direction.
     let uri = "/api/widget?made_at=2026-01-02T03:04:05.678Z";
     check(
         uri,
@@ -693,8 +616,6 @@ async fn main() {
         &format!(r#"{{"data":[{widget_a}],"total":1,"limit":50,"offset":0}}"#),
     );
 
-    // --- Scenario 4: a filter that eliminates every row ---
-    // Pushdown half: `Some([])` → the gather runs on an empty selection.
     let uri = "/api/widget?serial=999";
     check(
         uri,
@@ -702,7 +623,6 @@ async fn main() {
         200,
         r#"{"data":[],"total":0,"limit":50,"offset":0}"#,
     );
-    // Full-scan half: `sel = None`, every row decoded and rejected by `keep`.
     let uri = "/api/widget?label=nope";
     check(
         uri,
@@ -711,7 +631,6 @@ async fn main() {
         r#"{"data":[],"total":0,"limit":50,"offset":0}"#,
     );
 
-    // --- Scenario 5: offset beyond total — empty page, TRUE total ---
     let uri = "/api/widget?sort=serial&offset=5";
     check(
         uri,
@@ -720,7 +639,6 @@ async fn main() {
         r#"{"data":[],"total":2,"limit":50,"offset":5}"#,
     );
 
-    // --- Scenario 6: rows scattered across a churned table (gather_sparse) ---
     let uri = "/api/churn?sort=seq";
     check(
         uri,
@@ -730,7 +648,6 @@ async fn main() {
             r#"{{"data":[{churn_0},{churn_1},{churn_2}],"total":3,"limit":50,"offset":0}}"#
         ),
     );
-    // Pushdown over the same churned table: one candidate, far from row 0.
     let uri = "/api/churn?seq=30";
     check(
         uri,
@@ -739,11 +656,6 @@ async fn main() {
         &format!(r#"{{"data":[{churn_2}],"total":1,"limit":50,"offset":0}}"#),
     );
 
-    // --- Scenario 7: descending sort — row ORDER unchanged ---
-    // The refs are built by buffer slot, then filtered, then reordered; after that
-    // a ref's position says nothing about its physical row. A `__slot`-to-row
-    // mis-mapping returns real rows in the wrong order, which no assertion on
-    // `total` catches — only the exact body does.
     let uri = "/api/widget?sort=serial&order=desc";
     check(
         uri,
@@ -751,8 +663,6 @@ async fn main() {
         200,
         &format!(r#"{{"data":[{widget_b},{widget_a}],"total":2,"limit":50,"offset":0}}"#),
     );
-    // Sort then TRUNCATE: the surviving row is the one the sort moved to the front,
-    // so a mis-mapping shows up as the wrong single row rather than a wrong order.
     let uri = "/api/widget?sort=serial&order=desc&limit=1";
     check(
         uri,
@@ -760,8 +670,6 @@ async fn main() {
         200,
         &format!(r#"{{"data":[{widget_b}],"total":2,"limit":1,"offset":0}}"#),
     );
-    // The hardest shape: descending sort + a mid-page slice over the SPARSE
-    // selection, where slot order, physical order and sorted order all differ.
     let uri = "/api/churn?sort=seq&order=desc&limit=2&offset=1";
     check(
         uri,
@@ -770,7 +678,6 @@ async fn main() {
         &format!(r#"{{"data":[{churn_1},{churn_0}],"total":3,"limit":2,"offset":1}}"#),
     );
 
-    // --- Scenario 8: the #160 index-pushdown arm (`sel = Some(..)`) ---
     let uri = "/api/widget?serial=1";
     check(
         uri,
@@ -778,7 +685,6 @@ async fn main() {
         200,
         &format!(r#"{{"data":[{widget_a}],"total":1,"limit":50,"offset":0}}"#),
     );
-    // The enum-keyed index is a second pushdown-eligible column.
     let uri = "/api/widget?tier=Enterprise";
     check(
         uri,
@@ -787,28 +693,9 @@ async fn main() {
         &format!(r#"{{"data":[{widget_b}],"total":1,"limit":50,"offset":0}}"#),
     );
 
-    // --- Scenario 9: `?as_of=` — the snapshot branch is a DIFFERENT arm ---
-    // Asserted against `live_page` itself, so "unchanged" means unchanged from the
-    // live read, not merely unchanged from a literal copied beside it.
     let uri = &format!("/api/widget?as_of={widget_rows}&sort=serial");
     check(uri, call(router(), uri).await, 200, &live_page);
 
-    // --- W1 (#281): the UNFILTERED, UNSORTED page — the fast path ---
-    //
-    // Every URI above carries `?sort=` or a field filter, so before this block the
-    // fast path was invisible to the byte guard: it could have been emitted, never
-    // taken, and every assertion here would still pass. These are the requests that
-    // reach it.
-    //
-    // Byte-identical to the sorted reads above, and that equality is the assertion
-    // rather than a fresh literal: `widget_a` is created before `widget_b` and
-    // `note_a` before `note_b`, so on this fixture physical order coincides with
-    // serial/weight order. That is convenient and it is also the caveat — these
-    // three URIs pin the BYTES and the WINDOW, not the ordering. Ordering is pinned
-    // where it can actually be discriminated: `tests/list_scan_test.rs` recomputes
-    // the physical order of a churned corpus independently, and
-    // `tests/page_identity_test.rs` compares the two construction sites over a
-    // 1,000-row corpus whose updates and deletes genuinely scramble it.
     let uri = "/api/widget";
     check(uri, call(router(), uri).await, 200, &live_page);
     let uri = "/api/note";
@@ -826,18 +713,11 @@ async fn main() {
         &format!(r#"{{"data":[{churn_0},{churn_1},{churn_2}],"total":3,"limit":50,"offset":0}}"#),
     );
 
-    // The fast path's own pagination arithmetic. `offset` past the end and `limit`
-    // shorter than the page are where the clamping lives, and neither is expressible
-    // through any sorted URI above.
     let uri = "/api/widget?limit=1";
     check(
         uri,
         call(router(), uri).await,
         200,
-        // `total` is the live-row count, NOT the page length — the envelope's
-        // pagination fields describe the window, `total` describes the set it is a
-        // window onto. A fast path that returned `__page.len()` here would look
-        // right on every unpaginated URI above.
         &format!(r#"{{"data":[{widget_a}],"total":2,"limit":1,"offset":0}}"#),
     );
     let uri = "/api/widget?offset=5";
@@ -855,18 +735,9 @@ async fn main() {
         &format!(r#"{{"data":[{churn_1},{churn_2}],"total":3,"limit":2,"offset":1}}"#),
     );
 
-    // `?projection=` on a model that declares NO `@projection`. `#proj_list_block` is
-    // empty for such a model, so `projection` is an ordinary unknown key naming no
-    // filterable field: the predicate holds and the fast path is taken. Asserted
-    // against the bare URI's own answer, so "unchanged" means unchanged from the
-    // request it must equal. If a future change makes `projection` a predicate term,
-    // this silently starts returning the scan path's envelope with no compile error.
     let uri = "/api/widget?projection=card";
     check(uri, call(router(), uri).await, 200, &live_page);
 
-    // #281 S9: the non-scan, inline-string FK. `Item.vendor` is decoded through a
-    // different arm of `field_read_stmt` on the fast path than on the scan path, so
-    // a frozen literal is what says the two arms produce the same bytes.
     let item_a = format!(r#"{{"id":"{ITEM_A}","sku":"sku-a","vendor":"acme"}}"#);
     let item_b = format!(r#"{{"id":"{ITEM_B}","sku":"sku-b","vendor":"acme"}}"#);
     let uri = "/api/item";
@@ -877,16 +748,6 @@ async fn main() {
         &format!(r#"{{"data":[{item_a},{item_b}],"total":2,"limit":50,"offset":0}}"#),
     );
 
-    // --- W2 (#281): `?as_of=` is a DIFFERENT arm, and the watermark must cut below
-    // the create count or the scenario cannot discriminate ---
-    //
-    // Scenario 9 above asserts the snapshot page EQUALS the live page, which is the
-    // right assertion there and is exactly why it cannot catch a fast-path branch
-    // hoisted above `match __as_of`: both sides would be the live page. `Churn` does
-    // not fix that by itself — it is churned with IDENTICAL values by construction,
-    // so at any watermark at or after the three creates the snapshot read is
-    // byte-identical to the live read. `as_of=2` cuts below the third create, so the
-    // two pages differ in ROW COUNT, and a hoist returns 3 rows where 2 are expected.
     let uri = "/api/churn?as_of=2";
     check(
         uri,
@@ -895,18 +756,6 @@ async fn main() {
         &format!(r#"{{"data":[{churn_0},{churn_1}],"total":2,"limit":50,"offset":0}}"#),
     );
 
-    // --- W3 (#281 S11): a model that legally declares `limit`/`offset`/`sort`/`order`
-    // as FIELDS — the only scenario separating the two predicate forms ---
-    //
-    // Every other scenario in this file passes under both the positive predicate
-    // ("does any key name a filterable field of this model?") and a negative
-    // reserved-key exclusion list. Here they differ: `?limit=1` names a real field of
-    // `Gauge`, so the filter must apply. Under the negative form the name is excluded,
-    // the fast path fires, and BOTH gauges come back.
-    //
-    // `?limit=1` is simultaneously a filter (set 1) and the page limit (set 3), and
-    // both behaviours are asserted — the row is filtered to `limit == 1` AND the
-    // envelope's `limit` is 1. Asserting only one documents half of what it proves.
     let gauge_a =
         format!(r#"{{"id":"{GAUGE_A}","limit":1,"offset":0,"sort":"none","order":"asc"}}"#);
     let uri = "/api/gauge?limit=1";

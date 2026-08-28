@@ -104,8 +104,6 @@ fn main() {
     })
     .expect("create post");
 
-    // This is the hop's first step verbatim (transform.rs): every row is read
-    // through the v_from typed struct and serialized to a JSON value.
     let row = db.post.all().into_iter().next().expect("the row just written");
     let json = serde_json::to_value(&row).expect("serialize the v1 row");
     println!("v1 row as JSON: {}", json);
@@ -130,7 +128,6 @@ fn main() {
         serde_json::from_str(&std::fs::read_to_string(&src).expect("read row.json"))
             .expect("parse row.json");
 
-    // No field ops: `build_model_ops` emits none for a ChangeEnumVariants hop.
     let record: Post = serde_json::from_value(json).expect("decode the v1 row at v2");
 
     let mut db = Database::open_at(dir);

@@ -17,20 +17,6 @@ const DRIVER: &str = r##"mod database;
 use database::*;
 use forgedb_types::Uuid;
 
-/// The seq values `all_at` must return, in order, after the churn below.
-///
-/// Hand-computed from physical row placement, NOT read back from another generated
-/// helper — see the module docs. Inserts take rows 0..13 in seq order. Updating
-/// seq 3 and seq 9 appends their new versions at rows 14 and 15, so both move to
-/// the **tail**. Deleting seq 6 appends a tombstone at row 16, so it is absent.
-/// Ascending row order is therefore:
-///
-///   rows 0 1 3 4 6 7 9 10 11 12 13 14 15
-///   seq  1 2 4 5 7 8 10 11 12 13 14  3  9
-///
-/// Two things this literal pins that a length or a set could not: the updated rows
-/// are LAST rather than in seq position, and the deleted one is gone rather than
-/// resurrected at its old row.
 const EXPECTED: &[i64] = &[1, 2, 4, 5, 7, 8, 10, 11, 12, 13, 14, 3, 9];
 
 static mut FAILURES: u32 = 0;
@@ -44,8 +30,6 @@ fn check(label: &str, cond: bool, detail: String) {
     }
 }
 
-/// Insert 14 rows, update two of them, delete one. Only the first process does
-/// this; the rest reopen the bytes it left.
 fn seed(db: &mut Database) {
     let mut ids = Vec::new();
     for seq in 1..=14i64 {
@@ -83,14 +67,6 @@ fn main() {
         format!("want {EXPECTED:?}\n           got  {got:?}"),
     );
 
-    // Anti-vacuity, and it has to be a RUNTIME property. Comparing EXPECTED to a
-    // written-out insertion order would compare two constants and could never
-    // fail whatever the code did. What actually makes this fixture discriminating
-    // is that superseding-version append happened: 14 inserts + 2 updates + 1
-    // delete = 17 physical rows behind 13 live ones. If append ever became
-    // in-place mutation, physical order would collapse back to insertion order,
-    // the literal would stop telling "sorted by row" from "returned as inserted",
-    // and this is the only assertion that would notice.
     let physical = db.ledger.row_count();
     check(
         "the fixture is churned: more physical rows than live ones",
@@ -98,9 +74,6 @@ fn main() {
         format!("want 17 physical / 13 live; got {physical} physical / {} live", got.len()),
     );
 
-    // The #113 projection resolves its snapshot rows through a SECOND gather
-    // (`__proj_live_rows_at`) that had the identical defect. Same order or the
-    // two views of one snapshot disagree.
     let proj: Vec<i64> = db.ledger.all_brief_at(&snap).into_iter().map(|r| r.seq).collect();
     check(
         "the projection's snapshot scan agrees with all_at",

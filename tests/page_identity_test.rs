@@ -69,8 +69,6 @@ use database::*;
 
 use forgedb_types::{InlineStr, Timestamp, Uuid};
 
-/// Deterministic uuids: the corpus must be identical on every run so a failure is
-/// reproducible from the printed `(model, offset, limit)` alone.
 fn uuid_of(kind: u8, n: usize) -> Uuid {
     let mut b = [0u8; 16];
     b[0] = kind;
@@ -82,25 +80,16 @@ fn org_id(n: usize) -> InlineStr<6> {
     InlineStr::try_from(format!("o{n:05}").as_str()).expect("org key fits 6 chars")
 }
 
-// Sized so that EVERY model is still above 1,000 live rows AFTER the churn below
-// removes `n/DELETE_EVERY` of them — the floor is asserted at the end rather than
-// trusted, because it is the property that keeps the `limit = 1000` column
-// discriminating.
 const ORGS: usize = 1_050;
 const WIDGETS: usize = 1_100;
 const OTHERS: usize = 1_100;
 
-/// Rows updated (a dead version stays in the span, the live row moves to the tail)
-/// and rows deleted (a hole in the selection). Chosen so the live count stays above
-/// 1,000 and the live set is nowhere near the dense prefix `[0, n)`.
 const UPDATE_EVERY: usize = 11;
 const DELETE_EVERY: usize = 19;
 
 fn widget_of(n: usize, rev: u32) -> Widget {
     Widget {
         id: uuid_of(1, n),
-        // Nullable, and BOTH inhabitants appear — a byte-exact comparison cannot
-        // discriminate a silently-defaulted field whose fixture value IS the default.
         label: if n % 3 == 0 {
             None
         } else {
@@ -128,8 +117,6 @@ fn widget_of(n: usize, rev: u32) -> Widget {
     }
 }
 
-/// The windows. `limit = 0` and an `offset` past the end are legitimate requests and
-/// both paths must agree on them too — that is where the clamping arithmetic lives.
 const OFFSETS: [usize; 4] = [0, 1, 5, 50];
 const LIMITS: [usize; 6] = [0, 1, 2, 5, 50, 1000];
 
@@ -151,10 +138,6 @@ fn check(model: &str, offset: usize, limit: usize, fast: (usize, String), slow: 
     }
 }
 
-/// One grid sweep for one model. A macro rather than a function because the two
-/// methods are inherent to each `*Storage` type and the view types differ per model —
-/// there is no trait to be generic over, and inventing one for a test would be a
-/// different shape than the code under test.
 macro_rules! sweep {
     ($db:expr, $field:ident, $name:literal) => {{
         let mut cells = 0usize;
@@ -229,11 +212,6 @@ fn main() {
             .expect("insert link");
     }
 
-    // Churn. An update appends a new version and repoints `id_to_row` at it, so the
-    // live row moves to the tail and a dead version stays inside the mapped span; a
-    // delete appends a tombstone and punches a hole. Both are what stop the live set
-    // from being the dense prefix `[0, n)` — the only condition under which slicing
-    // the selection could disagree with mapping through a recorded slot.
     for n in (0..WIDGETS).step_by(UPDATE_EVERY) {
         db.widget
             .update(uuid_of(1, n), widget_of(n, 1))
@@ -242,9 +220,6 @@ fn main() {
     for n in (0..WIDGETS).step_by(DELETE_EVERY) {
         assert!(db.widget.delete(uuid_of(1, n)), "delete widget {n}");
     }
-    // `Part` has no dependants, so it can be churned freely. `Doc`/`Tag` are each
-    // referenced by a `Link` and `@on_delete` defaults to restrict, so they are left
-    // alone deliberately rather than by oversight.
     for n in (0..OTHERS).step_by(UPDATE_EVERY) {
         db.part
             .update(
@@ -269,9 +244,6 @@ fn main() {
     let live_tag = sweep!(db, tag, "tag");
     let live_link = sweep!(db, link, "link");
 
-    // The corpus size is part of the spec: below 1,000 the `limit = 1000` column
-    // stops being a near-full page and the grid quietly loses its discriminating
-    // cells. Assert it rather than trusting the constants above to stay in step.
     for (name, live) in [
         ("widget", live_widget),
         ("org", live_org),
@@ -285,9 +257,6 @@ fn main() {
             unsafe { FAILURES += 1 };
         }
     }
-    // `limit = 1000` against ~1,000 live rows is the `p = r` regime — the page IS
-    // the table — which is where the cost model predicts a zero win. It has to be a
-    // real cell, not a page that happens to be the whole table on every model.
     if live_widget <= 1_000 {
         println!("  FAIL widget must exceed 1,000 live rows so `limit=1000` is a partial page");
         unsafe { FAILURES += 1 };

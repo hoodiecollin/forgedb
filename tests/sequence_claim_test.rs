@@ -27,8 +27,6 @@ use std::path::{Path, PathBuf};
 
 const PER_WRITER: u64 = 40;
 const BULK: u64 = 60;
-/// Deliberately far below `BULK`: a writer that walks its counter one value per
-/// attempt cannot close a 60-value gap in 3 tries. Only a fast-forward can.
 const LAG_RETRIES: u32 = 3;
 
 fn main() {
@@ -47,12 +45,9 @@ fn connect(dir: &Path) -> CoordinatedDatabase {
     Database::connect(dir.to_path_buf(), dir.join("_coord.sock")).expect("connect to coordinator")
 }
 
-/// Phase 1 writer: commit `PER_WRITER` rows, racing a peer.
 fn writer(dir: PathBuf) {
     let db = connect(&dir);
     for i in 0..PER_WRITER {
-        // A `Nack` is the EXPECTED outcome of a collision, not a failure, so the
-        // budget here is generous — phase 1 is about distinctness, not convergence.
         db.transaction_coordinated(256, |tx| {
             tx.create_ticket(Ticket { id: Uuid::nil(), seq: 0, title: format!("row-{i}") })
         })
@@ -60,7 +55,6 @@ fn writer(dir: PathBuf) {
     }
 }
 
-/// Phase 2 bulk writer: run the counter far ahead of the lagging writer.
 fn bulk(dir: PathBuf) {
     let db = connect(&dir);
     for i in 0..BULK {
@@ -72,8 +66,6 @@ fn bulk(dir: PathBuf) {
     std::fs::write(dir.join("bulk_done"), b"1").unwrap();
 }
 
-/// Phase 2 lagging writer: connect FIRST (so the counter is seeded at 0), wait for
-/// the bulk writer to run far ahead, then commit one row on a tight budget.
 fn lag(dir: PathBuf) {
     let db = connect(&dir);
     std::fs::write(dir.join("lag_ready"), b"1").unwrap();
@@ -89,9 +81,6 @@ fn lag(dir: PathBuf) {
         std::process::exit(1);
     }
 
-    // THE phase-2 assertion. Our counter is ~60 behind; the first attempt collides
-    // with a committed value. Passing within LAG_RETRIES requires jumping past the
-    // conflicting value, not incrementing toward it.
     db.transaction_coordinated(LAG_RETRIES, |tx| {
         tx.create_ticket(Ticket { id: Uuid::nil(), seq: 0, title: "lagger".to_string() })
     })
@@ -145,8 +134,6 @@ fn wait_ok(child: std::process::Child, role: &str) -> bool {
     true
 }
 
-/// Read every committed `seq` straight off disk, standalone. Stronger than
-/// collecting values the writers print: it proves what actually landed.
 fn committed_seqs(dir: &Path) -> Vec<u64> {
     let db = Database::open_at(dir.to_path_buf());
     db.ticket.all().iter().map(|t| t.seq).collect()
@@ -156,7 +143,6 @@ fn parent(root: PathBuf, forgedb: PathBuf) {
     let me = std::env::current_exe().unwrap();
     let mut bad = 0;
 
-    // ---- Phase 1: concurrent allocation must never duplicate -----------------
     let p1 = root.join("p1");
     let mut coord = spawn_coordinator(&forgedb, &p1);
     let writers: Vec<_> = (0..2).map(|_| run(&me, &p1, &forgedb, "writer")).collect();
@@ -181,8 +167,6 @@ fn parent(root: PathBuf, forgedb: PathBuf) {
         eprintln!("FAIL every create committed: got {issued}, want {expected}");
         bad += 1;
     }
-    // THE phase-1 assertion: without the b"s" claim key both processes commit the
-    // same number and the coordinator never sees the collision.
     if sorted.len() != issued {
         eprintln!(
             "FAIL every bare-auto allocation is distinct ACROSS PROCESSES: {} unique of {issued}",
@@ -195,12 +179,9 @@ fn parent(root: PathBuf, forgedb: PathBuf) {
         bad += 1;
     }
 
-    // ---- Phase 2: a Nacked writer converges in ~1 retry, not ~BULK -----------
     let p2 = root.join("p2");
     let mut coord = spawn_coordinator(&forgedb, &p2);
 
-    // The lagging writer must connect BEFORE any row exists, so its counter starts
-    // at 0 and the bulk writer's commits are invisible to it.
     let lagger = run(&me, &p2, &forgedb, "lag");
     let ready = p2.join("lag_ready");
     let mut waited = 0;

@@ -147,10 +147,6 @@ fn main() {
     let d = sample();
     let js = serde_json::to_value(&d).expect("serialize");
 
-    // --- shape: continuous across the ceiling ------------------------------
-    // A field's wire form must not change at N = 32. `boundary`/`few`/`small` use
-    // serde's own impl and `past`/`many`/`plain` use the generated one; if the two
-    // disagreed, the boundary is where a client would see it.
     for (key, len) in [
         ("plain", 64usize), ("past", 33), ("boundary", 32),
         ("many", 40), ("few", 4), ("many_uuid", 33),
@@ -161,11 +157,9 @@ fn main() {
     check("arr_big is 2 arrays of 64", js["arr_big"].as_array().map(|a| a.len()) == Some(2)
         && js["arr_big"][0].as_array().map(|a| a.len()) == Some(64));
     check("arr_small is 2 arrays of 8", js["arr_small"][0].as_array().map(|a| a.len()) == Some(8));
-    // The inline struct: a second emission site that broke independently.
     check("struct field digest is 64", js["fp"]["digest"].as_array().map(|a| a.len()) == Some(64));
     check("struct field wide is 40", js["fp"]["wide"].as_array().map(|a| a.len()) == Some(40));
 
-    // --- round-trip --------------------------------------------------------
     let back: Doc = serde_json::from_value(js.clone()).expect("deserialize");
     check("plain round-trips", back.plain == d.plain);
     check("past round-trips", back.past == d.past);
@@ -176,13 +170,11 @@ fn main() {
     check("many round-trips", back.many == d.many);
     check("many_uuid round-trips", back.many_uuid == d.many_uuid);
 
-    // --- nullable ----------------------------------------------------------
     let mut null_js = js.clone();
     null_js["opt_hash"] = serde_json::Value::Null;
     let n: Doc = serde_json::from_value(null_js).expect("deserialize null");
     check("an oversized nullable reads null as None", n.opt_hash.is_none());
 
-    // --- length rejection --------------------------------------------------
     for (key, bad) in [
         ("plain", serde_json::json!([1, 2, 3])),
         ("many", serde_json::json!([1, 2, 3])),
