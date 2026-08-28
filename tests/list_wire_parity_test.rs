@@ -40,7 +40,6 @@ use tower::ServiceExt;
 
 const ROWS: usize = 200;
 const LIMIT: usize = 25;
-/// A `views` value the corpus is guaranteed to contain exactly once.
 const PROBE_VIEWS: u64 = 7;
 
 static mut FAILURES: u32 = 0;
@@ -57,9 +56,6 @@ fn ok(what: &str) {
     println!("  ok   {what}");
 }
 
-/// The envelope's `total` — the match count BEFORE pagination. Sliced out of the raw bytes
-/// rather than parsed, for the same reason the comparison above is on bytes: a
-/// `serde_json::Value` round-trip normalizes formatting and would hide a divergence.
 fn total_of(body: &str) -> usize {
     let after = body.split(",\"total\":").nth(1).expect("envelope has a total");
     let end = after.find(',').unwrap_or(after.len());
@@ -78,29 +74,16 @@ async fn call(router: axum::Router, uri: &str) -> (u16, String) {
     (status, String::from_utf8(bytes.to_vec()).expect("utf8 body"))
 }
 
-// --- the mirror: what the bench's S1/S2 arms supply by hand ------------------
-//
-// Each of the three is a hand-written stand-in for something the generated handler
-// derives from the query string. The three RED mutations that make this test worth its
-// runtime all live here: admit a row the handler rejects, sort the other way, or resolve
-// the wrong selection.
-
-/// #288's hoisted predicate: does any parameter name a FILTERABLE field of this model?
-/// Positive, not a reserved-key exclusion list — a model may legally declare a field named
-/// `limit`, and an exclusion list would short-circuit and return the unfiltered page.
 fn keep_all(params: &HashMap<String, String>) -> bool {
     !["id", "title", "views", "published", "created_at"]
         .iter()
         .any(|f| params.contains_key(*f))
 }
 
-/// The per-row residual filter. Mirrors the generated `__post_scan_matches`.
 fn scan_matches(r: &PostScanRef<'_>, params: &HashMap<String, String>) -> bool {
     if let Some(v) = params.get("views") {
         match v.parse::<u64>() {
             Ok(w) if r.views == w => {}
-            // An unparseable value must never MATCH and must never SKIP the row silently
-            // for the wrong reason; the generated code falls through to no-match.
             _ => return false,
         }
     }
@@ -113,9 +96,6 @@ fn scan_matches(r: &PostScanRef<'_>, params: &HashMap<String, String>) -> bool {
     true
 }
 
-/// Descending is `sort_by(..)` then `reverse()`, NOT a flipped comparator: `sort_by` is
-/// stable, so reversing also reverses ties. A descending page is not the ascending page
-/// read backwards, and the generated code does the two steps.
 fn scan_sort(rows: &mut Vec<PostScanRef<'_>>, sort: &Option<Sort>) {
     let Some(s) = sort else { return };
     if s.field != "views" {
@@ -127,16 +107,12 @@ fn scan_sort(rows: &mut Vec<PostScanRef<'_>>, sort: &Option<Sort>) {
     }
 }
 
-/// The index pushdown. `views` is the only `^` field, so it is the only key that can
-/// resolve a selection.
 fn row_selection(db: &Database, params: &HashMap<String, String>) -> Option<Vec<usize>> {
     match params.get("views") {
         Some(v) => db.post.__rows_by_views(v),
         None => None,
     }
 }
-
-// --- the four shapes --------------------------------------------------------
 
 struct Shape {
     label: &'static str,
@@ -164,29 +140,17 @@ fn shapes() -> Vec<Shape> {
             label: "sorted",
             params: vec![],
             sort: Some(Sort::new("views", SortOrder::Desc)),
-            // `&sort=views&order=desc`, NOT `&sort=-views`. The leading-minus spelling is
-            // NOT parsed by `forgedb-query-params` — it is silently ignored, and the
-            // endpoint answers 200 with the UNSORTED page. #282's Gate 2 wrote `?sort=-views`
-            // in BDD-1's own scenario text, and the first RED run of this test is what caught
-            // it: the mirror sorted, the router did not, and the bytes diverged. A benchmark
-            // arm carrying that spelling would have measured the unfiltered page under a
-            // "sorted" label and never failed.
             query: "&sort=views&order=desc".to_string(),
         },
     ]
 }
 
-/// Build the envelope the way the bench's S2 arm does: the page bytes from the generated
-/// page scope with the mirrored trio, wrapped in a locally reconstructed envelope.
 fn mirrored_envelope(db: &Database, shape: &Shape) -> String {
     let params: HashMap<String, String> =
         shape.params.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
     let sel = row_selection(db, &params);
     let keep_everything = keep_all(&params);
 
-    // `total` comes FIRST in the terminal closure, and the call returns `R` directly
-    // rather than a `Result` — annotate both, so a signature change is a compile error
-    // here instead of a silently swapped pair of numbers in the envelope.
     let (total, data) = db.post.__with_page(
         sel,
         |r: &PostScanRef<'_>| keep_everything || scan_matches(r, &params),
@@ -206,8 +170,6 @@ async fn main() {
     let dir = std::env::args().nth(1).expect("data dir as argv[1]");
     let mut db = Database::open_at(std::path::PathBuf::from(&dir));
 
-    // Seed. `views` is `i % 40` so PROBE_VIEWS lands on a handful of rows and `sorted` has
-    // ties to reverse; `published` alternates so the unindexed filter drops half.
     let author = Uuid::new_v4();
     db.transaction(|tx| {
         tx.create_user(User { id: author, name: "author".into(), posts: () })?;
@@ -233,7 +195,6 @@ async fn main() {
 
     let state = Arc::new(RwLock::new(db));
 
-    // BDD-1: for each shape, the mirror's bytes and the router's bytes are equal.
     for shape in shapes() {
         let uri = format!("/api/post?limit={LIMIT}&offset=0{}", shape.query);
         let mirrored = {
@@ -256,15 +217,6 @@ async fn main() {
         }
     }
 
-    // BDD-5: the indexed shape's URI is spelled the way the endpoint actually PARSES it.
-    // A `?views=` spelling the parser ignores would leave the "filtered_indexed" arm
-    // measuring the unfiltered page under a filtered label — and BDD-1 above would stay
-    // green, because the mirror would ignore it identically. So it is asserted as a
-    // property of the RESULT: strictly fewer rows than unfiltered at the same limit.
-    // Compared on `total`, NOT on the number of rows in the page. `published=true` matches
-    // 100 of 200 rows, so at `limit=25` both pages hold exactly 25 and a row count cannot
-    // tell a working filter from an ignored one. `total` is the count BEFORE pagination,
-    // which is the quantity the filter actually moves.
     let (_, unfiltered) =
         call(api::create_router(state.clone()), &format!("/api/post?limit={LIMIT}&offset=0")).await;
     let all_total = total_of(&unfiltered);

@@ -53,7 +53,6 @@ fn ticket(title: &str) -> Ticket {
     Ticket { id: 0, title: title.to_string() }
 }
 
-/// The persisted `Ticket.id` allocation floor, read straight off disk.
 fn manifest_floor(root: &std::path::Path) -> u64 {
     let bytes = match std::fs::read(root.join("ticket/manifest.json")) {
         Ok(b) => b,
@@ -66,7 +65,6 @@ fn manifest_floor(root: &std::path::Path) -> u64 {
 fn main() {
     let dir = std::path::PathBuf::from(std::env::args().nth(1).expect("data dir"));
 
-    // ---- 1. Allocation is monotonic from 1, and `0` means "allocate" ---------
     {
         let mut db = Database::open_at(dir.join("basic"));
         let a = db.create_ticket(ticket("a")).unwrap();
@@ -74,11 +72,9 @@ fn main() {
         let c = db.create_ticket(ticket("c")).unwrap();
         eq("first allocation is 1, not 0", a, 1u64);
         eq("allocation is monotonic", (b, c), (2u64, 3u64));
-        // `0` is the sentinel, so it can never be a value the store hands back.
         check("no row was given the sentinel", a != 0 && b != 0 && c != 0, format!("{a} {b} {c}"));
     }
 
-    // ---- 2. Reopen does not re-issue ----------------------------------------
     {
         let root = dir.join("reopen");
         {
@@ -90,11 +86,6 @@ fn main() {
         eq("reopen resumes past the highest existing value", db.create_ticket(ticket("next")).unwrap(), 6u64);
     }
 
-    // ---- 3. Deleting the top row does not free its number -------------------
-    // The reopen id-scan is deliberately UNGATED by tombstones, so a deleted row
-    // still bounds the counter. Without that, deleting the newest row and
-    // restarting would re-issue its id to a different row — visible in the
-    // replication log, in backups, and in any URL holding it.
     {
         let root = dir.join("delete");
         {
@@ -107,39 +98,19 @@ fn main() {
         eq("a deleted row's number is not recycled after restart", db.create_ticket(ticket("next")).unwrap(), 4u64);
     }
 
-    // ---- 4. compact → drop → reopen → create does not re-issue --------------
-    // THE scenario the persisted high-water mark exists for. Compaction physically
-    // drops dead rows, so the reopen rescan yields a LOWER max than was ever
-    // issued; only the manifest floor prevents a second issuance.
     {
         let root = dir.join("compact");
         let highest;
         {
             let mut db = Database::open_at(root.clone());
             for i in 0..10 { db.create_ticket(ticket(&format!("t{i}"))).unwrap(); }
-            // Delete all but the first, so compaction reclaims 9 rows and the
-            // surviving max is 1 — far below the 10 actually handed out.
             for id in 2..=10 { db.delete_ticket(id).unwrap(); }
             db.compact();
             highest = 10u64;
-            // Still correct in THIS process (the live counter never regressed).
             eq("compaction does not regress the live counter", db.create_ticket(ticket("post")).unwrap(), highest + 1);
             db.commit().unwrap();
         }
 
-        // Assert the DURABLE contract directly, not only its observable effect.
-        //
-        // The floor's job is NOT to record every value ever issued — that would
-        // mean rewriting the manifest on every allocation, the per-allocation
-        // fsync the design exists to avoid. Live rows are covered by the reopen
-        // scan for free. What the scan *cannot* recover is a value issued to a row
-        // compaction physically destroyed, and that is exactly what the floor has
-        // to cover.
-        //
-        // Here ids 2..=10 were deleted and reclaimed, so nothing on disk mentions
-        // them; only the persisted number stands between a rescan and re-issuing
-        // `10`. The reopen contract is `max(persisted, scanned)`, so this and the
-        // value checks above are two halves of one claim.
         let manifest: serde_json::Value = serde_json::from_slice(
             &std::fs::read(root.join("ticket/manifest.json")).expect("read manifest"),
         )
@@ -151,47 +122,10 @@ fn main() {
             format!("manifest holds {persisted}, but ids up to {highest} were reclaimed"),
         );
 
-        // Read BEFORE any reopen, deliberately. `new_at` writes the manifest too,
-        // from a counter the reopen scan just seeded — so checking after a reopen
-        // would measure that write instead, and would pass even if `compact()`
-        // itself persisted nothing. The moment the floor has to be right is the
-        // moment compaction ends, because a crash there is the case it exists for.
-
-        // ...and it is still correct after a restart, which is the half that fails
-        // silently when the counter is not carried across `compact()`'s reset.
         let mut db = Database::open_at(root);
         eq("compaction + restart does not re-issue", db.create_ticket(ticket("after")).unwrap(), highest + 2);
     }
 
-    // ---- 4b. Compaction refuses to run if the floor cannot be persisted -----
-    // Scenario 4 proves the floor is right once `compact()` has *returned*, which
-    // a re-persist placed AFTER the destructive rewrite satisfies just as well.
-    // This one pins the ordering, and it is the assertion scenario 4 cannot make.
-    //
-    // The floor reaches disk at open and at compaction, and nowhere between — so
-    // between them it holds the counter as of process *open*. Every value allocated
-    // since exists only in memory and in the rows themselves, and
-    // `compact_model_keeping` is about to delete those rows. Persist only after
-    // that rewrite and a crash in the window leaves a reopen scanning a LOWER
-    // maximum and re-issuing the difference: exactly what the floor exists to
-    // prevent, in the one case a rescan cannot recover from.
-    //
-    // Making that window observable needs the manifest write to fail while the
-    // column rewrite still succeeds, so the two orderings diverge in the final
-    // state. Replacing `manifest.json` with a *directory* does it precisely:
-    // `save_to`'s temp-file rename cannot land on a directory, and the compactor
-    // never touches the manifest at all (it rewrites `fixed/`, `variable/` and
-    // `tombstones.bin`). So:
-    //
-    //   floor first → the write fails → compaction ABORTS → rows survive → the
-    //     ungated reopen scan still sees 15 → the next id is 16.
-    //   rewrite first → rows are destroyed → the re-persist then fails with
-    //     nothing left to fall back on → the reopen scan sees 5 → 6..=15 are
-    //     handed out a second time.
-    //
-    // Deliberately two processes: a single fresh one opens at floor 0, where the
-    // gap is easy to misread as "nothing written yet." Opening onto existing rows
-    // starts the floor at 5 while 15 have been issued, which is unambiguous.
     #[cfg(unix)]
     {
         let root = dir.join("prefloor");
@@ -202,9 +136,6 @@ fn main() {
         }
 
         let mut db = Database::open_at(root.clone());
-        // Opening is what stamps the floor: the scan seeds the counter and the
-        // constructor persists it. Nothing between now and compaction writes it
-        // again, which is precisely why the window below exists.
         eq("reopen persists the scanned maximum as the floor", manifest_floor(&root), 5u64);
         let mut highest = 0u64;
         let mut doomed = Vec::new();
@@ -213,13 +144,9 @@ fn main() {
             highest = highest.max(id);
             doomed.push(id);
         }
-        // Delete every row allocated this run so compaction reclaims all of them:
-        // afterwards nothing on disk would mention 6..=15.
         for id in &doomed { db.delete_ticket(*id).unwrap(); }
         db.commit().unwrap();
 
-        // Jam the manifest write, and leave it jammed across the reopen — the
-        // point is that there is no persisted floor to rescue a lost scan.
         let manifest = root.join("ticket/manifest.json");
         std::fs::remove_file(&manifest).unwrap();
         std::fs::create_dir(&manifest).unwrap();
@@ -236,9 +163,6 @@ fn main() {
         );
     }
 
-    // ---- 5. An explicitly supplied value advances the counter ---------------
-    // Required regardless of compaction: it is what stops a restored backup or an
-    // imported dataset from colliding with live rows immediately.
     {
         let mut db = Database::open_at(dir.join("explicit"));
         db.create_ticket(ticket("a")).unwrap();
@@ -247,10 +171,6 @@ fn main() {
         eq("and the counter jumps past it", db.create_ticket(ticket("next")).unwrap(), 501u64);
     }
 
-    // ---- 6. A rolled-back transaction burns its number ----------------------
-    // Pinned as INTENDED, not tolerated. Rewinding is unsafe under Tier 2 (the
-    // prepare closure runs with no lock, so you cannot know you were the last
-    // taker), and gaps are the same contract Postgres/MySQL offer.
     {
         let mut db = Database::open_at(dir.join("rollback"));
         let first = db.create_ticket(ticket("a")).unwrap();
@@ -261,10 +181,6 @@ fn main() {
         eq("a rolled-back allocation is burned, not reused", db.create_ticket(ticket("b")).unwrap(), first + 2);
     }
 
-    // ---- 7. A non-identity `&+u64` allocates too ----------------------------
-    // Its counter cannot be seeded by the ungated id-scan (which decodes only the
-    // identity column), so this is the case that needs its own column read at
-    // reopen — the Gate 2 correction to "folding the max in is free".
     {
         let root = dir.join("nonidentity");
         let mk = |n: u64| Invoice { id: Uuid::nil(), number: n, total: 1.0 };
@@ -282,9 +198,6 @@ fn main() {
         eq("a non-identity auto allocates and survives reopen", nums, vec![1u64, 2, 3]);
     }
 
-    // ---- 8. Tier 2: concurrent prepares never duplicate ---------------------
-    // `transaction_concurrent` runs its prepare closure with NO write lock, so this
-    // is the path where two threads can interleave inside allocation.
     {
         const THREADS: u64 = 8;
         const EACH: u64 = 25;
@@ -312,9 +225,6 @@ fn main() {
         eq("and every create succeeded", issued, (THREADS * EACH) as usize);
     }
 
-    // ---- 9. `+u32` refuses to wrap -----------------------------------------
-    // Wrapping would re-issue 0 — which is also the allocate sentinel — and then
-    // collide with every id already handed out.
     {
         let mut db = Database::open_at(dir.join("overflow"));
         db.create_small(Small { id: u32::MAX, name: "last".into() }).unwrap();

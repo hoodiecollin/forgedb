@@ -86,8 +86,6 @@ const AUTHOR_ID: &str = "11111111-1111-1111-1111-111111111111";
 
 static mut FAILURES: u32 = 0;
 
-/// The oracle's mirror of one live row. `status_ord` is the enum's DECLARATION
-/// index, which is what the generated `Ord` derive compares — not the name.
 #[derive(Clone, Debug)]
 struct R {
     id: String,
@@ -115,9 +113,6 @@ fn status_name(ord: u8) -> &'static str {
     }
 }
 
-/// The live set in PHYSICAL ROW ORDER — the order the scan yields before any sort.
-/// `upsert` models append-only storage: an updated row's new version lands at the
-/// tail, so it moves to the end here too.
 struct Live(Vec<R>);
 
 impl Live {
@@ -135,8 +130,6 @@ impl Live {
         self.0.remove(pos);
     }
 
-    /// Recompute what `GET /api/post?<query>` must return: the page's ids in order,
-    /// and `total` (the filtered count BEFORE pagination).
     fn expect(
         &self,
         filters: &[(&str, &str)],
@@ -144,11 +137,6 @@ impl Live {
         limit: Option<usize>,
         offset: usize,
     ) -> (Vec<String>, usize) {
-        // Closed-set filter: every named param must match, parsing the raw string
-        // into the field's type first. A value that does not parse matches nothing
-        // (it can never equal a stored value) — which is also why an unparseable
-        // value on an INDEXED field must fall back to the full scan rather than
-        // silently returning the empty index bucket.
         let mut rows: Vec<&R> = self
             .0
             .iter()
@@ -165,8 +153,6 @@ impl Live {
             })
             .collect();
 
-        // Stable sort ascending, THEN reverse for descending — the two steps the
-        // generated helper performs, tie behaviour included.
         if let Some((field, desc)) = sort {
             match field {
                 "id" => rows.sort_by(|a, b| a.id.cmp(&b.id)),
@@ -175,8 +161,6 @@ impl Live {
                 "summary" => rows.sort_by(|a, b| a.summary.cmp(&b.summary)),
                 "views" => rows.sort_by(|a, b| a.views.cmp(&b.views)),
                 "status" => rows.sort_by(|a, b| a.status_ord.cmp(&b.status_ord)),
-                // An unknown sort field returns early in the generated helper,
-                // leaving physical order untouched.
                 _ => {}
             }
             if desc {
@@ -204,7 +188,6 @@ async fn call(router: axum::Router, uri: &str) -> (u16, String) {
     (status, String::from_utf8(bytes.to_vec()).expect("utf8 body"))
 }
 
-/// Pull `(ids, total)` back out of the response envelope.
 fn observed(body: &str) -> (Vec<String>, usize) {
     let v: serde_json::Value = serde_json::from_str(body).expect("envelope is json");
     let ids = v["data"]
@@ -220,8 +203,6 @@ fn uuid(s: &str) -> Uuid {
     s.parse().expect("parse uuid")
 }
 
-/// Deterministic id for post `n` — the ids are compared as strings, so they have
-/// to be stable across runs.
 fn post_id(n: usize) -> String {
     format!("22222222-2222-2222-2222-{:012}", n)
 }
@@ -240,10 +221,6 @@ async fn main() {
     })
     .expect("create author");
 
-    // 12 posts. `views` repeats deliberately (so an indexed pushdown resolves
-    // MULTIPLE candidate rows, not one), `summary` is absent on every third row
-    // (so the nullable sort has `None`s to order), and `body` groups rows into
-    // buckets a non-indexed filter can select.
     for n in 0..12usize {
         let id = post_id(n);
         let views = (n % 4) as u32 * 10;
@@ -276,10 +253,6 @@ async fn main() {
         });
     }
 
-    // Churn. Updates leave DEAD VERSIONS inside the mapped data span and move the
-    // live row to the tail; deletes punch HOLES in the gathered selection and
-    // remove the ids from every secondary index (which is why the pushdown arm can
-    // skip the tombstone read).
     for n in [1usize, 5, 9] {
         let id = post_id(n);
         let mut updated = live.0.iter().find(|r| r.id == id).expect("live").clone();
@@ -311,9 +284,6 @@ async fn main() {
         live.delete(&id);
     }
 
-    // #288 H2. Four gauges whose `limit` FIELD takes four distinct values. Exactly
-    // one holds 3, so `?limit=3` against this model must return that single row —
-    // and must NOT be read as "page size 3", which would return three rows.
     for n in 0..4u32 {
         db.create_gauge(Gauge {
             id: 0, // `0` is the allocate sentinel for a `+u32` identity
@@ -330,7 +300,6 @@ async fn main() {
     let db = Arc::new(RwLock::new(db));
     let router = || api::create_router(db.clone());
 
-    // (label, uri, filters, sort, limit, offset)
     type Case = (
         &'static str,
         String,
@@ -344,7 +313,6 @@ async fn main() {
     let title_1: &'static str = Box::leak(live_title_1.into_boxed_str());
 
     let cases: Vec<Case> = vec![
-        // --- full scan, no filter -------------------------------------------------
         (
             "unsorted — response order IS physical row order, updated rows at the tail",
             "/api/post".to_string(),
@@ -409,7 +377,6 @@ async fn main() {
             None,
             0,
         ),
-        // --- index pushdown -------------------------------------------------------
         (
             "pushdown on the indexed enum, sorted",
             "/api/post?status=Published&sort=views".to_string(),
@@ -450,7 +417,6 @@ async fn main() {
             None,
             0,
         ),
-        // --- fallbacks ------------------------------------------------------------
         (
             "unparseable value on an INDEXED field falls back to the full scan",
             "/api/post?views=not-a-number".to_string(),
@@ -491,7 +457,6 @@ async fn main() {
             None,
             0,
         ),
-        // --- pagination edges -----------------------------------------------------
         (
             "offset past the end — empty page, total unchanged",
             "/api/post?sort=views&limit=5&offset=100".to_string(),
@@ -508,20 +473,6 @@ async fn main() {
             Some(500),
             0,
         ),
-        // --- #281: the UNFILTERED, UNSORTED page, WINDOWED ------------------------
-        //
-        // The one unfiltered case above (`/api/post`) reads the whole live set, so
-        // it pins the order but never exercises the window. These do both, and this
-        // is the file where they belong: the oracle recomputes the physical order
-        // from its own append-only mirror rather than comparing two readers, so it
-        // is the only place the ORDER of #281's page is checked against something
-        // that is not itself the implementation.
-        //
-        // That order is genuinely discriminating here. Updating 1, 5, 9 moves them
-        // to the tail and deleting 3, 7 punches holes, so the live physical order is
-        // [0, 2, 4, 6, 8, 10, 11, 1, 5, 9] — nothing like id order, insertion order,
-        // or any field's sort order. A window taken from the wrong sequence lands on
-        // different ids rather than the same ids differently arranged.
         (
             "#281 unsorted + limit — the window is cut from PHYSICAL order",
             "/api/post?limit=3".to_string(),
@@ -584,18 +535,6 @@ async fn main() {
         }
     }
 
-    // ---- #288: the hoisted unfiltered predicate ----------------------------------
-    //
-    // The cases above already cover the hoist's equivalence for free — several carry
-    // non-filter keys (`?sort=`, `?limit=`) with no filter, which is exactly the arm
-    // that now short-circuits, and the filtered ones take the fall-through. The two
-    // checks below cover what the oracle structurally cannot.
-
-    // H4. `/api/post` and `/api/post?limit=50` differ ONLY in whether the params map
-    // is empty (50 is the default page size), so they must be byte-identical. That
-    // pair is the whole reason this issue exists: pre-hoist they returned the same
-    // bytes for 1.63x/2.44x different cost. Comparing bytes rather than (ids, total)
-    // also catches an envelope divergence the oracle would not see.
     {
         let (s_a, b_a) = call(router(), "/api/post").await;
         let (s_b, b_b) = call(router(), "/api/post?limit=50").await;
@@ -609,16 +548,8 @@ async fn main() {
         }
     }
 
-    // H2. The decisive case for the predicate's SHAPE. `Gauge` declares a field
-    // literally named `limit`, so `?limit=3` names a filterable field of this model
-    // and must filter to the one row holding 3. A predicate built as a negative
-    // exclusion list of reserved query keys would short-circuit here and return all
-    // four rows — behaviourally wrong, and wrong in the silent direction.
     {
         let (status, body) = call(router(), "/api/gauge?limit=3").await;
-        // Parsed inline rather than via `observed`, which reads `id` as a string for
-        // the uuid-keyed `Post`; `Gauge`'s identity is a `+u32` and serializes as a
-        // JSON number.
         let v: serde_json::Value = serde_json::from_str(&body).expect("envelope is json");
         let rows = v["data"].as_array().map(|a| a.len()).unwrap_or(0);
         let total = v["total"].as_u64().unwrap_or(u64::MAX);
@@ -632,8 +563,6 @@ async fn main() {
         }
     }
 
-    // The whole point of the corpus is that it is churned; if the churn silently
-    // stopped happening the cases above would still pass against a smaller table.
     assert_eq!(live.0.len(), 10, "corpus should be 12 created - 2 deleted");
 
     let failures = unsafe { FAILURES };

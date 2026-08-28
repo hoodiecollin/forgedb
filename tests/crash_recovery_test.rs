@@ -79,8 +79,6 @@ fn main() {
                 })
                 .expect("insert");
             }
-            // Crash: no clean shutdown, no Drop, no flush-on-exit. If the rows
-            // survive, per-insert WAL commit made them durable — not a graceful close.
             std::process::abort();
         }
         "count" => {

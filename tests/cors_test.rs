@@ -44,7 +44,6 @@ fn check(what: &str, got: (u16, Option<String>), want_status: u16, want_acao: Op
     unsafe { FAILURES += 1 }
 }
 
-/// Send `req` and return its status plus `access-control-allow-origin`.
 async fn call(router: axum::Router, req: Request<Body>) -> (u16, Option<String>) {
     let resp = router.oneshot(req).await.expect("router call");
     let status = resp.status().as_u16();
@@ -73,10 +72,6 @@ fn bare_options() -> Request<Body> {
         .unwrap()
 }
 
-/// An authenticator that can never verify anything: an empty JWKS. Exactly right
-/// here — the point is that a preflight must be answered WITHOUT auth, and that a
-/// rejected request still carries the CORS headers the browser needs in order to
-/// let the page read the status.
 fn authenticator() -> Arc<forgedb_auth::Authenticator> {
     let keys = forgedb_auth::KeySource::from_jwks_json(r#"{"keys":[]}"#).expect("empty jwks");
     Arc::new(forgedb_auth::Authenticator::new(
@@ -86,14 +81,6 @@ fn authenticator() -> Arc<forgedb_auth::Authenticator> {
     ))
 }
 
-/// Boot the generated router on a real loopback listener, speak a WebSocket
-/// handshake over raw TCP, and assert the response status.
-///
-/// A real server connection is required because axum's `WebSocketUpgrade` extractor
-/// needs hyper's `OnUpgrade` extension; `tower::oneshot` has none, so it rejects
-/// every handshake with 426 before the handler's origin check can run. Reading only
-/// the status line keeps this dependency-free — 101 means the gate let it through,
-/// 403 means the gate refused it.
 async fn ws_check(
     what: &str,
     origins: Option<Vec<&str>>,
@@ -116,8 +103,6 @@ async fn ws_check(
         let _ = axum::serve(listener, router).await;
     });
 
-    // Own the origin before it crosses into the blocking task: a `&str` borrowed
-    // from the caller cannot escape into `spawn_blocking`.
     let origin_line = match origin {
         Some(o) => format!("Origin: {o}\r\n"),
         None => String::new(),
@@ -159,10 +144,6 @@ async fn main() {
     };
     let with = |origins: Vec<&str>| api::create_router_with_options(db.clone(), opts(origins));
 
-    // ── The unconfigured default must be byte-identical to today ──────────────
-    //
-    // This is the regression guard for "omit the layer, do not emit an empty one".
-    // It fails the moment anyone makes the layer unconditional.
     check(
         "default: OPTIONS on a data route",
         call(none(), bare_options()).await,
@@ -176,7 +157,6 @@ async fn main() {
         None,
     );
 
-    // ── Configured: the allow-list decides ───────────────────────────────────
     check(
         "configured: preflight from an allowed origin",
         call(with(vec![APP]), preflight(APP, "POST")).await,
@@ -210,11 +190,6 @@ async fn main() {
         Some("*"),
     );
 
-    // ── Placement: outermost, outside the auth guard ──────────────────────────
-    //
-    // A browser preflight carries no Authorization header. If the CORS layer sat
-    // inside the tenant guard this would be 401 and the browser would report a
-    // CORS error with nothing actionable in it.
     let guarded = |origins: Vec<&str>| {
         api::create_router_with_auth_and_options(db.clone(), authenticator(), opts(origins))
     };
@@ -224,8 +199,6 @@ async fn main() {
         200,
         Some(APP),
     );
-    // And an unauthenticated real request is still rejected — but with the header,
-    // so the page can read the 401 instead of seeing an opaque network failure.
     check(
         "auth + configured: unauthenticated GET is 401 WITH the CORS header",
         call(
@@ -241,14 +214,6 @@ async fn main() {
         Some(APP),
     );
 
-    // ── WebSocket: checked by the handler, not by CORS ────────────────────────
-    //
-    // These cannot go through `tower::oneshot`: axum's `WebSocketUpgrade` extractor
-    // requires hyper's `OnUpgrade` request extension, which only a real server
-    // connection carries, so `oneshot` rejects every handshake 426 before the
-    // handler body ever runs. So this half binds a real listener and speaks the
-    // handshake over raw TCP — no ws client dependency needed, since only the
-    // status line is under test.
     ws_check("default: WS from any origin is accepted (unchanged)", None, Some(EVIL), 101).await;
     ws_check(
         "configured: WS from a disallowed origin is refused before upgrade",
@@ -264,10 +229,6 @@ async fn main() {
         101,
     )
     .await;
-    // Native `/replicate` followers, CLI tools and tests send no Origin. Rejecting
-    // on absence would break them and buy nothing: an attacker who controls the
-    // client controls the header. Origin checking defends the browser threat model
-    // only, where the browser sets it and the page cannot forge it.
     ws_check(
         "configured: WS with no Origin at all is accepted",
         Some(vec![APP]),
@@ -276,7 +237,6 @@ async fn main() {
     )
     .await;
 
-    // ── Parsing ──────────────────────────────────────────────────────────────
     assert!(api::parse_origins("").expect("empty is not an error").is_none());
     assert_eq!(
         api::parse_origins(" https://a.example , https://b.example ").unwrap(),
