@@ -297,6 +297,39 @@ fn s337_the_go_reclose_proves_the_init_check_executes() {
 }
 
 #[test]
+fn the_comment_rule_has_a_place_where_it_can_fail() {
+    let recipe = make_recipe("comment-check");
+
+    assert!(
+        recipe.contains("scripts/strip-comments.ts"),
+        "`make comment-check` must invoke the checker. A target that runs something else \
+         reports green on a tree full of comments, which is worse than no target: the rule \
+         then LOOKS enforced. Got: {recipe}"
+    );
+    assert!(
+        recipe.contains("--check"),
+        "`make comment-check` must pass --check. Without it the script defaults to `stats`, \
+         which prints a count and EXITS ZERO — the report-is-not-a-gate shape (§5.5). \
+         Got: {recipe}"
+    );
+
+    let cmd = run_command("test.yml", "No comments in ForgeDB's own source");
+    assert!(
+        cmd.contains("make comment-check"),
+        "test.yml must run `make comment-check`, or the rule is enforced by memory. \
+         Got: {cmd}"
+    );
+
+    let wf = unwrap_continuations(&workflow("test.yml"));
+    assert!(
+        wf.contains("setup-bun"),
+        "the comment check runs under bun, so test.yml must install it. Without the setup \
+         step the job fails on a missing interpreter rather than on a real finding, and \
+         the usual repair is to delete the step"
+    );
+}
+
+#[test]
 fn tier_two_runs_the_whole_workspace_not_a_list_of_binaries() {
     let recipe = make_recipe("test-ignored");
 
