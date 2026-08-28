@@ -57,7 +57,7 @@ to filter for it, because no GitHub filter can compute it.
 | `PM012` | an `epic` never carries gates |
 | `PM013` | a work item on the focused milestone carries its complete gate set |
 | `PM014` | `hotfix` ⇒ `bugfix` + milestone, and ⊕ {`experiment`, `epic`} |
-| `PM015` | a patch milestone holds one hotfix and its gates, nothing else |
+| `PM015` | a patch milestone holds exactly one work item and its gates, nothing else |
 | `PM016` | *(warn)* every gate closed but the work item still open |
 | `PM105` | only an `epic` has non-gate sub-issues; only a work item has gates |
 
