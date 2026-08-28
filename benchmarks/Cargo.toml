@@ -8,32 +8,15 @@ description = "Comparative benchmarks of ForgeDB's generated code vs. establishe
 [lib]
 path = "src/lib.rs"
 
-# The config-matrix variant modules (`gen/<variant>/database.rs`, epic #126) are
-# GITIGNORED — regenerable from `bench.forge` + `configs/*.toml`, never committed.
-# So they are compiled only behind this feature (#279): every target that links a
-# variant declares `required-features = ["matrix"]` (or cfg-gates its use), and a
-# clean clone therefore builds every OTHER target without generating anything.
-# Enable with `--features matrix` after `make bench-regen-matrix`.
 [features]
 matrix = []
 
-# #282: the generated REST router (`gen/api.rs`) and the crates its emitted `use`
-# statements pull in. OFF by default. Section 1's gate criterion in src/lib.rs names
-# this case by number: `gen/api.rs` is TRACKED, but declaring it unconditionally would
-# make EVERY bench target — `make bench-sqlite` included — compile axum, tokio,
-# tower-http and utoipa-axum. Measured: +78 packages on the library's normal graph
-# (41 -> 119, ~2.9x). Tracked is not the same as free; `[[bench]] list_rest_bench`
-# carries the matching `required-features`, and `make bench-deps-check` asserts both
-# directions of this gate.
 router = [
   "dep:axum", "dep:tokio", "dep:tower", "dep:tower-http", "dep:utoipa-axum",
   "dep:forgedb-auth", "dep:forgedb-query-params",
   "dep:hyper", "dep:hyper-util", "dep:http-body-util",
 ]
 
-# Substrate the ForgeDB-generated `gen/database.rs` links against, path-patched to
-# the local crates (this is a detached project — see `[workspace]` below — so the
-# heavy bench deps never enter the root workspace build or test baseline).
 [dependencies]
 forgedb-types = { path = "../crates/types" }
 forgedb-storage = { path = "../crates/storage" }
@@ -47,15 +30,6 @@ serde_json = "1"
 utoipa = { version = "5", features = ["uuid"] }
 uuid = { version = "1", features = ["v4"] }
 
-# #282 `router` feature only — what the generated `gen/api.rs` links, plus the three
-# S4 client crates. All `optional = true`: see the feature comment above.
-#
-# `forgedb-auth` takes DEFAULT features, NOT `jwks-http`. The `forgedb init` scaffold
-# pins `features = ["jwks-http"]` (src/commands/init.rs) for runtime convenience, but
-# the generated `api.rs` references only `forgedb_auth::Authenticator` and
-# `forgedb_auth::axum_mw::require_tenant` — neither needs the HTTP JWKS fetcher. The
-# in-tree proof is tests/common/mod.rs, whose `fn dep()` emits no `features` key and
-# whose generated crates boot a real router. Dropping it saves 37 packages.
 axum                 = { version = "0.8", features = ["ws"],            optional = true }
 tokio                = { version = "1",   features = ["full"],          optional = true }
 tower                = { version = "0.5", features = ["util"],          optional = true }
@@ -69,13 +43,6 @@ http-body-util       = { version = "0.1",                                 option
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-# #218 mixed-workload driver. `hdrhistogram` because a sustained-load run is judged
-# on tail latency and a mean would hide exactly the stalls under test. `rand`/
-# `rand_distr` for seeded Zipfian key selection (hot-key skew is what makes churn
-# concentrate). Deliberately NO rate-limiter crate: open-loop pacing needs a fixed
-# precomputed arrival SCHEDULE, and a GCRA limiter (governor et al.) throttles to a
-# rate instead — it would absorb the very stalls this is built to measure, and add
-# non-determinism to a run that must be seed-reproducible.
 hdrhistogram = "7.5"
 rand = "0.8"
 rand_distr = "0.4"
@@ -105,28 +72,18 @@ harness = false
 name = "pg_bench"
 harness = false
 
-# Links all seven gitignored config variants, so it is the one bench target that
-# needs `make bench-regen-matrix` first. Cargo SKIPS it on a bare `cargo bench`
-# when the feature is off, and errors with the feature name if it is asked for by
-# name — either way the failure is at target selection, not 238 type errors.
 [[bench]]
 name = "matrix_bench"
 harness = false
 required-features = ["matrix"]
 
-# #226 kill gate: how much of a list request is the per-row page materialization.
 [[bench]]
 name = "list_page_bench"
 harness = false
 
-# #282 scenario 21: the generated REST list endpoint measured at four boundaries
-# (typed rows -> JSON bytes -> router -> socket). Needs `gen/api.rs`, hence the
-# feature gate — see `[features] router` above.
 [[bench]]
 name = "list_rest_bench"
 harness = false
 required-features = ["router"]
 
-# Detached from the root workspace on purpose: keeps SQLite (and later DuckDB / PG
-# client libs) out of `cargo build --workspace` and the test baseline.
 [workspace]

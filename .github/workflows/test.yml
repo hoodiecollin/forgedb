@@ -1,46 +1,3 @@
-# Tier 1 — the default test suite (#390).
-#
-# Until this file existed, NOTHING in CI ran `cargo test`. All eleven workflows here were
-# release, publish, deploy or scope-gate jobs, and the suite ran only when a person chose
-# to run it. That is not a control, and it cost two defects before anyone noticed: #381,
-# whose generated driver called an API deleted two weeks earlier and stayed green for a
-# fortnight, and #386, which panicked before reaching its assertion. Both were found by
-# hand, by someone who happened to look.
-#
-# WHAT RUNS, AND WHY IT IS `make test` RATHER THAN THE COMMANDS
-#
-# One definition. `make test` is the same thing a contributor runs locally, so there is no
-# way for "what CI checks" and "what you can reproduce" to drift apart — and
-# tests/ci_gate_test.rs asserts the recipe still contains both halves. Inlining the cargo
-# commands here would create a second definition that looks identical right up until it
-# isn't.
-#
-# The second half is the one worth defending: `cargo build --workspace --examples`.
-# `--lib`, `--bins`, `--tests` AND `--doc` all EXCLUDE examples, so nothing in the test
-# command compiles them. Dropping it costs no test results and produces no warning, which
-# is exactly why it has silently broken the tree twice.
-#
-# WHY BOTH A `pull_request` ARM AND A `push` ARM
-#
-# The PR arm is the gate — it is the one a ruleset can require, and it is the only arm
-# that can stop anything, because it runs before the merge exists.
-#
-# The push arm cannot block: by the time it runs, the merge has happened. It is kept
-# anyway, as the net for whatever still lands directly. Core work moved to pull requests
-# with #390 precisely so the gate covers more than a minority of changes — before that,
-# most work here merged locally and a PR-only check would have been watching an empty road
-# (the same limitation cycle-scope.yml documents in its own header).
-#
-# THE JOB NAME IS A PUBLIC IDENTIFIER
-#
-# `jobs.suite.name` below is what the branch ruleset's required-status-check matches on.
-# Renaming it does not fail — it silently un-requires the check, and every PR starts
-# passing a gate that is no longer there. If you rename it, update the ruleset in the same
-# change.
-#
-# NOT HERE, DELIBERATELY: the ignored suite. Those tests each generate and compile a
-# crate; they run nightly, in nightly-ignored.yml. See #390 for why a build-only check
-# (`--no-run -- --ignored`) does not substitute — it reports green on a broken tree.
 name: Tests
 
 on:
@@ -52,39 +9,24 @@ on:
 permissions:
   contents: read
 
-# One run per ref. A quick follow-up push supersedes an in-flight run rather than queueing
-# behind it; `website.yml` sets the same precedent.
 concurrency:
   group: tests-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   suite:
-    # PUBLIC IDENTIFIER — matched by the branch ruleset's required status check.
-    # Renaming this un-requires the gate silently. See the header.
     name: test suite
     runs-on: ubuntu-22.04
-    # Measured at ~4m30s warm locally. The ceiling is here so a hung generated-crate
-    # compile fails in a readable time instead of burning the 6-hour default.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
-      # NO SYSTEM DEPENDENCIES, and that is now a property worth keeping.
-      #
-      # This job briefly installed a GTK/WebKit toolchain, because the inspector's Tauri
-      # shell was a root workspace member and `--workspace` therefore built it. #411 made
-      # the inspector its own workspace, so the core suite builds on any host with nothing
-      # but the pinned Rust toolchain. If a step here ever needs `apt-get`, something has
-      # been added to the core workspace that probably should not be in it.
-      #
-      # The cost of that split is real and is tracked, not absorbed: the inspector's own
-      # tests no longer run here. See #411.
-
-      # Toolchain comes from rust-toolchain.toml (channel 1.96); rustup on the runner
-      # honours it, so no setup-rust action is needed. Matches substrate-reclose.yml and
-      # go-reclose.yml.
       - uses: Swatinem/rust-cache@v2
 
       - name: Tier 1 — workspace suite + examples
         run: make test
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: No comments in ForgeDB's own source
+        run: make comment-check
