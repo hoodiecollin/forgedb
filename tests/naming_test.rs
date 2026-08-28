@@ -1,22 +1,3 @@
-//! Guards for the derived-name scheme (#335 §2, epic #332).
-//!
-//! Scenario numbers refer to the BDD table in the accepted plan gate (#347).
-//! Scenarios 1 and 2 live here; scenario 3 (two apps' FFI symbol sets are
-//! disjoint) needs the ffi generator and lives in `build_cache_compile_test.rs`.
-//!
-//! **These vectors are load-bearing.** `cargo install forgedb` builds the CLI
-//! with whatever toolchain the user has, so a name that moves under a released
-//! cache re-keys every package in it and the whole world silently recompiles.
-//! Do not update a vector to match new output; work out why the output moved.
-//!
-//! # What changed, and what did not
-//!
-//! Names used to be `<stem>-<member_hash>-<kind>`. They are now
-//! `<project_id>_<path segments…>-<kind>`: legible, and unique because two
-//! distinct relative paths cannot reduce to the same segment list. The member
-//! **directory** is still `member_hash`-keyed, which is why the hash vectors
-//! below still stand — they simply no longer appear in any name a user reads.
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -27,19 +8,9 @@ fn paths(raw: &[&str]) -> Vec<PathBuf> {
     raw.iter().map(PathBuf::from).collect()
 }
 
-// ---------------------------------------------------------------------------
-// Scenario 2 — golden vectors over the composed names
-// ---------------------------------------------------------------------------
-
-/// The hashes `cache_dir_test.rs::scenario_2_golden_hash_vectors` pins, repeated
-/// verbatim rather than computed, so a drift in `member_hash` fails **both**
-/// files and neither can quietly adopt the other's new answer.
-///
-/// These still key the member *directory*. They are no longer part of any
-/// package name, `[[bin]]` name or C symbol.
-const H_ROOT: &str = "60acb6cba9beb3cf"; // schema.forge
-const H_API: &str = "4ec83b602ecd29f5"; // apps/api/schema.forge
-const H_WEB: &str = "ad9a0dc7a10decf7"; // apps/web/schema.forge
+const H_ROOT: &str = "60acb6cba9beb3cf";
+const H_API: &str = "4ec83b602ecd29f5";
+const H_WEB: &str = "ad9a0dc7a10decf7";
 
 #[test]
 fn scenario_2_hashes_still_key_the_member_directory() {
@@ -48,8 +19,6 @@ fn scenario_2_hashes_still_key_the_member_directory() {
     assert_eq!(cache::member_hash(Path::new("apps/web/schema.forge")), H_WEB);
 }
 
-/// The worked example from the design discussion: a project whose leaf names
-/// collide, so `minimal` has to lengthen two of them and leaves the third short.
 #[test]
 fn scenario_2_golden_app_names_minimal() {
     let project = paths(&[
@@ -60,12 +29,9 @@ fn scenario_2_golden_app_names_minimal() {
     ]);
 
     const VECTORS: &[(&str, &str)] = &[
-        // `blog` is ambiguous — `services/blog` vs `app/blog` — so both lengthen.
         ("services/blog/schema.forge", "foo_services_blog"),
-        // `cart` is already unique, so `minimal` stops at one segment.
         ("services/cart/schema.forge", "foo_cart"),
         ("app/blog/schema.forge", "foo_app_blog"),
-        // A non-conventional stem is a segment of its own, and `api` is unique.
         ("app/blog/api.forge", "foo_api"),
     ];
 
@@ -78,8 +44,6 @@ fn scenario_2_golden_app_names_minimal() {
     }
 }
 
-/// The same project under `uniform`: every segment, always. `cart` and `api`
-/// are the rows that differ, and they are why the knob exists.
 #[test]
 fn scenario_2_golden_app_names_uniform() {
     let project = paths(&[
@@ -105,8 +69,6 @@ fn scenario_2_golden_app_names_uniform() {
     }
 }
 
-/// The second worked example: no leaf collides, so `minimal` keeps every name
-/// to one segment and `services/` never appears.
 #[test]
 fn scenario_2_golden_app_names_shallow_project() {
     let project = paths(&[
@@ -158,18 +120,10 @@ fn scenario_2_golden_range_stamped_names() {
 
 #[test]
 fn scenario_2_golden_symbol_prefix() {
-    // `-` becomes `_` so the result is a legal C identifier; the trailing `_`
-    // separates the prefix from the symbol it is glued to.
     assert_eq!(naming::symbol_prefix("foo_services_blog"), "foo_services_blog_");
     assert_eq!(naming::symbol_prefix("bar-api"), "bar_api_");
 }
 
-// ---------------------------------------------------------------------------
-// Scenario 1 — every derived name is cargo-legal
-// ---------------------------------------------------------------------------
-
-/// A leading digit is a **hard error** in a cargo package name, and it takes the
-/// whole workspace down rather than just that package.
 #[test]
 fn scenario_1_a_digit_leading_path_is_rescued() {
     let project = paths(&["2024-orders/schema.forge"]);
@@ -181,8 +135,6 @@ fn scenario_1_a_digit_leading_path_is_rescued() {
     assert_eq!(name, "app_2024_orders");
 }
 
-/// A project id that itself starts with a digit is rescued the same way — the
-/// rescue is applied to the *joined* name, not to either half.
 #[test]
 fn scenario_1_a_digit_leading_project_id_is_rescued() {
     let project = paths(&["schema.forge"]);
@@ -190,7 +142,6 @@ fn scenario_1_a_digit_leading_project_id_is_rescued() {
     assert!(name.starts_with(|c: char| c.is_ascii_alphabetic()), "got {name:?}");
 }
 
-/// An empty project id and a conventional stem leave nothing to name with.
 #[test]
 fn scenario_1_an_empty_derivation_falls_back() {
     let project = paths(&["schema.forge"]);
@@ -200,8 +151,6 @@ fn scenario_1_an_empty_derivation_falls_back() {
     );
 }
 
-/// Every kind, composed onto a real derived name, is a package name cargo
-/// accepts — checked by `cargo metadata`, not by our own idea of the rules.
 #[test]
 fn scenario_1_every_kind_is_cargo_legal() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -247,13 +196,6 @@ fn scenario_1_every_kind_is_cargo_legal() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The properties the scheme rests on
-// ---------------------------------------------------------------------------
-
-/// The conventional stem carries no information — `forgedb init` writes
-/// `schema.forge` for every project — so it is dropped, and any other stem is
-/// kept as a segment of its own.
 #[test]
 fn the_conventional_stem_is_dropped_and_others_are_kept() {
     assert_eq!(
@@ -266,10 +208,6 @@ fn the_conventional_stem_is_dropped_and_others_are_kept() {
     );
 }
 
-/// **The property the whole scheme rests on**: within one project, no two apps
-/// derive the same name — under either mode. Without this, two apps export
-/// byte-identical C symbols and a Go binary importing both fails to link
-/// (scenario 3), which is precisely what the hash used to prevent.
 #[test]
 fn no_two_apps_in_a_project_share_a_name() {
     let project = paths(&[
@@ -298,9 +236,6 @@ fn no_two_apps_in_a_project_share_a_name() {
     }
 }
 
-/// Non-alphanumerics are collapsed rather than passed through, in **both** a
-/// directory component and a stem — a `.` reaching a C symbol is a syntax
-/// error at the far end of the build, in generated code nobody reads.
 #[test]
 fn every_segment_is_sanitised() {
     let rel = Path::new("my services/v1.2/order-book.forge");

@@ -3,8 +3,6 @@ use tempfile::TempDir;
 
 #[test]
 fn test_migration_generate_and_load_roundtrip() {
-    // The record/track/load lifecycle (data-at-rest transformation now lives in
-    // the offline transformer bin, #74 Phase 3 — not a runtime executor).
     let temp_dir = TempDir::new().unwrap();
     let migrations_dir = temp_dir.path().join("migrations");
 
@@ -27,7 +25,6 @@ fn test_migration_generate_and_load_roundtrip() {
             .unwrap();
     assert_eq!(migration.changes.len(), 2);
 
-    // Create tracker
     let mut tracker = MigrationTracker::new(&migrations_dir).unwrap();
     assert!(!tracker.is_applied(&migration.id));
     tracker
@@ -35,7 +32,6 @@ fn test_migration_generate_and_load_roundtrip() {
         .unwrap();
     assert!(tracker.is_applied(&migration.id));
 
-    // Verify we can load migrations
     let all_migrations = MigrationGenerator::load_all_migrations(&migrations_dir).unwrap();
     assert_eq!(all_migrations.len(), 1);
     assert_eq!(all_migrations[0].id, migration.id);
@@ -68,7 +64,6 @@ fn test_breaking_change_detection() {
     let migration = Migration::new("Update User model".to_string(), changes);
 
     assert!(migration.has_breaking_changes());
-    // M4: AddField { nullable: false, default_json: None } is also breaking now
     assert_eq!(migration.breaking_changes().len(), 3);
     assert_eq!(migration.safe_changes().len(), 0);
 }
@@ -155,10 +150,8 @@ fn test_schema_differ() {
 
     let changes = SchemaDiffer::diff(&old_schema, &new_schema).changes;
 
-    // Should detect: AddField, AddIndex, AddUniqueConstraint, AddConstraint
     assert!(changes.len() >= 1);
 
-    // Check that we detected the new field
     let has_add_field = changes
         .iter()
         .any(|c| matches!(c, SchemaChange::AddField { .. }));
@@ -167,12 +160,7 @@ fn test_schema_differ() {
 
 #[test]
 fn test_diff_classifies_authored_body_residue() {
-    // #74 Phase 2 (C8/C9): each hop's new-row body is classified ONCE at create
-    // time as `Auto` (the differ can PROVE it) or `Authored` (semantic residue the
-    // developer must supply).  Crucially the classifier is DISTINCT from
-    // `is_breaking()` — a change can be breaking yet `Auto`.
 
-    // Authored residue: only what the differ genuinely cannot prove a value for.
     let type_change = SchemaChange::ChangeFieldType {
         model_name: "User".to_string(),
         field_name: "age".to_string(),
@@ -203,10 +191,6 @@ fn test_diff_classifies_authored_body_residue() {
         );
     }
 
-    // Breaking-but-Auto: the residue is NOT just "everything breaking".  Dropping a
-    // field/model is breaking for readers but the row transform is a pure omit;
-    // adding a &unique may fail on dups but the row bytes are identity.  These are
-    // Auto despite being breaking — proving the classifier ≠ is_breaking().
     let remove_field = SchemaChange::RemoveField {
         model_name: "User".to_string(),
         field_name: "legacy".to_string(),
@@ -227,7 +211,6 @@ fn test_diff_classifies_authored_body_residue() {
         );
     }
 
-    // Additive / structural provable hops are Auto.
     let add_nullable = SchemaChange::AddField {
         model_name: "User".to_string(),
         field_name: "bio".to_string(),
@@ -250,7 +233,6 @@ fn test_diff_classifies_authored_body_residue() {
         assert_eq!(c.hop_body_class(), HopBodyClass::Auto, "{c:?}");
     }
 
-    // A migration exposes exactly its Authored residue.
     let mig = Migration::new(
         "mixed".to_string(),
         vec![add_nullable.clone(), type_change.clone(), remove_field.clone()],
@@ -262,19 +244,13 @@ fn test_diff_classifies_authored_body_residue() {
 
 #[test]
 fn test_migration_lineage_expands_range() {
-    // #74 Phase 2: the committed migrations form a serial version lineage; the
-    // transformer generator (Phase 3) walks it to expand a `--from B --to G` range
-    // into the ordered hop sequence between those versions (C1 — a closed, fixed
-    // serial range; never a synthesized jump).
     let temp = TempDir::new().unwrap();
     let dir = temp.path().join("migrations");
 
-    // Empty lineage → baseline version 1, next span 1→2.
     let empty = MigrationLineage::load(&dir).unwrap();
     assert_eq!(empty.current_schema_version(), BASELINE_SCHEMA_VERSION);
     assert_eq!(empty.next_version_span(), (1, 2));
 
-    // Record three contiguous hops: v1→2, v2→3, v3→4.
     for (i, (from, to)) in [(1u32, 2u32), (2, 3), (3, 4)].iter().enumerate() {
         MigrationGenerator::generate_versioned(
             &dir,
@@ -294,40 +270,31 @@ fn test_migration_lineage_expands_range() {
     }
 
     let lineage = MigrationLineage::load(&dir).unwrap();
-    // Current version is the highest to_version; next span continues the chain.
     assert_eq!(lineage.current_schema_version(), 4);
     assert_eq!(lineage.next_version_span(), (4, 5));
 
-    // Full range expands to all three hops in version order.
     let full = lineage.expand_range(1, 4).unwrap();
     assert_eq!(full.len(), 3);
     assert_eq!(full[0].from_version, 1);
     assert_eq!(full[0].to_version, 2);
     assert_eq!(full[2].to_version, 4);
 
-    // A sub-range is a contiguous slice.
     let sub = lineage.expand_range(2, 4).unwrap();
     assert_eq!(sub.len(), 2);
     assert_eq!(sub[0].from_version, 2);
 
-    // Empty range (from == to) is a valid no-op.
     assert!(lineage.expand_range(3, 3).unwrap().is_empty());
 
-    // A range beyond the recorded lineage is refused (never synthesized).
     assert!(lineage.expand_range(1, 9).is_err());
     assert!(lineage.expand_range(4, 2).is_err());
 }
 
 #[test]
 fn test_scaffold_authored_body_only_for_residue() {
-    // #74 Phase 2 (C8/C9/C13): a migration with an Authored hop scaffolds a frozen
-    // `migrations/{id}/transform.rs` for the developer; a fully-automatic migration
-    // scaffolds nothing; and an existing authored body is NEVER clobbered.
     let temp = TempDir::new().unwrap();
     let dir = temp.path().join("migrations");
     std::fs::create_dir_all(&dir).unwrap();
 
-    // Fully automatic (nullable add) → no scaffold.
     let auto = Migration::new_versioned(
         "auto".to_string(),
         vec![SchemaChange::AddField {
@@ -343,7 +310,6 @@ fn test_scaffold_authored_body_only_for_residue() {
     );
     assert!(scaffold_authored_body(&dir, &auto).unwrap().is_none());
 
-    // Authored (type change) → scaffold written.
     let authored = Migration::new_versioned(
         "authored".to_string(),
         vec![SchemaChange::ChangeFieldType {
@@ -362,7 +328,6 @@ fn test_scaffold_authored_body_only_for_residue() {
     let body = std::fs::read_to_string(&path).unwrap();
     assert!(body.contains("TODO"), "scaffold documents the residue to author");
 
-    // Freeze the developer's authored body, then re-scaffold: must NOT clobber.
     std::fs::write(&path, "// FROZEN AUTHORED BODY\n").unwrap();
     let (path2, created2) = scaffold_authored_body(&dir, &authored).unwrap().unwrap();
     assert_eq!(path, path2);
@@ -370,16 +335,6 @@ fn test_scaffold_authored_body_only_for_residue() {
     assert_eq!(std::fs::read_to_string(&path2).unwrap(), "// FROZEN AUTHORED BODY\n");
 }
 
-// ---------------------------------------------------------------------------
-// #374 step 2 — `SimpleType` is a real type, and its wire form round-trips
-// ---------------------------------------------------------------------------
-
-/// Every variant's [`Display`] parses back to itself.
-///
-/// This is the property the whole design rests on: a `SimpleType` reaches a
-/// migration record as a **plain string**, so if rendering and parsing ever
-/// disagree the record silently degrades to `Opaque` — which reads exactly like
-/// "this record predates #374" and would quietly un-prove every widening.
 #[test]
 fn simple_type_round_trips_through_its_wire_form() {
     use crate::SimpleType as S;
@@ -412,7 +367,6 @@ fn simple_type_round_trips_through_its_wire_form() {
         let rendered = t.to_string();
         let back: S = rendered.parse().unwrap();
         assert_eq!(back, t, "{rendered:?} did not round-trip");
-        // And through serde, which is how it actually reaches a record.
         let json = serde_json::to_string(&t).unwrap();
         assert_eq!(json, format!("{:?}", rendered), "wire form is a plain string");
         let de: S = serde_json::from_str(&json).unwrap();
@@ -420,11 +374,6 @@ fn simple_type_round_trips_through_its_wire_form() {
     }
 }
 
-/// A type string written before #374 loads as `Opaque` rather than failing.
-///
-/// Every already-committed record carries `format!("{:?}", FieldType::U32)`.
-/// Refusing to *load* those is worse than refusing to build them: the lineage
-/// would become unreadable, `migrate status` included.
 #[test]
 fn a_pre_374_type_string_loads_as_opaque() {
     use crate::SimpleType as S;
@@ -438,17 +387,11 @@ fn a_pre_374_type_string_loads_as_opaque() {
     }
 }
 
-/// Scenario 2 — the widening table, positives **and** negatives.
-///
-/// The negative rows are the load-bearing ones: a classifier that says "yes" too
-/// often silently corrupts data at a boundary value, and no snapshot can see it.
 #[test]
 fn scenario_2_widenings_are_provable_and_everything_else_is_not() {
     use crate::SimpleType as S;
 
     let ints = [S::U32, S::U64, S::I32, S::I64, S::F64];
-    // The COMPLETE set of provable numeric pairs. Anything not listed must be
-    // false, including every int -> f64.
     let provable: &[(S, S)] = &[
         (S::U32, S::U64),
         (S::I32, S::I64),
@@ -466,7 +409,6 @@ fn scenario_2_widenings_are_provable_and_everything_else_is_not() {
         }
     }
 
-    // string(N): grows only, exactness must be equal.
     let sn = |chars: usize, exact: bool| S::StrN { chars, exact };
     assert!(sn(4, false).widens_to(&sn(8, false)));
     assert!(sn(4, true).widens_to(&sn(8, true)));
@@ -476,18 +418,14 @@ fn scenario_2_widenings_are_provable_and_everything_else_is_not() {
     assert!(!sn(4, false).widens_to(&S::Str), "fixed slot -> variable column");
     assert!(!S::Str.widens_to(&sn(4, false)), "variable column -> fixed slot");
 
-    // timestamp: coarser -> finer only (rank s < ms < us).
     assert!(S::Timestamp(0).widens_to(&S::Timestamp(1)));
     assert!(S::Timestamp(0).widens_to(&S::Timestamp(2)));
     assert!(S::Timestamp(1).widens_to(&S::Timestamp(2)));
     assert!(!S::Timestamp(2).widens_to(&S::Timestamp(1)), "finer -> coarser floors");
     assert!(!S::Timestamp(1).widens_to(&S::Timestamp(0)), "finer -> coarser floors");
 
-    // Identity is not a widening — the differ never emits it, and answering
-    // `true` would read as "the widening set includes doing nothing".
     assert!(!S::U32.widens_to(&S::U32));
 
-    // Cross-family changes are never provable.
     assert!(!S::U32.widens_to(&S::Str));
     assert!(!S::Str.widens_to(&S::U32));
     assert!(!S::Uuid.widens_to(&S::Str));
@@ -495,25 +433,11 @@ fn scenario_2_widenings_are_provable_and_everything_else_is_not() {
     assert!(!S::Enum("A".into()).widens_to(&S::Str));
 }
 
-// ---------------------------------------------------------------------------
-// #374 step 3 — the provable set, and the two matches that decide it
-// ---------------------------------------------------------------------------
-
-/// The body of a `fn` in this crate's `types.rs`, **with every comment
-/// stripped**, from its signature to its closing brace at the same indent.
-///
-/// Stripping is not tidiness. Both matches below are heavily commented, and the
-/// comments *explain the wildcard that is no longer there* — so a guard that
-/// greps the raw text is satisfied by the prose describing the invariant it is
-/// supposed to enforce, and a well-commented file makes that worse rather than
-/// better. What is asserted on is only the code.
 fn code_of(fn_signature: &str) -> String {
     let src = include_str!("types.rs");
     let start = src
         .find(fn_signature)
         .unwrap_or_else(|| panic!("`{fn_signature}` is not in types.rs — did it get renamed?"));
-    // The function ends at the first line that is exactly the 4-space-indented
-    // closing brace (these are inherent-impl methods).
     let rest = &src[start..];
     let end = rest
         .find("\n    }\n")
@@ -528,18 +452,6 @@ fn code_of(fn_signature: &str) -> String {
         .join("\n")
 }
 
-/// Neither classifier may carry a catch-all arm (#374 step 3, scenario 3).
-///
-/// `hop_body_class`'s wildcard was `Auto` and `is_breaking`'s was `false` — so
-/// **any** variant added to `SchemaChange` later was silently declared both
-/// provable and safe for data at rest. Both are exactly the wrong default:
-/// #438's `ChangeEnumVariants` would have made a dropped enum variant a hop no
-/// human ever looked at.
-///
-/// A structural guard rather than a runtime one because the property is a
-/// compile-time one. Verified by mutation: re-adding `_ => HopBodyClass::Auto`
-/// to `hop_body_class` makes this test RED, and deleting a named arm instead
-/// makes `cargo check` fail — which is the property itself.
 #[test]
 fn scenario_3_neither_classifier_has_a_catch_all_arm() {
     for sig in [
@@ -556,11 +468,6 @@ fn scenario_3_neither_classifier_has_a_catch_all_arm() {
     }
 }
 
-/// Scenario 2, at the classifier rather than at `widens_to`.
-///
-/// `widens_to` being right is necessary and not sufficient — the arm has to
-/// *call* it. Mutating `widens_to` proves the predicate works; this asserts it
-/// is reached from `hop_body_class`.
 #[test]
 fn scenario_2_the_classifier_calls_the_widening_table() {
     use crate::SimpleType as S;
@@ -585,9 +492,6 @@ fn scenario_2_the_classifier_calls_the_widening_table() {
             HopBodyClass::Auto,
             "{old} -> {new} is value-preserving and must need no author"
         );
-        // Still breaking: the bytes at rest change width, so the offline
-        // transformer is still the route. Provable and breaking are independent
-        // axes and this pins that they stayed independent.
         assert!(c.is_breaking(), "{old} -> {new} still rewrites data at rest");
     }
 
@@ -609,7 +513,6 @@ fn scenario_2_the_classifier_calls_the_widening_table() {
     }
 }
 
-/// `T -> ?T` needs no author; `?T -> T` does.
 #[test]
 fn scenario_3b_widening_nullability_is_provable_and_narrowing_is_not() {
     let n = |old: bool, new: bool| SchemaChange::ChangeFieldNullability {
@@ -625,12 +528,6 @@ fn scenario_3b_widening_nullability_is_provable_and_narrowing_is_not() {
     assert!(n(true, false).is_breaking());
 }
 
-/// A rename rewrites data at rest.
-///
-/// The model's directory name and the column's file name are both derived from
-/// the declared name, so a renamed field's bytes do not follow it across a
-/// reopen. Reporting a rename as non-breaking routed the operator to the
-/// "additive — just reopen" message, which silently empties the column.
 #[test]
 fn a_rename_is_breaking_even_though_it_needs_no_author() {
     let f = SchemaChange::RenameField {

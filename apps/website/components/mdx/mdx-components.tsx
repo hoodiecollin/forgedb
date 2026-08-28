@@ -19,7 +19,6 @@ function anchor(id?: string) {
   ) : null;
 }
 
-/** Side-by-side comparison used for `.forge` → generated-output showcases. */
 function Compare({ children }: { children: ReactNode }) {
   return (
     <div className="my-5 grid gap-4 md:grid-cols-2 [&_pre]:my-0 [&>div>:first-child]:mt-0">
@@ -125,12 +124,6 @@ export const mdxComponents: MDXComponents = {
       {...props}
     />
   ),
-  // Inline `<code>` is styled globally (`code:not(pre code)` in globals.css) so MDX,
-  // callouts, and TSX chips all match — no per-component override needed here. Table
-  // cells (<td> above) add `whitespace-nowrap` + `text-xs`: prose chips wrap normally
-  // (nowrap would overflow long multi-word spans on narrow screens), but narrow table
-  // columns otherwise break flags like `--verbose` mid-token at the hyphen, and the
-  // overflow-x-auto wrapper is a safe fallback there.
   pre: Pre,
   figure: ({ className, ...props }) => <figure className={cn("my-4", className)} {...props} />,
   figcaption: ({ className, ...props }) => (

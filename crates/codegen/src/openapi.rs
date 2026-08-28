@@ -1,30 +1,10 @@
-//! OpenAPI 3.1 specification generator.
-//!
-//! Emits a standalone OpenAPI document describing the REST surface the
-//! [`ApiGenerator`](crate::ApiGenerator) produces — **without compiling or
-//! running the generated crate**. It mirrors the actual generated routes
-//! (`/api/<kebab>` list + create, `/api/<kebab>/{id}` get + replace + delete)
-//! and the serialized model shapes, so `forgedb generate openapi` yields the
-//! spec at schema-compile time.
-//!
-//! This is deliberately distinct from the runtime `utoipa` `ApiDoc` /
-//! `openapi_json()` emitted into the generated `api.rs`: that path requires
-//! building and running the app to produce a spec, whereas this is the offline,
-//! generate-time artifact the CLI writes to `openapi.json`.
-//!
-//! Identity note: this is a generator (schema → spec string), not a runtime
-//! engine. It reads the compile-time schema and emits a tailored document; it
-//! ships nothing that interprets a schema at runtime.
-
 use crate::{GeneratedCode, Result, RustGenerator};
 use forgedb_parser::{FieldType, Model, RelationType, Schema, Struct};
 use serde_json::{json, Map, Value};
 
-/// OpenAPI specification generator.
 pub struct OpenApiGenerator;
 
 impl OpenApiGenerator {
-    /// Generate an OpenAPI 3.1 spec (pretty-printed JSON) from a schema.
     pub fn generate(schema: &Schema) -> Result<GeneratedCode> {
         let spec = Self::build_spec(schema);
         let code = serde_json::to_string_pretty(&spec).map_err(|e| {
@@ -37,7 +17,6 @@ impl OpenApiGenerator {
         })
     }
 
-    /// Build the full OpenAPI document as a JSON value.
     fn build_spec(schema: &Schema) -> Value {
         let mut paths = Map::new();
         for model in &schema.models {
@@ -47,13 +26,9 @@ impl OpenApiGenerator {
         }
 
         let mut schemas = Map::new();
-        // Component schemas: one per model, plus one per inline struct a model
-        // field may `$ref`.
         for st in &schema.structs {
             schemas.insert(st.name.clone(), Self::struct_schema(schema, st));
         }
-        // One string-enum component schema per declared enum (#enum): a field of
-        // that type `$ref`s it, exactly like a struct.
         for en in &schema.enums {
             schemas.insert(en.name.clone(), Self::enum_schema(en));
         }
@@ -77,7 +52,6 @@ impl OpenApiGenerator {
         })
     }
 
-    /// The `/api/<kebab>` path item: `GET` (list) + `POST` (create).
     fn collection_path(model: &Model) -> Value {
         let name = &model.name;
         let model_ref = Self::model_ref(name);
@@ -115,7 +89,6 @@ impl OpenApiGenerator {
         })
     }
 
-    /// The `/api/<kebab>/{id}` path item: `GET` + `PUT` (replace) + `DELETE`.
     fn item_path(model: &Model) -> Value {
         let name = &model.name;
         let model_ref = Self::model_ref(name);
@@ -173,7 +146,6 @@ impl OpenApiGenerator {
         })
     }
 
-    /// The `{ "id": "..." }` body returned by create/replace.
     fn id_response() -> Value {
         json!({
             "type": "object",
@@ -181,23 +153,18 @@ impl OpenApiGenerator {
         })
     }
 
-    /// A `$ref` to a model's component schema.
     fn model_ref(name: &str) -> Value {
         json!({ "$ref": format!("#/components/schemas/{}", name) })
     }
 
-    /// Component schema for a model: the stored/serialized scalar and FK fields.
     fn model_schema(schema: &Schema, model: &Model) -> Value {
         Self::object_schema(schema, &model.name, &model.fields)
     }
 
-    /// Component schema for an inline struct (all fields are fixed-size scalars).
     fn struct_schema(schema: &Schema, st: &Struct) -> Value {
         Self::object_schema(schema, &st.name, &st.fields)
     }
 
-    /// Component schema for a declared enum (#enum): a string with the closed set
-    /// of variant names, e.g. `{ "type": "string", "enum": ["Active", ...] }`.
     fn enum_schema(en: &forgedb_parser::EnumDef) -> Value {
         let variants: Vec<Value> = en
             .variants
@@ -211,17 +178,13 @@ impl OpenApiGenerator {
         })
     }
 
-    /// Build an `object` schema from a field list, skipping virtual fields that
-    /// carry no data payload (one-to-many / many-to-many collections and
-    /// component references — they serialize to `null` and are never part of a
-    /// create/replace body). Non-nullable fields are marked `required`.
     fn object_schema(schema: &Schema, name: &str, fields: &[forgedb_parser::Field]) -> Value {
         let mut properties = Map::new();
         let mut required: Vec<Value> = Vec::new();
 
         for field in fields {
             let Some(prop) = Self::field_schema(schema, &field.field_type) else {
-                continue; // virtual / component field — not represented in the body
+                continue;
             };
             properties.insert(field.name.clone(), prop);
             if !field.is_nullable() {
@@ -242,8 +205,6 @@ impl OpenApiGenerator {
         Value::Object(obj)
     }
 
-    /// Map a field type to its OpenAPI schema, or `None` for virtual fields that
-    /// have no serialized data value.
     fn field_schema(schema: &Schema, field_type: &FieldType) -> Option<Value> {
         Some(match field_type {
             FieldType::U32 => json!({ "type": "integer", "format": "int32", "minimum": 0 }),
@@ -253,11 +214,6 @@ impl OpenApiGenerator {
             FieldType::F64 => json!({ "type": "number", "format": "double" }),
             FieldType::Bool => json!({ "type": "boolean" }),
             FieldType::String => json!({ "type": "string" }),
-            // #238: an inline `string(N)` is a *string* on the wire — its fixed
-            // slot is a storage fact, invisible to a client. The width is the
-            // one thing worth publishing, and it is a CHARACTER count, which is
-            // exactly what OpenAPI's `maxLength` means. The exact form pins
-            // `minLength` to the same number.
             FieldType::StringN { chars, exact } => {
                 let n = *chars as u64;
                 if *exact {
@@ -266,14 +222,9 @@ impl OpenApiGenerator {
                     json!({ "type": "string", "maxLength": n })
                 }
             }
-            // `json` accepts any JSON value. In JSON Schema 2020-12 an empty
-            // schema validates everything; keep a description for readability.
             FieldType::Json => json!({ "description": "Arbitrary JSON value" }),
-            // decimal serializes as a precision-preserving JSON string.
             FieldType::Decimal => json!({ "type": "string", "format": "decimal" }),
             FieldType::Uuid => json!({ "type": "string", "format": "uuid" }),
-            // #254: RFC 3339 on the wire — a strictly better contract than
-            // `format: int64`, and one every OpenAPI client already understands.
             FieldType::Timestamp(p) => json!({
                 "type": "string",
                 "format": "date-time",
@@ -282,8 +233,6 @@ impl OpenApiGenerator {
                     p.key()
                 )
             }),
-            // char(N) serializes as an N-byte array (`[u8; N]`), so it is a
-            // fixed-length array of bytes on the wire, not a string.
             FieldType::Bytes(n) => json!({
                 "type": "array",
                 "items": { "type": "integer", "minimum": 0, "maximum": 255 },
@@ -300,13 +249,9 @@ impl OpenApiGenerator {
                     "maxItems": *n
                 })
             }
-            // An enum serializes as its variant name string; reference the
-            // per-enum string-enum component schema (#enum).
             FieldType::Enum(enum_name) => Self::model_ref(enum_name),
             FieldType::StructType(struct_name) => Self::model_ref(struct_name),
             FieldType::OptionalStructType(struct_name) => {
-                // OpenAPI 3.1 / JSON Schema 2020-12: nullability is a schema, not
-                // a keyword — allow the ref or an explicit null.
                 json!({
                     "anyOf": [ Self::model_ref(struct_name), { "type": "null" } ]
                 })
@@ -316,19 +261,12 @@ impl OpenApiGenerator {
                 Self::make_nullable(&mut inner_schema);
                 inner_schema
             }
-            // #266: an FK serializes as the TARGET's identity value, so its
-            // schema is the target key's schema.  Describing every FK as
-            // `{"type":"string","format":"uuid"}` was not merely unhelpful for a
-            // `u64` key — the server sends a JSON number, so the document lied.
             FieldType::Relation(rel) => match rel {
                 RelationType::RequiredReference(target)
                 | RelationType::OptionalReference(target) => {
                     let optional = matches!(rel, RelationType::OptionalReference(_));
-                    // An unresolvable target is a validation error; fall back to
-                    // the pre-#266 shape rather than dropping the property.
                     let key = RustGenerator::fk_backing_type(schema, field_type)
                         .unwrap_or(FieldType::Uuid);
-                    // Optionality is applied here, so the key is unwrapped first.
                     let key = match key {
                         FieldType::Nullable(inner) => *inner,
                         k => k,
@@ -345,20 +283,14 @@ impl OpenApiGenerator {
                     }
                     fk
                 }
-                // Virtual collections have no scalar body value.
                 RelationType::OneToMany(_) | RelationType::ManyToMany(_) => return None,
             },
             FieldType::Component(_) => return None,
         })
     }
 
-    /// Mark a schema value nullable per OpenAPI 3.1 / JSON Schema 2020-12: append
-    /// `"null"` to a scalar `type`, or express a nullable composite (`$ref`,
-    /// `anyOf`/`allOf`, or a schema with no plain `type`) as `anyOf [schema,
-    /// null]`. There is no `nullable` keyword in 3.1.
     fn make_nullable(schema: &mut Value) {
         match schema.get("type") {
-            // Scalar type: widen it to a `["<type>", "null"]` union in place.
             Some(Value::String(t)) => {
                 let t = t.clone();
                 if let Some(obj) = schema.as_object_mut() {
@@ -368,7 +300,6 @@ impl OpenApiGenerator {
                     );
                 }
             }
-            // Already a type array: add "null" if not present.
             Some(Value::Array(types)) => {
                 let mut types = types.clone();
                 if !types.iter().any(|v| v == "null") {
@@ -378,7 +309,6 @@ impl OpenApiGenerator {
                     obj.insert("type".to_string(), Value::Array(types));
                 }
             }
-            // No plain type ($ref / anyOf / allOf): wrap in an anyOf with null.
             _ => {
                 let inner = schema.clone();
                 *schema = json!({ "anyOf": [inner, { "type": "null" }] });
@@ -386,8 +316,6 @@ impl OpenApiGenerator {
         }
     }
 
-    /// Convert PascalCase to kebab-case — identical to `ApiGenerator`'s route
-    /// casing, so the documented paths match the generated ones.
     fn to_kebab_case(s: &str) -> String {
         let mut result = String::new();
         for (i, c) in s.chars().enumerate() {

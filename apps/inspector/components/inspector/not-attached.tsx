@@ -6,10 +6,6 @@ import { PlugZap } from "lucide-react";
 import { connectedAtom } from "@/lib/inspector/atoms";
 import { Button } from "@/components/ui/button";
 
-/**
- * Shown wherever a Live surface needs the running API server. The Structure
- * lens (schema, storage, stats) still works at rest, so the copy points there.
- */
 export function NotAttached({
   title,
   body,

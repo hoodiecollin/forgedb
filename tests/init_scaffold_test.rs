@@ -1,28 +1,8 @@
-//! What `forgedb init` scaffolds after #335 — and, just as load-bearing, what it
-//! no longer scaffolds.
-//!
-//! Plan #347 scenario **37**. Scenario 34's `init` rows (`--rust`,
-//! `--api-only`) live in `tests/removed_surface_test.rs` with the other four:
-//! the removed surface is one cross-cutting rule, and a rule split across the
-//! three files that happened to implement it cannot notice a row going missing.
-//!
-//! Every assertion runs the real binary in a tempdir with `FORGEDB_HOME`
-//! redirected (see `cache_home_isolation_test`), because the thing under test is
-//! the *files on disk after the command*, and a unit test that called the
-//! scaffolder directly would prove nothing about the clap surface that reaches
-//! it.
-//!
-//! **Anchored on the work, not on labels.** The Dockerfile "drives the CLI" is
-//! asserted as the presence of the `--print-artifact server` *invocation* and the
-//! absence of any `cargo build` of a user crate — not on the word "forgedb"
-//! appearing in a comment, which the old Dockerfile also managed.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::TempDir;
 
-/// Run `forgedb <args...>` in `dir`, with the ForgeDB home redirected inside it.
 fn forgedb(dir: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_forgedb"))
         .current_dir(dir)
@@ -32,9 +12,6 @@ fn forgedb(dir: &Path, args: &[&str]) -> Output {
         .expect("run forgedb")
 }
 
-/// `forgedb init <name>` in a fresh tempdir; returns the tempdir and the project
-/// directory. Panics with the captured output if the command failed, so a
-/// regression reads as the CLI's own diagnostic rather than as a missing file.
 fn scaffold(name: &str) -> (TempDir, PathBuf) {
     let tmp = TempDir::new().expect("tempdir");
     let out = forgedb(tmp.path(), &["init", name]);
@@ -53,12 +30,6 @@ fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-// ---------------------------------------------------------------------------
-// Scenario 37 — `forgedb init` scaffolds no cargo package.
-// ---------------------------------------------------------------------------
-
-/// The headline: nothing in the scaffold is a cargo package, because the
-/// generated Rust is compiled in ForgeDB's cache now (#335 §15).
 #[test]
 fn init_scaffolds_no_cargo_package() {
     let (_tmp, project) = scaffold("myapp");
@@ -81,7 +52,6 @@ fn init_scaffolds_no_cargo_package() {
         "init scaffolded a server main.rs"
     );
 
-    // What it DOES scaffold, so "delete everything" cannot pass this test.
     for present in ["schema.forge", "forgedb.toml", ".gitignore", "README.md"] {
         assert!(
             project.join(present).exists(),
@@ -91,9 +61,6 @@ fn init_scaffolds_no_cargo_package() {
     assert!(project.join("generated").is_dir(), "no generated/ directory");
 }
 
-/// The deploy files are present for EVERY project now — they used to be gated on
-/// the Rust scaffold existing (`init.rs`'s `options.rust || !options.api_only`),
-/// and that gate is gone with the scaffold.
 #[test]
 fn init_always_emits_the_deploy_files() {
     let (_tmp, project) = scaffold("myapp");
@@ -113,17 +80,11 @@ fn init_always_emits_the_deploy_files() {
     }
 }
 
-/// The Dockerfile drives the CLI and copies out the path ForgeDB *reports*.
-///
-/// Anchored on the invocation, not on prose: the pre-#335 Dockerfile also said
-/// "ForgeDB" in a comment while doing `RUN cargo build --release` on a scaffolded
-/// crate that no longer exists.
 #[test]
 fn the_dockerfile_drives_the_cli_and_copies_the_reported_artifact() {
     let (_tmp, project) = scaffold("myapp");
     let dockerfile = read(&project.join("Dockerfile"));
 
-    // It resolves the artifact rather than constructing a path.
     assert!(
         dockerfile.contains("--print-artifact server"),
         "the Dockerfile does not ask ForgeDB where the server binary is:\n{dockerfile}"
@@ -140,15 +101,12 @@ fn the_dockerfile_drives_the_cli_and_copies_the_reported_artifact() {
         dockerfile.contains("cargo install forgedb --version"),
         "the Dockerfile does not install a PINNED forgedb:\n{dockerfile}"
     );
-    // The pin is this CLI's own version — a scaffold that pinned some other
-    // release would generate different code than the CLI that wrote it.
     assert!(
         dockerfile.contains(&format!("--version {}", env!("CARGO_PKG_VERSION"))),
         "the Dockerfile pins a version other than {}:\n{dockerfile}",
         env!("CARGO_PKG_VERSION")
     );
 
-    // Every input of the old builder stage is gone.
     for dead in [
         "COPY Cargo.toml",
         "COPY src ./src",
@@ -161,7 +119,6 @@ fn the_dockerfile_drives_the_cli_and_copies_the_reported_artifact() {
         );
     }
 
-    // CONTRACT-artifact-report §6, properties 1 and 2.
     assert!(
         dockerfile.contains("ENV FORGEDB_HOME=/forgedb"),
         "the builder stage does not name the build cache explicitly:\n{dockerfile}"
@@ -171,10 +128,6 @@ fn the_dockerfile_drives_the_cli_and_copies_the_reported_artifact() {
         "the runtime data root is not an absolute path outside the cache:\n{dockerfile}"
     );
 
-    // Property 3: `--print-artifact` is handed the stable KIND, never a package
-    // name — package names are derived from the app's path and change when the
-    // schema file is moved or renamed. Asserted by reading the token that
-    // follows the flag.
     let invocation = dockerfile
         .lines()
         .find(|l| !l.trim_start().starts_with('#') && l.contains("$(forgedb build"))
@@ -191,8 +144,6 @@ fn the_dockerfile_drives_the_cli_and_copies_the_reported_artifact() {
     );
 }
 
-/// The on-host path is the container path's sibling and must not have been left
-/// behind on `cargo build` either.
 #[test]
 fn the_systemd_readme_installs_the_reported_artifact() {
     let (_tmp, project) = scaffold("myapp");
@@ -208,16 +159,11 @@ fn the_systemd_readme_installs_the_reported_artifact() {
     );
 }
 
-/// `.gitignore` stops ignoring `/generated/` wholesale (#335 §15): generated text
-/// is committed, only compiled output is ignored.
 #[test]
 fn the_gitignore_no_longer_ignores_generated_wholesale() {
     let (_tmp, project) = scaffold("myapp");
     let gitignore = read(&project.join(".gitignore"));
 
-    // A wholesale ignore is a bare `/generated/` (or `generated/`) PATTERN line —
-    // matched as a line rather than a substring so the narrow rules below, which
-    // contain the same characters, cannot make this pass vacuously.
     let wholesale: Vec<&str> = gitignore
         .lines()
         .map(str::trim)
@@ -229,16 +175,6 @@ fn the_gitignore_no_longer_ignores_generated_wholesale() {
         ".gitignore still ignores generated code wholesale ({wholesale:?}):\n{gitignore}"
     );
 
-    // ...and the artifact patterns are GONE from here (#337 decision 4). They
-    // hardcoded the literal `generated/`, which #333 made a per-app setting, so
-    // this file was already wrong for every project that configures `output`.
-    // Ignoring the delivered artifacts is `<output>/.gitignore`'s job now, and
-    // two files listing the same patterns is a drift source.
-    //
-    // Asserted as an ABSENCE of the pattern anywhere in the file, comments
-    // included: the old text explained the pattern in the words the pattern is
-    // written in, so a substring check that tolerated comments would pass on a
-    // file that still carried it.
     for stale in ["/generated/**/*.a", "/generated/**/*.lib"] {
         assert!(
             !gitignore.contains(stale),
@@ -247,29 +183,12 @@ fn the_gitignore_no_longer_ignores_generated_wholesale() {
         );
     }
 
-    // Data is still ignored — this is not "ignore nothing".
     assert!(
         gitignore.lines().any(|l| l.trim() == "/data/"),
         ".gitignore stopped ignoring the data directory:\n{gitignore}"
     );
 }
 
-// ---------------------------------------------------------------------------
-// S17 (#367, replaced by #479) — the id `init` mints
-// ---------------------------------------------------------------------------
-//
-// What stood here guarded `init --project-name`, the flag that decoupled the
-// project id from the directory name. The flag existed because the id was the
-// directory's last path component, so a scaffold whose directory name was
-// already taken had no other way to get a usable id. #479 mints the id instead,
-// which decouples them unconditionally — so the flag has nothing left to do and
-// the property worth guarding moved to the value `init` writes.
-
-/// `init` writes a minted `[project].id`, and two scaffolds never share one.
-///
-/// The uniqueness half is the point: under the derivation this replaced, these
-/// two `init api` runs produced the *same* id by construction, and the second
-/// project to run `generate` hit a collision it had to be talked out of.
 #[test]
 fn s17_init_mints_a_unique_committed_id() {
     let (_a, one) = scaffold("api");
@@ -287,33 +206,12 @@ fn s17_init_mints_a_unique_committed_id() {
     assert!(a.starts_with("id = \"api-"), "the slug keeps it legible: {a}");
     assert_ne!(a, b, "two scaffolds of the same directory name share an id");
 
-    // Committed, not cached: the whole reason it lives in `forgedb.toml` is that
-    // a teammate or a CI runner must resolve the same one, and `~/.forgedb` is
-    // machine-local and disposable.
     assert!(
         read(&one.join(".gitignore")).lines().all(|l| l.trim() != "forgedb.toml"),
         "the scaffold must not gitignore the file carrying the id"
     );
 }
 
-// ---------------------------------------------------------------------------
-// #338 scenario 14 — the scaffold parses against its own CLI, and opts out.
-// ---------------------------------------------------------------------------
-
-/// **#338 scenario 14.** The scaffolded `forgedb.toml` parses with the REAL
-/// loader and contains no `[placement]` table.
-///
-/// Two halves, and both are load-bearing.
-///
-/// *Parses*: `ForgeConfig` is `deny_unknown_fields` at every level, so adding a
-/// table the scaffold does not know about cannot break it — but adding a table
-/// the scaffold DOES write and the struct does not declare would break every
-/// scaffolded project against its own CLI. This is the guard `src/config.rs`
-/// names, and until now it did not exist as a test.
-///
-/// *No `[placement]`*: a scaffolded project is opted out **by absence**, which
-/// is the whole contract of #338. There is no affirmative "cache-only"
-/// spelling to assert instead, so the assertion is that the table is not there.
 #[test]
 fn s338_14_the_scaffolded_config_parses_and_carries_no_placement() {
     let (_tmp, project) = scaffold("myapp");

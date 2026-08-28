@@ -1,12 +1,3 @@
-//! Basic usage example for forgedb-wal
-//!
-//! Demonstrates creating a Write-Ahead Log (WAL), writing opaque `Raw`
-//! entries, and replaying them for crash recovery.
-//!
-//! The WAL is schema-agnostic: it stores and returns byte payloads verbatim.
-//! The encoding of each payload is owned entirely by the caller (generated
-//! code in production use).
-
 use forgedb_wal::{FsyncPolicy, WalEntry, WalManager, WalOperation};
 use std::path::PathBuf;
 
@@ -23,8 +14,6 @@ fn main() -> std::io::Result<()> {
     let mut wal = WalManager::open(&wal_path, FsyncPolicy::Always)?;
     println!("WAL opened at: {:?}\n", wal_path);
 
-    // In generated code the payload would be a serialized row struct.
-    // Here we use simple byte literals to illustrate the API.
     println!("--- Writing Raw Entries ---");
 
     let entry_a = WalEntry::raw("Post", b"serialized post row #1".to_vec());

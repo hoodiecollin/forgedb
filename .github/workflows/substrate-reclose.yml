@@ -1,76 +1,3 @@
-# Substrate outside-repo reclose — the "is `main` actually releasable?" check.
-#
-# ForgeDB's generated code links the substrate crates by their pinned versions,
-# resolved from crates.io. That creates a failure mode with no in-repo symptom:
-# work lands that makes generated code call a substrate API which has not been
-# published yet, an in-tree `cargo build` resolves it by workspace path and
-# passes, and an installed user resolving from the registry cannot build at all.
-# CI is green and the branch is unshippable. See CLAUDE.md → publish-gap rule, and
-# ai-pm-playbook PLAYBOOK.md §5.2.
-#
-# No test suite can catch that, because what is broken is the relationship between
-# this repo and crates.io, and the repo cannot observe it. The only proof is this:
-# scaffold a project OUTSIDE the checkout, generate into it, and build it with
-# every `forgedb-*` dependency resolved from the registry. If a needed API is
-# unpublished, the build fails here and nowhere else.
-#
-# WHY THIS RUNS ON `main` AND NOT ON `develop`
-#
-# `develop` is where the current release cycle integrates and is *allowed* to carry
-# a publish gap — that is the whole point of holding the gap off the default branch.
-# Requiring this check there would leave it red for an entire cycle, and a check
-# that is always red is a check nobody reads. `main` is the branch that must stay
-# releasable, so this is where the gate belongs. The release order it enforces:
-# publish the substrate -> merge develop -> main -> tag.
-#
-# WHAT THE PINS ARE NOW, AND WHERE THEY LIVE (#335)
-#
-# There is no longer a scaffolded `Cargo.toml` in the user's project — `forgedb
-# init` writes none, and `forgedb build` compiles in ForgeDB's own cache
-# workspace under $FORGEDB_HOME. So the manifests this check must inspect are the
-# GENERATED ones, and they live at:
-#
-#   $FORGEDB_HOME/projects/<project-id>/apps/<app-hash>/{core,server,ffi,napi,pyo3,wasm}/Cargo.toml
-#
-# and the one lockfile that resolves them all is at the cache workspace root.
-# Only TWO of those six pin substrate at all:
-#
-#   * core/   — the big one: storage, types, changefeed, wal, compaction, txn,
-#               and coordinator under a `cfg(not(wasm32))` target table.
-#   * server/ — auth (with `jwks-http`) and query-params. It is the ONLY carrier
-#               of those two in the whole reclose; drop this arm and they leave
-#               coverage entirely.
-#
-# The four wrappers pin ZERO substrate by design: each depends on `core` alone and
-# reaches every substrate type through its re-exports, which is what makes their
-# types UNIFY with the database's rather than merely resolve to the same version.
-# A consequence worth stating, because it bit the previous version of this file:
-# `grep '^forgedb-' <wrapper>/Cargo.toml` now matches NOTHING and, under
-# `set -e`, kills the step. The substrate assertion therefore moved to the
-# LOCKFILE, where it is both more informative and indifferent to that choice.
-#
-# WHY `cargo build`, NOT `cargo check`
-#
-# The old rationale here said `napi`/`pyo3` were checked rather than built because
-# linking an extension-module cdylib tests the runner's Node/Python headers. That
-# is void: `napi build` and `maturin` are gone from this path, `forgedb build` has
-# no check mode, and the generated pyo3 package now carries a `build.rs` that
-# supplies `-undefined dynamic_lookup` itself.
-#
-# What `build` buys that `check` cannot is a whole failure class: **`cargo check`
-# never links, so it cannot see an output filename collision at all**. Cargo
-# reports that condition as a WARNING, exits 0, and leaves exactly one of the two
-# files behind — after which a command resolving a binary by name can run the
-# wrong one. `check` reports nothing there; only a linking build does.
-#
-# Hence also the [ubuntu-22.04, macos-14] matrix: the pyo3 link failure that
-# shipped once is macOS-only (Linux `ld -shared` permits undefined symbols), so a
-# Linux-only reclose is green on exactly the platform where it breaks.
-#
-# Cost went DOWN with all of this, not up. The old file compiled FIVE
-# byte-identical copies of `database.rs`, one per scaffold. There is now one
-# `core` rlib that `server` and the four wrappers link. Layering is what makes a
-# linking build affordable.
 name: Substrate reclose
 
 on:
@@ -78,11 +5,6 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  # Run before cutting a tag, and any time you want to know whether the gap is
-  # currently open without waiting for a merge. #335's own branch never triggers
-  # the push/pull_request arms, so dispatch this against the branch and get it
-  # green BEFORE merging — otherwise its first real execution is the release
-  # merge, where it is a release blocker.
   workflow_dispatch:
 
 permissions:
@@ -104,7 +26,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Toolchain comes from rust-toolchain.toml (channel 1.96).
       - uses: Swatinem/rust-cache@v2
 
       - name: Build the forgedb CLI
@@ -377,16 +298,6 @@ jobs:
           sys.exit(1 if fail else 0)
           PY
 
-      # ---------------------------------------------------------------------
-      # One step per emitter, so a failure names the emitter rather than "the
-      # build". Each prints the pins it is about to resolve, so a failing log
-      # shows the requirement next to the resolution that rejected it.
-      #
-      # `forgedb build` compiles every package the project declares, so after the
-      # first arm the rest are incremental: the split costs essentially nothing
-      # and buys the naming.
-      # ---------------------------------------------------------------------
-
       - name: 1/6 core + server — the two packages that pin substrate
         shell: bash
         env:
@@ -614,9 +525,6 @@ jobs:
           test ! -e "$HOME/.forgedb"
 
       - name: Report open release gates
-        # Informational: names anything still blocking the next tag. Never fails
-        # the job — the reclose above is the mechanical gate; this is the human
-        # one, and its rows may legitimately be open mid-cycle.
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
@@ -632,26 +540,6 @@ jobs:
             echo "No open release gates."
           fi
 
-  # ---------------------------------------------------------------------------
-  # migrate_tests — relocated here from the nightly ignored suite (#390).
-  # ---------------------------------------------------------------------------
-  #
-  # This test compiles a real transformer against the PUBLISHED substrate. That makes it
-  # a measurement of the same thing the job above measures — this repo's relationship to
-  # crates.io — and NOT a measurement of the commit under test.
-  #
-  # Which is exactly why it cannot live in the nightly. The nightly watches `develop`, and
-  # `develop` is *allowed* to carry a publish gap; that is the whole point of holding the
-  # gap off the default branch. Run there, this test would be red for most of every cycle
-  # for a completely correct reason — and a job that is permanently red stops being read,
-  # which is the non-control #390 was filed to remove.
-  #
-  # It runs on `main`, where a failure means something is genuinely wrong, and it runs on
-  # ONE host: it is a network- and minutes-heavy compile, and the matrix above exists to
-  # catch host-specific scaffold problems, which this test does not probe.
-  #
-  # tests/ci_gate_test.rs asserts this step still exists. `make test-ignored` skips this
-  # test by name, so without a home here that skip would silently be a deletion.
   migrate:
     name: migrate_tests against the published substrate
     runs-on: ubuntu-22.04
@@ -661,67 +549,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run migrate_tests
-        # --ignored is load-bearing: without it libtest FILTERS THE TEST OUT and the step
-        # passes having run nothing at all.
         run: cargo test --test migrate_tests -- --ignored --nocapture
 
-  # ---------------------------------------------------------------------------
-  # parent-workspace — the reclose under a FOREIGN cargo workspace root (#339).
-  # ---------------------------------------------------------------------------
-  #
-  # The job above scaffolds into a bare `mktemp -d` with no parent workspace root.
-  # That is not what a real consumer's tree looks like, and it is exactly why #330
-  # case A — a scaffold that could not build inside a workspace — was invisible to
-  # CI through the whole of v0.4.0. This job supplies the shape the other one
-  # cannot: a `[workspace]` root the consumer owns, one member they own, the app
-  # and the build cache beneath it.
-  #
-  # THIS JOB IS EXPECTED TO BE GREEN ON DAY ONE, AND THAT IS NOT REDUNDANCY.
-  #
-  # It is a REGRESSION AND COVERAGE guard, not a bug-finder. Every property below
-  # was measured green before the job was written — the cache resolves its own
-  # workspace root under a foreign one, ForgeDB leaves the foreign root
-  # byte-identical, and the generated Rust SDK compiles against real reqwest. A
-  # green first run must not be read as evidence there was nothing to check: what
-  # these steps hold is that the epic's central claim — the cache directory is why
-  # #328 mostly dissolves — stays true, and that three surfaces nothing else
-  # compiles keep compiling.
-  #
-  # WHY THE SDK IS BUILT BY ADOPTION AND NOT IN PLACE
-  #
-  # An earlier design ran `cargo build` inside `generated/rust-sdk`, expected it to
-  # fail with cargo's "current package believes it's in a workspace when it's not",
-  # and fixed that by emitting a `[workspace]` table into the generated package.
-  # That remedy is withdrawn (#430, closed as not-a-defect): a nested package
-  # carrying `[workspace]` that any member path-depends on makes cargo fail the
-  # ENTIRE workspace, so it is buildable only while nothing depends on it. With the
-  # fix gone, an in-place build under a foreign root has no green state at all.
-  #
-  # The shape that does is the one #338 already prescribes: the consumer ADOPTS the
-  # crate with one path dep from a crate they own, and cargo makes it an implicit
-  # member. The step deliberately does NOT assert the pre-adoption failure —
-  # encoding cargo's error text as a required property would make a future cargo
-  # relaxation read as a ForgeDB regression, and the property worth holding is "a
-  # consumer in a workspace can build what we wrote", not "cargo still refuses".
-  #
-  # WHY UBUNTU ONLY, AND WHY THE TARGETS ARE NARROWED
-  #
-  # Cost. The matrix on the job above exists to catch host-specific LINK problems
-  # (the macOS-only pyo3 `-undefined dynamic_lookup` failure); nothing here probes
-  # one. `[generate].targets` is narrowed to rust + api + rust-sdk for the same
-  # reason: the wrappers pin zero substrate and are already covered arm by arm
-  # above, so compiling them again under a foreign root buys nothing.
-  #
-  # WHY IN-TREE IS `P4` HERE AND NOT `7/7` ABOVE
-  #
-  # The property in-tree placement measures — a ForgeDB-owned package joining a
-  # foreign cargo workspace and resolving its substrate pins in the CONSUMER's
-  # lockfile — only exists under a foreign root. In the bare job it would test a
-  # shape no consumer has. And renumbering `0/6 … 6/6` would break every tier-1
-  # guard keyed to those step names, loudly but pointlessly.
-  #
-  # NO CARGO_TARGET_DIR HERE, deliberately: "the cache has its own target/" is one
-  # of the properties P1 asserts, and a shared redirect would make it unobservable.
   parent-workspace:
     name: reclose under a foreign cargo workspace root
     runs-on: ubuntu-22.04

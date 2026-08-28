@@ -1,47 +1,5 @@
-//! Integer auto-increment behaviour (#187), proved by **running** generated code.
-//!
-//! # Why this test exists in this form
-//!
-//! The counter is not a string in the emitted source — it is a value handed out
-//! over time, across a compaction, across a reopen, and across threads. Every
-//! property #187 promises is a property of what the generated code *does*:
-//!
-//! - **Monotonic and unique**, never contiguous. A rolled-back transaction burns
-//!   its number, deliberately.
-//! - **Restart-safe.** The counter is in-memory, seeded by the reopen scan and
-//!   floored by a high-water mark in `Manifest.auto_sequences`.
-//! - **Reuse-free across compaction** — the one case a pure rescan cannot survive,
-//!   because compaction physically drops the rows the rescan derives the max from.
-//!
-//! A codegen snapshot compares emitted *strings* and can say none of that. The
-//! companion guards in `crates/codegen/tests/codegen_snapshots.rs` pin that the
-//! machinery is emitted at all; this file pins that it is correct.
-//!
-//! # The scenario that motivates the persistence
-//!
-//! `compact → drop → reopen → create` (`compaction_does_not_re_issue` below) is the
-//! whole reason a number is written to disk. It also fails **silently** in the most
-//! plausible wrong implementation: `compact()` does `*self = Self::new_at_no_rehydrate(..)`,
-//! which zeroes the counter *and* rewrites the manifest from inside the constructor.
-//! Miss either the max-merge or the save/reinstall and this reads as working until
-//! the second run after a compaction — so the assertion is on the **value**, never
-//! on "no error".
-//!
-//! It compiles a generated crate, so it is `#[ignore]`d out of the fast hermetic
-//! default suite. Run it explicitly:
-//!
-//! ```bash
-//! make auto-increment-test   # or:
-//! cargo test --test auto_increment_test -- --ignored --nocapture
-//! ```
-
 mod common;
 
-/// `Ticket` is the plain integer identity. `Invoice` carries a *non-identity*
-/// `&+u64` — the shape whose counter must be seeded by a column the ungated reopen
-/// scan does not otherwise decode. (#187 decision 6 once *required* that `&`; since
-/// #260 a bare `+u64` is legal too, and `&` marks a deliberate uniqueness
-/// constraint rather than a workaround.) `Small` is `+u32`, for the overflow guard.
 const SCHEMA: &str = r#"
 Ticket {
   id: +u64

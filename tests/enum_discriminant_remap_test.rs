@@ -1,83 +1,8 @@
-//! #438 — the **stored** half of the enum-reorder defect, witnessed by running
-//! two separately generated crates over one data directory.
-//!
-//! # Why this file cannot be a snapshot test
-//!
-//! An enum is persisted as a **positional 1-byte discriminant**: `generate_enum`
-//! builds `__to_u8`/`__from_u8` with `enumerate()`, so the variant's declaration
-//! index *is* the byte, and the variant's name never reaches disk. Reorder two
-//! variants and **not one byte on disk changes** — the bytes simply mean
-//! something else.
-//!
-//! Nothing that compares generated code as *strings* can see that. A codegen
-//! snapshot would show the two `match` arms swapping, which is the change the
-//! author intended and looks correct; the defect is what the swap does to bytes
-//! that were written before it. A test asserting on `database.rs` would be
-//! asserting on the diff's *shape*. Only a compiled, running pair of crates —
-//! one writing, the other reading the same directory — can observe it.
-//!
-//! # The two tests, and the different jobs they do
-//!
-//! 1. `a_reordered_enum_silently_remaps_a_stored_row` — the **witness**. It pins
-//!    the premise the tier-1 detection in `crates/migrations/tests/diff_tests.rs`
-//!    exists to serve.
-//!
-//!    **It is not a regression test and it does not flip with the #438 fix.**
-//!    That fix changes no generated code, so the re-map stays exactly as real as
-//!    it was; what changes is that `migrate create` now *reports* it. Saying so
-//!    plainly matters, because a test that can never go red on the change it
-//!    ships beside invites deletion. What it would go red on is the positional
-//!    encoding itself changing — which is the day the classification table in
-//!    `crates/migrations/src/types.rs` has to be revisited.
-//!
-//! 2. `the_json_transport_re_encodes_a_reordered_enum_by_name` — the claim the
-//!    **`Auto` classification rests on**. `ChangeEnumVariants` for a reorder is
-//!    classified `Auto`, meaning ForgeDB promises the operator that no authoring
-//!    is needed. That promise is only good if the transformer's hop really does
-//!    repair the row. If this test is red, the reorder row moves from `Auto` to
-//!    `Authored` and the table is wrong — which is exactly why it is a test and
-//!    not a paragraph.
-//!
-//! ## What test 2 exercises, and what it deliberately does not
-//!
-//! It runs the transformer's hop body — **`serde_json::to_value(&row_from)` →
-//! (field ops) → `serde_json::from_value::<v_to::Post>()` → `v_to` insert**,
-//! `crates/codegen/src/transform.rs` — across two *real generated crates*, with
-//! the field-op list empty, which is precisely what a `ChangeEnumVariants` hop
-//! emits (`build_model_ops` adds no structural op for it, by design).
-//!
-//! It does **not** shell out to `forgedb migrate build`. That is a deliberate
-//! limit, not an oversight: the transformer scaffold pins its substrate deps from
-//! **crates.io** (`forgedb-storage = "0.3"`), so a test that builds one is red for
-//! the whole of any cycle carrying a publish gap — which is why
-//! `test_migrate_build_reports_the_path_cargo_actually_wrote` is the single
-//! `--skip` in `make test-ignored`, and why `tests/ci_gate_test.rs` asserts that
-//! skip matches *exactly one* test. A second registry-dependent ignored test
-//! cannot be added without breaking that invariant. The mechanism under test is
-//! identical either way; only the crate that hosts it differs.
-//!
-//! # Running it
-//!
-//! Both tests generate and compile crates, so both are `#[ignore]`d out of the
-//! fast suite:
-//!
-//! ```bash
-//! make enum-remap-test      # or:
-//! cargo test --test enum_discriminant_remap_test -- --ignored --nocapture
-//! ```
-//!
-//! `cargo test --no-run` will NOT catch a break here: the drivers below are string
-//! literals a subprocess compiles at run time, so only *running* this file
-//! type-checks them (#381).
-
-// This file uses only `generate_compile_run_in` + `assert_driver_ok`; the rest of
-// the shared harness is dead *here* and live in its other consumers.
 #[allow(dead_code)]
 mod common;
 
 use std::path::PathBuf;
 
-/// The original ordering. `Draft` is discriminant 0.
 const SCHEMA_V1: &str = r#"enum Status { Draft, Published, Archived }
 
 Post {
@@ -87,9 +12,6 @@ Post {
 }
 "#;
 
-/// The first two variants swapped, and nothing else. `Published` is now
-/// discriminant 0 — so the byte `Draft` wrote reads back as `Published`, and
-/// every byte stays in range, so nothing fails.
 const SCHEMA_V2: &str = r#"enum Status { Published, Draft, Archived }
 
 Post {
@@ -99,8 +21,6 @@ Post {
 }
 "#;
 
-/// A scratch directory shared by the two crates a test generates. Outside both
-/// project dirs, because `assert_driver_ok` removes those on success.
 fn shared(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("forgedb-{tag}-shared-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -108,11 +28,6 @@ fn shared(tag: &str) -> PathBuf {
     dir
 }
 
-// ---------------------------------------------------------------------------
-// 1 — the witness
-// ---------------------------------------------------------------------------
-
-/// Writes one `Post { status: Draft }` into `argv[1]`.
 const WRITE_DRAFT: &str = r##"mod database;
 use database::*;
 mod api;
@@ -130,13 +45,6 @@ fn main() {
 }
 "##;
 
-/// Reads `argv[1]` back through a schema whose first two variants are swapped,
-/// and reports what the stored byte now means.
-///
-/// It asserts the value is `Published` — the WRONG one. That is the point: the
-/// row was written as `Draft` and no byte on disk has changed. If this ever
-/// reads `Draft`, the discriminant has stopped being positional and the whole
-/// classification table for `ChangeEnumVariants` needs revisiting.
 const READ_BACK: &str = r##"mod database;
 use database::*;
 mod api;
@@ -181,13 +89,6 @@ fn a_reordered_enum_silently_remaps_a_stored_row() {
     let _ = std::fs::remove_dir_all(&shared);
 }
 
-// ---------------------------------------------------------------------------
-// 2 — the round-trip the `Auto` classification promises
-// ---------------------------------------------------------------------------
-
-/// Writes one `Post { status: Draft }`, then emits the row exactly as the
-/// transformer's hop does — `serde_json::to_value(&row)` — into
-/// `<data dir>/../row.json`.
 const EMIT_ROW_JSON: &str = r##"mod database;
 use database::*;
 mod api;
@@ -218,12 +119,6 @@ fn main() {
 }
 "##;
 
-/// The hop's remaining two steps under the *new* schema: decode the v1 JSON into
-/// the v2 typed struct and insert it, then read it back.
-///
-/// The field-op list a `ChangeEnumVariants` hop emits is EMPTY (see
-/// `build_model_ops`), so an identity body is the whole transform — which is
-/// what makes this the real mechanism rather than a stand-in for it.
 const DECODE_AND_INSERT: &str = r##"mod database;
 use database::*;
 mod api;

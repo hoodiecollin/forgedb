@@ -1,22 +1,3 @@
-# PyPI distribution for the `forgedb` CLI — epic #173 / issue #185.
-#
-# The ONE channel cargo-dist can't drive (dist has no PyPI support). maturin
-# `bindings = "bin"` (see pyproject.toml) wraps the compiled `forgedb` binary —
-# plus the bundled `forgedb-lsp`, via the crate's `lsp` feature — into a
-# self-contained console wheel per platform, so `uv tool install hoodiecollin-forgedb`
-# / `pip install hoodiecollin-forgedb` deliver the CLI with no Rust toolchain
-# (bare `forgedb` is taken on PyPI; the installed command is still `forgedb`).
-#
-# Runs off the SAME `v*` tag that drives dist-workspace.toml's release.yml, and
-# derives the wheel version from the crate version (pyproject `dynamic`), keeping
-# this channel in lockstep. Wheel targets mirror #182's matrix
-# (manylinux/musllinux ↔ the gnu/musl Linux targets). Independent of dist — it
-# shares only the "cross-build works" prerequisite.
-#
-# Publishing uses PyPI **Trusted Publishing (OIDC)** — no stored secret. The
-# pending publisher is registered on PyPI (project `hoodiecollin-forgedb`, repo
-# `hoodiecollin/forgedb`, workflow `pypi.yml`, environment `pypi`); PRs/manual
-# runs only build+validate wheels, and only a stable `v*` tag publishes.
 name: PyPI
 
 on:
@@ -62,12 +43,6 @@ jobs:
             target: x86_64
             manylinux: musllinux_1_2
           - name: macos-x86_64
-            # Cross-compiled on an Apple-Silicon runner (macos-14) rather than a
-            # native Intel one (macos-13): GitHub's Intel-macOS runners are scarce
-            # and being retired, and a `bin` wheel is just the compiled binary, so
-            # x86_64-apple-darwin cross-builds cleanly from arm64. The x86_64 wheel
-            # therefore can't be run on this host — it is excluded from the smoke
-            # test below (only same-arch wheels self-test).
             runner: macos-14
             target: x86_64
             manylinux: 'off'
@@ -75,18 +50,11 @@ jobs:
             runner: macos-14
             target: aarch64
             manylinux: 'off'
-          # Windows (windows-x86_64) intentionally omitted: the `forgedb` binary is
-          # currently Unix-only (storage-native positional I/O + coordinator Unix
-          # sockets), so its wheel can't build. Mirrors dist dropping the Windows
-          # target — tracked in #209.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
-      # bindings/features come from pyproject.toml ([tool.maturin]); this only
-      # needs the target + release + output dir. A `bin` wheel is
-      # py3-none-<platform> — one wheel per platform, no per-interpreter builds.
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
@@ -95,8 +63,6 @@ jobs:
           args: --release --out dist
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
       - name: Smoke-test the wheel (same-arch runners only)
-        # Only wheels whose arch matches the host can self-execute. macos-x86_64 is
-        # cross-built on arm64 (macos-14), so it can't run here — skip it.
         if: ${{ matrix.name == 'linux-x86_64-gnu' || matrix.name == 'macos-aarch64' }}
         shell: bash
         run: |
@@ -132,18 +98,11 @@ jobs:
     name: publish to PyPI
     needs: [wheels, sdist]
     runs-on: ubuntu-22.04
-    # Stable tag pushes publish automatically — PRs and `-prerelease` tags
-    # build+validate but never publish (mirrors dist's prerelease gate so PyPI
-    # doesn't burn a version on an rc/beta tag). A manual dispatch publishes ONLY
-    # when explicitly opted in via the `publish` input (the recovery path for a
-    # tag run whose wheel never got a runner); a plain dispatch just validates.
     if: >-
       ${{ (startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, '-')) ||
           (github.event_name == 'workflow_dispatch' && inputs.publish) }}
     environment: pypi
     permissions:
-      # OIDC token exchange for Trusted Publishing — this is what authenticates
-      # the upload; no PyPI password/token secret is stored.
       id-token: write
     steps:
       - uses: actions/download-artifact@v4
@@ -155,5 +114,3 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
-          # No `password:` — the action mints a short-lived OIDC token and PyPI's
-          # pending/registered Trusted Publisher for this repo+workflow authorizes it.

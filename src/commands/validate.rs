@@ -3,18 +3,6 @@ use forgedb_parser::{ComponentProtocol, FieldType, ParsedSchema, Parser};
 use std::fs;
 use std::path::Path;
 
-/// The one seam behind CLI↔LSP diagnostic parity (epic #173).
-///
-/// Both surfaces derive their diagnostics from the *same* resilient parse:
-/// `Parser::parse_recover` returns a best-effort AST plus every syntax **and**
-/// semantic diagnostic at once (positioned, source-ordered). The CLI renders the
-/// resulting `ParsedSchema::diagnostics` here; the LSP (`crates/lsp-server`) calls
-/// `parse_recover` inside `update_document` and maps the identical set. The
-/// `tests/lsp_cli_parity.rs` fixture pins the two together over `examples/*`, so
-/// neither can drift onto a private notion of "valid".
-///
-/// Lexer errors remain fatal (no token stream to recover from) and surface as the
-/// `Err(String)` here — the LSP shows the same message as a single diagnostic.
 pub fn parse_and_validate(content: &str) -> std::result::Result<ParsedSchema, String> {
     Ok(Parser::new(content)?.parse_recover())
 }
@@ -22,21 +10,15 @@ pub fn parse_and_validate(content: &str) -> std::result::Result<ParsedSchema, St
 pub struct ValidateOptions {
     pub strict: bool,
     pub schema_only: bool,
-    /// `--implementations`: accepted but not yet enforced. The real check —
-    /// verifying every `@computed` field resolves — lands with the schema-
-    /// expression feature (`@computed(<expr>)`); until then this flag is a
-    /// documented no-op. See task #46.
     #[allow(dead_code)]
     pub implementations: bool,
     pub components: bool,
-    /// Explicit schema file path (from CLI `--schema` or config `[generate].schema`).
     pub schema: Option<String>,
 }
 
 pub fn run(options: ValidateOptions) -> Result<()> {
     ui::header("🔍", "Validating project");
 
-    // Find and read schema file — explicit path takes priority.
     let schema_path = match options.schema.as_deref() {
         Some(p) => p.to_string(),
         None => find_schema_file()?,
@@ -46,21 +28,10 @@ pub fn run(options: ValidateOptions) -> Result<()> {
     let schema_content = fs::read_to_string(&schema_path)
         .map_err(|e| CliError::SchemaNotFound(format!("{}: {}", schema_path, e)))?;
 
-    // Resilient parse via the shared CLI↔LSP seam: one call yields a best-effort
-    // AST plus every syntax and semantic diagnostic (positioned, source-ordered) —
-    // the exact set the LSP surfaces (#173 parity). Only a lexer error is fatal here.
     let parsed = parse_and_validate(&schema_content)
         .map_err(|e| CliError::SchemaValidation(format!("Lexer error: {}", e)))?;
     let schema = &parsed.schema;
 
-    // Syntax + schema-level semantic errors (naming, duplicates, dangling
-    // relations/type references, projection/index field references) are ALWAYS
-    // fatal — they are not advisory, so they fail regardless of `--strict`.
-    //
-    // Since #237 this list can also carry `Severity::Warning` entries (schema-
-    // language deprecations), so it is partitioned rather than tested for
-    // emptiness — the old `!is_empty()` check would have turned every deprecation
-    // into a hard validation failure.
     let diag = if parsed.diagnostics.is_empty() {
         crate::diagnostics::Report::default()
     } else {
@@ -79,7 +50,6 @@ pub fn run(options: ValidateOptions) -> Result<()> {
 
     ui::success("Schema valid");
 
-    // Count statistics
     let model_count = schema.models.len();
     let field_count: usize = schema.models.iter().map(|m| m.fields.len()).sum();
     let relation_count: usize = schema
@@ -99,33 +69,20 @@ pub fn run(options: ValidateOptions) -> Result<()> {
     ui::info(&format!("  {} relations", relation_count));
     ui::blank();
 
-    // If schema-only mode, we're done
     if options.schema_only {
         ui::success("Validation complete");
         return Ok(());
     }
 
-    // Beyond this point the schema is already known semantically valid (the
-    // `validate_schema` gate above is fatal). What remains are checks that are
-    // NOT pure-schema diagnostics and therefore stay CLI-only:
-    //   - filesystem: `--components` verifies referenced component files exist;
-    //   - advisory lints: the no-timestamp warning (soft, exit 0). The no-id lint
-    //     was promoted to a fatal schema diagnostic in #248.
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
 
-    // --components: check that component references are well-formed and that
-    // tsx:// / jsx:// component files exist on disk relative to the schema directory.
     if options.components {
-        // #437: `parent()` on a bare `schema.forge` yields `Some("")`, not `None`, so
-        // the `unwrap_or` this used to be never fired and component paths resolved against
-        // the filesystem root. `project::schema_dir` is the one definition that handles it.
         let schema_dir = crate::project::schema_dir(Path::new(&schema_path));
 
         for model in &schema.models {
             for field in &model.fields {
                 if let FieldType::Component(component_ref) = &field.field_type {
-                    // Empty path is always an error regardless of protocol.
                     if component_ref.path.is_empty() {
                         errors.push(format!(
                             "Component field '{}.{}' has an empty path",
@@ -142,7 +99,6 @@ pub fn run(options: ValidateOptions) -> Result<()> {
                                 ComponentProtocol::Api => unreachable!(),
                             };
 
-                            // Check for the file with its natural extension, or as-is.
                             let with_ext = schema_dir
                                 .join(format!("{}.{}", component_ref.path, ext));
                             let as_is = schema_dir.join(&component_ref.path);
@@ -160,9 +116,6 @@ pub fn run(options: ValidateOptions) -> Result<()> {
                             }
                         }
                         ComponentProtocol::Api => {
-                            // api:// paths are logical identifiers, not filesystem paths.
-                            // Validate that the path is well-formed (non-empty, no whitespace,
-                            // starts with a non-separator character).
                             if component_ref.path.contains(char::is_whitespace) {
                                 errors.push(format!(
                                     "Component field '{}.{}': api:// path '{}' must not \
@@ -181,14 +134,7 @@ pub fn run(options: ValidateOptions) -> Result<()> {
         }
     }
 
-    // Check for potential issues (warnings)
-    //
-    // The missing-identity advisory that used to live here is gone: #248 made it a
-    // fatal, positioned diagnostic in `crate::validate::collect_structure_errors`,
-    // so it now reaches the LSP too and a schema that would generate uncompilable
-    // code no longer exits 0.
     for model in &schema.models {
-        // Warn if model has no timestamp fields
         let has_timestamp = model
             .fields
             .iter()
@@ -202,7 +148,6 @@ pub fn run(options: ValidateOptions) -> Result<()> {
         }
     }
 
-    // Report errors and warnings
     if !errors.is_empty() {
         ui::blank();
         for error in &errors {
@@ -217,11 +162,6 @@ pub fn run(options: ValidateOptions) -> Result<()> {
         }
     }
 
-    // Determine success/failure.
-    //
-    // `--strict` is what turns validation issues into a non-zero exit (for CI);
-    // plain `validate` is advisory and always exits 0. Keep the message honest so
-    // it never says "failed" while the process exits successfully.
     if !errors.is_empty() {
         ui::blank();
         if options.strict {
@@ -235,10 +175,6 @@ pub fn run(options: ValidateOptions) -> Result<()> {
             errors.len()
         ));
     } else {
-        // Schema-level warnings (#237 deprecations) count toward the summary
-        // alongside the CLI-local advisory lints, so the closing line is honest
-        // about everything that was printed. Neither kind affects the exit code —
-        // not even under `--strict`, which escalates lints, not deprecations.
         let total_warnings = warnings.len() + diag.warnings;
         if total_warnings == 0 {
             ui::success("Validation passed with no issues");
@@ -267,8 +203,6 @@ mod tests {
         schema_path.to_str().unwrap().to_string()
     }
 
-    /// A schema with a tsx:// component reference to a file that does not exist
-    /// should fail validation when `--components --strict` is used.
     #[test]
     fn test_components_tsx_missing_file_strict_fails() {
         let dir = tempfile::tempdir().unwrap();
@@ -301,8 +235,6 @@ User {
         );
     }
 
-    /// A schema that has no component references passes `--components` without
-    /// errors even when `--strict` is set.
     #[test]
     fn test_components_no_refs_always_passes() {
         let dir = tempfile::tempdir().unwrap();
@@ -327,13 +259,10 @@ User {
         assert!(result.is_ok(), "expected ok for schema with no component refs: {result:?}");
     }
 
-    /// A tsx:// component reference whose file actually exists on disk passes
-    /// validation.
     #[test]
     fn test_components_tsx_existing_file_passes() {
         let dir = tempfile::tempdir().unwrap();
 
-        // Create the referenced component file
         let comp_dir = dir.path().join("components");
         fs::create_dir_all(&comp_dir).unwrap();
         fs::write(comp_dir.join("UserCard.tsx"), "export default function UserCard() {}").unwrap();

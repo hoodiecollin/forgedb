@@ -1,38 +1,3 @@
-//! Gate 3 for #140 — CORS on the generated HTTP routes, `Origin` on the generated
-//! WebSocket routes.
-//!
-//! # Why these live at the wire level
-//!
-//! Three of the decisions in #140 cannot be checked by a snapshot, because they are
-//! about what the *composed router* does rather than about what text is emitted:
-//!
-//! 1. **Omitting the layer is not the same as emitting an empty one.** A
-//!    `CorsLayer` with no configured origins still *answers* preflight `OPTIONS`
-//!    (200, no allow headers), whereas the generated routes — registered only with
-//!    `get`/`post`/`put`/`delete` — return **405**. Emitting an empty layer would
-//!    therefore change observable behavior for every existing deployment. Only a
-//!    real request can tell the two apart.
-//! 2. **The layer must be outermost, outside the auth guard.** Browsers send
-//!    preflight `OPTIONS` with **no** `Authorization` header, so a CORS layer placed
-//!    inside the tenant guard has its preflight rejected 401 and the browser reports
-//!    an opaque CORS failure. A snapshot sees `.layer(cors)` either way; only a
-//!    request through the guarded router sees 200-vs-401.
-//! 3. **WebSocket handshakes are not covered by CORS at all.** Browsers do not
-//!    preflight them and do not enforce CORS on them, so the server must check
-//!    `Origin` itself. Shipping "wire origins" without this would read as done when
-//!    it is half done.
-//!
-//! The generator-side counterparts (which functions exist, which methods and headers
-//! are configured, that no `allow_credentials` appears) are
-//! `test_api_generation_cors_*` in `crates/codegen/tests/codegen_snapshots.rs`. Both
-//! must move together.
-//!
-//! Compiles a generated crate, so it is `#[ignore]`d out of the fast default suite:
-//!
-//! ```bash
-//! make cors-test
-//! ```
-
 mod common;
 
 const SCHEMA: &str = r#"
@@ -50,9 +15,6 @@ fn cors_and_ws_origin_behavior() {
     common::assert_driver_ok(&out, &proj, "driver reported a CORS/origin mismatch");
 }
 
-/// The driver drives each router variant through `tower::oneshot` and asserts on
-/// status + the `access-control-allow-origin` header. No socket is needed: a
-/// preflight is an ordinary request, and a rejected WS upgrade never upgrades.
 const DRIVER: &str = r##"mod database;
 use database::*;
 

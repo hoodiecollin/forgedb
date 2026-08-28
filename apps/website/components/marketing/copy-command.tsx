@@ -11,7 +11,6 @@ export function CopyCommand({ command }: { command: string }) {
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch {
-      /* no-op */
     }
   };
   return (

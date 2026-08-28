@@ -12,7 +12,7 @@ fn test_writer_always_fsync() {
 
     let entry = WalEntry::raw("User", b"row bytes".to_vec());
     writer.write(&entry).unwrap();
-    assert_eq!(writer.bytes_since_fsync(), 0); // flushed immediately
+    assert_eq!(writer.bytes_since_fsync(), 0);
 
     std::fs::remove_dir_all(&temp_dir).unwrap();
 }
@@ -28,10 +28,10 @@ fn test_writer_never_fsync() {
 
     let entry = WalEntry::raw("User", b"row bytes".to_vec());
     writer.write(&entry).unwrap();
-    assert!(writer.bytes_since_fsync() > 0); // unflushed bytes remain
+    assert!(writer.bytes_since_fsync() > 0);
 
     writer.flush().unwrap();
-    assert_eq!(writer.bytes_since_fsync(), 0); // flushed after explicit call
+    assert_eq!(writer.bytes_since_fsync(), 0);
 
     std::fs::remove_dir_all(&temp_dir).unwrap();
 }
@@ -48,14 +48,11 @@ fn test_writer_periodic_fsync() {
 
     let entry = WalEntry::raw("User", b"row bytes".to_vec());
 
-    // First write should not fsync immediately
     writer.write(&entry).unwrap();
     assert!(writer.bytes_since_fsync() > 0);
 
-    // Wait for the period to elapse
     std::thread::sleep(Duration::from_millis(150));
 
-    // Next write should trigger fsync
     writer.write(&entry).unwrap();
     assert_eq!(writer.bytes_since_fsync(), 0);
 
@@ -87,8 +84,6 @@ fn test_writer_truncate() {
 
 #[test]
 fn test_writer_write_buffered_defers_fsync_but_persists_after_flush() {
-    // #170 group commit: write_buffered appends WITHOUT fsync (regardless of
-    // policy Always), and an explicit flush makes the batch durable + replayable.
     let temp_dir = std::env::temp_dir().join("forgedb_wal_writer_buffered");
     let _ = std::fs::remove_dir_all(&temp_dir);
     std::fs::create_dir_all(&temp_dir).unwrap();
@@ -96,7 +91,6 @@ fn test_writer_write_buffered_defers_fsync_but_persists_after_flush() {
     let wal_path = temp_dir.join("buffered.wal");
     let mut writer = WalWriter::new(&wal_path, FsyncPolicy::Always).unwrap();
 
-    // Buffered appends do not reset the fsync accounting (no sync happened).
     for i in 0..5u8 {
         writer
             .write_buffered(&WalEntry::raw("User", vec![i; 8]))
@@ -107,12 +101,9 @@ fn test_writer_write_buffered_defers_fsync_but_persists_after_flush() {
         "buffered appends leave bytes un-synced (no per-record fsync under Always)"
     );
 
-    // The bytes are still in the file (write_all happened); one flush makes the
-    // batch durable and resets the accounting.
     writer.flush().unwrap();
     assert_eq!(writer.bytes_since_fsync(), 0, "flush clears the un-synced accounting");
 
-    // All five entries replay in order (a reopened reader sees the flushed batch).
     let mut reader = WalReader::new(&wal_path).unwrap();
     let entries = reader.read_all().unwrap();
     assert_eq!(entries.len(), 5, "all buffered-then-flushed entries are durable + replayable");

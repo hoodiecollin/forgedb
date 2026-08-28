@@ -1,11 +1,5 @@
 "use client";
 
-/**
- * Console — query-first workbench. Compose predicates → see the generated
- * request → run. Tabs hold parallel work: a filter query, a live tail (typed
- * Added/Updated/Removed deltas), and a snapshot read (time-travel scrubber).
- */
-
 import { useAtom, useAtomValue, useSetAtom } from "jotai";
 import { toast } from "sonner";
 import { Clock, RefreshCw, Star } from "lucide-react";
@@ -32,7 +26,6 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { cn } from "@/lib/utils";
-
 const CONSOLE_COLS = ["id", "email", "created_at", "org →"];
 const tagColor = (k: string) =>
   k === "Added" ? "bg-ok" : k === "Updated" ? "bg-info" : "bg-danger";
@@ -48,7 +41,6 @@ export function ConsoleScreen() {
   const setScreen = useSetAtom(screenAtom);
   const setStudioModel = useSetAtom(studioModelAtom);
   const studioModel = useAtomValue(studioModelAtom);
-
   const rows = (GRID.User?.rows ?? []).slice(0, 5);
   const idxCount = predicates.filter((p) => p.idx).length;
   const scanCount = predicates.length - idxCount;
@@ -59,10 +51,6 @@ export function ConsoleScreen() {
         `  ${p.field}${p.op === "=" ? ".eq(" : ".gte("}${p.val})${p.idx ? "" : "   // scan"}`,
     )
     .join(",\n")}\n}`;
-
-  // #85: honest "as of" readout — the active lens is either live (newest) or a
-  // pinned snapshot's row-count **watermark** for the current model. There is no
-  // wall-clock instant; the token is a row-count position.
   const activePinName =
     snapshotToken &&
     pinned.find((p) => JSON.stringify(p.token) === JSON.stringify(snapshotToken))
@@ -71,9 +59,6 @@ export function ConsoleScreen() {
   const snapReadout = !snapshotToken
     ? "now (live)"
     : `${activePinName ?? "snapshot"} · ${studioModel} @ ${activeWatermark ?? "?"} rows`;
-
-  // Pin the server's current watermarks under an auto-numbered name (live-lens
-  // only — a capture needs the running API).
   const pinCurrent = async () => {
     if (!isTauri() || !connected) {
       toast.error("Attach to a running API to pin a snapshot");
@@ -87,10 +72,9 @@ export function ConsoleScreen() {
       toast.error(e instanceof Error ? e.message : String(e));
     }
   };
-
   return (
     <div className="flex h-full min-h-0">
-      {/* library rail */}
+      { }
       <aside className="flex w-56 flex-none flex-col overflow-auto border-r border-border bg-card/40">
         <RailHeading>Saved queries</RailHeading>
         {SAVED.map((q) => (
@@ -142,10 +126,9 @@ export function ConsoleScreen() {
           </button>
         ))}
       </aside>
-
-      {/* workspace */}
+      { }
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-        {/* tabs */}
+        { }
         <div className="flex flex-none items-center border-b border-border px-2">
           <TabBtn active={tab === "q1"} onClick={() => setTab("q1")}>
             Users where…
@@ -159,8 +142,7 @@ export function ConsoleScreen() {
             Snapshot
           </TabBtn>
         </div>
-
-        {/* QUERY TAB */}
+        { }
         {tab === "q1" ? (
           <div className="flex min-h-0 flex-1 flex-col overflow-auto">
             <div className="border-b border-border px-4 py-3.5">
@@ -243,8 +225,7 @@ export function ConsoleScreen() {
             <ResultsTable rows={rows} />
           </div>
         ) : null}
-
-        {/* LIVE TAB */}
+        { }
         {tab === "live" ? (
           <div className="flex min-h-0 flex-1 flex-col overflow-auto">
             <div className="flex items-center gap-3 border-b border-border px-4 py-3.5">
@@ -287,8 +268,7 @@ export function ConsoleScreen() {
             </div>
           </div>
         ) : null}
-
-        {/* SNAPSHOT TAB */}
+        { }
         {tab === "snap" ? (
           <div className="flex min-h-0 flex-1 flex-col overflow-auto">
             <div className="border-b border-border px-4 py-4">
@@ -300,10 +280,7 @@ export function ConsoleScreen() {
                   reading as of <span className="text-info">{snapReadout}</span>
                 </span>
               </div>
-              {/* #85: discrete snapshot selector (live + pinned captures). A
-                  ForgeDB snapshot is a row-count watermark, not a wall-clock
-                  instant, so this is a set of captured points — not a continuous
-                  time slider. */}
+              { }
               <div className="flex flex-wrap items-center gap-1.5">
                 <button
                   type="button"
@@ -369,7 +346,6 @@ export function ConsoleScreen() {
     </div>
   );
 }
-
 function ResultsTable({
   rows,
 }: {
@@ -406,7 +382,6 @@ function ResultsTable({
     </Table>
   );
 }
-
 function RailHeading({ children }: { children: React.ReactNode }) {
   return (
     <div className="px-3 pt-3.5 pb-1 text-[10px] uppercase tracking-wider text-muted-foreground">
@@ -414,7 +389,6 @@ function RailHeading({ children }: { children: React.ReactNode }) {
     </div>
   );
 }
-
 function TabBtn({
   active,
   onClick,
@@ -439,7 +413,6 @@ function TabBtn({
     </button>
   );
 }
-
 function Legend({ color, label }: { color: string; label: string }) {
   return (
     <span className="flex items-center gap-1.5">

@@ -1,45 +1,15 @@
-//! `Doc` subject targets — the variable-width mirror of the `Metric` targets (#218).
-//!
-//! `Metric` isolates `FixedColumn::export`; `Doc` isolates
-//! `VariableColumn::gather_buffered`, which ignores the requested indices and reads the
-//! **whole** committed offsets index plus the **whole** data region — dead versions
-//! included — into owned buffers on every scan. That cost is ~`A x live_bytes`, so where
-//! #221 was a *step* (a lost `mmap` fast path, flat in amplification) this should be a
-//! *slope*. Telling those two shapes apart is the point: a step is an implementation
-//! artifact, a slope is a real cost of keeping old versions.
-//!
-//! Two ForgeDB flavours are built from one macro:
-//!
-//! * `compacting` — the default generated build. Auto-compaction caps amplification at
-//!   `1 + 4000/live_rows`, so on a 10k-row corpus the whole reachable ladder is
-//!   1.0x-1.4x. Useful as the realistic-configuration reference, useless for
-//!   establishing a slope.
-//! * `unbounded` — the `churn_probe` variant (`compaction = false` + `fsync = "never"`).
-//!   Compaction-off lifts the ceiling so the ladder can reach 8x/16x/32x at all;
-//!   fsync-never keeps the preload affordable there. Legitimate because this measures
-//!   *reads*: durability is an orthogonal axis in the #167 framing, and #218 finding 3
-//!   already showed writes are ~100% fsync-bound and identical across engines.
-
 use crate::driver::{dir_size, OpOutcome, ScanKind, UpdateWidth, WorkloadTarget};
 
-/// Stable uuid for a `Doc` workload key. Kind tag 5 keeps these clear of the shared
-/// corpus (1/2/3) and of `Metric` (4).
 pub fn doc_id(key: u64) -> uuid::Uuid {
     uuid::Uuid::from_u128((5u128 << 96) | key as u128)
 }
 
-/// Deterministic ASCII payload of **exactly** `n` bytes.
-///
-/// Varies with `(key, generation, col)` so every update writes genuinely different
-/// bytes — an engine that noticed an unchanged value and skipped the write would
-/// quietly stop churning, and the amplification ladder would silently measure nothing.
 pub fn payload(key: u64, generation: u64, col: u8, n: usize) -> String {
     let mut s = String::with_capacity(n);
     let mut x = key
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
         ^ generation.wrapping_mul(0xBF58_476D_1CE4_E5B9)
         ^ (col as u64).wrapping_mul(0x94D0_49BB_1331_11EB);
-    // Non-zero seed: xorshift64 is stuck at zero.
     x |= 1;
     while s.len() < n {
         x ^= x << 13;
@@ -60,16 +30,9 @@ pub fn payload(key: u64, generation: u64, col: u8, n: usize) -> String {
     s
 }
 
-/// Stamps out a `Doc` [`WorkloadTarget`] over whichever generated `Database`/`Doc` pair
-/// is in scope at the expansion site. The two generated builds are distinct types with
-/// identical shape, so a macro is the honest way to avoid duplicating the body — there
-/// is no trait over generated models to be generic across.
 macro_rules! forge_doc_target {
     ($name:ident, $label:literal) => {
         pub struct $name {
-            /// `Option` so `reopen` can drop the live handle first: the data dir is under
-            /// an exclusive `DirLock` (#89), so opening a second handle without dropping
-            /// the first panics rather than measures.
             db: Option<Database>,
             dir: tempfile::TempDir,
             generation: u64,
@@ -129,10 +92,6 @@ macro_rules! forge_doc_target {
             fn update(&mut self, key: u64, width: UpdateWidth) -> OpOutcome {
                 self.generation += 1;
                 let id = doc_id(key);
-                // ForgeDB writes the whole row either way; the widths differ in which
-                // bytes actually change. `OneField` touches only the fixed `seq`, so the
-                // four string columns re-append byte-identical content — which is itself
-                // the point, since the append happens regardless.
                 let rec = match width {
                     UpdateWidth::AllFields => self.row(key, self.generation),
                     UpdateWidth::OneField => match self.db().doc.get(id) {
@@ -159,17 +118,7 @@ macro_rules! forge_doc_target {
 
             fn scan(&mut self, kind: ScanKind, limit: usize) -> OpOutcome {
                 let n = match kind {
-                    // `@projection(meta: seq, kind)` — fixed columns ONLY, so this path
-                    // never touches a `VariableColumn`. It is the in-run control: it
-                    // should stay flat in amplification after #221, which makes any slope
-                    // in `Narrow` attributable to the variable path rather than to
-                    // machine state.
                     ScanKind::Projection => self.db().doc.all_meta().len(),
-                    // Drags all four string columns through `gather_buffered`. Since
-                    // #228 the narrow scan is a SCOPE (`__with_scan`) rather than an
-                    // owned `Vec<Doc>`: the refs are still built eagerly, one per live
-                    // row, so the buffered decode under test is unchanged — only the
-                    // per-row `String` allocation that #228 removed is gone.
                     ScanKind::Narrow => self
                         .db()
                         .doc
@@ -209,7 +158,6 @@ macro_rules! forge_doc_target {
     };
 }
 
-/// The default generated build — auto-compaction on, amplification capped.
 pub mod compacting {
     use super::{doc_id, payload};
     use crate::driver::{dir_size, OpOutcome, ScanKind, UpdateWidth, WorkloadTarget};
@@ -218,8 +166,6 @@ pub mod compacting {
     forge_doc_target!(ForgeDocTarget, "forgedb");
 }
 
-/// The `churn_probe` build — compaction off, so amplification is unbounded and a slope
-/// can actually be established.
 pub mod unbounded {
     use super::{doc_id, payload};
     use crate::driver::{dir_size, OpOutcome, ScanKind, UpdateWidth, WorkloadTarget};
@@ -228,19 +174,13 @@ pub mod unbounded {
     forge_doc_target!(ForgeDocTargetNoCompact, "forgedb-nc");
 }
 
-// ---------------------------------------------------------------------------
-// SQLite / redb reference lines
-// ---------------------------------------------------------------------------
-
 fn key_blob(key: u64) -> [u8; 16] {
     let mut b = [0u8; 16];
-    b[0] = 5; // matches doc_id's kind tag
+    b[0] = 5;
     b[8..].copy_from_slice(&key.to_be_bytes());
     b
 }
 
-/// SQLite over the `doc` table. Same durability parity rules as the `Metric` target:
-/// `synchronous = FULL` + `fullfsync = 1`, one autocommit transaction per op.
 pub struct SqliteDocTarget {
     conn: rusqlite::Connection,
     dir: tempfile::TempDir,
@@ -301,8 +241,6 @@ impl WorkloadTarget for SqliteDocTarget {
         self.generation += 1;
         let g = self.generation;
         let n = self.payload_bytes;
-        // The in-place advantage made explicit: a one-field update writes one column,
-        // where the append-only path re-appends every column regardless.
         let r = match width {
             UpdateWidth::OneField => self.conn.execute(
                 "UPDATE doc SET seq = ?2 WHERE id = ?1",
@@ -339,8 +277,6 @@ impl WorkloadTarget for SqliteDocTarget {
     }
 
     fn scan(&mut self, kind: ScanKind, limit: usize) -> OpOutcome {
-        // Mirrors ForgeDB's column sets exactly: the projection reads the two fixed
-        // columns, the narrow scan reads all four TEXT bodies.
         let sql = match kind {
             ScanKind::Projection => "SELECT seq, kind FROM doc",
             ScanKind::Narrow => "SELECT id, seq, kind, body_a, body_b, body_c, body_d FROM doc",
@@ -350,8 +286,6 @@ impl WorkloadTarget for SqliteDocTarget {
         let mut n = 0u64;
         while let Some(row) = rows.next().unwrap() {
             if matches!(kind, ScanKind::Narrow) {
-                // Materialize the strings; leaving them unread would compare a
-                // full materialization against a column-offset walk.
                 let _: Vec<u8> = row.get(0).unwrap();
                 for i in 3..7 {
                     let _: String = row.get(i).unwrap();

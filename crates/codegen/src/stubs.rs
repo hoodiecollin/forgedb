@@ -1,21 +1,9 @@
-//! Component and computed field stub generator
-
 use crate::{GeneratedCode, Result};
 use forgedb_parser::Schema;
 
-/// Stub generator for components and computed fields
 pub struct StubGenerator;
 
 impl StubGenerator {
-    /// Generate stub files for computed fields and components
-    ///
-    /// # Arguments
-    ///
-    /// * `_schema` - Parsed schema AST (currently unused but reserved for future use)
-    ///
-    /// # Returns
-    ///
-    /// Generated stub README content
     pub fn generate(_schema: &Schema) -> Result<GeneratedCode> {
         let code = Self::generate_readme();
 
@@ -25,7 +13,6 @@ impl StubGenerator {
         })
     }
 
-    /// Generate README content for stubs directory
     fn generate_readme() -> String {
         r#"# Generated Stubs
 

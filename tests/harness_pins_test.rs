@@ -1,46 +1,9 @@
-//! The test harness's substrate list is anchored on the manifests ForgeDB
-//! actually emits (#339).
-//!
-//! # What was stale
-//!
-//! `tests/common/mod.rs` hand-writes a `Cargo.toml` for the crate its driver
-//! tests compile, and its dependency list used to be justified as "mirrors the
-//! `forgedb init` server scaffold". Since #335 there is no scaffold manifest:
-//! `init` writes no `Cargo.toml` at all, and the manifests that pin substrate are
-//! the GENERATED `core/` and `server/`, rendered into ForgeDB's own build cache.
-//!
-//! A comment cannot fail. Replacing the claim with a check is the point of this
-//! file — the relation it asserted was true when written, and nothing would have
-//! reported it going false.
-//!
-//! # Superset, not equality
-//!
-//! A harness crate compiles one generated `database.rs` **and** one `api.rs` into
-//! a single package, so it links what `core` and `server` link *together*, and
-//! may legitimately carry a pin neither needs alone. The failure that matters is
-//! the other direction: a NEW substrate dep appearing in an emitted manifest and
-//! not in the harness, which surfaces as an unresolved-import compile error in
-//! whichever driver test happens to exercise it — a failure that names the symbol
-//! and not the cause.
-//!
-//! # Pure
-//!
-//! No fixture, no subprocess, no `generate`. The manifests are rendered in memory
-//! by the same functions the emitters call, which is what makes this a statement
-//! about the real renderer rather than about a copy of its output.
-
 mod common;
 
 use std::collections::BTreeSet;
 
 use forgedb_codegen::{CorePackage, GenConfig, ServerPackage};
 
-/// The `forgedb-*` dependency keys of a rendered manifest.
-///
-/// Reads the KEY at the start of a line, which is the form both renderers emit —
-/// including inside `core`'s `[target.'cfg(not(target_arch = "wasm32"))']` table,
-/// where `forgedb-coordinator` lives and where a scrape that only looked at
-/// `[dependencies]` would miss it.
 fn substrate_keys(manifest: &str) -> BTreeSet<String> {
     manifest
         .lines()
@@ -59,9 +22,6 @@ fn the_harness_pins_a_superset_of_what_forgedb_emits() {
     let mut emitted = substrate_keys(&core);
     emitted.extend(substrate_keys(&server));
 
-    // The scrape itself must not be vacuous: a renderer change that moved every
-    // pin into a shape this parser does not recognise would otherwise make the
-    // superset assertion trivially true.
     assert!(
         emitted.len() >= 8,
         "scraped only {} substrate pins from the emitted core+server manifests — \
@@ -69,8 +29,6 @@ fn the_harness_pins_a_superset_of_what_forgedb_emits() {
          would now pass having compared against almost nothing. Got: {emitted:?}",
         emitted.len()
     );
-    // `core` alone must contribute, and so must `server`: `server` is the only
-    // carrier of forgedb-auth and forgedb-query-params anywhere.
     assert!(
         substrate_keys(&server).contains("forgedb-auth"),
         "the emitted `server` manifest no longer pins forgedb-auth; it is the only \
@@ -91,12 +49,6 @@ fn the_harness_pins_a_superset_of_what_forgedb_emits() {
     );
 }
 
-/// Every name in the harness list resolves to a real crate in this workspace.
-///
-/// `common::dep` derives the directory by stripping the `forgedb-` prefix, so a
-/// typo in the list produces a path dep pointing at nothing — which cargo reports
-/// as a manifest error from a temp directory, at the point some unrelated driver
-/// test runs. This says it here instead.
 #[test]
 fn every_harness_pin_names_a_crate_in_this_workspace() {
     for name in common::SUBSTRATE_PINS {

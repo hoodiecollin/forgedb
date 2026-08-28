@@ -1,74 +1,6 @@
-# Go binding outside-repo reclose smoke — issue #215 (parent #122, origin #204).
-#
-# Defense-in-depth CI for the Go runtime binding (`forgedb generate go --runtime`).
-# The `test_go_calls_match_ffi_symbols` unit guard proves the generated Go cgo
-# calls line up with the FFI C-ABI symbols *as strings*; this workflow proves the
-# full outside-repo chain actually **builds, links, and runs**:
-#
-#   1. Build the `forgedb` CLI from this checkout (`cargo build --release`).
-#   2. `forgedb init` a temp project OUTSIDE the checkout + a multi-model schema,
-#      with FORGEDB_HOME outside it too (so every substrate crate resolves from
-#      crates.io, not from this workspace — the true installed-user path).
-#   3. `forgedb generate go --runtime` → emits the `go/` cgo package into the
-#      output directory, and the `ffi` package into the build cache.
-#   4. `forgedb build` → compiles the cache workspace AND delivers the ffi
-#      **staticlib** to `generated/go/libforgedb.a`.
-#   5. `go mod tidy` (pulls `arrow-go/v18`) + `CGO_ENABLED=1 go build ./...`.
-#   6. Round-trip smoke `go run`: open → insert → get → assert.
-#   7. Delete the cargo target directory, then run the smoke binary AGAIN.
-#
-# WHY STEP 4 IS `forgedb build` AND WHY THE ARCHIVE, NOT THE DYLIB (#335)
-#
-# This file used to say: "`cargo build --release` the sibling `ffi/` cdylib (the
-# generated cgo LDFLAGS hardcodes `../ffi/target/release`, so release is
-# mandatory)". Both halves of that are gone.
-#
-# There is no sibling `generated/ffi/` any more — the ffi package is a member of
-# ForgeDB's own cache workspace, and `forgedb build` is what compiles it. And the
 # cgo preamble no longer points into a cargo target directory at all: it is
-# `-L${SRCDIR} -lforgedb`, resolved against a `libforgedb.a` sitting beside the
-# Go source, which `forgedb build` copies there.
-#
-# The archive rather than the dylib is the whole point. rustc stamps an ABSOLUTE
-# `LC_ID_DYLIB` into a cdylib, so a Go binary that linked one records the cache
-# path — and the cache is a cache, deletable at any time (C8). The binary then
-# dies `dyld: Library not loaded`, and CI never sees it, because the cache still
-# exists while the workflow runs. Step 7 exists precisely to remove that blind
-# spot: it deletes the target directory and re-runs the binary.
-#
-# Toolchain matrix mirrors pypi.yml's same-arch convention: Rust (pinned 1.96 via
-# rust-toolchain.toml) + Go + `CGO_ENABLED=1` + a C compiler, Unix-only (Windows
-# is excluded across every channel — storage-native positional I/O + coordinator
-# Unix sockets; tracked in #209). For the trigger, see the next section: #402 made
-# this `main`-only and dropped the paths filter, and this paragraph used to claim
-# otherwise twenty lines above the rule that contradicts it.
 name: Go reclose
 
-# WHY THIS IS `main`-ONLY, AND WHY IT WAS RED FOR TWO WEEKS BEFORE ANYONE NOTICED (#402)
-#
-# This job builds a generated project OUTSIDE the checkout, so every `forgedb-*` dep
-# resolves from crates.io. That makes it the same class of check as substrate-reclose —
-# and it needs the same branch restriction, which it never had.
-#
-# It used to run on `pull_request` with no branch filter, so it ran on PRs into `develop`.
-# `develop` is *allowed* to carry a publish gap; that is the entire point of holding the gap
-# off the default branch. A job resolving from the registry therefore fails there BY DESIGN,
-# and it did: the 2026-08-07/08 runs failed with `no field `auto_sequences` on type
-# `Manifest`` — #187 had added that field to `forgedb-storage` and generated code used it
-# before the crate was published. Correct behaviour from the job, on the one branch where it
-# means nothing.
-#
-# Nine runs, nine failures, six branches, and nobody read it — because everyone who saw it
-# red saw it red on a branch that had not caused it. A job that is always red is not a
-# control; its signal is indistinguishable from noise, so a REAL Go/FFI reclose break would
-# have landed unnoticed, which is exactly what this job exists to prevent.
-#
-# The paths filter went with it. On `main` the meaningful event is a release merge, and
-# whether that merge happens to touch `go.rs` is unrelated to whether the Go reclose still
-# closes. substrate-reclose has no paths filter for the same reason.
-#
-# Changing the Go generator on `develop` and want this run against it? `workflow_dispatch`
-# against the branch — the same escape hatch substrate-reclose documents.
 on:
   push:
     branches: [main]
@@ -94,22 +26,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Rust toolchain comes from rust-toolchain.toml (channel 1.96); rustup on
-      # the runner honors it, so no setup-rust action is needed. Cache the
-      # workspace build — two release builds (CLI here + the generated cdylib
-      # below) is the heavy part of this job.
       - uses: Swatinem/rust-cache@v2
 
       - uses: actions/setup-go@v5
         with:
           go-version: stable
 
-      # 1. Build the CLI from source.
       - name: Build the forgedb CLI
         run: cargo build --release --bin forgedb
 
-      # 2–6. Everything downstream runs in a temp dir OUTSIDE the checkout so the
-      # generated project resolves the substrate crates from crates.io.
       - name: Reclose — generate, build, link, run
         shell: bash
         env:

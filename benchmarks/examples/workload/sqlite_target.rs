@@ -1,18 +1,3 @@
-//! SQLite [`WorkloadTarget`] — the update-in-place baseline.
-//!
-//! **Durability parity is the whole point of this target and is not negotiable.**
-//! ForgeDB's generated write path WAL-records every mutation under
-//! `FsyncPolicy::Always`, i.e. one durability barrier per operation. So SQLite runs
-//! `synchronous = FULL` with `fullfsync = 1` (on Apple hardware a plain fsync does not
-//! reach the platter, and comparing a real barrier against a lying one would be the
-//! single easiest way to produce a flattering, meaningless number), and each operation
-//! is its own autocommit transaction rather than batched.
-//!
-//! Its value here is as the honest in-place reference: whatever curve SQLite traces
-//! under the same churn is roughly what a ForgeDB in-place variant could hope to
-//! reproduce. A ForgeDB-vs-SQLite gap that closes after compaction says the append tax
-//! is bounded; one that widens with amplification is the investment case for #172.
-
 use rusqlite::{params, Connection};
 
 use crate::driver::{dir_size, OpOutcome, ScanKind, UpdateWidth, WorkloadTarget};
@@ -25,7 +10,7 @@ pub struct SqliteTarget {
 
 fn key_blob(key: u64) -> [u8; 16] {
     let mut b = [0u8; 16];
-    b[0] = 4; // kind tag, matching the ForgeDB target's uuid layout
+    b[0] = 4;
     b[8..].copy_from_slice(&key.to_be_bytes());
     b
 }
@@ -108,12 +93,10 @@ impl WorkloadTarget for SqliteTarget {
         self.generation += 1;
         let g = self.generation;
         let n = match width {
-            // The in-place engine's advantage made explicit: it can touch one column.
             UpdateWidth::OneField => self.conn.execute(
                 "UPDATE metric SET sample_seq = ?2 WHERE id = ?1",
                 params![&key_blob(key)[..], g as i64],
             ),
-            // Full-row rewrite — the shape ForgeDB is forced into on every update.
             UpdateWidth::AllFields => {
                 let m = key.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ g.wrapping_mul(0xBF58_476D_1CE4_E5B9);
                 self.conn.execute(
@@ -165,10 +148,6 @@ impl WorkloadTarget for SqliteTarget {
     }
 
     fn scan(&mut self, kind: ScanKind, limit: usize) -> OpOutcome {
-        // Mirrors the ForgeDB scan's column set exactly: the projection reads two
-        // columns, the narrow scan reads the filterable/sortable set. Letting SQLite
-        // read fewer columns than ForgeDB would hand it a free win on a columnar
-        // engine's home turf.
         let sql = match kind {
             ScanKind::Projection => "SELECT id, cpu_pct, mem_pct FROM metric",
             ScanKind::Narrow => "SELECT id, recorded_at, device_id, sample_seq, region, cpu_pct, \
@@ -181,7 +160,6 @@ impl WorkloadTarget for SqliteTarget {
         let mut rows = stmt.query([]).unwrap();
         let mut n = 0u64;
         while let Ok(Some(r)) = rows.next() {
-            // Touch a column so the read is not optimized into a pure row count.
             let _: Vec<u8> = r.get(0).unwrap_or_default();
             n += 1;
         }
@@ -189,7 +167,6 @@ impl WorkloadTarget for SqliteTarget {
     }
 
     fn maintain(&mut self) {
-        // SQLite's analogue of compaction: fold the WAL back and reclaim free pages.
         let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;");
     }
 
@@ -203,8 +180,6 @@ impl WorkloadTarget for SqliteTarget {
             .unwrap_or(0) as usize
     }
 
-    // No version chain: an UPDATE rewrites the row. Reporting an amplification here
-    // would invent a quantity the engine does not have.
     fn physical_rows(&mut self) -> Option<usize> {
         None
     }

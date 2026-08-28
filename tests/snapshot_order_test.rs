@@ -1,41 +1,3 @@
-//! **#457** — a snapshot read (`?as_of=` / `all_at`) must return rows in the same
-//! order every process, and it must be the order the live list returns.
-//!
-//! `all_at` gathered its rows by iterating `id_versions`, a `std::collections::
-//! HashMap` whose `RandomState` seed is drawn per process. So the row order of a
-//! point-in-time read was a different random permutation in every process, while
-//! the live list — which sorts its row indices — was stable. Paging a snapshot
-//! across a restart or a second replica therefore skipped some rows and repeated
-//! others, with every page individually well-formed and `total` correct.
-//!
-//! Two properties, and **neither alone is the guard**:
-//!
-//! 1. **The order is exactly ascending physical row order** — asserted against a
-//!    hand-computed literal, not against another generated helper. `all_at` and
-//!    `export_live_indices` now both sort, so comparing them would go green if a
-//!    change removed both sorts together. The literal below cannot move with the
-//!    code.
-//! 2. **Every process agrees** — the compiled driver is run repeatedly as separate
-//!    processes over one data dir. Within a single process the buggy order was
-//!    *stable*, so a one-shot assertion could only ever catch it by luck of the
-//!    seed; re-running is what exercises the actual failure mechanism. The first
-//!    process seeds and the rest reopen, so each gets a fresh seed over identical
-//!    bytes.
-//!
-//! The fixture is **churned on purpose**. Two rows are updated (superseding-version
-//! append moves their live row to the tail) and one is deleted. That makes ascending
-//! physical row order differ from insertion order, so the literal discriminates
-//! between "sorted by row" and "happened to come back in the order I inserted".
-//! On a churn-free table the two coincide and the test would prove nothing — the
-//! driver asserts the churn took effect rather than assuming it.
-//!
-//! It compiles and RUNS a generated crate, so it is `#[ignore]`d out of the fast
-//! hermetic default suite:
-//!
-//! ```bash
-//! cargo test --test snapshot_order_test -- --ignored --nocapture
-//! ```
-
 mod common;
 
 use std::process::Command;
@@ -49,12 +11,6 @@ Ledger {
 }
 "#;
 
-/// How many separate processes read the same seeded directory.
-///
-/// The buggy gather is stable *within* a process, so this count is the whole
-/// experiment. Six independent seeds miss a 13-row misordering with probability
-/// far below any flake threshold; one process would have caught it only when the
-/// seed happened to permute.
 const RUNS: usize = 6;
 
 const DRIVER: &str = r##"mod database;
@@ -177,9 +133,6 @@ fn a_snapshot_read_returns_the_same_row_order_in_every_process() {
          reads an empty table and the order assertion is vacuous:\n{first}"
     );
 
-    // The seeding run is one process, i.e. one `RandomState` seed. Re-run the
-    // SAME binary over the SAME bytes: each is a fresh seed, and the buggy gather
-    // permuted per process while staying stable within one.
     let bin = proj.join("target/debug/snapshot-order");
     let data = proj.join("data");
     let mut orders = std::collections::BTreeSet::new();
@@ -200,9 +153,6 @@ fn a_snapshot_read_returns_the_same_row_order_in_every_process() {
         orders.insert(order_line(&stdout));
     }
 
-    // Every run asserted the literal itself, so this can only fail if a run
-    // reported an order the literal check somehow passed. Kept because the count
-    // is the property the issue is about, and it names the disagreement.
     assert_eq!(
         orders.len(),
         1,
@@ -213,7 +163,6 @@ fn a_snapshot_read_returns_the_same_row_order_in_every_process() {
     let _ = std::fs::remove_dir_all(&proj);
 }
 
-/// The driver's final line, which carries the order it observed.
 fn order_line(stdout: &str) -> String {
     stdout
         .lines()

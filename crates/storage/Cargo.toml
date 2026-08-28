@@ -8,12 +8,6 @@ repository = "https://github.com/hoodiecollin/forgedb"
 keywords = ["database", "storage", "forgedb", "wasm"]
 categories = ["database"]
 
-# The facade selects a backend by target. Generated code keeps
-# `use forgedb_storage::{FixedColumn, VariableColumn, Tombstones};` verbatim; the
-# re-export below resolves to the native engine on host builds and to the
-# in-memory-arena web backend on the browser read-replica target (#110). Only one
-# backend is ever linked per build, so their (identical) public types never
-# collide.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 forgedb-storage-native = { path = "../storage-native", version = "0.2.0" }
 
