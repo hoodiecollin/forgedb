@@ -23,7 +23,6 @@ import { AnimatedForgeMark } from "@/components/animated-forgemark";
 import { Markdown } from "@/components/markdown";
 import { landing, type IconKey } from "@/content/landing";
 
-/** Resolves a content `IconKey` to its lucide icon; the copy lives in the content module. */
 const ICONS: Record<IconKey, LucideIcon> = {
   ShieldCheck,
   Columns3,
@@ -39,15 +38,14 @@ const ICONS: Record<IconKey, LucideIcon> = {
 export default function Home() {
   return (
     <main>
-      {/* Hero */}
+      { }
       <section className="relative overflow-hidden border-b border-border/50">
         <div
           aria-hidden
           className="pointer-events-none absolute inset-0 -z-10 bg-[radial-gradient(60%_50%_at_50%_-10%,color-mix(in_oklch,var(--primary)_22%,transparent),transparent)]"
         />
         <div className="mx-auto max-w-screen-xl px-4 py-16 text-center sm:px-6 sm:pt-18 sm:pb-26">
-          {/* Hero-only animated mark (2c: 256px on desktop, stepped down on smaller
-              screens). The static ForgeMark stays in the header/footer/favicon. */}
+          { }
           <AnimatedForgeMark className="mx-auto mb-8 size-40 sm:mb-10 sm:size-56 lg:mb-11 lg:size-64" />
           <Markdown
             as="h1"
@@ -88,8 +86,7 @@ export default function Home() {
           </div>
         </div>
       </section>
-
-      {/* Code showcase — the schema (the single input) */}
+      { }
       <section className="mx-auto max-w-screen-xl px-4 py-16 sm:px-6">
         <div className="mx-auto mb-10 max-w-2xl text-center">
           <Markdown
@@ -114,8 +111,7 @@ export default function Home() {
           filename="schema.forge"
         />
       </section>
-
-      {/* Multi-language clients — the typed output, in every language */}
+      { }
       <section className="border-y border-border/50 bg-muted/20">
         <div className="mx-auto max-w-screen-xl px-4 py-16 sm:px-6">
           <div className="mx-auto mb-10 max-w-2xl text-center">
@@ -157,8 +153,7 @@ export default function Home() {
           />
         </div>
       </section>
-
-      {/* Invariant band */}
+      { }
       <section className="border-y border-border/50 bg-muted/20">
         <div className="mx-auto max-w-screen-lg px-4 py-14 text-center sm:px-6">
           <Markdown
@@ -177,8 +172,7 @@ export default function Home() {
           />
         </div>
       </section>
-
-      {/* Feature grid */}
+      { }
       <section className="mx-auto max-w-screen-xl px-4 py-16 sm:px-6">
         <div className="mb-10 max-w-2xl">
           <Markdown
@@ -229,8 +223,7 @@ export default function Home() {
           })}
         </div>
       </section>
-
-      {/* Stats / benchmarks */}
+      { }
       <section className="border-y border-border/50 bg-muted/20">
         <div className="mx-auto max-w-screen-xl px-4 py-16 sm:px-6">
           <div className="mb-8 flex flex-wrap items-end justify-between gap-4">
@@ -279,8 +272,7 @@ export default function Home() {
           </div>
         </div>
       </section>
-
-      {/* How it works */}
+      { }
       <section className="mx-auto max-w-screen-xl px-4 py-16 sm:px-6">
         <div className="mb-10 max-w-2xl">
           <Markdown
@@ -323,8 +315,7 @@ export default function Home() {
           ))}
         </div>
       </section>
-
-      {/* CTA band */}
+      { }
       <section className="border-t border-border/50">
         <div className="mx-auto max-w-screen-lg px-4 py-20 text-center sm:px-6">
           <Boxes className="mx-auto mb-5 size-8 text-primary" />

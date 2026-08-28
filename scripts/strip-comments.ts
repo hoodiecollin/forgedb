@@ -216,12 +216,25 @@ function scanTs(src: string): Cut[] {
   return cuts;
 }
 
-function scanHash(src: string): Cut[] {
+function scanHash(src: string, yaml: boolean): Cut[] {
   const cuts: Cut[] = [];
   const lines = src.split("\n");
   let off = 0;
   let inRegression = false;
+  let blockIndent: number | null = null;
   for (const line of lines) {
+    if (yaml) {
+      const indent = line.length - line.trimStart().length;
+      if (blockIndent !== null) {
+        if (line.trim() === "" || indent > blockIndent) { off += line.length + 1; continue; }
+        blockIndent = null;
+      }
+      if (/[|>][+-]?\d*\s*$/.test(line.replace(/\s+#.*$/, ""))) {
+        blockIndent = indent;
+        off += line.length + 1;
+        continue;
+      }
+    }
     if (inRegression && !/^\s*(#|$)/.test(line)) inRegression = false;
     let i = 0;
     let inStr: string | null = null;
@@ -250,14 +263,14 @@ function scanHash(src: string): Cut[] {
   return cuts;
 }
 
-function scan(src: string, kind: Kind): Cut[] {
+function scan(src: string, kind: Kind, yaml = false): Cut[] {
   if (kind === "rust") return scanRust(src);
   if (kind === "ts") return scanTs(src);
-  return scanHash(src);
+  return scanHash(src, yaml);
 }
 
-function strip(src: string, kind: Kind): string {
-  const cuts = scan(src, kind);
+function strip(src: string, kind: Kind, yaml = false): string {
+  const cuts = scan(src, kind, yaml);
   if (cuts.length === 0) return src;
 
   let out = "";
@@ -380,11 +393,12 @@ function selfTest(): number {
     ["const T = `x // y`;\n", "ts", "const T = `x // y`;\n"],
     ["/** doc */\nexport const a = 1;\n", "ts", "export const a = 1;\n"],
     ['key = "value" # note\n', "hash", 'key = "value"\n'],
+    ["a: b # gone\nrun: |\n  echo '#390 stays'\n  # and so does this\nc: d\n", "hash", "a: b\nrun: |\n  echo '#390 stays'\n  # and so does this\nc: d\n"],
     ['key = "# not a comment"\n', "hash", 'key = "# not a comment"\n'],
   ];
   let failed = 0;
   for (const [input, kind, want] of cases) {
-    const got = strip(input, kind);
+    const got = strip(input, kind, kind === "hash" && input.includes(": |"));
     if (got !== want) {
       failed++;
       console.error(`FAIL [${kind}]\n  in:   ${JSON.stringify(input)}\n  want: ${JSON.stringify(want)}\n  got:  ${JSON.stringify(got)}`);
@@ -418,12 +432,13 @@ function main(): number {
     } catch {
       continue;
     }
-    const out = strip(src, kind);
+    const isYaml = /\.ya?ml$/.test(path);
+    const out = strip(src, kind, isYaml);
     if (out === src) continue;
     changed++;
     const delta = src.split("\n").length - out.split("\n").length;
     removedLines += delta;
-    offenders.push([path, scan(src, kind).length]);
+    offenders.push([path, scan(src, kind, isYaml).length]);
     if (mode === "write") writeFileSync(path, out);
   }
 

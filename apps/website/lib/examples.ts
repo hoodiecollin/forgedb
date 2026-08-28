@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
 
-/** The example schema corpus lives at repo-root examples/ (two dirs up). */
 export const EXAMPLES_DIR = path.resolve(process.cwd(), "..", "..", "examples");
 
 export interface ExampleMeta {
@@ -17,10 +16,6 @@ export interface Example extends ExampleMeta {
   source: string;
 }
 
-/**
- * The catalog metadata mirrors examples/README.md. The `.forge` source itself is
- * read from disk at build time so it never drifts from the real schema.
- */
 export const catalog: ExampleMeta[] = [
   { slug: "hr-directory", title: "HR Directory", origin: "Adapted", provenance: "Oracle HR (UPL)", models: 7, showcases: "Geo hierarchy, employee self-reference, a mutual FK cycle, and temporal job history — the small intro example." },
   { slug: "music-store", title: "Music Store", origin: "Adapted", provenance: "Chinook (MIT)", models: 10, showcases: "Many-to-many playlists, an InvoiceLine join-with-payload, self-referential reports_to, @soft_delete, money as i64 cents." },
@@ -41,7 +36,6 @@ export const catalog: ExampleMeta[] = [
   { slug: "ecommerce-store", title: "E-commerce Store", origin: "Synthetic", provenance: "Synthetic", models: 9, showcases: "Product variants, CartItem/OrderItem joins, money as i64 minor units, and SKU/order-number natural keys." },
   { slug: "iot-sensors", title: "IoT Sensors", origin: "Synthetic", provenance: "Synthetic", models: 3, showcases: "A +u64 high-volume PK, a fixed array [f64; 3], a struct Calibration, and append-heavy telemetry." },
 ];
-
 function readSource(slug: string): string {
   const file = path.join(EXAMPLES_DIR, slug, "schema.forge");
   try {
@@ -50,13 +44,11 @@ function readSource(slug: string): string {
     return "";
   }
 }
-
 export function getExample(slug: string): Example | null {
   const meta = catalog.find((c) => c.slug === slug);
   if (!meta) return null;
   return { ...meta, source: readSource(slug) };
 }
-
 export function getAllExamples(): Example[] {
   return catalog.map((m) => ({ ...m, source: readSource(m.slug) }));
 }
