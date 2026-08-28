@@ -1,19 +1,3 @@
-//! redb benchmark suite (pure-Rust embedded KV). Mirrors the ForgeDB / SQLite
-//! suites' scenarios over the SAME seeded corpus so the Criterion groups line up.
-//!
-//! redb is the closest comparison on *deployment shape*: like ForgeDB's generated
-//! code, it is a Rust crate linked in-process — no external server, no query
-//! planner. It is a B-tree KV store, so the relational shape (secondary index,
-//! reverse FK, M2M) is modeled explicitly with extra tables / multimap tables,
-//! exactly as a hand-rolled redb app would. Values are packed to bytes and decoded
-//! on read, so reads materialize the FULL record (matching the SQLite suite, which
-//! SELECTs every column — a `get(id)` that skipped the payload would flatter redb).
-//!
-//! Durability: redb `Durability::Immediate` fsyncs on commit (on macOS `sync_all`
-//! is an `F_FULLFSYNC` barrier — the same guarantee ForgeDB's WAL issues), so the
-//! write scenarios run at BOTH `immediate` (matched barrier) and `eventual` (redb's
-//! relaxed, no per-commit fsync) — never mixing durability levels in one chart.
-
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use forgedb_benchmarks::{
     dataset, id_for, ts_from_seconds, uuid_of, Dataset, PostJson, LIST_CORE_LIMIT,
@@ -24,18 +8,13 @@ use redb::{Database, Durability, MultimapTableDefinition, ReadableTable, TableDe
 const READ_USERS: usize = 1_000;
 const READ_POSTS: usize = 10_000;
 
-// key = 16-byte id (or &str email); value = a manually packed record blob.
 const USER: TableDefinition<&[u8], &[u8]> = TableDefinition::new("user");
 const POST: TableDefinition<&[u8], &[u8]> = TableDefinition::new("post");
 const TAG: TableDefinition<&[u8], &[u8]> = TableDefinition::new("tag");
-// Secondary index: unique email -> user id (mirrors ForgeDB's email_index probe).
 const EMAIL_IDX: TableDefinition<&str, &[u8]> = TableDefinition::new("email_idx");
-// Reverse one-to-many: author id -> post ids (mirrors the FK index / user_posts).
 const AUTHOR_IDX: MultimapTableDefinition<&[u8], &[u8]> = MultimapTableDefinition::new("author_idx");
-// Many-to-many: post id -> tag ids (mirrors post_tags).
 const POST_TAG: MultimapTableDefinition<&[u8], &[u8]> = MultimapTableDefinition::new("post_tag");
 
-// --- Manual record packing (little-endian) -----------------------------------
 fn pack_user(name: &str, email: &str, created_at: i64) -> Vec<u8> {
     let mut v = Vec::with_capacity(12 + name.len() + email.len());
     v.extend_from_slice(&created_at.to_le_bytes());
@@ -77,7 +56,6 @@ fn fresh_db(path: &std::path::Path) -> Database {
     Database::create(path).expect("create redb")
 }
 
-/// Load `data` into `db` in ONE write transaction (setup — not timed).
 fn load(db: &Database, data: &Dataset) {
     let mut tx = db.begin_write().unwrap();
     tx.set_durability(Durability::Immediate);
@@ -108,7 +86,6 @@ fn load(db: &Database, data: &Dataset) {
     tx.commit().unwrap();
 }
 
-// --- Scenario 2: single-row insert latency (one write txn = one fsync) --------
 fn bench_insert(c: &mut Criterion) {
     let mut group = c.benchmark_group("redb/insert_user");
     group.throughput(Throughput::Elements(1));
@@ -145,10 +122,6 @@ fn bench_insert(c: &mut Criterion) {
     group.finish();
 }
 
-// --- Scenario 1: bulk load (per-row write txn at eventual — relaxed) ----------
-// Per-row commits (not one big txn) mirror the per-row durable-insert shape of the
-// SQLite/ForgeDB bulk paths; `eventual` keeps a 1e4 sweep runnable (no per-commit
-// barrier). The durability level is in the label, never mixed with `immediate`.
 fn bench_bulk_load(c: &mut Criterion) {
     let mut group = c.benchmark_group("redb/bulk_load_posts");
     group.sample_size(10);
@@ -189,14 +162,12 @@ fn bench_bulk_load(c: &mut Criterion) {
     group.finish();
 }
 
-// --- Read / traversal scenarios (5, 6, 8/10, 11) -----------------------------
 fn bench_reads(c: &mut Criterion) {
     let data = dataset(READ_USERS, READ_POSTS);
     let dir = tempfile::tempdir().unwrap();
     let db = fresh_db(&dir.path().join("bench.redb"));
     load(&db, &data);
 
-    // Scenario 5: point lookup by PK (materialize the full post record).
     c.benchmark_group("redb/point_lookup")
         .throughput(Throughput::Elements(1))
         .bench_function("get_post_by_id", |b| {
@@ -211,7 +182,6 @@ fn bench_reads(c: &mut Criterion) {
             });
         });
 
-    // Scenario 6: secondary-index probe (email idx -> user id -> full record).
     c.benchmark_group("redb/index_probe")
         .throughput(Throughput::Elements(1))
         .bench_function("get_user_by_email", |b| {
@@ -230,7 +200,6 @@ fn bench_reads(c: &mut Criterion) {
             });
         });
 
-    // Scenario 8/10: FK-index probe -> reverse one-to-many (full post records).
     c.benchmark_group("redb/reverse_fk")
         .throughput(Throughput::Elements(1))
         .bench_function("user_posts", |b| {
@@ -252,7 +221,6 @@ fn bench_reads(c: &mut Criterion) {
             });
         });
 
-    // Scenario 11: many-to-many traversal (post_tag multimap -> full tags).
     c.benchmark_group("redb/m2m")
         .throughput(Throughput::Elements(1))
         .bench_function("post_tags", |b| {
@@ -275,17 +243,12 @@ fn bench_reads(c: &mut Criterion) {
         });
 }
 
-// --- Scenario 7: filtered scan + aggregate + top-N ---------------------------
-// A B-tree KV has no columnar projection: the full-table scan walks every leaf and
-// decodes each packed value blob, then filters/aggregates in Rust — exactly what a
-// hand-rolled redb app would do. This is the scenario a columnar engine should win.
 fn bench_scan(c: &mut Criterion) {
     let data = dataset(READ_USERS, READ_POSTS);
     let dir = tempfile::tempdir().unwrap();
     let db = fresh_db(&dir.path().join("bench.redb"));
     load(&db, &data);
 
-    // 7a: full scan + aggregate — decode every post, COUNT + SUM(views) WHERE published.
     c.benchmark_group("redb/scan_aggregate")
         .throughput(Throughput::Elements(READ_POSTS as u64))
         .bench_function("sum_views_where_published", |b| {
@@ -306,8 +269,6 @@ fn bench_scan(c: &mut Criterion) {
             });
         });
 
-    // 7b: filtered scan + sort + page — decode every post, filter views >= T,
-    // sort desc, take top 10 (full records — no early prune without a views index).
     type PostRowOut = (u64, i64, bool, [u8; 16], String);
     c.benchmark_group("redb/scan_sort_top10")
         .throughput(Throughput::Elements(READ_POSTS as u64))
@@ -330,25 +291,6 @@ fn bench_scan(c: &mut Criterion) {
         });
 }
 
-
-// --- Scenario 21 (#282): the REST list endpoint, S1 and S2 -------------------
-//
-// S1 = the page's rows in the serializable host-language form this engine's shipped read
-// path produces; S2 = the JSON array over the same field set, so `S2 - S1` is the same
-// added work in every suite. See `PostJson` and docs/BENCHMARKS.md.
-//
-// **BDD-10 — redb has no `views` index, and this suite does NOT register the
-// `filtered_indexed` shape.** The other four suites do. Registering it here as a full
-// scan under the same benchmark ID would produce a cell that lines up perfectly in the
-// comparison table and means something entirely different: "redb's indexed lookup is
-// 400x slower" rather than "redb was not given an index for this column". An ABSENT cell
-// is loud and forces the reader to the note; a slow same-named cell is quiet and reads as
-// an engine result. The other shapes need no index in any engine, so they are unaffected.
-//
-// This is a property of THIS harness, not of redb: the corpus loader builds `EMAIL_IDX`
-// and `AUTHOR_IDX` because the scenarios that came before needed them. Adding a
-// `VIEWS_IDX` table is the fix; it changes the write-path numbers every other scenario in
-// this file reports, so it is out of #282's scope and stated rather than done.
 const REDB_LIST_SHAPES: [&str; 3] = ["unfiltered", "filtered_unindexed", "sorted"];
 
 type PostRec = (u64, i64, bool, [u8; 16], String);
@@ -366,9 +308,6 @@ fn to_json_row(key: &[u8], rec: PostRec) -> PostJson {
     }
 }
 
-/// The page, materialized. redb is a B-tree KV with no query planner, so every shape is a
-/// `posts.iter()` walk — `unfiltered` can stop at `limit`, the filtered shape must keep
-/// walking until it has `limit` matches, and `sorted` must decode the whole table.
 fn redb_page(db: &Database, shape: &str, limit: usize) -> Vec<PostJson> {
     let rtx = db.begin_read().unwrap();
     let posts = rtx.open_table(POST).unwrap();
@@ -404,7 +343,6 @@ fn redb_page(db: &Database, shape: &str, limit: usize) -> Vec<PostJson> {
 }
 
 fn bench_list(c: &mut Criterion) {
-    // The core grid: four shapes at the core point.
     {
         let data = dataset(READ_USERS, LIST_CORE_ROWS);
         let dir = tempfile::tempdir().unwrap();
@@ -413,7 +351,7 @@ fn bench_list(c: &mut Criterion) {
         let mut g = c.benchmark_group("redb/list_core");
         for name in REDB_LIST_SHAPES {
             let limit = LIST_CORE_LIMIT;
-            
+
             let label = format!("{name}/rows={LIST_CORE_ROWS}/limit={limit}");
 
             g.bench_function(BenchmarkId::new("s1_rows", &label), |b| {
@@ -432,8 +370,6 @@ fn bench_list(c: &mut Criterion) {
         g.finish();
     }
 
-    // Size sweep, unfiltered. The core point recurs here on purpose — it is the sweep's
-    // middle point — which is legal because this is a DIFFERENT group.
     {
         let mut g = c.benchmark_group("redb/list_unfiltered");
         for rows in LIST_SIZES {
@@ -443,14 +379,11 @@ fn bench_list(c: &mut Criterion) {
         load(&db, &data);
             let name = "unfiltered";
             let limit = LIST_CORE_LIMIT;
-            
+
             let label = format!("{name}/rows={rows}/limit={limit}");
 
-            // BDD-3: every engine's page must hold the same number of rows at the same
-            // (rows, limit) point. A LIMIT that clamped differently would make the
-            // cross-engine comparison meaningless while every number looked plausible.
             {
-                
+
                 let n = redb_page(&db, name, limit).len();
                 assert_eq!(n, limit.min(rows), "BDD-3: redb page held {n} for limit={limit} over {rows}");
             }
@@ -471,7 +404,6 @@ fn bench_list(c: &mut Criterion) {
         g.finish();
     }
 
-    // Limit sweep, unfiltered, at the core size.
     {
         let data = dataset(READ_USERS, LIST_CORE_ROWS);
         let dir = tempfile::tempdir().unwrap();
@@ -481,7 +413,7 @@ fn bench_list(c: &mut Criterion) {
         for limit in LIST_LIMITS {
             let rows = LIST_CORE_ROWS;
             let name = "unfiltered";
-            
+
             let label = format!("{name}/rows={rows}/limit={limit}");
 
             g.bench_function(BenchmarkId::new("s1_rows", &label), |b| {

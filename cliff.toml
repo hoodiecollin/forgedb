@@ -1,21 +1,5 @@
-# git-cliff — CHANGELOG.md generator for the ForgeDB *core* release line (#211).
-#
-# The changelog is the backward-looking, mechanical record of what actually
-# shipped in each `v*` release, generated from the repo's conventional commits
-# (feat:/fix:/perf:/…). It is regenerated at release time (`make changelog`),
-# committed, and consumed by TWO surfaces from one source:
-#   - cargo-dist builds each GitHub Release body from this file (release.yml).
-#   - the website renders it statically at /changelog (apps/website).
-#
-# Scope discipline: this is the CORE (`v[0-9]*`) changelog. The VS Code extension
-# ships on its own `vscode-v*` tag line, and the marketing site / packaging
-# channels are not product releases — commits scoped to them are filtered out
-# below so they never headline a ForgeDB release.
-
 [changelog]
-# A stable preamble kept verbatim at the top of CHANGELOG.md.
 header = """
-# Changelog
 
 All notable changes to the ForgeDB core (the `forgedb` CLI and its published
 substrate crates) are documented here. This file is generated from conventional
@@ -25,30 +9,15 @@ and the project honors [Semantic Versioning](https://semver.org) per `docs/SEMVE
 
 """
 
-# One section per release. Keep-a-Changelog headings (`## [x.y.z] - date`) so
-# cargo-dist can locate the matching section and the website parser can split on
-# them. Issue refs are linked by a preprocessor below.
-#
-# The upgrade pointer sits INSIDE the version section, not in the header above.
-# cargo-dist extracts only the matching version section for the GitHub Release
-# body, so a line in the header reaches CHANGELOG.md and the website but never
-# reaches the release notes — which is the one place an upgrading user is
-# actually looking. It renders only for releases that carry a breaking commit,
-# and it points at a file rather than restating the steps, because a changelog
-# generated from commit subjects has nowhere to put a remedy: every subject says
-# what changed, none can say what to do about it.
 body = """
 {% if version %}\
-## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
 {% else %}\
-## [Unreleased]
 {% endif %}\
 {% if commits | filter(attribute="breaking", value=true) | length > 0 %}
 > **Breaking release — upgrading needs action.** Required migration steps are in
 > [docs/UPGRADING.md](https://github.com/hoodiecollin/forgedb/blob/main/docs/UPGRADING.md).
 {% endif %}\
 {% for group, commits in commits | group_by(attribute="group") %}
-### {{ group | striptags | trim | upper_first }}
 {% for commit in commits %}
 - {% if commit.scope %}**{{ commit.scope }}:** {% endif %}\
 {% if commit.breaking %}**breaking:** {% endif %}\
@@ -63,84 +32,31 @@ trim = true
 
 [git]
 conventional_commits = true
-# Drop commits that don't follow the conventional format — keeps the log clean
-# rather than surfacing every stray subject.
 filter_unconventional = true
 split_commits = false
 
-# Rewrite the raw subject before parsing/rendering.
 commit_preprocessors = [
-  # Link issue/PR refs so both the GitHub Release body and the website get
-  # clickable references. Single-quoted TOML literal → the regex sees `\(`.
   { pattern = '\(#([0-9]+)\)', replace = "([#${1}](https://github.com/hoodiecollin/forgedb/issues/${1}))" },
 ]
 
-# First match wins — order matters. Scope-based skips come first so the marketing
-# site / extension / packaging channels never appear in the core changelog.
-#
-# Group names carry an `<!-- N -->` sort-key prefix so `group_by` orders sections
-# logically (Features → Fixes → Performance) instead of alphabetically; the
-# template strips the comment with `striptags`.
-#
-# Only the user-facing axes are kept — features, fixes, performance. Docs,
-# refactors, chores, CI, and unconventional subjects are dropped as changelog
-# noise (`filter_unconventional = true` discards anything with no matching
-# parser). Breaking changes are the exception: `protect_breaking_commits = true`
-# keeps them even when their type is skipped, and they are routed to their own
-# top section here.
 commit_parsers = [
   { message = "^chore\\(release\\)", skip = true },
-  # Scopes that ship on their own line or ship to nobody. `benchmarks`/`bench` are
-  # the experiment track (CLAUDE.md: experiment work never rides the release spine)
-  # — a benchmark driver produces a measurement, not a binary a user installs, so
-  # `feat(benchmarks)` must never surface as a release feature.
-  # `ci` is here for the same reason as `benchmarks`: a workflow fix ships to
-  # nobody. `ci(...)` is already skipped by type, but `fix(ci)` is not, and a
-  # reader of the release notes cannot act on our cycle-scope gate.
   { message = "\\((website|vscode|npm|pypi|winget|docker|brew|homebrew|benchmarks|bench|ci)\\)", skip = true },
-  # SUPERSEDED WITHIN AN UNRELEASED CYCLE (#479).
-  #
-  # git-cliff builds the notes from commit subjects over a tag range, and has no
-  # notion of a feature that was added and then REMOVED before the tag. Four
-  # #367 commits describe surfaces that #479 deleted while v0.5.0 was still
-  # unreleased: `forgedb project name`, `project claim --take-over`,
-  # `init --project-name`, and the identity resolution that asked a question.
-  # None of them ever existed in a published release, so the correct entry for
-  # each is *no entry* — and left alone the notes tell a user to run commands the
-  # release does not have.
-  #
-  # Matched by SHA, deliberately, rather than by subject. A subject pattern would
-  # also swallow a future commit that legitimately reintroduced one of these
-  # names, and it would do so silently — which is the same class of failure this
-  # rule exists to fix, pointed the other way.
-  { sha = "e84d7c533861ab006fde17ba2a08426a96a5aa4b", skip = true },  # feat(project): `forgedb project name`
-  { sha = "0c0b36c9bd9bd8ca0461c584fb73f9a02992a732", skip = true },  # feat(project): detect a dead claim, and offer to take it over
-  { sha = "776f8ca6203cf0f5c28b4939e3a9781f25dd07d9", skip = true },  # feat(init): `--project-name`
-  { sha = "a6e295f244a8e92981d720e141073bf0ba98e98d", skip = true },  # feat(project): the resolution asks, and the answer persists
-  # Any `type!:` / `type(scope)!:` breaking marker headlines its own section,
-  # regardless of the underlying type.
+  { sha = "e84d7c533861ab006fde17ba2a08426a96a5aa4b", skip = true },
+  { sha = "0c0b36c9bd9bd8ca0461c584fb73f9a02992a732", skip = true },
+  { sha = "776f8ca6203cf0f5c28b4939e3a9781f25dd07d9", skip = true },
+  { sha = "a6e295f244a8e92981d720e141073bf0ba98e98d", skip = true },
   { message = "^[a-z]+(\\(.+\\))?!:", group = "<!-- 0 -->Breaking changes" },
   { message = "^feat", group = "<!-- 1 -->Features" },
   { message = "^fix", group = "<!-- 2 -->Bug Fixes" },
   { message = "^perf", group = "<!-- 3 -->Performance" },
-  # Everything else (docs, refactors, chores, ci, tests, bench, merge, reverts,
-  # and any other type) is changelog noise — skip it explicitly so a stray type
-  # never defaults into a section of its own.
   { message = ".*", skip = true },
 ]
 
-# Breaking changes are surfaced by the explicit `!:`-marker parser above (routed
-# to their own section), so the auto-resurrection of skipped breaking commits is
-# left off — otherwise a skipped `refactor!`/`bench!` reappears under a stray
-# type-named section.
 protect_breaking_commits = false
 filter_commits = false
 
-# Only the CORE release line counts as a release here. Anchored so `vscode-v*`
-# (extension line) and any other prefix are excluded — this is the single point
-# that keeps the two release lines from colliding (see docs/roadmap notes).
 tag_pattern = "^v[0-9]+\\.[0-9]+\\.[0-9]+"
-# Prereleases (`-rc`, `-beta`, …) are not public releases; keep them off the page.
 ignore_tags = "-(rc|alpha|beta)"
 
 topo_order = false

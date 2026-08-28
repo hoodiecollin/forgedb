@@ -1,17 +1,3 @@
-//! DuckDB benchmark suite (embedded, columnar/vectorized). Mirrors the ForgeDB /
-//! SQLite / redb scenarios over the SAME seeded corpus so the Criterion groups line
-//! up. DuckDB is here for its *storage model* (vectorized columnar, like ForgeDB's
-//! columns) — it is expected to WIN scan/aggregate workloads and to be comparatively
-//! WEAK at single-row OLTP (point insert / point lookup), because a columnar engine
-//! optimizes bulk vectorized access, not row-at-a-time. Showing that contrast is the
-//! point, not a failure. Reads materialize the full record (SELECT every column),
-//! matching the other suites.
-//!
-//! Durability note: DuckDB is an analytical store with a WAL + checkpoint; it has no
-//! per-row `synchronous=FULL`/`fullfsync` OLTP knob, so its single-insert latency
-//! reflects its own WAL/checkpoint model — NOT a matched `F_FULLFSYNC` barrier. Its
-//! write numbers are labeled `duckdb` and are not a like-for-like barrier comparison.
-
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use duckdb::{params, Connection};
 use forgedb_benchmarks::{
@@ -48,7 +34,6 @@ fn fresh_conn(path: &std::path::Path) -> Connection {
     conn
 }
 
-/// Load `data` into `conn` inside one transaction (setup — not timed).
 fn load(conn: &Connection, data: &Dataset) {
     conn.execute_batch("BEGIN TRANSACTION;").unwrap();
     for u in &data.users {
@@ -78,7 +63,6 @@ fn load(conn: &Connection, data: &Dataset) {
     conn.execute_batch("COMMIT;").unwrap();
 }
 
-// --- Scenario 2: single-row insert latency (autocommit) ----------------------
 fn bench_insert(c: &mut Criterion) {
     let mut group = c.benchmark_group("duckdb/insert_user");
     group.throughput(Throughput::Elements(1));
@@ -107,10 +91,6 @@ fn bench_insert(c: &mut Criterion) {
     group.finish();
 }
 
-// --- Scenario 1: bulk load (single-row INSERTs in one txn) -------------------
-// Row-at-a-time INSERT is a columnar engine's worst case (its bulk path is the
-// Appender API). We use per-row INSERT for cross-engine parity; DuckDB's own bulk
-// throughput would be measured separately with the Appender.
 fn bench_bulk_load(c: &mut Criterion) {
     let mut group = c.benchmark_group("duckdb/bulk_load_posts");
     group.sample_size(10);
@@ -147,7 +127,6 @@ fn bench_bulk_load(c: &mut Criterion) {
     group.finish();
 }
 
-// --- Read / traversal scenarios (5, 6, 8/10, 11) -----------------------------
 fn bench_reads(c: &mut Criterion) {
     let data = dataset(READ_USERS, READ_POSTS);
     let dir = tempfile::tempdir().unwrap();
@@ -158,7 +137,6 @@ fn bench_reads(c: &mut Criterion) {
     type UserRowOut = (Vec<u8>, String, String, i64);
     type TagRowOut = (Vec<u8>, String);
 
-    // Scenario 5: point lookup by PK.
     c.benchmark_group("duckdb/point_lookup")
         .throughput(Throughput::Elements(1))
         .bench_function("get_post_by_id", |b| {
@@ -178,7 +156,6 @@ fn bench_reads(c: &mut Criterion) {
             });
         });
 
-    // Scenario 6: secondary-index probe (unique email).
     c.benchmark_group("duckdb/index_probe")
         .throughput(Throughput::Elements(1))
         .bench_function("get_user_by_email", |b| {
@@ -196,7 +173,6 @@ fn bench_reads(c: &mut Criterion) {
             });
         });
 
-    // Scenario 8/10: FK-index probe -> reverse one-to-many.
     c.benchmark_group("duckdb/reverse_fk")
         .throughput(Throughput::Elements(1))
         .bench_function("user_posts", |b| {
@@ -218,7 +194,6 @@ fn bench_reads(c: &mut Criterion) {
             });
         });
 
-    // Scenario 11: many-to-many traversal (indexed junction join).
     c.benchmark_group("duckdb/m2m")
         .throughput(Throughput::Elements(1))
         .bench_function("post_tags", |b| {
@@ -242,17 +217,12 @@ fn bench_reads(c: &mut Criterion) {
         });
 }
 
-// --- Scenario 7: filtered scan + aggregate + top-N ---------------------------
-// This is the scenario a columnar/vectorized engine is BUILT to win — a full-table
-// scan pruned to the aggregated columns, and a vectorized top-N — the mirror image
-// of DuckDB's single-row-OLTP weakness above.
 fn bench_scan(c: &mut Criterion) {
     let data = dataset(READ_USERS, READ_POSTS);
     let dir = tempfile::tempdir().unwrap();
     let conn = fresh_conn(&dir.path().join("bench.duckdb"));
     load(&conn, &data);
 
-    // 7a: full scan + aggregate (CAST the UBIGINT SUM back to BIGINT to read as i64).
     c.benchmark_group("duckdb/scan_aggregate")
         .throughput(Throughput::Elements(READ_POSTS as u64))
         .bench_function("sum_views_where_published", |b| {
@@ -265,7 +235,6 @@ fn bench_scan(c: &mut Criterion) {
             });
         });
 
-    // 7b: filtered scan + sort + page (top-10 by views, full records).
     type PostRowOut = (Vec<u8>, String, u64, bool, Vec<u8>, i64);
     c.benchmark_group("duckdb/scan_sort_top10")
         .throughput(Throughput::Elements(READ_POSTS as u64))
@@ -289,19 +258,6 @@ fn bench_scan(c: &mut Criterion) {
         });
 }
 
-
-// --- Scenario 21 (#282): the REST list endpoint, S1 and S2 -------------------
-//
-// S1 = the page's rows in the serializable host-language form this engine's shipped read
-// path produces; S2 = the JSON array over the same field set, so `S2 - S1` is the same
-// added work in every suite. See `PostJson` and docs/BENCHMARKS.md.
-//
-// DuckDB is the interesting arm here: like ForgeDB it is columnar, so a 50-row page is a
-// vectorized engine being asked to do the one thing it is not built for. Its `filtered_indexed`
-// cell is now honest -- `post_views_idx` exists as of this issue (see SCHEMA).
-
-/// Decode the page into `PostJson`. DuckDB hands BLOBs back as `Vec<u8>` and UBIGINT as
-/// `u64`, so this is the same materialization the other SQL suites do.
 fn duck_page(stmt: &mut duckdb::Statement<'_>) -> Vec<PostJson> {
     stmt.query_map([], |r| {
         Ok(PostJson {
@@ -320,7 +276,6 @@ fn duck_page(stmt: &mut duckdb::Statement<'_>) -> Vec<PostJson> {
 }
 
 fn bench_list(c: &mut Criterion) {
-    // The core grid: four shapes at the core point.
     {
         let data = dataset(READ_USERS, LIST_CORE_ROWS);
         let dir = tempfile::tempdir().unwrap();
@@ -350,8 +305,6 @@ fn bench_list(c: &mut Criterion) {
         g.finish();
     }
 
-    // Size sweep, unfiltered. The core point recurs here on purpose — it is the sweep's
-    // middle point — which is legal because this is a DIFFERENT group.
     {
         let mut g = c.benchmark_group("duckdb/list_unfiltered");
         for rows in LIST_SIZES {
@@ -364,9 +317,6 @@ fn bench_list(c: &mut Criterion) {
             let sql = list_sql(clause, limit, 0);
             let label = format!("{name}/rows={rows}/limit={limit}");
 
-            // BDD-3: every engine's page must hold the same number of rows at the same
-            // (rows, limit) point. A LIMIT that clamped differently would make the
-            // cross-engine comparison meaningless while every number looked plausible.
             {
                 let mut stmt = conn.prepare(&sql).unwrap();
                 let n = duck_page(&mut stmt).len();
@@ -391,7 +341,6 @@ fn bench_list(c: &mut Criterion) {
         g.finish();
     }
 
-    // Limit sweep, unfiltered, at the core size.
     {
         let data = dataset(READ_USERS, LIST_CORE_ROWS);
         let dir = tempfile::tempdir().unwrap();

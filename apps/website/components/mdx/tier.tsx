@@ -7,20 +7,6 @@ import { ChevronRight, Telescope, Wrench } from "lucide-react";
 import { detailAtom } from "@/lib/atoms";
 import { cn } from "@/lib/utils";
 
-/**
- * The MDX vocabulary for progressive disclosure (Build B). A page's terse body
- * is Tier 1 — always visible. Authors wrap the deeper registers in these:
- *
- *   <DiveDeeper>            …Tier 2, mechanism-at-concept-level (scale 5-6)…
- *   <ImplementationDetails> …Tier 3, the manual (scale 7-10)…
- *
- * Both collapse by default and expand together when the reader flips the global
- * verbosity toggle to "detailed" — that flip is an expand-all. A reader can also
- * open one block on its own; the next global flip re-syncs everything, clearing
- * the local override. Content stays in the DOM when collapsed (search, deep
- * links, and the dev rewrite tool's source-mapping all need it there).
- */
-
 type TierStyle = {
   tier: "deeper" | "technical";
   icon: typeof Telescope;
@@ -28,7 +14,6 @@ type TierStyle = {
   head: string;
   iconCls: string;
 };
-
 const DEEPER: TierStyle = {
   tier: "deeper",
   icon: Telescope,
@@ -36,7 +21,6 @@ const DEEPER: TierStyle = {
   head: "text-primary/90 hover:text-primary",
   iconCls: "text-primary/70",
 };
-
 const TECHNICAL: TierStyle = {
   tier: "technical",
   icon: Wrench,
@@ -44,7 +28,6 @@ const TECHNICAL: TierStyle = {
   head: "text-muted-foreground hover:text-foreground",
   iconCls: "text-muted-foreground/70",
 };
-
 function TierDisclosure({
   style,
   label,
@@ -53,19 +36,13 @@ function TierDisclosure({
 }: {
   style: TierStyle;
   label: string;
-  /** One-line hint shown next to the label when collapsed. */
   summary?: string;
   children: ReactNode;
 }) {
   const detail = useAtomValue(detailAtom);
   const globalOpen = detail === "detailed";
   const [open, setOpen] = useState(globalOpen);
-
-  // The global toggle is an expand-all / collapse-all: whenever the reader's
-  // verbosity preference flips, re-sync this block to it (dropping any local
-  // override). Individual clicks below set only the local state.
   useEffect(() => setOpen(globalOpen), [globalOpen]);
-
   const Icon = style.icon;
   return (
     <div
@@ -104,8 +81,6 @@ function TierDisclosure({
     </div>
   );
 }
-
-/** Tier 2 — the mechanism, one level down from the terse body. */
 export function DiveDeeper({
   summary,
   children,
@@ -119,8 +94,6 @@ export function DiveDeeper({
     </TierDisclosure>
   );
 }
-
-/** Tier 3 — the manual. Optional; only where there's genuinely novel depth. */
 export function ImplementationDetails({
   summary,
   children,

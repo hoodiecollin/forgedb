@@ -1,9 +1,3 @@
-// Code completion for ForgeDB schemas.
-//
-// Type/modifier/directive suggestions are driven by the REAL grammar (via the
-// `forgedb_parser` AST for model/struct/enum references); there is no private
-// language model here anymore.
-
 use forgedb_parser::Schema;
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, Position};
 
@@ -16,14 +10,11 @@ pub fn get_completions(content: &str, position: Position, schema: &Schema) -> Ve
     let current_line = lines[position.line as usize];
     let before_cursor = &current_line[..position.character.min(current_line.len() as u32) as usize];
 
-    // Context-aware completions
     if before_cursor.trim_end().ends_with('@') {
-        // After @ - suggest directives
         return get_directive_completions();
     }
 
     if before_cursor.contains(':') && !before_cursor.contains('@') {
-        // In type position (after the colon) - suggest modifiers/types/references
         return get_type_completions(schema);
     }
 
@@ -33,8 +24,6 @@ pub fn get_completions(content: &str, position: Position, schema: &Schema) -> Ve
 fn get_type_completions(schema: &Schema) -> Vec<CompletionItem> {
     let mut completions = vec![];
 
-    // Field modifiers (prefix, before the type). ForgeDB has NO `~` auto-update
-    // modifier — order matches the schema reference: + & ^ * ?.
     let modifiers = [
         ("+", "Auto-generate on create", "Value is generated when the record is created (u32/u64 auto-increment, uuid, or timestamp)"),
         ("&", "Unique", "Adds a unique constraint — no two records can share this value"),
@@ -52,7 +41,6 @@ fn get_type_completions(schema: &Schema) -> Vec<CompletionItem> {
         });
     }
 
-    // Primitive types — the ACTUAL ForgeDB scalar set (no u8/u16/i8/i16/f32).
     let primitive_types = [
         ("string", "Variable-length UTF-8 string"),
         ("bool", "Boolean (true/false)"),
@@ -75,8 +63,6 @@ fn get_type_completions(schema: &Schema) -> Vec<CompletionItem> {
         });
     }
 
-    // bytes(n) fixed-size byte array. Deliberately NOT offering the deprecated
-    // `char(n)` spelling (#233) — completion is where a name is taught.
     completions.push(CompletionItem {
         label: "bytes(100)".to_string(),
         kind: Some(CompletionItemKind::TYPE_PARAMETER),
@@ -86,7 +72,6 @@ fn get_type_completions(schema: &Schema) -> Vec<CompletionItem> {
         ..Default::default()
     });
 
-    // Model references (and their [Model] one-to-many form).
     for model in &schema.models {
         completions.push(CompletionItem {
             label: model.name.clone(),
@@ -102,7 +87,6 @@ fn get_type_completions(schema: &Schema) -> Vec<CompletionItem> {
         });
     }
 
-    // Struct types — inline struct names are valid field types.
     for s in &schema.structs {
         let field_summary: String = s
             .fields
@@ -125,7 +109,6 @@ fn get_type_completions(schema: &Schema) -> Vec<CompletionItem> {
         });
     }
 
-    // Enum types — referenced by their bare PascalCase name.
     for e in &schema.enums {
         completions.push(CompletionItem {
             label: e.name.clone(),
@@ -281,7 +264,6 @@ mod tests {
         Parser::new(src).unwrap().parse_recover().schema
     }
 
-    /// Struct names appear in type-position completions with STRUCT kind.
     #[test]
     fn struct_completions_included_with_kind() {
         let schema = parse("struct Address {\n  street: string\n}\n");
@@ -293,8 +275,6 @@ mod tests {
         assert_eq!(item.unwrap().kind, Some(CompletionItemKind::STRUCT));
     }
 
-    /// Enum names appear in type-position completions (a real-grammar gap the old
-    /// private parser could not see).
     #[test]
     fn enum_completions_included() {
         let schema = parse("enum Status {\n  Active\n  Inactive\n}\n");
@@ -306,8 +286,6 @@ mod tests {
         assert_eq!(item.unwrap().kind, Some(CompletionItemKind::ENUM));
     }
 
-    /// Type completions expose real scalars (decimal/json) and never the phantom
-    /// `u8`/`f32` or the non-existent `~` modifier.
     #[test]
     fn type_completions_match_real_grammar() {
         let schema = parse("");

@@ -1,38 +1,3 @@
-//! The escape bridge, end to end: a transform written in the author's OWN
-//! language, running on the interpreter they already have (#374 direction C).
-//!
-//! # Why this is not a snapshot test
-//!
-//! What is under test is a *conversation between two processes*. The generated
-//! hop writes one JSON line and blocks on the reply; the author's runtime reads
-//! it, transforms it, and writes one line back. Every failure mode that matters
-//! here — a buffered stdout that deadlocks, a child that exits early, a reply
-//! that decodes into the wrong shape — is invisible to anything that compares
-//! generated code as strings, because the emitted text is identical in the
-//! broken and working cases. Only running it can see them.
-//!
-//! # It builds the transformer from `TransformGenerator`, not from `migrate build`
-//!
-//! Deliberately, and for a stated reason. `migrate build` emits a crate whose
-//! substrate deps are pinned from **crates.io**, so a test that shelled out to
-//! it would be red for the whole of any cycle carrying a publish gap — which is
-//! why `test_migrate_build_reports_the_path_cargo_actually_wrote` is the single
-//! `--skip` in `make test-ignored` and `tests/ci_gate_test.rs` asserts that skip
-//! matches *exactly one* test. A second registry-dependent ignored test cannot
-//! be added without breaking that invariant. So this assembles the same
-//! generated sources against **path** deps: identical mechanism, different
-//! resolution.
-//!
-//! # The interpreter
-//!
-//! `python3`, and its absence is a **hard failure, never a skip**: a guard that
-//! skips reports green because it never evaluated. It is present on every
-//! GitHub runner and on this machine.
-//!
-//! ```bash
-//! cargo test --test migrate_escape_test -- --ignored --nocapture
-//! ```
-
 #[allow(dead_code)]
 mod common;
 
@@ -52,7 +17,6 @@ fn parse(src: &str) -> Schema {
         .expect("fixture schema parses")
 }
 
-/// `python3`, or a hard failure naming why this is not a skip.
 fn python3() -> String {
     let out = Command::new("python3").arg("--version").output();
     match out {
@@ -65,7 +29,6 @@ fn python3() -> String {
     }
 }
 
-/// A scratch dir outside every project dir (`assert_driver_ok` removes those).
 fn scratch(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("forgedb-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -73,7 +36,6 @@ fn scratch(tag: &str) -> PathBuf {
     d
 }
 
-/// Writes three v1 `Post` rows into `argv[1]`.
 const WRITE_V1: &str = r##"mod database;
 use database::*;
 mod api;
@@ -95,8 +57,6 @@ fn main() {
 }
 "##;
 
-/// Reads `argv[1]` through the v2 schema and asserts every row's `views` is the
-/// DECIMAL STRING of its old number — which is what the author's transform did.
 const READ_V2: &str = r##"mod database;
 use database::*;
 
@@ -123,10 +83,6 @@ fn main() {
 }
 "##;
 
-/// Build a transformer crate for the v1 -> v2 hop and return its binary.
-///
-/// `escape` is the bridge to bake in; `field_adds` lets a caller build the
-/// deliberately-broken plan scenario 15 needs.
 fn build_transformer(
     tag: &str,
     escape: Option<EscapeBridge>,
@@ -179,15 +135,6 @@ fn build_transformer(
     (target.join(format!("debug/{name}")), proj)
 }
 
-/// Compile and run a driver against a schema generated at a SPECIFIC schema
-/// serial, and return its output.
-///
-/// `common::generate_compile_run_in` shells out to `forgedb generate`, which
-/// derives `EXPECTED_SCHEMA_VERSION` from the project's lineage — and a fixture
-/// with no `migrations/` is at the baseline, v1. The transformer stamps its
-/// destination v2, so a reader built that way refuses to open it, correctly and
-/// unhelpfully. This bakes the version the transformer wrote, through the very
-/// same generator call the transformer's own `v2` module comes from.
 fn run_driver_at_version(tag: &str, schema_src: &str, version: u32, driver: &str, data: &Path) {
     let schema = parse(schema_src);
     let code = forgedb_codegen::RustGenerator::generate_with_schema_version(&schema, version)
@@ -229,13 +176,10 @@ fn run_driver_at_version(tag: &str, schema_src: &str, version: u32, driver: &str
     let _ = std::fs::remove_dir_all(&proj);
 }
 
-/// The structural ops a real `u32 -> string` hop emits: none. The value change
-/// is entirely the author's transform.
 fn no_ops() -> Vec<ModelOp> {
     vec![]
 }
 
-/// Write an author's Python transform plus ForgeDB's host loop into `dir`.
 fn write_escape_script(dir: &Path, body: &str) -> PathBuf {
     let (host_name, host_src) = forgedb_codegen::python_host();
     common::write(&dir.join(&host_name), &host_src);
@@ -248,21 +192,15 @@ fn write_escape_script(dir: &Path, body: &str) -> PathBuf {
     script
 }
 
-// ---------------------------------------------------------------------------
-// Scenario 18 — the escape runs the author's own runtime, and the rows change
-// ---------------------------------------------------------------------------
-
 const GOOD_TRANSFORM: &str = r#"from host import run_transform, Row
 import v1
 import v2
-
 
 def transform(model: str, row: Row) -> Row:
     if model == "Post":
         source: v1.Post = row  # type: ignore[assignment]
         return {**source, "views": str(source["views"])}  # type: ignore[return-value]
     return row
-
 
 if __name__ == "__main__":
     run_transform(transform)
@@ -275,14 +213,11 @@ fn scenario_18_the_escape_runs_the_authors_runtime_and_transforms_the_rows() {
     let shared = scratch("escape18");
     let src_data = shared.join("src-data");
 
-    // 1. Three v1 rows.
     let (out, proj) = common::generate_compile_run_in("esc18writer", V1, WRITE_V1, Some(&src_data));
     common::assert_driver_ok(&out, &proj, "the v1 writer failed");
 
-    // 2. The author's transform, in their own language.
     let script = write_escape_script(&shared.join("escape"), GOOD_TRANSFORM);
 
-    // 3. The generated transformer, with the bridge baked in.
     let (bin, tproj) = build_transformer(
         "esc18",
         Some(EscapeBridge {
@@ -310,20 +245,14 @@ fn scenario_18_the_escape_runs_the_authors_runtime_and_transforms_the_rows() {
     );
     let _ = std::fs::remove_dir_all(&tproj);
 
-    // 4. Read the destination back through a v2 app and assert the VALUES.
     run_driver_at_version("esc18reader", V2, 2, READ_V2, &dst_data);
 
     let _ = std::fs::remove_dir_all(&shared);
 }
 
-// ---------------------------------------------------------------------------
-// Scenario 19 — a failing escape fails the hop and leaves the source untouched
-// ---------------------------------------------------------------------------
-
 const THROWING_TRANSFORM: &str = r#"from host import run_transform, Row
 
 _seen = 0
-
 
 def transform(model: str, row: Row) -> Row:
     global _seen
@@ -332,17 +261,10 @@ def transform(model: str, row: Row) -> Row:
         raise RuntimeError("deliberate failure on the second row")
     return {**row, "views": str(row["views"])}
 
-
 if __name__ == "__main__":
     run_transform(transform)
 "#;
 
-/// A transform that dies mid-run fails the WHOLE hop, surfaces the child's own
-/// error, publishes nothing, and leaves the source dir byte-identical.
-///
-/// The last two are the load-bearing assertions. A partial publish would be a
-/// data directory that is neither v1 nor v2, and a mutated source would remove
-/// the operator's only rollback.
 #[test]
 #[ignore = "generates and compiles two crates and runs a real interpreter; run with --ignored"]
 fn scenario_19_a_failing_escape_fails_the_hop_and_leaves_the_source_untouched() {
@@ -400,16 +322,6 @@ fn scenario_19_a_failing_escape_fails_the_hop_and_leaves_the_source_untouched() 
     let _ = std::fs::remove_dir_all(&shared);
 }
 
-/// Every ROW DATA file under `dir` as `(relative path, length, bytes hash)`,
-/// sorted.
-///
-/// `manifest.json` is deliberately excluded, and the exclusion is the honest
-/// scope of the claim rather than a convenience. The transformer opens the
-/// source through `vN::Database::open_at`, which normalizes the manifest — a
-/// reopen rewrites it whether or not the hop then fails. What the operator's
-/// rollback actually depends on is the columns, the tombstones and the WAL, and
-/// those are what is compared. Including the manifest would make this test fail
-/// on a successful *read*, which says nothing about the failure under test.
 fn fingerprint(dir: &Path) -> Vec<(String, u64, u64)> {
     fn walk(base: &Path, dir: &Path, out: &mut Vec<(String, u64, u64)>) {
         let Ok(rd) = std::fs::read_dir(dir) else { return };
@@ -420,7 +332,6 @@ fn fingerprint(dir: &Path) -> Vec<(String, u64, u64)> {
             } else if p.file_name().is_some_and(|n| n == "manifest.json") {
                 continue;
             } else if let Ok(bytes) = std::fs::read(&p) {
-                // FNV-1a, so this file needs no dependency to say "these bytes".
                 let mut h: u64 = 0xcbf2_9ce4_8422_2325;
                 for b in &bytes {
                     h ^= *b as u64;
@@ -440,26 +351,6 @@ fn fingerprint(dir: &Path) -> Vec<(String, u64, u64)> {
     out
 }
 
-// ---------------------------------------------------------------------------
-// Scenarios 13 and 15 — an unanswered required field FAILS, naming itself
-// ---------------------------------------------------------------------------
-
-/// The composition of gate 1's decisions 4 and 5, asserted by running it.
-///
-/// Decision 4 (the build refuses an unanswered hop) is a hash comparison, and
-/// gate 2 states its honest limit: hash equality proves *untouched*, not
-/// *answered*. An author who deletes the scaffold's `// TODO:` lines and changes
-/// nothing else passes it.
-///
-/// Decision 5 is what covers that case, and this is the test of it. With the
-/// defensive type-zero removed, a required field the hop supplies no value for
-/// is **absent from the row**, so the destination decode fails NAMING it —
-/// instead of the row receiving `""` and the transformer exiting 0. The defect's
-/// whole signature is a successful exit, so only running it can see this.
-///
-/// The plan is constructed by hand, deliberately bypassing
-/// `refuse_unanswered_hops`: that is the point — this asserts what happens when
-/// the first mechanism does not fire.
 #[test]
 #[ignore = "generates and compiles two crates; run with --ignored"]
 fn scenario_15_an_unanswered_required_field_errors_rather_than_writing_an_empty_string() {
@@ -469,8 +360,6 @@ fn scenario_15_an_unanswered_required_field_errors_rather_than_writing_an_empty_
     let (out, proj) = common::generate_compile_run_in("esc15writer", V1, WRITE_V1, Some(&src_data));
     common::assert_driver_ok(&out, &proj, "the v1 writer failed");
 
-    // v2 adds a REQUIRED `slug` with no default and no answer, so the hop emits
-    // no op for it and the key is absent from every row.
     let v1: &'static Schema = Box::leak(Box::new(parse(V1)));
     let v2: &'static Schema = Box::leak(Box::new(parse(
         "Post {\n  id: +uuid\n  title: string\n  views: u32\n  slug: string\n}\n",
@@ -489,8 +378,6 @@ fn scenario_15_an_unanswered_required_field_errors_rather_than_writing_an_empty_
                 source_model: "Post".to_string(),
                 field_renames: vec![],
                 field_removes: vec![],
-                // EMPTY. This is what `lower_fill` produces for a required add
-                // with no default and no answer.
                 field_adds: vec![],
                 field_copies: vec![],
                 field_null_fills: vec![],
@@ -553,15 +440,6 @@ fn scenario_15_an_unanswered_required_field_errors_rather_than_writing_an_empty_
     let _ = std::fs::remove_dir_all(&shared);
 }
 
-// ---------------------------------------------------------------------------
-// Scenario 20 — the emitted modules are real code
-// ---------------------------------------------------------------------------
-
-/// The generated Python modules and the scaffold that imports them **compile**.
-///
-/// `python -m compileall` is stdlib, so this needs nothing installed. It catches
-/// the class of break a string snapshot cannot: a type expression that renders
-/// plausibly and does not parse.
 #[test]
 #[ignore = "runs a real interpreter; run with --ignored"]
 fn scenario_20_the_generated_python_modules_compile() {
@@ -581,8 +459,6 @@ fn scenario_20_the_generated_python_modules_compile() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // And the control: a scaffold with a syntax error DOES fail, so the
-    // assertion above is not vacuous.
     let broken = scratch("escape20broken");
     write_escape_script(&broken, "def transform(model, row)\n    return row\n");
     let out = Command::new(&python)

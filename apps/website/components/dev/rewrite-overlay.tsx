@@ -1,15 +1,5 @@
 "use client";
 
-/**
- * In-browser prose-rewrite overlay (LOCAL DEV ONLY — mounted solely when
- * NODE_ENV === "development"). Toggle with ⌥E, then:
- *   • click a paragraph/list/callout   → rewrite that block
- *   • click a heading                  → rewrite the whole section (or just the heading)
- *   • drag-select text                 → rewrite that span
- * Type an instruction, submit, and Claude Code (woken by scripts/rewrite-watch.ts)
- * writes a proposal. Review the diff / candidates and Accept to splice it into the
- * .mdx; `next dev` HMR reflows the page.
- */
 import { useAtom } from "jotai";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { usePathname } from "next/navigation";
@@ -22,30 +12,19 @@ import {
   type DetectedTarget,
 } from "@/lib/dev/rewrite-target";
 import type { FeedbackMode, RewriteProposal } from "@/lib/dev/rewrite-types";
-
 const API = "/api/dev-rewrite/";
 const PRESETS = ["Tighten", "Simplify", "More precise", "Fix grammar", "Add an example"];
-
-/** /docs/schema/enums/ → ["schema","enums"]; /docs/ → []; non-docs → null. */
 function slugFromPath(pathname: string): string[] | null {
   const parts = pathname.replace(/^\/+|\/+$/g, "").split("/").filter(Boolean);
   if (parts[0] !== "docs") return null;
   return parts.slice(1);
 }
-
-/**
- * Content-module id for a page that stores its copy in a typed content module
- * (see content-target.ts), or null. One page → one module for now.
- */
 function moduleForPath(pathname: string): string | null {
   return pathname.replace(/\/+$/, "") === "" ? "landing" : null;
 }
-
 const insideUI = (n: EventTarget | null) =>
   n instanceof Element && n.closest("[data-rewrite-ui]") !== null;
-
 type Phase = "idle" | "picking" | "pending" | "review";
-
 export function RewriteOverlay() {
   const pathname = usePathname();
   const slug = slugFromPath(pathname);
@@ -63,7 +42,6 @@ export function RewriteOverlay() {
   const [hoverRect, setHoverRect] = useState<DOMRect | null>(null);
   const [staleMsg, setStaleMsg] = useState<string | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
-
   const reset = useCallback(() => {
     setPhase("idle");
     setTargets([]);
@@ -74,12 +52,9 @@ export function RewriteOverlay() {
     setHoverRect(null);
     window.getSelection()?.removeAllRanges();
   }, []);
-
   const target = targets[targetIndex] ?? null;
   const editable = slug !== null || contentModule !== null;
   const enabled = mode && editable;
-
-  // ⌥E toggles edit mode anywhere; Esc backs out.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.altKey && (e.key === "e" || e.key === "E")) {
@@ -93,11 +68,8 @@ export function RewriteOverlay() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [mode, phase, reset, setMode]);
-
-  // Selection / click / hover wiring while in edit mode.
   useEffect(() => {
     if (!enabled) return;
-
     const onMouseUp = (e: MouseEvent) => {
       if (insideUI(e.target) || phase === "pending" || phase === "review") return;
       const found = contentModule
@@ -112,7 +84,6 @@ export function RewriteOverlay() {
         setTimeout(() => inputRef.current?.focus(), 0);
       }
     };
-    // Swallow clicks (link nav, anchor jumps) while editing.
     const onClickCapture = (e: MouseEvent) => {
       if (insideUI(e.target)) return;
       e.preventDefault();
@@ -126,7 +97,6 @@ export function RewriteOverlay() {
       const block = (contentModule ? contentBlock : stampedBlock)(e.target as Node);
       setHoverRect(block ? block.getBoundingClientRect() : null);
     };
-
     document.addEventListener("mouseup", onMouseUp);
     document.addEventListener("click", onClickCapture, true);
     document.addEventListener("mousemove", onMouseMove);
@@ -136,8 +106,6 @@ export function RewriteOverlay() {
       document.removeEventListener("mousemove", onMouseMove);
     };
   }, [enabled, phase, defaultFeedback, contentModule]);
-
-  // Poll for the proposal once a request is in flight.
   useEffect(() => {
     if (phase !== "pending" || !requestId) return;
     let live = true;
@@ -151,7 +119,6 @@ export function RewriteOverlay() {
           setPhase("review");
         }
       } catch {
-        /* dev server reloading; keep polling */
       }
     };
     const iv = setInterval(tick, 1000);
@@ -161,17 +128,12 @@ export function RewriteOverlay() {
       clearInterval(iv);
     };
   }, [phase, requestId]);
-
   if (!mode) {
-    // Collapsed launcher.
     return editable ? <Fab active={false} onClick={() => setMode(true)} /> : null;
   }
   if (!editable) return null;
-
   async function submit() {
     if (!target || !instruction.trim()) return;
-
-    // Content-key target: the route resolves offsets + staleness from the module.
     const body =
       target.contentKey && contentModule
         ? {
@@ -199,7 +161,6 @@ export function RewriteOverlay() {
               renderedText: target.renderedText.slice(0, 2000),
             },
           };
-
     const res = await fetch(API, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -216,7 +177,6 @@ export function RewriteOverlay() {
       setPhase("pending");
     }
   }
-
   async function decide(action: "accept" | "reject", index = 0) {
     if (!requestId) return;
     const res = await fetch(API, {
@@ -229,18 +189,15 @@ export function RewriteOverlay() {
       reset();
       return;
     }
-    // The .mdx is fs-read at request time, not an imported module, so Next's
-    // HMR doesn't track it — reload to reflect the spliced change.
     if (action === "accept") {
       window.location.reload();
       return;
     }
     reset();
   }
-
   return (
     <>
-      {/* Hover highlight (idle only). */}
+      { }
       {phase === "idle" && hoverRect && (
         <div
           className="pointer-events-none fixed z-[9998] rounded-sm ring-2 ring-primary/60 bg-primary/5"
@@ -252,8 +209,7 @@ export function RewriteOverlay() {
           }}
         />
       )}
-
-      {/* Selected-target outline (picking). */}
+      { }
       {phase === "picking" && target && (
         <div
           className="pointer-events-none fixed z-[9998] rounded-sm ring-2 ring-primary bg-primary/10"
@@ -265,10 +221,8 @@ export function RewriteOverlay() {
           }}
         />
       )}
-
       <Banner phase={phase} />
       <Fab active onClick={() => setMode(false)} />
-
       {phase === "picking" && target && (
         <InstructionPopover
           rect={target.rect}
@@ -284,11 +238,8 @@ export function RewriteOverlay() {
           onCancel={reset}
         />
       )}
-
       {phase === "pending" && <PendingCard onCancel={() => decide("reject")} />}
-
       {staleMsg && <StaleCard message={staleMsg} onDismiss={() => setStaleMsg(null)} />}
-
       {phase === "review" && proposal && (
         <ReviewPanel
           proposal={proposal}
@@ -299,8 +250,6 @@ export function RewriteOverlay() {
     </>
   );
 }
-
-/* ------------------------------------------------------------------ pieces */
 
 function Fab({ active, onClick }: { active: boolean; onClick: () => void }) {
   return (
@@ -319,7 +268,6 @@ function Fab({ active, onClick }: { active: boolean; onClick: () => void }) {
     </button>
   );
 }
-
 function Banner({ phase }: { phase: Phase }) {
   const text =
     phase === "idle"
@@ -338,22 +286,18 @@ function Banner({ phase }: { phase: Phase }) {
     </div>
   );
 }
-
 const KIND_LABEL: Record<string, string> = {
   section: "Section",
   block: "Block",
   span: "Span",
   content: "Copy",
 };
-
-/** Clamp a popover to the viewport, anchored just below the target rect. */
 function popoverPos(rect: DOMRect): { left: number; top: number } {
   const width = 360;
   const left = Math.min(Math.max(8, rect.left), window.innerWidth - width - 8);
   const top = Math.min(rect.bottom + 8, window.innerHeight - 260);
   return { left, top };
 }
-
 function InstructionPopover(props: {
   rect: DOMRect;
   targets: DetectedTarget[];
@@ -376,7 +320,7 @@ function InstructionPopover(props: {
       className="fixed z-[9999] w-[360px] rounded-lg border border-border bg-background p-3 shadow-xl"
       style={{ left, top }}
     >
-      {/* Kind switch (only when there's a real choice). */}
+      { }
       {props.targets.length > 1 && (
         <div className="mb-2 flex gap-1">
           {props.targets.map((t, i) => (
@@ -394,7 +338,6 @@ function InstructionPopover(props: {
           ))}
         </div>
       )}
-
       <p className="mb-2 line-clamp-2 text-xs text-muted-foreground">
         <span className="font-mono text-[10px] uppercase tracking-wide text-primary">
           {KIND_LABEL[target.kind]}
@@ -402,7 +345,6 @@ function InstructionPopover(props: {
         “{target.renderedText.slice(0, 120)}
         {target.renderedText.length > 120 ? "…" : ""}”
       </p>
-
       <textarea
         ref={props.inputRef}
         value={props.instruction}
@@ -417,7 +359,6 @@ function InstructionPopover(props: {
         rows={3}
         className="w-full resize-none rounded border border-border bg-background px-2 py-1.5 text-sm outline-none focus:ring-1 focus:ring-primary"
       />
-
       <div className="mt-2 flex flex-wrap gap-1">
         {PRESETS.map((p) => (
           <button
@@ -465,7 +406,6 @@ function InstructionPopover(props: {
     </div>
   );
 }
-
 function PendingCard({ onCancel }: { onCancel: () => void }) {
   return (
     <div
@@ -480,7 +420,6 @@ function PendingCard({ onCancel }: { onCancel: () => void }) {
     </div>
   );
 }
-
 function StaleCard({ message, onDismiss }: { message: string; onDismiss: () => void }) {
   return (
     <div
@@ -501,7 +440,6 @@ function StaleCard({ message, onDismiss }: { message: string; onDismiss: () => v
     </div>
   );
 }
-
 function ReviewPanel({
   proposal,
   onAccept,
@@ -530,9 +468,7 @@ function ReviewPanel({
           Reject all
         </button>
       </div>
-
       {!multi && <DiffView original={proposal.original} next={first.text} />}
-
       <div className="mt-3 space-y-3">
         {(multi ? proposal.candidates : proposal.candidates.slice(0, 1)).map((c, i) => (
           <div key={i} className="rounded border border-border">
@@ -561,8 +497,6 @@ function ReviewPanel({
     </div>
   );
 }
-
-/** Minimal before/after view — line-level, good enough to eyeball a prose change. */
 function DiffView({ original, next }: { original: string; next: string }) {
   return (
     <div className="grid gap-2 md:grid-cols-2">

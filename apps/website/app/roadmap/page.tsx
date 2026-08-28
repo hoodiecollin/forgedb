@@ -29,14 +29,7 @@ function formatDate(iso: string): string {
   return `${MONTHS[Number(mo) - 1] ?? mo} ${Number(d)}, ${y}`;
 }
 
-/*
- * Labels worth surfacing as a chip. `improvement` is deliberately absent: it is the default type
- * on the overwhelming majority of roadmap items, so a chip for it would appear nearly everywhere
- * and distinguish nothing. A chip earns its place by being the exception.
- */
 const CHIP_LABELS = ["experiment", "bugfix", "hotfix", "release-gate"];
-
-/** A tiny milestone/state chip for a standalone issue or a child. */
 function WhenChip({ item }: { item: Pick<ChildIssue, "shipped" | "pending" | "state" | "milestone"> }) {
   if (item.shipped) {
     return (
@@ -63,7 +56,6 @@ function WhenChip({ item }: { item: Pick<ChildIssue, "shipped" | "pending" | "st
   }
   return null;
 }
-
 function labelChips(labels: string[]) {
   const chips = labels.filter((l) => CHIP_LABELS.includes(l));
   if (chips.length === 0) return null;
@@ -80,8 +72,6 @@ function labelChips(labels: string[]) {
     </span>
   );
 }
-
-/** A standalone issue row (a bug fix / one-off with no epic parent). */
 function IssueRow({ issue }: { issue: IssueItem }) {
   return (
     <li className="group flex items-baseline gap-3 py-2">
@@ -108,8 +98,6 @@ function IssueRow({ issue }: { issue: IssueItem }) {
     </li>
   );
 }
-
-/** A child sub-issue row inside an expanded epic. */
 function ChildRow({ child }: { child: ChildIssue }) {
   const Icon = child.state === "closed" ? CheckCircle2 : CircleDashed;
   return (
@@ -140,8 +128,6 @@ function ChildRow({ child }: { child: ChildIssue }) {
     </li>
   );
 }
-
-/** An epic — a collapsible initiative with a progress bar and grouped children. */
 function EpicCard({ epic, open }: { epic: EpicItem; open?: boolean }) {
   const pct = epic.total > 0 ? Math.round((epic.done / epic.total) * 100) : 0;
   return (
@@ -179,13 +165,9 @@ function EpicCard({ epic, open }: { epic: EpicItem; open?: boolean }) {
     </details>
   );
 }
-
-/** Render any top-level item (epic or standalone issue). */
 function ItemView({ item, openEpics }: { item: RoadmapItem; openEpics?: boolean }) {
   return item.kind === "epic" ? <EpicCard epic={item} open={openEpics} /> : <IssueRow issue={item} />;
 }
-
-/** A titled status section holding epics (cards) + standalone issues (rows). */
 function Section({
   icon: Icon, title, blurb, items, openEpics,
 }: {
@@ -223,10 +205,8 @@ function Section({
     </section>
   );
 }
-
 export default function RoadmapPage() {
   const data = getRoadmap();
-
   return (
     <main className="mx-auto max-w-3xl px-4 py-14 sm:px-6">
       <header className="mb-6">
@@ -236,8 +216,7 @@ export default function RoadmapPage() {
           fixes alongside. What&apos;s in progress, planned, experimental, and still an idea.
         </p>
       </header>
-
-      {/* Caveat banner — build-time snapshot; the GH Project is live. */}
+      { }
       <div className="mb-8 rounded-lg border border-border/60 bg-muted/20 px-4 py-3 text-sm text-muted-foreground">
         {data.ok ? (
           <>
@@ -269,8 +248,7 @@ export default function RoadmapPage() {
           </>
         )}
       </div>
-
-      {/* Waterline: latest release + the next release in flight. */}
+      { }
       {(data.latestRelease || data.nextMilestone) && (
         <div className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
           {data.latestRelease && (
@@ -309,7 +287,6 @@ export default function RoadmapPage() {
           </a>
         </div>
       )}
-
       <Section
         icon={Rocket}
         title="In progress"
@@ -335,8 +312,7 @@ export default function RoadmapPage() {
         blurb="Speculative and unscheduled — directions we're considering, pending design."
         items={data.ideas}
       />
-
-      {/* Shipped — grouped epics (if any) + compact release cards. */}
+      { }
       {(data.shippedEpics.length > 0 || data.releases.length > 0) && (
         <section className="mt-8 border-t border-border/60 pt-8">
           <div className="mb-3 flex items-center gap-2.5">

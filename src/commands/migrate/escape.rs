@@ -1,43 +1,7 @@
-//! The escape hatch: a transform written in the author's OWN language (#374
-//! direction C).
-//!
-//! ForgeDB **does not embed a JS or Python runtime** — no QuickJS, no CPython,
-//! no bundled interpreter. The generated transformer links the runtime the
-//! author already has installed, located through `[toolchain]`. This module
-//! owns the author-facing half: which language the escape is written in, and
-//! the scaffold ForgeDB writes for them to fill in.
-//!
-//! # Ownership inside `migrations/<id>/`, stated once
-//!
-//! * `transform.{rs,ts,py}` is **the author's**. It is never rewritten once it
-//!   exists.
-//! * `v{n}.{ts,py}` are **ForgeDB's**, derived from the committed
-//!   `migrations/schemas/v{n}.forge`, and are always rewritten — by `migrate
-//!   create` and again by `migrate build` — so a CLI upgrade reaches them and
-//!   any drift shows up in the author's own diff rather than as a type error.
-
 use crate::{Result, error::CliError};
 use forgedb_migrations::{EscapeLanguage, HopBodyClass, SchemaChange, checksum};
 use std::path::{Path, PathBuf};
 
-/// Which language an escape transform is written in, **derived from
-/// `[generate].targets`** (gate 1 decision 2).
-///
-/// There is no config key for it, and that is the point: a project that
-/// generates a TypeScript SDK writes its transforms in TypeScript because that
-/// is the language it already chose. A second declaration could disagree with
-/// the first.
-///
-/// Precedence is fixed — TypeScript, then Python, then Rust — rather than
-/// taken from the order the user listed targets in, so that `targets = ["all"]`
-/// (the default for a project with no config, and a set with no order) resolves
-/// the same way every time.
-///
-/// **Go falls back to Rust.** Go is compiled, so "run the author's own runtime
-/// out of process" would mean invoking a Go toolchain and linking generated
-/// packages — materially more than the line-oriented host loop the interpreted
-/// languages need, and not what `[toolchain]`'s location-and-version shape
-/// describes.
 pub fn language_for(internal_targets: &[String]) -> EscapeLanguage {
     let has = |t: &str| internal_targets.iter().any(|x| x == t);
     if has("typescript") || has("napi") {
@@ -49,23 +13,6 @@ pub fn language_for(internal_targets: &[String]) -> EscapeLanguage {
     }
 }
 
-/// Write the authored-transform scaffold for a migration, returning its path
-/// and the checksum of **what ForgeDB wrote**.
-///
-/// The checksum is captured here, once, and stored in the record — never
-/// recomputed at build time. A scaffold regenerated at build reads as
-/// equivalent and is not: any improvement to the scaffold text would then make
-/// every previously-authored file compare unequal to a scaffold that was never
-/// written, and an author whose file happened to match the *new* scaffold would
-/// be refused for no reason.
-///
-/// An existing file is **never clobbered** — an authored body is authoritative.
-/// The checksum returned is of the scaffold text either way, INCLUDING when the
-/// file was already there and the scaffold was therefore not written. That is
-/// the meaning the build-time comparison wants: "are these bytes still the ones
-/// ForgeDB would have handed you?". Returning the hash of the *existing* file
-/// instead would make every pre-authored transform compare equal to its own
-/// recorded hash and be refused as unedited.
 pub fn write_scaffold(
     migrations_dir: &Path,
     migration_id: &str,
@@ -88,17 +35,6 @@ pub fn write_scaffold(
     Ok((path, checksum::compute(body.as_bytes())))
 }
 
-/// (Re)write ForgeDB's own files beside an escape transform: the host loop and
-/// one typed module per version in the hop's range (#374 step 11).
-///
-/// **Always rewritten**, by both `migrate create` and `migrate build`. They are
-/// derived from the committed `migrations/schemas/v{n}.forge`, so a CLI upgrade
-/// reaches them and any drift surfaces in the author's own `git diff` rather
-/// than as a type error in a file nobody edited. The author's
-/// `transform.{ts,py}` beside them is theirs and is never touched.
-///
-/// A Rust escape writes nothing here: it is embedded verbatim into the hop and
-/// compiled with it, so its types are the generated `vN` modules already.
 pub fn write_support_files(
     migrations_dir: &Path,
     migration_id: &str,
@@ -137,8 +73,6 @@ pub fn write_support_files(
     Ok(written)
 }
 
-/// Every model this migration has authored residue for, with the residue's
-/// descriptions.
 fn residue_by_model(changes: &[SchemaChange]) -> std::collections::BTreeMap<String, Vec<String>> {
     let mut by_model: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     for c in changes {
@@ -153,12 +87,6 @@ fn residue_by_model(changes: &[SchemaChange]) -> std::collections::BTreeMap<Stri
     by_model
 }
 
-/// The scaffold text.
-///
-/// It deliberately does **not** say "fill in every TODO, then this migration is
-/// ready to build". That sentence taught the `TODO` convention the build-time
-/// refusal must not use — a grep for `TODO` is satisfied by deleting a comment,
-/// and refuses a genuinely authored file that happens to contain the word.
 fn scaffold(
     lang: EscapeLanguage,
     changes: &[SchemaChange],
@@ -172,7 +100,6 @@ fn scaffold(
     }
 }
 
-/// The shared header, in the target language's comment syntax.
 fn header(comment: &str, changes: &[SchemaChange], lang: EscapeLanguage) -> String {
     let mut s = String::new();
     let l = |s: &mut String, line: &str| {

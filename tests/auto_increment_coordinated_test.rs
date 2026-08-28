@@ -1,41 +1,3 @@
-//! Multi-process integer auto-increment under the Tier-3 coordinator (#187/#84).
-//!
-//! # Why this test exists at all
-//!
-//! It covers the **identity** integer auto specifically — the shape whose claim on
-//! the write-set is its row key (`b"r"`). `tests/sequence_claim_test.rs` is its
-//! sibling for the bare shape, which claims via `b"s"` (#260); keeping them apart
-//! means a regression in one cannot be masked by the other still passing.
-//!
-//! The counter is per-process. Two coordinated writers open the same data dir
-//! lock-free and each derive their own, so they *can* allocate the same number.
-//! Nothing prevents that, and the design deliberately does not try to. What makes
-//! it safe is that the collision is **detected**: the opaque write-set carries a
-//! key the coordinator equality-compares, so it `Nack`s the loser and the retry
-//! re-derives past the winner's value and allocates again.
-//!
-//! That is why this file's assertion is "every value distinct across processes"
-//! rather than "it compiles".
-//!
-//! # Shape
-//!
-//! One driver binary plays three roles, selected by `argv[3]`:
-//!
-//! - no role  → **parent**: spawns `forgedb coordinate`, re-execs itself twice as
-//!   writers, collects their ids, asserts global distinctness.
-//! - `writer` → opens via `Database::connect` and commits N rows through
-//!   `transaction_coordinated`, printing each id.
-//!
-//! Re-execing the same binary is what makes this a genuine multi-*process* proof;
-//! two threads would exercise Tier 2, which `auto_increment_test` already covers.
-//!
-//! Compiles a generated crate and spawns processes, so it is `#[ignore]`d out of
-//! the fast default suite:
-//!
-//! ```bash
-//! make auto-increment-test   # runs this and the single-process probe
-//! ```
-
 #![cfg(unix)]
 
 mod common;
@@ -75,14 +37,10 @@ fn main() {
     }
 }
 
-/// Commit `PER_WRITER` rows through the coordinator, printing each allocated id on
-/// its own line for the parent to collect.
 fn writer(dir: PathBuf) {
     let socket = dir.join("_coord.sock");
     let db = Database::connect(dir, socket).expect("connect to coordinator");
     for i in 0..PER_WRITER {
-        // Generous retries: a `Nack` is the EXPECTED outcome of a collision here,
-        // not a failure. Exhausting them would mean the retry never converges.
         let id = db
             .transaction_coordinated(256, |tx| {
                 tx.create_ticket(Ticket { id: 0, title: format!("row-{i}") })
@@ -103,7 +61,6 @@ fn parent(dir: PathBuf, forgedb: PathBuf) {
         .spawn()
         .expect("spawn forgedb coordinate");
 
-    // Wait for the socket rather than sleeping a guessed interval.
     let socket = dir.join("_coord.sock");
     let mut waited = 0;
     while !socket.exists() && waited < 200 {
@@ -168,9 +125,6 @@ fn parent(dir: PathBuf, forgedb: PathBuf) {
         eprintln!("FAIL every coordinated create committed: got {issued}, want {expected}");
         bad += 1;
     }
-    // THE assertion. A duplicate here means two processes both committed the same
-    // number and the coordinator did not see the collision — which is exactly what
-    // decision 6's identity-or-`&unique` rule exists to make impossible.
     if sorted.len() != issued {
         eprintln!(
             "FAIL every allocation is distinct ACROSS PROCESSES: {} unique of {issued}",
@@ -178,8 +132,6 @@ fn parent(dir: PathBuf, forgedb: PathBuf) {
         );
         bad += 1;
     }
-    // Gaps are allowed and expected (a `Nack`ed attempt burns its number), so the
-    // set is deliberately NOT asserted to be contiguous — only distinct.
     if sorted.iter().any(|&n| n == 0) {
         eprintln!("FAIL no row was given the allocate sentinel");
         bad += 1;

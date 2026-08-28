@@ -1,24 +1,6 @@
-//! CLI ↔ LSP diagnostic parity — the anti-drift guarantee for epic #173 (#176).
-//!
-//! `forgedb validate` (the CLI) and the ForgeDB language server must surface the
-//! *same* diagnostic set for any schema. Both derive it from a single shared seam,
-//! `forgedb_parser::Parser::parse_recover` — a resilient parse returning every
-//! syntax and semantic diagnostic at once:
-//!
-//! * the CLI reaches it through `forgedb::commands::validate::parse_and_validate`,
-//! * the LSP calls `parse_recover` in `update_document`, then maps the result with
-//!   `forgedb_lsp_server::to_lsp_diagnostics`.
-//!
-//! This fixture imports **both real code paths** and asserts they agree, so the two
-//! surfaces cannot drift onto private notions of validity. It runs over the entire
-//! `examples/*` corpus (which must stay clean under both) plus a battery of
-//! intentionally-broken schemas that exercise non-empty parity — the case that
-//! actually catches drift.
-
 use forgedb::commands::validate::parse_and_validate;
 use forgedb_lsp_server::to_lsp_diagnostics;
 
-/// `(label, source)` for every `examples/*/schema.forge`.
 fn example_schemas() -> Vec<(String, String)> {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
     let mut out = Vec::new();
@@ -34,9 +16,6 @@ fn example_schemas() -> Vec<(String, String)> {
     out
 }
 
-/// The core parity assertion: the CLI's diagnostic vector and the LSP's mapped
-/// diagnostics are the same set — same count, same order, each CLI message carried
-/// verbatim into the LSP message, and 1-based positions converted to 0-based ranges.
 fn assert_parity(label: &str, content: &str) {
     let parsed =
         parse_and_validate(content).unwrap_or_else(|e| panic!("{label}: fatal lexer error: {e}"));
@@ -53,14 +32,12 @@ fn assert_parity(label: &str, content: &str) {
     );
 
     for (c, l) in cli.iter().zip(lsp.iter()) {
-        // The LSP may append "\nSuggestion: …"; the CLI message must be a prefix.
         assert!(
             l.message.starts_with(&c.message),
             "{label}: LSP message {:?} does not carry the CLI message {:?}",
             l.message,
             c.message,
         );
-        // Position parity: 1-based compiler position -> 0-based LSP range start.
         if let Some(pos) = c.position {
             assert_eq!(
                 l.range.start.line,
@@ -78,9 +55,6 @@ fn assert_parity(label: &str, content: &str) {
     }
 }
 
-/// Every shipped example validates clean under BOTH surfaces (the corpus is the
-/// shared fixture #176 calls out): the CLI reports zero diagnostics and the LSP
-/// maps that to zero squiggles.
 #[test]
 fn examples_are_clean_for_both_cli_and_lsp() {
     for (label, content) in example_schemas() {
@@ -103,9 +77,6 @@ fn examples_are_clean_for_both_cli_and_lsp() {
     }
 }
 
-/// Non-empty parity — the case that actually guards against drift. Each fixture
-/// trips a distinct compiler rule; the CLI and the LSP must report the identical
-/// diagnostic set for it.
 #[test]
 fn invalid_schemas_produce_matching_diagnostic_sets() {
     let fixtures = [

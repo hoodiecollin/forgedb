@@ -1,38 +1,13 @@
 [workspace]
 members = ["cargo:."]
 
-# Config for 'dist' (cargo-dist) — epic #173.
-#
-# One dist "app" = the `forgedb` cargo package, shipping BOTH the `forgedb` CLI
-# and the bundled `forgedb-lsp` language server in every archive. `forgedb-lsp`
-# is a feature-gated bin (`required-features = ["lsp"]`), so `features = ["lsp"]`
-# below makes the release build compile it. `forgedb-lsp-server` is lib-only and
-# marked `dist = false`, so it is never treated as its own app.
-#
-# Versions ship in lockstep off a single `v*` git tag. PyPI is intentionally NOT
-# here: dist can't publish to PyPI, so #185 uses a separate maturin job (added to
-# the release workflow after `dist generate`).
 [dist]
-# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.32.0"
-# CI backends to support
 ci = "github"
-# Build the bundled language server binary into every archive.
 features = ["lsp"]
-# Build only the `forgedb` package (not `cargo build --workspace`). The workspace
 # includes `apps/inspector/src-tauri` (a Tauri desktop app pulling the GTK stack)
-# which the CLI does NOT depend on; a `--workspace` build would compile it and
-# fail on Linux runners (missing `gdk-3.0`). precise-builds scopes each target's
-# build to `-p forgedb`, so the inspector is never compiled here.
 precise-builds = true
-# The installers to generate for each app. Windows is NOT shipped in this release
-# (the `forgedb` binary is currently Unix-only — storage-native positional I/O +
-# coordinator Unix sockets; tracked for a follow-up), so no `powershell`/`msi`
-# installer and no winget.
 installers = ["shell", "homebrew", "npm"]
-# Target platforms to build apps for (Rust target-triple syntax). Windows
-# (x86_64-pc-windows-msvc) is intentionally omitted until the substrate crates are
-# made portable — see #209.
 targets = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
@@ -40,15 +15,7 @@ targets = [
     "x86_64-unknown-linux-gnu",
     "x86_64-unknown-linux-musl",
 ]
-# Checksum algorithm for release artifacts.
 checksum = "sha256"
-# Homebrew tap the `brew install` formula is published to.
 tap = "hoodiecollin/homebrew-tap"
-# npm scope for the `npm install` package (=> @hoodiecollin/forgedb).
 npm-scope = "@hoodiecollin"
-# Actually publish to the tap and npm registry on a real `v*` release.
-# npm uses a CUSTOM publish job (`./publish-npm` => .github/workflows/publish-npm.yml)
-# that authenticates with npm Trusted Publishing (OIDC), not a stored NPM_TOKEN —
-# aligning the npm channel with PyPI (`pypi.yml`). `npm` stays in `installers` so
-# dist still builds the npm package; only the publish step is overridden.
 publish-jobs = ["homebrew", "./publish-npm"]

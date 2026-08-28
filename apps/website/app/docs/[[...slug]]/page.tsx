@@ -26,14 +26,12 @@ import { Toc } from "@/components/docs/toc";
 import { DocsPager } from "@/components/docs/pager";
 import { DocsBreadcrumb } from "@/components/docs/breadcrumb";
 
-// Fully static: enumerate every doc page at build time.
 export const dynamic = "error";
 export const dynamicParams = false;
 
 type Params = { slug?: string[] };
 
 export function generateStaticParams(): Params[] {
-  // The optional catch-all needs the index represented as an empty slug.
   return getAllDocSlugs().map((slug) => ({ slug: slug.length ? slug : [] }));
 }
 
@@ -50,8 +48,6 @@ export async function generateMetadata({
   return {
     title: detailed ? `${doc.frontmatter.title} — detailed` : doc.frontmatter.title,
     description: doc.frontmatter.description,
-    // The terse body is canonical; a detailed variant points its canonical at it
-    // so the two tellings don't compete as duplicate content.
     ...(detailed ? { alternates: { canonical: baseHref } } : {}),
   };
 }
@@ -63,23 +59,14 @@ export default async function DocPage({ params }: { params: Promise<Params> }) {
 
   const toc = extractToc(doc.content);
 
-  // Build-C pages keep terse + detailed as sibling routes. Page chrome
-  // (breadcrumb group, prev/next) always comes from the base page so a detailed
-  // variant sits in the same place in the docs as its terse twin.
   const detailed = isDetailedSlug(slug);
   const baseSlug = detailed ? slug.slice(0, -1) : slug;
   const baseHref = hrefForSlug(baseSlug);
   const meta = docMeta(baseHref);
   const isCPage = detailed || hasDetailedVariant(baseSlug);
 
-  // Only surface the verbosity control on pages that actually have deeper blocks
-  // to expand — otherwise it would toggle nothing. (Build-C pages use the
-  // variant switch instead, which is always shown.)
   const hasTiers = /<(DiveDeeper|ImplementationDetails)\b/.test(doc.content);
 
-  // Surface the language switch only on pages that carry per-ecosystem blocks —
-  // it swaps their install command + runtime/SDK examples and would do nothing
-  // elsewhere. Can co-exist with the verbosity/variant control (both shown).
   const hasEco = /<Eco\b/.test(doc.content);
 
   return (
@@ -114,9 +101,6 @@ export default async function DocPage({ params }: { params: Promise<Params> }) {
         </header>
 
         {process.env.NODE_ENV === "development" ? (
-          // Staleness fingerprint for the local prose-rewrite tool: if the .mdx
-          // body changes after this render, stamped offsets are stale and a
-          // splice is refused server-side. Never emitted in the export build.
           <span hidden data-rewrite-doc-hash={hashContent(doc.content)} />
         ) : null}
 
@@ -126,9 +110,6 @@ export default async function DocPage({ params }: { params: Promise<Params> }) {
             components={mdxComponents}
             options={{
               mdxOptions: {
-                // Dev-only: stamp source offsets onto blocks so the in-browser
-                // rewrite tool can map a rendered element back to the .mdx.
-                // Never added to the production export build.
                 remarkPlugins:
                   process.env.NODE_ENV === "development"
                     ? [remarkGfm, remarkSourceMap]

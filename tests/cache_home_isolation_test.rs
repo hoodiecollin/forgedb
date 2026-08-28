@@ -1,17 +1,3 @@
-//! Every test that runs the `forgedb` binary must redirect the ForgeDB home.
-//!
-//! Since #333, `forgedb generate` claims its project id in a ledger under
-//! `$FORGEDB_HOME`, defaulting to `~/.forgedb`. A test that does not override it
-//! writes into the developer's real home, and two fixtures that happen to share a
-//! `[project].name` then collide **across unrelated test runs** — the second one
-//! failing for a reason that is nowhere in its own source. That is exactly what
-//! happened to `config_flag_test`, whose two tests both scaffold
-//! `name = "discriminator"`.
-//!
-//! This guard is anchored on `CARGO_BIN_EXE_forgedb` — the token that represents
-//! *running the binary*, which is the thing that can pollute — rather than on a
-//! helper's name, which a new file is free not to use.
-
 use std::path::Path;
 
 #[test]
@@ -23,7 +9,6 @@ fn every_binary_invoking_test_redirects_the_forgedb_home() {
     files.sort();
 
     for file in files {
-        // This file names the constant while describing it, and runs nothing.
         if file.file_name().and_then(|n| n.to_str()) == Some("cache_home_isolation_test.rs") {
             continue;
         }

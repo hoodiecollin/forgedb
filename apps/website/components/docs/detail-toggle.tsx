@@ -10,12 +10,6 @@ const OPTIONS: { value: DetailLevel; label: string; icon: typeof AlignLeft }[] =
   { value: "detailed", label: "Detailed", icon: AlignJustify },
 ];
 
-/**
- * The reader's global verbosity switch. Sets the sticky `detailAtom`; every
- * disclosure block on the page follows (see `TierDisclosure`). Rendered only on
- * pages that actually carry deeper blocks — the doc page computes that and omits
- * the control otherwise, so it never appears where it would do nothing.
- */
 export function DetailToggle() {
   const [detail, setDetail] = useAtom(detailAtom);
   return (

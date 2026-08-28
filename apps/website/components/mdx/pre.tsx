@@ -4,15 +4,9 @@ import * as React from "react";
 import { Check, Copy } from "lucide-react";
 import { cn } from "@/lib/utils";
 
-/**
- * Code-block wrapper with a copy button. rehype-pretty-code renders the inner
- * `<code>` (already highlighted); we add the chrome + clipboard action, reading
- * the rendered text off the DOM so we never re-serialize the tokens.
- */
 export function Pre({ className, children, ...props }: React.ComponentProps<"pre">) {
   const ref = React.useRef<HTMLPreElement>(null);
   const [copied, setCopied] = React.useState(false);
-
   const copy = async () => {
     const text = ref.current?.textContent ?? "";
     try {
@@ -20,10 +14,8 @@ export function Pre({ className, children, ...props }: React.ComponentProps<"pre
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch {
-      /* clipboard unavailable — no-op */
     }
   };
-
   return (
     <div className="group relative my-4">
       <button

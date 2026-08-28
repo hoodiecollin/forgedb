@@ -2,21 +2,8 @@ use crate::{error::CliError, Result};
 use std::path::PathBuf;
 use std::process::Command;
 
-/// `forgedb lsp` — run the ForgeDB language server over stdio.
-///
-/// The main `forgedb` CLI deliberately stays free of the async LSP stack
-/// (`tokio` / `tower-lsp`): the language server lives in a **sibling
-/// `forgedb-lsp` binary** that ships alongside `forgedb` on every distribution
-/// channel (epic #173). This subcommand is a thin, synchronous launcher —
-/// it resolves that binary and hands the process off to it, so `forgedb lsp`
-/// and invoking `forgedb-lsp` directly are equivalent. Editor extensions may
-/// use either; routing through `forgedb lsp` keeps binary resolution in one
-/// place (here).
 pub struct LspOptions {
-    /// Explicit path to the `forgedb-lsp` binary (from `--server-path`). When
-    /// unset, the server is resolved next to the running `forgedb`, then on PATH.
     pub server_path: Option<PathBuf>,
-    /// Extra arguments forwarded verbatim to `forgedb-lsp`.
     pub args: Vec<String>,
 }
 
@@ -28,13 +15,9 @@ pub fn run(options: LspOptions) -> Result<()> {
     let mut cmd = Command::new(&server);
     cmd.args(&options.args);
 
-    // Hand this process over to the language server. On Unix, `exec` *replaces*
-    // the process image so no wrapper sits in the stdio pipe between the editor
-    // and the server. On other platforms, spawn it and forward the exit code.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // `exec` only returns if the handoff itself fails.
         let err = cmd.exec();
         Err(CliError::Other(format!(
             "failed to launch '{}': {}",
@@ -52,9 +35,6 @@ pub fn run(options: LspOptions) -> Result<()> {
     }
 }
 
-/// Resolve the `forgedb-lsp` binary: explicit `--server-path` → sibling of the
-/// running `forgedb` (the layout every release archive ships) → `forgedb-lsp`
-/// on `PATH`. Returns an actionable error otherwise.
 fn resolve_server(explicit: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(p) = explicit {
         if p.is_file() {
@@ -87,7 +67,6 @@ fn resolve_server(explicit: Option<PathBuf>) -> Result<PathBuf> {
     )))
 }
 
-/// Platform-correct executable file name (`forgedb-lsp` / `forgedb-lsp.exe`).
 fn exe_name(stem: &str) -> String {
     if cfg!(windows) {
         format!("{stem}.exe")

@@ -1,19 +1,3 @@
-//! PostgreSQL benchmark suite (`postgres` crate, localhost unix socket). Mirrors
-//! the other suites' scenarios over the SAME seeded corpus. PostgreSQL is a full
-//! client/server RDBMS: every op carries **parse + plan + IPC** cost the embedded
-//! engines (ForgeDB / SQLite / redb / DuckDB) do NOT pay, so this anchors the
-//! "what a real RDBMS costs" axis rather than being head-to-head. Even over a unix
-//! socket (no network), the protocol round-trip is real and is the point.
-//!
-//! Connection: the suite reads `FORGEDB_BENCH_PG_URL` (a libpq DSN, e.g.
-//! `host=/tmp/pgsock user=me dbname=bench`). If it is unset the suite is a no-op
-//! (prints guidance) so `cargo bench` without a running server does not fail — use
-//! `make bench-postgres`, which spins an ephemeral cluster from the devbox-provided
-//! `postgresql` package (no binary download) and sets the env.
-//!
-//! Durability: run at BOTH `synchronous_commit=on` (WAL fsync per commit — the
-//! durable tier) and `off` (relaxed, group-commit) — never mixed in one chart.
-
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use forgedb_benchmarks::{
     dataset, id_for, list_sql, ts_from_seconds, uuid_of, Dataset, PostJson, LIST_CORE_LIMIT,
@@ -45,7 +29,6 @@ CREATE TABLE post_tag_link (post_id BYTEA, tag_id BYTEA);
 CREATE INDEX ptl_post_idx ON post_tag_link(post_id);
 "#;
 
-/// Connect using `FORGEDB_BENCH_PG_URL`, or `None` (suite skipped) if unset.
 fn connect() -> Option<Client> {
     let dsn = std::env::var("FORGEDB_BENCH_PG_URL").ok()?;
     Some(Client::connect(&dsn, NoTls).expect("connect postgres"))
@@ -62,7 +45,6 @@ fn schema(client: &mut Client) {
     client.batch_execute(SCHEMA).expect("apply schema");
 }
 
-/// Load `data` in one transaction (setup — not timed).
 fn load(client: &mut Client, data: &Dataset) {
     let mut tx = client.transaction().unwrap();
     for u in &data.users {
@@ -92,7 +74,6 @@ fn load(client: &mut Client, data: &Dataset) {
     tx.commit().unwrap();
 }
 
-// --- Scenario 2: single-row insert latency (autocommit → WAL fsync per commit)
 fn bench_insert(c: &mut Criterion) {
     let Some(mut client) = connect() else {
         skip_notice();
@@ -101,15 +82,12 @@ fn bench_insert(c: &mut Criterion) {
     schema(&mut client);
     let mut group = c.benchmark_group("postgres/insert_user");
     group.throughput(Throughput::Elements(1));
-    // Both durability groups insert into the same `email UNIQUE` table, so id +
-    // email are namespaced per group (`gi`) — otherwise the second group collides
-    // with the first group's rows. n grows monotonically within a group (unique).
     for (gi, &(sync, label)) in [("on", "sync_on"), ("off", "sync_off")].iter().enumerate() {
         client.batch_execute(&format!("SET synchronous_commit = {sync};")).unwrap();
         let stmt = client
             .prepare("INSERT INTO \"user\" (id, name, email, created_at) VALUES ($1,$2,$3,$4)")
             .unwrap();
-        let base = (gi as u128) << 96; // distinct id space per durability group
+        let base = (gi as u128) << 96;
         let mut i = 0usize;
         group.bench_function(label, |b| {
             b.iter_batched(
@@ -133,7 +111,6 @@ fn bench_insert(c: &mut Criterion) {
     group.finish();
 }
 
-// --- Read / traversal scenarios (5, 6, 8/10, 11) -----------------------------
 fn bench_reads(c: &mut Criterion) {
     let Some(mut client) = connect() else {
         skip_notice();
@@ -159,7 +136,6 @@ fn bench_reads(c: &mut Criterion) {
         )
         .unwrap();
 
-    // Scenario 5: point lookup by PK.
     c.benchmark_group("postgres/point_lookup")
         .throughput(Throughput::Elements(1))
         .bench_function("get_post_by_id", |b| {
@@ -179,7 +155,6 @@ fn bench_reads(c: &mut Criterion) {
             });
         });
 
-    // Scenario 6: secondary-index probe (unique email).
     c.benchmark_group("postgres/index_probe")
         .throughput(Throughput::Elements(1))
         .bench_function("get_user_by_email", |b| {
@@ -197,7 +172,6 @@ fn bench_reads(c: &mut Criterion) {
             });
         });
 
-    // Scenario 8/10: FK-index probe -> reverse one-to-many.
     c.benchmark_group("postgres/reverse_fk")
         .throughput(Throughput::Elements(1))
         .bench_function("user_posts", |b| {
@@ -210,7 +184,6 @@ fn bench_reads(c: &mut Criterion) {
             });
         });
 
-    // Scenario 11: many-to-many traversal (indexed junction join).
     c.benchmark_group("postgres/m2m")
         .throughput(Throughput::Elements(1))
         .bench_function("post_tags", |b| {
@@ -223,21 +196,6 @@ fn bench_reads(c: &mut Criterion) {
             });
         });
 }
-
-
-// --- Scenario 21 (#282): the REST list endpoint, S1 and S2 -------------------
-//
-// S1 = the page's rows in the serializable host-language form this engine's shipped read
-// path produces; S2 = the JSON array over the same field set, so `S2 - S1` is the same
-// added work in every suite. See `PostJson` and docs/BENCHMARKS.md.
-//
-// **PostgreSQL's S1 already contains a protocol round-trip**, which no embedded engine's
-// S1 does. So the honest comparison for this suite is against ForgeDB's **S4** (the rung
-// over a real socket), NOT its S1/S2. Reading `pg/list/s1_rows` beside
-// `forgedb/list/s1_rows` compares "query + IPC + materialize" against "materialize" and
-// makes ForgeDB look ~2 orders better for a reason that is definitional rather than
-// measured. The rung exists precisely so this comparison has a correct partner; the
-// pairing rule is stated in docs/BENCHMARKS.md next to the table.
 
 fn pg_page(client: &mut Client, sql: &str) -> Vec<PostJson> {
     client
@@ -261,7 +219,6 @@ fn bench_list(c: &mut Criterion) {
         skip_notice();
         return;
     };
-    // The core grid: four shapes at the core point.
     {
         let data = dataset(READ_USERS, LIST_CORE_ROWS);
         schema(&mut client);
@@ -288,8 +245,6 @@ fn bench_list(c: &mut Criterion) {
         g.finish();
     }
 
-    // Size sweep, unfiltered. The core point recurs here on purpose — it is the sweep's
-    // middle point — which is legal because this is a DIFFERENT group.
     {
         let mut g = c.benchmark_group("pg/list_unfiltered");
         for rows in LIST_SIZES {
@@ -301,11 +256,8 @@ fn bench_list(c: &mut Criterion) {
             let sql = list_sql(clause, limit, 0);
             let label = format!("{name}/rows={rows}/limit={limit}");
 
-            // BDD-3: every engine's page must hold the same number of rows at the same
-            // (rows, limit) point. A LIMIT that clamped differently would make the
-            // cross-engine comparison meaningless while every number looked plausible.
             {
-                
+
                 let n = pg_page(&mut client, &sql).len();
                 assert_eq!(n, limit.min(rows), "BDD-3: pg page held {n} for limit={limit} over {rows}");
             }
@@ -326,7 +278,6 @@ fn bench_list(c: &mut Criterion) {
         g.finish();
     }
 
-    // Limit sweep, unfiltered, at the core size.
     {
         let data = dataset(READ_USERS, LIST_CORE_ROWS);
         schema(&mut client);

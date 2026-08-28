@@ -1,15 +1,3 @@
-# #218: the high-amplification read probe.
-#
-# compaction = false lifts the auto-compaction ceiling (A_max = 1 + 4000/live_rows,
-# which caps the reachable ladder at ~1.4x on a 10k-row corpus) so a SLOPE in
-# amplification can actually be established rather than inferred from a 1.4x lever arm.
-#
-# fsync = "never" makes the preload affordable at those rungs — reaching A = 32 over
-# 10k live rows is ~310k writes, every one of them F_FULLFSYNC-bound by default. This
-# is legitimate because the probe measures READS: durability policy is an explicitly
-# orthogonal axis in the #167 framing, and #218 finding 3 already established that
-# writes are ~100% fsync-bound and identical across all three engines, so removing the
-# barrier changes setup cost and nothing about the read path under test.
 [storage]
 compaction = false
 fsync = "never"

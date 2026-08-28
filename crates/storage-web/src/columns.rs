@@ -1,13 +1,3 @@
-//! Arena-backed columns with byte-identical positional semantics to the native
-//! `FixedColumn` / `VariableColumn` / `Tombstones`.
-//!
-//! Every method matches the native signature so the generated code links
-//! unchanged. The only difference is the backing: a keyed [`crate::store`] arena
-//! instead of a file. Reads are slice math; appends push to the arena; length is
-//! derived **live** from the arena byte length (no cached row count to drift).
-//! `flush` is a no-op here — durability happens at the [`crate::store::dump`]
-//! commit boundary, not per append.
-
 use std::io;
 use std::path::PathBuf;
 
@@ -17,15 +7,6 @@ fn oob() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, "Index out of bounds")
 }
 
-/// The backing of one columnar export batch — the browser twin of the native
-/// [`forgedb_storage_native::ColumnExport`](../../forgedb_storage_native).
-///
-/// The native backend can hand out a zero-copy `mmap` alias of a dense prefix;
-/// this backend is **gather-only** (constraint 7 — no aliasing into the wasm
-/// arena / `thread_local` store), so an export is always an owned copy. The
-/// public surface (`as_ptr` / `len` / `is_empty` / `as_slice`) matches the
-/// native type exactly, so the shared generated columnar-export code links
-/// unchanged across targets.
 pub struct ColumnExport {
     bytes: Vec<u8>,
 }
@@ -52,10 +33,6 @@ impl ColumnExport {
     }
 }
 
-/// In-memory bulk-loaded selection of a [`FixedColumn`]'s rows (#168), the
-/// browser twin of the native
-/// [`BufferedFixedColumn`](../../forgedb_storage_native). Same slot-addressed
-/// `read_*` surface, so the shared generated column-scan code links unchanged.
 pub struct BufferedFixedColumn {
     buf: ColumnExport,
     value_size: usize,
@@ -106,26 +83,16 @@ impl BufferedFixedColumn {
         Ok(self.slot_bytes(slot)?.to_vec())
     }
 
-    /// The whole slot, borrowed — no allocation (#238). Browser twin of the
-    /// native `BufferedFixedColumn::read_slice`; generated code calls this name
-    /// on both targets.
     pub fn read_slice(&self, slot: usize) -> io::Result<&[u8]> {
         self.slot_bytes(slot)
     }
 
-    /// The whole slot as UTF-8, borrowed (#238) — for a column where the slot IS
-    /// the value and carries no length prefix (`string(N!)`). Browser twin of the
-    /// native `BufferedFixedColumn::read_str`. Prefix decoding stays in generated
-    /// code on both targets.
     pub fn read_str(&self, slot: usize) -> io::Result<&str> {
         core::str::from_utf8(self.slot_bytes(slot)?)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 }
 
-/// In-memory bulk-loaded selection of a [`VariableColumn`]'s rows (#168), the
-/// browser twin of the native
-/// [`BufferedVariableColumn`](../../forgedb_storage_native).
 pub struct BufferedVariableColumn {
     data: Vec<u8>,
     slots: Vec<(u64, u64)>,
@@ -140,9 +107,6 @@ impl BufferedVariableColumn {
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }
-    /// The slot's value borrowed from the buffered arena — no allocation (#224).
-    /// Browser twin of the native `read_str`; generated code calls this name on
-    /// both targets.
     pub fn read_str(&self, slot: usize) -> io::Result<&str> {
         let &(offset, length) = self.slots.get(slot).ok_or_else(oob)?;
         let start = offset as usize;
@@ -151,13 +115,11 @@ impl BufferedVariableColumn {
         std::str::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
-    /// Owned form of [`read_str`](Self::read_str) — one decode path, plus the copy.
     pub fn read_string(&self, slot: usize) -> io::Result<String> {
         self.read_str(slot).map(str::to_owned)
     }
 }
 
-/// Fixed-size column storage backed by an in-memory arena.
 pub struct FixedColumn {
     path: PathBuf,
     value_size: usize,
@@ -253,7 +215,6 @@ impl FixedColumn {
         Ok(i64::from_le_bytes(self.read_raw(index, 8)?.try_into().unwrap()))
     }
 
-    /// Append arbitrary fixed-width bytes (char(N), inline struct, fixed array).
     pub fn append_bytes(&mut self, value: &[u8]) -> io::Result<()> {
         if value.len() != self.value_size {
             return Err(io::Error::new(
@@ -268,16 +229,6 @@ impl FixedColumn {
         self.read_raw(index, self.value_size)
     }
 
-    /// Copy the physical rows at `indices` into one contiguous owned buffer, in
-    /// the order given (`indices.len() * value_size` bytes). Arena-backed twin of
-    /// the native [`FixedColumn::gather`](../../forgedb_storage_native) — same
-    /// signature and byte semantics, so the shared generated columnar-export code
-    /// links unchanged across targets. Schema-agnostic: `indices` are opaque
-    /// physical row positions the caller (generated code) computed.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err(InvalidInput)` if any index is `>= self.len()`.
     pub fn gather(&self, indices: &[usize]) -> io::Result<Vec<u8>> {
         let vs = self.value_size;
         store::with_bytes(&self.path, |b| {
@@ -293,24 +244,12 @@ impl FixedColumn {
         })
     }
 
-    /// Export the physical rows at `indices` as a [`ColumnExport`]. Arena-backed
-    /// twin of the native [`FixedColumn::export`](../../forgedb_storage_native) —
-    /// same signature, but **gather-only** (this target never aliases the arena),
-    /// so it always returns an owned copy. Schema-agnostic: `indices` are opaque
-    /// physical row positions the caller (generated code) computed.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err(InvalidInput)` if any index is `>= self.len()`.
     pub fn export(&self, indices: &[usize]) -> io::Result<ColumnExport> {
         Ok(ColumnExport {
             bytes: self.gather(indices)?,
         })
     }
 
-    /// Bulk-load the rows at `indices` into a [`BufferedFixedColumn`] (#168
-    /// column scan). Arena twin of the native
-    /// [`FixedColumn::gather_buffered`](../../forgedb_storage_native).
     pub fn gather_buffered(&self, indices: &[usize]) -> io::Result<BufferedFixedColumn> {
         Ok(BufferedFixedColumn {
             buf: self.export(indices)?,
@@ -318,21 +257,14 @@ impl FixedColumn {
         })
     }
 
-    /// No-op on this target — durability is at the [`crate::store::dump`] commit
-    /// boundary, not per append.
     pub fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 
-    /// No-op on the wasm arena backend (#153): there is no device barrier;
-    /// durability comes from the transport writing arenas to IndexedDB/OPFS at
-    /// the [`crate::store::dump`] boundary. Present for API parity with
-    /// `storage-native`, since the generated `checkpoint()` calls it ungated.
     pub fn sync_to_drive(&self) -> io::Result<()> {
         Ok(())
     }
 
-    /// No-op on the wasm arena backend (#153): see [`Self::sync_to_drive`].
     pub fn barrier(&self) -> io::Result<()> {
         Ok(())
     }
@@ -355,11 +287,6 @@ impl FixedColumn {
                 "truncate_to_rows beyond current length",
             ));
         }
-        // Truncating to the current length is a no-op — return WITHOUT touching
-        // the bytes, so a lazily source-backed column (whose length is known from
-        // the source) is not needlessly faulted in. This is load-bearing for
-        // partial hydrate: recovery calls `truncate_to_rows(anchor)` on every
-        // column at open, and only genuinely-torn columns should load.
         if rows == cur {
             return Ok(());
         }
@@ -367,13 +294,6 @@ impl FixedColumn {
         Ok(())
     }
 
-    /// API-parity no-op for the native `sync_from_disk` (#84 MVCC Tier 3 peer
-    /// read-currency). On the arena backend `len()` is derived live from the
-    /// store on every call ("the path IS the key"), so there is no cached
-    /// `row_count` to re-derive — and a browser replica is a single-follower,
-    /// never a multi-process coordinated peer. Present so the shared generated
-    /// `database.rs` (which calls it in `__sync_columns_from_disk`) compiles for
-    /// `wasm32` identically to native.
     pub fn sync_from_disk(&mut self) -> io::Result<()> {
         Ok(())
     }
@@ -386,8 +306,6 @@ impl FixedColumn {
     }
 }
 
-/// Variable-length (string) column: an append-only data arena plus a 16-byte
-/// `(offset, length)` offsets arena, mirroring the native file layout.
 pub struct VariableColumn {
     data_path: PathBuf,
     offsets_path: PathBuf,
@@ -415,13 +333,6 @@ impl VariableColumn {
         Ok(())
     }
 
-    /// Append a single tag byte followed by `value`'s bytes, as one row (#231).
-    ///
-    /// Arena twin of the native `VariableColumn::append_tagged`. Generated code
-    /// calls this on both targets, so the web backend carries the same name, the
-    /// same argument order, and the same on-arena bytes — the tag byte is pushed
-    /// straight into the data arena ahead of the value, with no intermediate
-    /// `String`. See the native doc for the UTF-8 caveat on tags >= 0x80.
     pub fn append_tagged(&mut self, tag: u8, value: &str) -> io::Result<()> {
         let bytes = value.as_bytes();
         let offset = store::byte_len(&self.data_path) as u64;
@@ -449,11 +360,6 @@ impl VariableColumn {
         String::from_utf8(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
-    /// Bulk-load the rows at `indices` into a [`BufferedVariableColumn`] (#168
-    /// column scan). Arena twin of the native
-    /// [`VariableColumn::gather_buffered`](../../forgedb_storage_native): reads
-    /// the whole offsets + data arenas once, then records each slot's
-    /// `(offset, length)` in selection order.
     pub fn gather_buffered(&self, indices: &[usize]) -> io::Result<BufferedVariableColumn> {
         let data: Vec<u8> =
             store::with_bytes(&self.data_path, |b| Ok::<Vec<u8>, io::Error>(b.to_vec()))?;
@@ -477,15 +383,10 @@ impl VariableColumn {
         Ok(())
     }
 
-    /// No-op on the wasm arena backend (#153): there is no device barrier;
-    /// durability comes from the transport writing arenas to IndexedDB/OPFS at
-    /// the [`crate::store::dump`] boundary. Present for API parity with
-    /// `storage-native`, since the generated `checkpoint()` calls it ungated.
     pub fn sync_to_drive(&self) -> io::Result<()> {
         Ok(())
     }
 
-    /// No-op on the wasm arena backend (#153): see [`Self::sync_to_drive`].
     pub fn barrier(&self) -> io::Result<()> {
         Ok(())
     }
@@ -508,7 +409,6 @@ impl VariableColumn {
                 "truncate_to_rows beyond current length",
             ));
         }
-        // No-op truncation must not fault a lazy column in (see FixedColumn).
         if rows == cur {
             return Ok(());
         }
@@ -523,10 +423,6 @@ impl VariableColumn {
         Ok(())
     }
 
-    /// API-parity no-op for the native `sync_from_disk` (#84 MVCC Tier 3). See
-    /// `FixedColumn::sync_from_disk` — arena length is always live, so there is
-    /// nothing to re-derive; present so the shared generated `database.rs`
-    /// compiles for `wasm32`.
     pub fn sync_from_disk(&mut self) -> io::Result<()> {
         Ok(())
     }
@@ -539,7 +435,6 @@ impl VariableColumn {
     }
 }
 
-/// Read the `(offset, length)` pair for `index` from an offsets arena.
 fn read_offset_pair(offsets_path: &std::path::Path, index: usize) -> io::Result<(usize, usize)> {
     let pos = index * 16;
     store::with_bytes(offsets_path, |b| {
@@ -552,7 +447,6 @@ fn read_offset_pair(offsets_path: &std::path::Path, index: usize) -> io::Result<
     })
 }
 
-/// Tombstone bitmap (1 byte per row) backed by an arena.
 pub struct Tombstones {
     path: PathBuf,
 }
@@ -577,9 +471,6 @@ impl Tombstones {
         })
     }
 
-    /// Return the subset of `rows` that are **not** tombstoned, preserving order
-    /// (#168 scan filter). Arena twin of the native
-    /// [`Tombstones::live_indices`](../../forgedb_storage_native).
     pub fn live_indices(&self, rows: &[usize]) -> io::Result<Vec<usize>> {
         store::with_bytes(&self.path, |b| {
             Ok(rows
@@ -594,15 +485,10 @@ impl Tombstones {
         Ok(())
     }
 
-    /// No-op on the wasm arena backend (#153): there is no device barrier;
-    /// durability comes from the transport writing arenas to IndexedDB/OPFS at
-    /// the [`crate::store::dump`] boundary. Present for API parity with
-    /// `storage-native`, since the generated `checkpoint()` calls it ungated.
     pub fn sync_to_drive(&self) -> io::Result<()> {
         Ok(())
     }
 
-    /// No-op on the wasm arena backend (#153): see [`Self::sync_to_drive`].
     pub fn barrier(&self) -> io::Result<()> {
         Ok(())
     }
@@ -625,7 +511,6 @@ impl Tombstones {
                 "truncate_to_rows beyond current length",
             ));
         }
-        // No-op truncation must not fault a lazy column in (see FixedColumn).
         if rows == cur {
             return Ok(());
         }
@@ -633,9 +518,6 @@ impl Tombstones {
         Ok(())
     }
 
-    /// API-parity no-op for the native `sync_from_disk` (#84 MVCC Tier 3). See
-    /// `FixedColumn::sync_from_disk` — arena length is always live; present so
-    /// the shared generated `database.rs` compiles for `wasm32`.
     pub fn sync_from_disk(&mut self) -> io::Result<()> {
         Ok(())
     }
@@ -647,11 +529,6 @@ impl Tombstones {
     }
 }
 
-/// Read-only positional view over a [`FixedColumn`]'s arena. On this target a
-/// reader is just another handle to the same keyed arena — single-threaded, so
-/// there is no fd/lock story, but the API matches the native reader so the
-/// generated single-writer/many-reader code links unchanged. Length is derived
-/// live, so a reader observes appends made after it was created.
 pub struct FixedColumnReader {
     path: PathBuf,
     value_size: usize,
@@ -706,7 +583,6 @@ impl FixedColumnReader {
     }
 }
 
-/// Read-only positional view over a [`VariableColumn`]'s arenas.
 pub struct VariableColumnReader {
     data_path: PathBuf,
     offsets_path: PathBuf,
@@ -734,7 +610,6 @@ impl VariableColumnReader {
     }
 }
 
-/// Read-only positional view over a [`Tombstones`] arena.
 pub struct TombstonesReader {
     path: PathBuf,
 }

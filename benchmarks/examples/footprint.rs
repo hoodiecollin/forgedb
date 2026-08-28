@@ -1,17 +1,3 @@
-//! Footprint report (scenario 18): on-disk bytes per N rows for each engine over
-//! the SAME seeded corpus, plus ForgeDB's update-churn bloat before/after
-//! compaction (superseding-version append grows storage until `compact()` reclaims).
-//!
-//! This is a SIZE report, not a Criterion timing, so it lives as an example (which,
-//! unlike a plain bin, may use the bench dev-deps rusqlite/redb/duckdb). Run:
-//!   cargo run --manifest-path benchmarks/Cargo.toml --example footprint --release
-//!
-//! Every engine is loaded via its simplest durable write path and then measured by
-//! summing the on-disk file sizes of its data directory/file — an apples-to-apples
-//! "how many bytes on disk for this dataset" number. Durability/WAL state is
-//! normalized (SQLite checkpointed to its main db, ForgeDB checkpointed) so the
-//! comparison is steady-state data size, not transient journal size.
-
 use std::path::Path;
 
 use duckdb::{params as dparams, Connection as DuckConn};
@@ -25,7 +11,6 @@ use uuid::Uuid;
 const N_USERS: usize = 1_000;
 const N_POSTS: usize = 10_000;
 
-// --- helpers -----------------------------------------------------------------
 fn dir_size(path: &Path) -> u64 {
     if path.is_file() {
         return path.metadata().map(|m| m.len()).unwrap_or(0);
@@ -54,7 +39,6 @@ fn human(bytes: u64) -> String {
     }
 }
 
-// --- ForgeDB -----------------------------------------------------------------
 fn user_of(r: &UserRow) -> User {
     User {
         id: Uuid::from_bytes(r.id),
@@ -98,9 +82,6 @@ fn forgedb_size(data: &Dataset) -> u64 {
     dir_size(dir.path())
 }
 
-/// Update-churn bloat: insert `N_USERS`, then update ONE user `churn` times.
-/// Each update appends a superseding version (storage grows), until `compact()`
-/// reclaims the dead versions. Returns (bytes_before_compact, bytes_after_compact).
 fn forgedb_churn(churn: usize) -> (u64, u64) {
     let dir = tempfile::tempdir().unwrap();
     let mut db = Database::open_at(dir.path().to_path_buf());
@@ -122,7 +103,6 @@ fn forgedb_churn(churn: usize) -> (u64, u64) {
     (before, after)
 }
 
-// --- SQLite ------------------------------------------------------------------
 fn sqlite_size(data: &Dataset) -> u64 {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bench.db");
@@ -154,11 +134,10 @@ fn sqlite_size(data: &Dataset) -> u64 {
         .unwrap();
     }
     tx.commit().unwrap();
-    drop(conn); // flush + close so only the steady-state .db file remains
+    drop(conn);
     dir_size(dir.path())
 }
 
-// --- redb --------------------------------------------------------------------
 const USER: TableDefinition<&[u8], &[u8]> = TableDefinition::new("user");
 const POST: TableDefinition<&[u8], &[u8]> = TableDefinition::new("post");
 const TAG: TableDefinition<&[u8], &[u8]> = TableDefinition::new("tag");
@@ -218,7 +197,6 @@ fn redb_size(data: &Dataset) -> u64 {
     dir_size(dir.path())
 }
 
-// --- DuckDB ------------------------------------------------------------------
 fn duckdb_size(data: &Dataset) -> u64 {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bench.duckdb");
@@ -279,8 +257,6 @@ fn main() {
     println!("  {:<10} {:>12}", "ForgeDB", human(forgedb));
     println!("  {:<10} {:>12}", "SQLite", human(sqlite));
     println!("  {:<10} {:>12}", "redb", human(redb));
-    // DuckDB is the slow-to-build engine (bundled C++); build it last so the
-    // fast engines already printed if the DuckDB compile is what you're waiting on.
     let duck = duckdb_size(&data);
     println!("  {:<10} {:>12}", "DuckDB", human(duck));
 

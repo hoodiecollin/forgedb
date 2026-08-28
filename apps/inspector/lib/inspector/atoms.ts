@@ -1,9 +1,3 @@
-/**
- * Inspector UI state (jotai). Split into small atoms so screens subscribe only
- * to what they render. Editor field-overrides live in nested records keyed by
- * field name (null-state, tri-state bool, struct open/closed).
- */
-
 import { atom } from "jotai";
 import { atomWithStorage } from "jotai/utils";
 import { DB_NAME, DEFAULT_PREDICATES, MODELS, REL, SCHEMA } from "./mock";
@@ -16,25 +10,13 @@ import type {
   Predicate,
   Screen,
 } from "./types";
-
-// ---- navigation / connection ----
 export const screenAtom = atom<Screen>("atlas");
 export const connectedAtom = atom(true);
-/**
- * Base URL of the running generated API for the Live lens (#13). The generated
- * `serve` binds `0.0.0.0:3000` by default; the client issues requests over the
- * Tauri HTTP/WebSocket plugins (CORS-proof). User-editable + persisted across
- * launches (#71) so attaching to a non-default host/port sticks.
- */
+
 export const apiBaseAtom = atomWithStorage(
   "forgedb.inspector.apiBase",
   "http://localhost:3000",
 );
-
-// ---- project structure (Structure lens, #12) --------------------------------
-// The single source screens read schema/model/relation data from. Its default is
-// the mock database, so a browser (web dev / static preview) needs no backend.
-// Inside Tauri, `openProjectAtom` replaces it with a parsed real `.forge`.
 const MOCK_STRUCTURE: ProjectStructure = {
   dbName: DB_NAME,
   models: MODELS,
@@ -49,11 +31,8 @@ export const relAtom = atom((get) => get(structureAtom).rel);
 export const schemaAtom = atom((get) => get(structureAtom).schema);
 export const dbNameAtom = atom((get) => get(structureAtom).dbName);
 export const projectSourceAtom = atom((get) => get(structureAtom).source);
-
 export const projectErrorAtom = atom<string | null>(null);
 export const projectLoadingAtom = atom(false);
-
-/** Open-project flow (Tauri only): pick a `.forge`, load it into `structureAtom`. */
 export const openProjectAtom = atom(null, async (_get, set) => {
   set(projectLoadingAtom, true);
   set(projectErrorAtom, null);
@@ -66,7 +45,7 @@ export const openProjectAtom = atom(null, async (_get, set) => {
       set(studioModelAtom, first);
       set(selectionAtom, {});
       set(pivotAtom, null);
-      set(predicatesAtom, []); // mock predicates don't apply to a real schema
+      set(predicatesAtom, []);
     }
   } catch (e) {
     set(projectErrorAtom, e instanceof Error ? e.message : String(e));
@@ -74,12 +53,6 @@ export const openProjectAtom = atom(null, async (_get, set) => {
     set(projectLoadingAtom, false);
   }
 });
-
-/**
- * Bootstrap on launch (Tauri only): if a startup project is configured
- * (`FORGEDB_INSPECTOR_PROJECT`), load it; otherwise stay on the mock sample.
- * Runs once from the shell mount.
- */
 export const bootstrapProjectAtom = atom(null, async (_get, set) => {
   try {
     const loaded = await loadStartupProject();
@@ -94,32 +67,15 @@ export const bootstrapProjectAtom = atom(null, async (_get, set) => {
     set(projectErrorAtom, e instanceof Error ? e.message : String(e));
   }
 });
-
-// ---- atlas ----
 export const lensAtom = atom<Lens>("live");
-/** currently-selected model on the Atlas map */
 export const selModelAtom = atom("User");
-
-// ---- snapshot / time-travel (#85) --------------------------------------------
-// A snapshot token is the server's per-model row-count watermark map, frozen at
-// `GET /snapshot`. `null` = live (read the newest committed version). When a
-// token is active, reads pass the current model's watermark as `as_of` and the
-// live-query subscription is suspended (a point-in-time view is not a live tail).
 export type SnapshotToken = Record<string, number>;
-/** the active snapshot token, or null for the live "as of: now" lens */
 export const snapshotTokenAtom = atom<SnapshotToken | null>(null);
-/** named point-in-time captures the user has pinned */
 export interface PinnedSnapshot {
   name: string;
   token: SnapshotToken;
 }
 export const pinnedSnapshotsAtom = atom<PinnedSnapshot[]>([]);
-
-/**
- * Capture the server's current watermarks (`GET /snapshot`) and pin them under a
- * name, then activate the pinned token. Tauri live-lens only (guarded by the
- * caller); throws with a surfaced message if the API is unreachable.
- */
 export const pinSnapshotAtom = atom(
   null,
   async (get, set, name: string): Promise<void> => {
@@ -132,22 +88,12 @@ export const pinSnapshotAtom = atom(
     set(snapshotTokenAtom, token);
   },
 );
-
-// ---- studio ----
 export const studioModelAtom = atom("User");
-/** pivot breadcrumb (set when following a relation into another model) */
 export const pivotAtom = atom<string | null>(null);
-/** selected row ids in the studio grid */
 export const selectionAtom = atom<Record<string, true>>({});
 export const liveTailAtom = atom(false);
-
-// ---- filter composer (shared studio + console) ----
 export const predicatesAtom = atom<Predicate[]>(DEFAULT_PREDICATES);
-
-// ---- console ----
 export const consoleTabAtom = atom<ConsoleTab>("q1");
-
-// ---- record editor ----
 export type EditorMode = "edit" | "create";
 export interface EditorState {
   open: boolean;
@@ -161,18 +107,12 @@ export const editorAtom = atom<EditorState>({
   rowId: null,
   mode: "edit",
 });
-/** per-field editor overrides, reset each time the editor opens */
 export const editNullsAtom = atom<Record<string, boolean>>({});
 export const editBoolsAtom = atom<Record<string, string>>({});
 export const editStructsAtom = atom<Record<string, boolean>>({});
-/** controlled scalar field values (#68); seeded from the live row on edit-open */
 export const editValuesAtom = atom<Record<string, string>>({});
-/** the full live row being edited, so a PUT sends every generated struct field */
 export const editBaseRowAtom = atom<Record<string, unknown>>({});
-/** in-flight state for a mutation submission */
 export const editSubmittingAtom = atom(false);
-
-// ---- live stream (mock ticker) ----
 export interface StreamEvent {
   kind: LiveDeltaKind;
   id: string;
@@ -181,8 +121,6 @@ export interface StreamEvent {
   ts: string;
 }
 export const streamAtom = atom<StreamEvent[]>([]);
-
-// ---- derived helpers ----
 export const isConnectedScreenLiveAtom = atom((get) => {
   const screen = get(screenAtom);
   const connected = get(connectedAtom);
@@ -192,8 +130,6 @@ export const isConnectedScreenLiveAtom = atom((get) => {
   if (screen === "studio" && get(liveTailAtom)) return true;
   return false;
 });
-
-/** open the editor fresh (clearing all per-field overrides) */
 export const openEditorAtom = atom(
   null,
   (
@@ -210,14 +146,6 @@ export const openEditorAtom = atom(
   },
 );
 
-// ---- mutation submission (#68) — create (POST) / replace (PUT) / delete ------
-
-/**
- * Submit the editor as a create or replace against the live API. Builds the
- * wire body by overlaying the controlled field values onto the base row (edit)
- * or an empty template (create), then POSTs (create) or PUTs (edit). Returns the
- * new/updated id, or throws with a surfaced message.
- */
 export const submitEditorAtom = atom(null, async (get, set): Promise<string> => {
   const { buildRecordBody, createRow, updateRow } = await import("./live");
   const editor = get(editorAtom);
@@ -241,8 +169,6 @@ export const submitEditorAtom = atom(null, async (get, set): Promise<string> => 
     set(editSubmittingAtom, false);
   }
 });
-
-/** Delete the row currently open in the editor (live mode). */
 export const deleteEditorRowAtom = atom(null, async (get, set): Promise<void> => {
   const { deleteRow } = await import("./live");
   const editor = get(editorAtom);
@@ -254,12 +180,9 @@ export const deleteEditorRowAtom = atom(null, async (get, set): Promise<void> =>
     set(editSubmittingAtom, false);
   }
 });
-
 export const closeEditorAtom = atom(null, (get, set) => {
   set(editorAtom, { ...get(editorAtom), open: false });
 });
-
-/** navigate to a model's grid, optionally with a pivot breadcrumb */
 export const browseModelAtom = atom(
   null,
   (_get, set, payload: { model: string; pivot?: string | null }) => {

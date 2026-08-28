@@ -17,7 +17,6 @@ const KINDS: LiveDeltaKind[] = ["Added", "Added", "Updated", "Removed"];
 const NAMES = ["ada", "lin", "max", "sol", "ivy", "ken", "zoe", "raf"];
 const pick = <T,>(xs: T[]) => xs[Math.floor(Math.random() * xs.length)]!;
 
-/** Best-effort one-line summary of a wire row for the live tail. */
 function summarize(row: Record<string, unknown> | undefined): string {
   if (!row) return "(row)";
   const label =
@@ -30,26 +29,15 @@ function summarize(row: Record<string, unknown> | undefined): string {
   return String(label).slice(0, 60);
 }
 
-/**
- * The live tail feeding `streamAtom` (Console live tab, Dashboards tile).
- *
- * When attached to a real project's API inside Tauri, this is a genuine
- * `/live-query` subscription on the focused model — typed added/updated/removed
- * deltas. In the browser / mock demo it falls back to a fabricated ticker so the
- * shell still animates. Either way it only runs while a Live surface is on screen.
- */
 export function useLiveTicker() {
   const live = useAtomValue(isConnectedScreenLiveAtom);
   const source = useAtomValue(projectSourceAtom);
   const model = useAtomValue(studioModelAtom);
   const base = useAtomValue(apiBaseAtom);
   const setStream = useSetAtom(streamAtom);
-
   const real = isTauri() && source === "project";
-
   useEffect(() => {
     if (!live) return;
-
     if (real) {
       let sub: Subscription | null = null;
       let cancelled = false;
@@ -80,8 +68,6 @@ export function useLiveTicker() {
         sub?.close();
       };
     }
-
-    // Mock ticker (browser / demo).
     const iv = setInterval(() => {
       const kind = pick(KINDS);
       const id =

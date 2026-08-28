@@ -1,5 +1,3 @@
-//! REST API server code generator
-
 use crate::rust::RustGenerator;
 use crate::{GenConfig, GeneratedCode, Result};
 use forgedb_parser::Schema;
@@ -7,29 +5,16 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
 thread_local! {
-    /// The generate-time runtime-behavior config (#126) active for the current
-    /// `ApiGenerator::generate*` call. Mirrors `RustGenerator`'s thread-local
-    /// (that one is module-private): each entry point sets it before emitting,
-    /// and the config-dependent sites (pagination clamp #141, metrics gate #151)
-    /// read it via `active_cfg()`. Safe under parallel tests — set per-thread.
     static ACTIVE_CONFIG: std::cell::Cell<GenConfig> = const { std::cell::Cell::new(GenConfig::DEFAULT) };
 }
 
-/// API code generator
 pub struct ApiGenerator;
 
 impl ApiGenerator {
-    /// Generate REST API server implementation from schema, using the default
-    /// generate-time config (`GenConfig::DEFAULT`). See `generate_with_config`
-    /// for the #126 configurable-behavior knobs.
     pub fn generate(schema: &Schema) -> Result<GeneratedCode> {
         Self::generate_with_config(schema, GenConfig::DEFAULT)
     }
 
-    /// Generate the REST API server with an explicit generate-time config (#126).
-    /// The config tailors the emitted pagination clamp (#141) and gates the
-    /// `/metrics` route (#151, Tier A). `GenConfig::DEFAULT` reproduces the
-    /// pre-#126 output byte-for-byte.
     pub fn generate_with_config(schema: &Schema, config: GenConfig) -> Result<GeneratedCode> {
         ACTIVE_CONFIG.with(|c| c.set(config));
         let code = Self::generate_code(schema)?;
@@ -40,32 +25,21 @@ impl ApiGenerator {
         })
     }
 
-    /// The generate-time runtime-behavior config (#126) active for the current
-    /// `generate*` call. Read at each config-dependent emission site.
     fn active_cfg() -> GenConfig {
         ACTIVE_CONFIG.with(|c| c.get())
     }
 
-    /// Generate API server code using quote!
     fn generate_code(schema: &Schema) -> Result<String> {
         let mut tokens = TokenStream::new();
 
-        // File header comments
         let header = quote! {
-            //! Generated API server by ForgeDB
-            //! DO NOT EDIT - This file is auto-generated
         };
         tokens.extend(header);
 
-        // Imports
         let inline_str_import = RustGenerator::inline_str_import(schema);
         let imports = quote! {
             #![allow(dead_code, unused_imports)]
 
-            // Bring the generated models + `Database` (defined in the sibling
-            // `database` module and re-exported by the parent) into scope so the
-            // `#[utoipa::path]` attributes and `OpenApi` derive can name them
-            // unqualified, matching the `super::`-qualified handler signatures.
             use super::*;
 
             use axum::{
@@ -76,9 +50,6 @@ impl ApiGenerator {
                 routing::{delete, get, post, put},
                 Router,
             };
-            // #254: a `+timestamp` identity is a legal primary key, so the path
-            // param can be a `Timestamp` — it round-trips through a URL segment as
-            // RFC 3339 by construction (res 3).
             #inline_str_import
             use forgedb_types::{Timestamp, Uuid};
             use serde_json::json;
@@ -91,11 +62,6 @@ impl ApiGenerator {
         };
         tokens.extend(imports);
 
-        // Pagination clamp bounds (#141, epic #126): baked from
-        // `[server].page_default_limit` / `page_max_limit`; defaults 50 / 1000
-        // (byte-identical). The generated list handler clamps against these
-        // rather than the substrate's fixed consts, so an app can tailor the page
-        // size without a runtime schema. Schema-blind — same value for every app.
         let cfg = Self::active_cfg();
         let __page_default_limit = proc_macro2::Literal::usize_unsuffixed(cfg.page_default_limit);
         let __page_max_limit = proc_macro2::Literal::usize_unsuffixed(cfg.page_max_limit);
@@ -104,22 +70,6 @@ impl ApiGenerator {
             const PAGE_MAX_LIMIT: usize = #__page_max_limit;
         });
 
-        // #229: the list envelope, serialized straight to bytes.  Building it with
-        // `json!` ran `serde_json::to_value(page)` first, which clones every string
-        // of every page row into an intermediate `Value` tree that axum then
-        // serializes again — so every string in a list response was allocated twice
-        // (once decoding it out of the column, once into the `Value`).  A typed
-        // struct with a BORROWED page serializes in one pass and clones nothing.
-        //
-        // The wire shape is unchanged and must stay so: serde emits struct fields
-        // in declaration order, so `data`/`total`/`limit`/`offset` here are
-        // byte-identical to the `json!` literal they replaced.
-        //
-        // Generic over the row type because the `?projection=` arms each carry a
-        // different one; emitted once per file, not per model — it names no field
-        // and no model, so there is nothing schema-specific to generate per model.
-        // `__`-prefixed because this file does `use super::*`, which would otherwise
-        // put it one PascalCase model name away from a collision.
         tokens.extend(quote! {
             #[derive(serde::Serialize)]
             struct __ListEnvelope<'a, T: serde::Serialize> {
@@ -130,81 +80,39 @@ impl ApiGenerator {
             }
         });
 
-        // Generate handler functions for each model
         for model in &schema.models {
             let handler_tokens = Self::generate_handlers(schema, model)?;
             tokens.extend(handler_tokens);
         }
 
-        // Generate the change-feed WebSocket subscription handler + per-model
-        // filter for each model (#62 Direction A).
         for model in &schema.models {
             tokens.extend(Self::generate_subscription(model));
         }
 
-        // Generate the live-query WebSocket handler for each model (#62 Direction
-        // B): reuses the per-model closed-set filter defined above, so it must be
-        // emitted after the subscription handlers.
         for model in &schema.models {
             tokens.extend(Self::generate_live_query(schema, model));
         }
 
-        // Generate the durable replication WS endpoint (#82 Direction C): a single
-        // schema-wide `/replicate` handler that streams the field-blind broker
-        // frames to a resumable follower.  Emitted once (not per model) — the
-        // broker carries one global offset across all models.
         tokens.extend(Self::generate_replication_handler());
 
-        // Generate the operational endpoints — liveness / readiness / metrics
-        // (Phase 5 observability).  Schema-agnostic transport glue: `/health`
-        // and `/ready` are identical for every app; `/metrics` reports per-model
-        // row counts, generated by naming each model's storage field.  These
-        // handlers stay OUTSIDE the tenant-auth guard in the router (below) so
-        // load balancers / k8s probes can reach them without a JWT.
         tokens.extend(Self::generate_ops_handlers(schema));
 
-        // Generate OpenAPI doc struct
         let openapi_tokens = Self::generate_openapi_doc(schema)?;
         tokens.extend(openapi_tokens);
 
-        // Generate router function
         let router_tokens = Self::generate_router(schema)?;
         tokens.extend(router_tokens);
 
-        // Parse and format with prettyplease
         let syntax_tree = syn::parse_file(&tokens.to_string())
             .map_err(|e| crate::CodegenError::GenerationFailed(format!("Failed to parse generated code: {}", e)))?;
 
         Ok(prettyplease::unparse(&syntax_tree))
     }
 
-    /// Rust type a model's primary key parses into (mirrors `RustGenerator`'s
-    /// identity type).  UUID PKs parse as `Uuid`; integer PKs as `u64` / `u32` /
-    /// `i64` / `i32` so the generated `get` handler passes the right key type to
-    /// storage.
     fn id_parse_type(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
-        // #252 closed the `_ => quote! { Uuid }` fall-through this used to end in
-        // — by DELETING the duplicate match, not by adding one more arm.
-        //
-        // The fall-through had been here since 9a54319 (2026-07-06) and made every
-        // non-integer, non-uuid identity generate an `api.rs` that does not
-        // compile: a bare `string` identity produced 32 errors of one class. It
-        // was also blind to a relation identity (`id: *Customer` matched `_`), so
-        // an integer-keyed parent's child parsed its own path segment as a uuid.
-        // Both are the `is_uuid_pk` shape #265 named: a generator that falls
-        // through instead of failing turns a compile error into a silent hole.
-        //
-        // The path segment must parse into exactly the type storage is keyed on,
-        // so there is no second definition of that type to keep in step —
-        // `RustGenerator::id_type_tokens` is it. Every type it yields carries
-        // `FromStr` (`Uuid`, the integers, `Timestamp` via #254's RFC 3339 parse,
-        // `InlineStr<N>` via #252), which is what axum's `Path<T>` extracts with.
         RustGenerator::id_type_tokens(schema, model)
     }
 
-    /// The field identifier used as a model's identity (`id`, or the first
-    /// auto-generate field).  Used by the live-query handler (#62 Direction B) to
-    /// key result-set membership by id.  Falls back to `id`.
     fn id_field_ident(model: &forgedb_parser::Model) -> proc_macro2::Ident {
         match model.identity_field() {
             Some(f) => format_ident!("{}", f.name),
@@ -212,19 +120,6 @@ impl ApiGenerator {
         }
     }
 
-    /// Generate handler functions for a model
-    /// Build the `?projection=<name>` REST support for a model (#113): a closed
-    /// set of declared projection names only — no ad-hoc `?fields=` — so the wire
-    /// carries a compile-time-declared name, never a runtime column list (PM
-    /// constraint 6).  Returns `(get_query_param, get_block, list_block)`, all
-    /// empty when the model declares no projections.  On the `get` path we route
-    /// through the narrow `get_<name>` read (full server-side skip of unselected
-    /// columns); on `list` we field-copy the already-filtered/sorted page to the
-    /// projection struct (filter/sort need full rows, so only the wire shrinks).
-    /// Returns `(get_block, list_block)` — both empty when the model declares no
-    /// projections.  The `get` handler always owns its own `Query(params)`
-    /// extractor (needed for `?as_of=` even without projections, #85), so this
-    /// function no longer emits one.
     fn generate_projection_rest(
         model: &forgedb_parser::Model,
         storage_field: &proc_macro2::Ident,
@@ -253,9 +148,6 @@ impl ApiGenerator {
                 })
                 .collect();
 
-            // #229: serialize the projected record straight to bytes.  The
-            // `serde_json::to_value` this replaced cloned every projected string
-            // into an intermediate `Value` that axum then serialized again.
             get_arms.push(quote! {
                 #name => match db.#storage_field.#get_fn(key) {
                     Some(r) => (StatusCode::OK, Json(r)).into_response(),
@@ -263,11 +155,6 @@ impl ApiGenerator {
                         .into_response(),
                 },
             });
-            // #229: build the projected page as a typed `Vec`, then borrow it into
-            // the shared envelope.  This used to `serde_json::to_value` each row
-            // into a `Vec<serde_json::Value>` — a per-row clone of every projected
-            // string on top of the envelope's own.  Each arm has a different row
-            // type, which is why `__ListEnvelope` is generic rather than per-model.
             list_arms.push(quote! {
                 #name => {
                     let __data: Vec<super::#proj_ident> = page
@@ -289,7 +176,6 @@ impl ApiGenerator {
         }
 
         let get_block = quote! {
-            // #113: named-projection point read (closed set of declared names).
             if let Some(__proj) = params.get("projection") {
                 let key = match id.parse::<#id_type>() {
                     Ok(key) => key,
@@ -305,8 +191,6 @@ impl ApiGenerator {
             }
         };
         let list_block = quote! {
-            // #113: named-projection list (filter/sort/paginate on full rows,
-            // then emit only the projection's columns for the page).
             if let Some(__proj) = params.get("projection") {
                 return match __proj.as_str() {
                     #(#list_arms)*
@@ -333,9 +217,6 @@ impl ApiGenerator {
         let model_name_str = &model.name;
         let model_tag = &model.name;
         let list_summary = format!("List all {}", model.name);
-        // #141: the OpenAPI description reflects the generate-time-baked page
-        // bounds (`[server].page_default_limit` / `page_max_limit`), not the
-        // substrate's fixed 50/1000.
         let __cfg = Self::active_cfg();
         let limit_param_desc = format!(
             "Max rows (clamped to [1, {}]; default {})",
@@ -348,31 +229,13 @@ impl ApiGenerator {
 
         let sort_fn = format_ident!("{}_apply_sort", Self::to_snake_case(&model.name));
         let filter_fn = format_ident!("{}_event_matches", Self::to_snake_case(&model.name));
-        // #160: narrow scan filter/sort for the live list path (id-bearing models).
         let has_id = model.identity_field().is_some();
         let id_field = Self::id_field_ident(model);
         let scan_matches_fn = format_ident!("__{}_scan_matches", Self::to_snake_case(&model.name));
-        // #288: evaluated ONCE per request and read as a bool per row. See
-        // `generate_list_scan_helpers` for why the question is positive.
         let is_unfiltered_fn =
             format_ident!("__{}_is_unfiltered", Self::to_snake_case(&model.name));
         let scan_sort_fn = format_ident!("__{}_scan_sort", Self::to_snake_case(&model.name));
         let scan_ref_ident = format_ident!("{}ScanRef", model.name);
-        // The live list source+filter+sort+page-materialize.  For an id-bearing
-        // model this is the #160 narrow path: filter/sort a narrow scan view (only
-        // the filterable/sortable columns), then full-materialize ONLY the page.  A
-        // model with no id keeps the original full `all()` scan (it has no
-        // `id_to_row`-driven narrow scan and cannot be mutated anyway).
-        //
-        // #160 (C): index pushdown — if the filter names an eligible indexed field,
-        // resolve candidate rows from that field's index (O(matches)) instead of
-        // scanning every row.  `__rows_by_*` returns `None` when the value does not
-        // parse, which falls through to the full scan, so a match is never missed.
-        //
-        // #228: the pushdown now selects *rows*, not rows-and-decode, so both paths
-        // go through the one scan scope and the pushdown arm gets the borrowed view
-        // (#224) it previously could not have — it read its candidates positionally
-        // and so held no buffered span to borrow from.
         let pushdown_fields = crate::rust::RustGenerator::scan_pushdown_fields(model);
         let row_selection = if pushdown_fields.is_empty() {
             quote! { None }
@@ -389,33 +252,6 @@ impl ApiGenerator {
             quote! { #(#branches else)* { None } }
         };
         let page_ref_ident = format_ident!("{}PageRef", model.name);
-        // #226: the live, non-projected page — the whole list read, done inside the
-        // scan scope and returned as an already-serialized `Response`.
-        //
-        // Returning the response from inside the closure is what dissolves the
-        // higher-ranked-lifetime constraint the naive shape hits: the page views
-        // borrow the scan's buffers, so nothing that names their lifetime can leave
-        // the scope, but `Json(envelope).into_response()` produces an OWNED
-        // `Response`.  `__ListEnvelope` (`api.rs`, above) is already generic over the
-        // row type and holds `&'a [T]`, so it takes `&[PageRef<'_>]` unchanged — no
-        // `RawValue`, no string assembly, no envelope change.
-        //
-        // Replaces `__with_scan` + `__page_ids.filter_map(get)`, which re-read every
-        // page row through one positional `pread` per column — rows the scan had
-        // already decoded and dropped.  Measured at ~6.4 µs/row against the buffered
-        // scan's ~0.11 µs/row, i.e. 21.8% of the request at (10k rows, limit 50) and
-        // 91.8% at (1k rows, limit 1000).
-        //
-        // NOTE on the lost `filter_map` skip: `get(*__id)` returned `Option`, so a
-        // row deleted between the scan and the re-read was silently dropped from the
-        // page.  Under the read lock held here that is unreachable, and the buffered
-        // path has no second read to fail — `data.len()` is now exactly
-        // `min(limit, total - offset)`.  Not an observable change, and deliberately
-        // not reintroduced.
-        // The response shape, bound once and spliced into BOTH page calls (#281).
-        // Two splices are two independent closures — it captures only the `Copy`
-        // pagination scalars — so there is no borrow interaction between them, and
-        // the envelope keeps exactly one definition.
         let page_envelope_closure = quote! {
             |__total: usize, __page: &[super::#page_ref_ident<'_>]| {
                 (
@@ -431,23 +267,7 @@ impl ApiGenerator {
             }
         };
         let page_scope_return = quote! {
-            // #288: loop-invariant, so it is answered before the scan rather than on
-            // every scanned row. `__keep_all || matches(..)` is exactly equivalent to
-            // `matches(..)` — when no key names a filterable field, every `params.get`
-            // inside `matches` misses and it returns true for every record — so this
-            // is a pure evaluation-order change with no observable behaviour.
             let __keep_all: bool = #is_unfiltered_fn(&params);
-            // #281: with nothing to filter and nothing to sort, the page was knowable
-            // from the live row set alone — `keep` accepts everything, `sort` reorders
-            // nothing, so `__refs[i].__slot == i` and the scan's full-table gather
-            // decodes every row only to throw all but `limit` of them away. Take the
-            // page-bounded gather instead. Same rows, same order, same `total`, same
-            // bytes; that equality is guarded, not assumed.
-            //
-            // `__sel` is deliberately BELOW this: index pushdown resolves only fields
-            // `is_filterable_field` admits, so a request that names none resolves no
-            // index and `#row_selection` would be pure waste on this path. Placing the
-            // branch first makes that structural rather than a comment.
             if __keep_all && qp.sort.is_none() {
                 return db.#storage_field.__with_fast_page(
                     qp.pagination.offset,
@@ -467,16 +287,8 @@ impl ApiGenerator {
                 #page_envelope_closure,
             );
         };
-        // The OWNED narrow path (#160/#228), kept verbatim for the one live caller
-        // that still needs `Vec<Model>`: the `?projection=` arms field-copy the page
-        // rows into the projection struct, so they cannot take a borrowed view.
         let owned_narrow_block = quote! {
             let __sel: Option<Vec<usize>> = #row_selection;
-            // #228: filter, sort, count and page all run INSIDE the scan scope,
-            // on the borrowed view.  Only `(total, ids)` crosses the boundary —
-            // no scan row is ever materialized, so the strings of the rows that
-            // the page does not contain are never copied out of the buffer.
-            // #288: same hoist as the page scope — `?projection=` filters per row too.
             let __keep_all: bool = #is_unfiltered_fn(&params);
             let (total, __page_ids) = db.#storage_field.__with_scan(
                 __sel,
@@ -492,23 +304,12 @@ impl ApiGenerator {
                     (__total, __ids)
                 },
             );
-            // Full-materialize only the paginated page (or 404-skip a row that
-            // was deleted between the scan and here — the read lock makes that
-            // impossible, but `filter_map` is the honest primitive).
             let page: Vec<super::#model_name> = __page_ids
                 .iter()
                 .filter_map(|__id| db.#storage_field.get(*__id))
                 .collect();
         };
-        // The `None` (live) arm of the `as_of` match, as a whole expression.
-        //
-        // Three shapes, and which one is emitted is a property of the model, not a
-        // runtime branch — a model with no `@projection` has no owned caller left, so
-        // emitting the owned block for it would be dead code AFTER a `return`, i.e. an
-        // `unreachable_code` warning in the user's crate.
         let live_list_arm = if !has_id {
-            // No identity ⇒ no `id_to_row`, so no narrow scan and no page scope
-            // either.  Unchanged full `all()` path.
             quote! {
                 {
                     let mut rows: Vec<super::#model_name> = db.#storage_field.all()
@@ -522,12 +323,8 @@ impl ApiGenerator {
                 }
             }
         } else if model.projections.is_empty() {
-            // The common case: the borrowed page is the only live path, and this arm
-            // diverges (`!` coerces to the match's `(Vec<Model>, usize)`).
             quote! { { #page_scope_return } }
         } else {
-            // `?projection=` needs owned rows to field-copy from, so it keeps the
-            // #160/#228 path; everything else takes the borrowed page.
             quote! {
                 {
                     if params.get("projection").is_none() {
@@ -555,43 +352,16 @@ impl ApiGenerator {
                     (status = 200, description = #list_summary, body = Vec<#model_name>)
                 )
             )]
-            // Real list endpoint (#90): fetch live rows, then filter / sort /
-            // paginate.  `forgedb_query_params` is schema-agnostic substrate — it
-            // only parses the query string into generic Sort / Pagination; every
-            // field-aware step is generated per-model.  Filtering reuses the exact
-            // closed-set `#filter_fn` the change-feed / live-query paths use (no
-            // second predicate parser); sorting uses the generated `#sort_fn`
-            // comparator; pagination is clamped by the substrate (MAX_LIMIT).
-            // #229: returns `Response`, not `(StatusCode, Json<serde_json::Value>)`
-            // — the success body is now a typed envelope while the error bodies are
-            // still ad-hoc `json!` objects, so the arms have different body types.
-            // `#[utoipa::path]` documents the response from its own `responses(...)`
-            // attribute, so the OpenAPI document is unchanged by this.
             async fn #list_fn(
                 Query(params): Query<HashMap<String, String>>,
                 State(db): State<Arc<RwLock<super::Database>>>,
             ) -> Response {
-                // Parse the generic query params (sort/order/limit/offset); the
-                // remaining `?field=value` pairs stay in `params` for the filter.
                 let mut qp = forgedb_query_params::QueryParams::from_map(params.clone());
-                // #141: re-derive the page limit against the generate-time-baked
-                // default/max (`PAGE_DEFAULT_LIMIT`/`PAGE_MAX_LIMIT`) instead of the
-                // substrate's fixed `DEFAULT_LIMIT`/`MAX_LIMIT`.  The raw `?limit`
-                // survives in `params` (from_map got a clone), so we recompute it
-                // here: omitted ⇒ the baked default; otherwise clamped to
-                // `[1, PAGE_MAX_LIMIT]`.  Offset is left as the substrate parsed it.
                 qp.pagination.limit = params
                     .get("limit")
                     .and_then(|__s| __s.parse::<usize>().ok())
                     .unwrap_or(PAGE_DEFAULT_LIMIT)
                     .clamp(1, PAGE_MAX_LIMIT);
-                // #85: optional point-in-time read.  `as_of=<watermark>` is an
-                // opaque row-count position (a `usize`, same class as
-                // limit/offset) — present ⇒ read `all_at(&Snapshot::new(w))`
-                // instead of the live `all()`; a non-numeric value is a 400 (never
-                // silently fall back to live — a client asking for a snapshot and
-                // getting live data is a correctness trap).  `as_of` is not a model
-                // field, so the closed-set filter below ignores it.
                 let __as_of: Option<usize> = match params.get("as_of") {
                     Some(__w) => match __w.parse::<usize>() {
                         Ok(__n) => Some(__n),
@@ -606,18 +376,6 @@ impl ApiGenerator {
                     None => None,
                 };
                 let db = db.read().await;
-                // Materialize `page` (Vec<Model>) + `total`.  Paths:
-                //  - live (no `as_of`), no `?projection=`: #226 — filter/sort the
-                //    #228 borrowed scan, then serialize the page's rows straight out
-                //    of a second buffered gather.  Returns the finished `Response`
-                //    from inside the scan scope; nothing is materialized at all.
-                //  - live with `?projection=`: the #160 narrow path — filter/sort a
-                //    scan record (only filterable/sortable columns), full-materialize
-                //    ONLY the paginated page, because the projection arms field-copy
-                //    owned rows.
-                //  - `as_of` snapshot: the original full-record path over
-                //    `all_at(&Snapshot)` (a rarer inspector read; #159 already made
-                //    its newest-version resolution sub-linear).
                 let (page, total) = match __as_of {
                     Some(__w) => {
                         let mut rows: Vec<super::#model_name> = db
@@ -634,9 +392,6 @@ impl ApiGenerator {
                     None => #live_list_arm,
                 };
                 #proj_list_block
-                // #229: borrow the page into the envelope — no intermediate
-                // `serde_json::Value`, so the page's strings are written to the
-                // socket from the rows themselves rather than cloned first.
                 (
                     StatusCode::OK,
                     Json(__ListEnvelope {
@@ -666,20 +421,13 @@ impl ApiGenerator {
                 Path(id): Path<String>,
                 Query(params): Query<HashMap<String, String>>,
                 State(db): State<Arc<RwLock<super::Database>>>,
-            // #229: `Response`, not `(StatusCode, Json<serde_json::Value>)` — the
-            // record is now serialized from its own type, so the success and error
-            // arms carry different body types.  The projection arms above each
-            // carry a *different* record type again, which is the other reason.
             ) -> Response {
-                // #113 projection takes precedence (a projected read is live-only);
-                // `?as_of=` below applies to the full-record point read.
                 #proj_get_block
                 let key = match id.parse::<#id_type>() {
                     Ok(key) => key,
                     Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid id" })))
                         .into_response(),
                 };
-                // #85: optional point-in-time read (see the list handler note).
                 let __as_of: Option<usize> = match params.get("as_of") {
                     Some(__w) => match __w.parse::<usize>() {
                         Ok(__n) => Some(__n),
@@ -699,8 +447,6 @@ impl ApiGenerator {
                     None => db.#storage_field.get(key),
                 };
                 match __found {
-                    // #229: straight to bytes — no intermediate `Value` clone of
-                    // every string in the record.
                     Some(record) => (StatusCode::OK, Json(record)).into_response(),
                     None => (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" })))
                         .into_response(),
@@ -727,8 +473,6 @@ impl ApiGenerator {
                     Err(_) => return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({ "error": "invalid payload" }))),
                 };
                 let mut db = db.write().await;
-                // Route through the Database-level validated wrapper (#91): FK
-                // existence + field constraints + `&unique`, mapped to 409/422.
                 match db.#create_fn(record) {
                     Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id.to_string() }))),
                     Err(e) => {
@@ -754,8 +498,6 @@ impl ApiGenerator {
                     (status = 422, description = "Field constraint violation")
                 )
             )]
-            // Whole-record replace over the generated `update` (#66):
-            // superseding-version append + id repoint, not a field-level patch.
             async fn #update_fn(
                 Path(id): Path<String>,
                 State(db): State<Arc<RwLock<super::Database>>>,
@@ -770,7 +512,6 @@ impl ApiGenerator {
                     Err(_) => return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({ "error": "invalid payload" }))),
                 };
                 let mut db = db.write().await;
-                // Route through the Database-level validated wrapper (#91).
                 match db.#update_fn(key, record) {
                     Ok(true) => (StatusCode::OK, Json(json!({ "id": key.to_string() }))),
                     Ok(false) => (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" }))),
@@ -795,10 +536,6 @@ impl ApiGenerator {
                     (status = 409, description = "Referenced by children (on_delete=restrict)")
                 )
             )]
-            // Route through the Database-level `delete_<model>` wrapper (delete
-            // semantics): each child FK's `@on_delete` policy (restrict/cascade/
-            // set_null) is applied + M2M junctions unlinked, then the row is
-            // tombstoned.  A `restrict` violation surfaces as 409.
             async fn #delete_fn(
                 Path(id): Path<String>,
                 State(db): State<Arc<RwLock<super::Database>>>,
@@ -825,12 +562,6 @@ impl ApiGenerator {
         Ok(quote! { #tokens #sort_tokens #scan_helpers })
     }
 
-    /// Generate the per-model `<model>_apply_sort` comparator used by the list
-    /// endpoint (#90).  Closed-set: a `match` over each declared scalar field by
-    /// name selects a typed comparison (`Ord::cmp`, or `f64::partial_cmp` for
-    /// floating-point fields); an unknown / relation `sort` field is a no-op.
-    /// `forgedb_query_params::Sort` supplies only the field name + direction —
-    /// the type-aware ordering is generated here, never interpreted at runtime.
     fn generate_list_sort(model: &forgedb_parser::Model) -> TokenStream {
         let model_name = format_ident!("{}", model.name);
         let sort_fn = format_ident!("{}_apply_sort", Self::to_snake_case(&model.name));
@@ -853,11 +584,6 @@ impl ApiGenerator {
         }
     }
 
-    /// The per-field `match`-arm comparators for the list sort (#90) — shared by
-    /// the full-record `<model>_apply_sort` and the #160 narrow
-    /// `__<model>_scan_sort`, so both order identically (each arm accesses
-    /// `a.<field>`/`b.<field>`, which compiles against any struct carrying the
-    /// filterable/sortable fields).
     fn list_sort_arms(model: &forgedb_parser::Model) -> Vec<TokenStream> {
         model
             .fields
@@ -867,8 +593,6 @@ impl ApiGenerator {
                 let fname = &f.name;
                 let fident = format_ident!("{}", f.name);
                 if Self::is_float_field(&f.field_type) {
-                    // f64 (or nullable f64): only PartialOrd — fall back to Equal
-                    // for NaN so the total order `sort_by` requires is well-defined.
                     quote! {
                         #fname => rows.sort_by(|a, b| {
                             a.#fident.partial_cmp(&b.#fident)
@@ -876,8 +600,6 @@ impl ApiGenerator {
                         }),
                     }
                 } else {
-                    // Every other filterable scalar is `Ord` (integers, bool,
-                    // String, char(N), Uuid, Timestamp, and their nullable forms).
                     quote! {
                         #fname => rows.sort_by(|a, b| a.#fident.cmp(&b.#fident)),
                     }
@@ -886,21 +608,6 @@ impl ApiGenerator {
             .collect()
     }
 
-    /// #160: the narrow list helpers — `__<model>_scan_matches` and
-    /// `__<model>_scan_sort` over the internal borrowed `<Model>ScanRef` (id +
-    /// filterable/sortable columns).  Emitted from the SAME `generate_filter_check`
-    /// per-field checks and `list_sort_arms` as the full-record `_event_matches` /
-    /// `_apply_sort`, so filtering + ordering are byte-identical — only the operand
-    /// type is narrower.  Lets the list endpoint filter/sort without decoding every
-    /// column, then full-materialize only the paginated page.  Empty for a model
-    /// with no id field (no list to optimize).
-    ///
-    /// #228 deleted the owned twin of both.  #224 had introduced a second,
-    /// borrowed-operand filter alongside the owned one because the index-pushdown
-    /// arm still worked on owned rows; unifying that arm on the scan scope left the
-    /// owned filter with no caller, and the sort's operand became the borrowed view.
-    /// Neither is a semantic change — `&str` and `Option<&str>` are both `Ord`, so
-    /// the emitted arms are unchanged.
     fn generate_list_scan_helpers(model: &forgedb_parser::Model) -> TokenStream {
         if model.identity_field().is_none() {
             return quote! {};
@@ -909,10 +616,6 @@ impl ApiGenerator {
         let snake = Self::to_snake_case(&model.name);
         let scan_matches_fn = format_ident!("__{}_scan_matches", snake);
         let scan_sort_fn = format_ident!("__{}_scan_sort", snake);
-        // #224: the borrowed-view filter comes from the SAME emitter as
-        // `_event_matches`, not a second predicate — same param keys, same parse,
-        // same semantics.  Only the nullable-string comparison differs, because
-        // `Option`'s `PartialEq` is homogeneous (see `generate_filter_check`).
         let filterable: Vec<_> = model
             .fields
             .iter()
@@ -922,11 +625,6 @@ impl ApiGenerator {
             .iter()
             .map(|f| Self::generate_filter_check(f, true))
             .collect();
-        // #288: the same iteration, asked the loop-INVARIANT question. Deriving both
-        // from one list is what makes it impossible for the predicate and the checks
-        // to disagree about which names are filterable — they key on the same
-        // `field.name`, so "no key names a filterable field" is exactly "every
-        // `params.get` below will miss".
         let is_unfiltered_fn = format_ident!("__{}_is_unfiltered", snake);
         let unfiltered_checks: Vec<_> = filterable
             .iter()
@@ -935,12 +633,6 @@ impl ApiGenerator {
                 quote! { if params.contains_key(#fname_str) { return false; } }
             })
             .collect();
-        // A model with ZERO filterable fields is legal — a pure junction whose
-        // identity is a required FK has none (`is_filterable_field` is false for every
-        // relation and for `json`), yet the scan field set pushes the identity
-        // unconditionally. Its predicate is a body-less `true`, so the parameter would
-        // be unused: an `unused_variables` warning in the USER's crate, which
-        // `database.rs`'s `allow` header does not and should not cover.
         let unfiltered_param = if unfiltered_checks.is_empty() {
             format_ident!("_params")
         } else {
@@ -948,31 +640,11 @@ impl ApiGenerator {
         };
         let arms = Self::list_sort_arms(model);
         quote! {
-            /// Is this request unfiltered — does NO query key name a filterable field
-            /// of this model (#288)?
-            ///
-            /// Hoisted out of the per-row loop by every caller, because it is a
-            /// property of the query string and not of the row. `_scan_matches` can
-            /// only short-circuit on `params.is_empty()`, and `?limit=50` defeats that
-            /// while naming no filterable field at all — so an unfiltered request was
-            /// running one `HashMap` lookup per filterable field per SCANNED ROW, all
-            /// of them guaranteed to miss. Measured at ~50 ns/row, i.e. 502 µs of a
-            /// 850 µs request over 10k rows.
-            ///
-            /// The question is POSITIVE — "does any key name a field of this model?" —
-            /// deliberately. A negative exclusion list (`limit`/`offset`/`sort`/
-            /// `order`/`as_of`) would need maintaining, and would be wrong: a model may
-            /// legally declare a field named `limit`, and for that model `?limit=3`
-            /// genuinely is a filter.
             fn #is_unfiltered_fn(#unfiltered_param: &HashMap<String, String>) -> bool {
                 #(#unfiltered_checks)*
                 true
             }
 
-            /// Narrow closed-set filter over the BORROWED scan view (#160/#224), so
-            /// a row is accepted or rejected before its strings are ever copied out
-            /// of the buffered column.  Same per-field checks as `_event_matches`,
-            /// only the operand type is narrower.
             fn #scan_matches_fn(
                 record: &super::#scan_ref_ident<'_>,
                 params: &HashMap<String, String>,
@@ -984,10 +656,6 @@ impl ApiGenerator {
                 true
             }
 
-            /// Narrow list sort over the borrowed scan view (#160/#228) — same arms
-            /// as `_apply_sort`.  Runs inside the scan scope, on views that borrow
-            /// the buffered columns: `&str` and `Option<&str>` are `Ord`, so
-            /// comparing them is comparing the buffer's bytes in place.
             fn #scan_sort_fn(
                 rows: &mut Vec<super::#scan_ref_ident<'_>>,
                 sort: &Option<forgedb_query_params::Sort>,
@@ -1004,9 +672,6 @@ impl ApiGenerator {
         }
     }
 
-    /// Whether a field's underlying scalar is `f64` (directly or nullable),
-    /// which only implements `PartialOrd` — so generated sort must use
-    /// `partial_cmp` rather than `Ord::cmp`.
     fn is_float_field(field_type: &forgedb_parser::FieldType) -> bool {
         use forgedb_parser::FieldType;
         match field_type {
@@ -1016,10 +681,6 @@ impl ApiGenerator {
         }
     }
 
-    /// Whether a field is a JSON scalar a subscription filter can match on.
-    /// Relations/components have no scalar JSON value; structs/arrays serialize to
-    /// composites that a `?field=value` param would never sensibly match, so both
-    /// are excluded from the generated per-model filter.
     pub(crate) fn is_filterable_field(field_type: &forgedb_parser::FieldType) -> bool {
         use forgedb_parser::FieldType;
         match field_type {
@@ -1032,14 +693,8 @@ impl ApiGenerator {
             | FieldType::Uuid
             | FieldType::Timestamp(_)
             | FieldType::String
-            // #238: an inline `string(N)` is a `String` in the record — same
-            // `Ord`, same comparisons, same wire form. Only its storage differs.
             | FieldType::StringN { .. }
-            // decimal is `Ord`, so it is filterable + sortable (sort uses the
-            // `Ord::cmp` branch, not float `partial_cmp`).
             | FieldType::Decimal
-            // enum derives `Ord`, so it is filterable + sortable via `Ord::cmp`
-            // (sort orders by declaration order — the variant discriminant).
             | FieldType::Enum(_)
             | FieldType::Bytes(_) => true,
             FieldType::Nullable(inner) => Self::is_filterable_field(inner),
@@ -1047,8 +702,6 @@ impl ApiGenerator {
         }
     }
 
-    /// Split a field type into `(base, is_nullable)` — peeling a single
-    /// `Nullable(..)` wrapper.  Used by the typed comparison generators (#84).
     fn peel_nullable(
         field_type: &forgedb_parser::FieldType,
     ) -> (&forgedb_parser::FieldType, bool) {
@@ -1058,32 +711,12 @@ impl ApiGenerator {
         }
     }
 
-    /// Emit one **typed** equality check for a filterable field inside
-    /// `<model>_event_matches` (#84).  Parses the string query param into the
-    /// field's Rust type and compares it to the typed record field, so
-    /// `?price=3` matches a stored `3.0` and bool/uuid/decimal/enum/timestamp
-    /// values compare by value — not by the fragile `serde_json` stringify the
-    /// old filter used (`3.0` != `"3"`).  An unparseable param matches nothing.
-    ///
-    /// The caller guarantees `field` is filterable (`is_filterable_field`); any
-    /// other type yields an empty check.
-    ///
-    /// `borrowed` selects the operand view (#224).  Only ONE comparison actually
-    /// differs: a **nullable string** on the borrowed view is `Option<&str>`, and
-    /// `Option`'s `PartialEq` is homogeneous — there is no
-    /// `Option<&str> == Option<String>` — so the parsed param has to be borrowed
-    /// too (`Some(__w.as_str())`).  Everything else compiles against both views
-    /// unchanged: non-nullable `&str == String` has a std heterogeneous impl, and
-    /// every non-string field has the same type in both structs.
     fn generate_filter_check(field: &forgedb_parser::Field, borrowed: bool) -> TokenStream {
         use forgedb_parser::FieldType;
         let fname_str = &field.name;
         let fname = format_ident!("{}", field.name);
         let (base, nullable) = Self::peel_nullable(&field.field_type);
 
-        // char(N) is a fixed `[u8; N]`: compare the param's bytes, zero-padded to
-        // N (a param longer than N can never match).  Handled inline because it
-        // parses into a buffer rather than a single `T`.
         if let FieldType::Bytes(n) = base {
             let cmp = if nullable {
                 quote! { record.#fname == Some(__buf) }
@@ -1105,8 +738,6 @@ impl ApiGenerator {
             };
         }
 
-        // `<parse> -> Option<T>`; `None` means the param can't match this typed
-        // field (unparseable / wrong shape).
         let parse: TokenStream = match base {
             FieldType::U32 => quote! { want.parse::<u32>().ok() },
             FieldType::U64 => quote! { want.parse::<u64>().ok() },
@@ -1117,20 +748,6 @@ impl ApiGenerator {
             FieldType::String | FieldType::StringN { .. } => quote! { Some(want.clone()) },
             FieldType::Uuid => quote! { want.parse::<Uuid>().ok() },
             FieldType::Decimal => quote! { want.parse::<rust_decimal::Decimal>().ok() },
-            // #254: the wire form is RFC 3339, so a filter param is parsed the same
-            // way the body is.  Parsing a bare integer here would have silently
-            // meant *seconds* while storage moved to micros — a filter that
-            // matched nothing rather than failing.
-            // #389: floor the parsed param to the field's quantum, because
-            // `Timestamp`'s `PartialEq` is over the raw `i64` micros and so does not
-            // self-correct — unlike `Decimal`, whose `PartialEq` compares by numeric
-            // value and therefore needed only its *key* normalized.
-            //
-            // This is a separate fix from the index key, and both are required. On the
-            // REST list path the index pushdown selects candidate rows and this
-            // predicate re-checks them; fixing only the key would have made the
-            // pushdown find the row and the predicate discard it — still `[]`, for a
-            // new reason.
             FieldType::Timestamp(p) => {
                 let quantum = p.quantum_micros();
                 if quantum > 1 {
@@ -1140,21 +757,17 @@ impl ApiGenerator {
                             .map(|__ts| __ts.floor_to_micros(#quantum))
                     }
                 } else {
-                    // `timestamp(us)` — flooring is the identity; emit nothing extra.
                     quote! { want.parse::<forgedb_types::Timestamp>().ok() }
                 }
             }
             FieldType::Enum(name) => {
                 let en = format_ident!("{}", name);
-                // Reuse the canonical variant-name <-> enum serde mapping so the
-                // wire form matches REST/TS exactly (no second name table).
                 quote! {
                     serde_json::from_value::<super::#en>(
                         serde_json::Value::String(want.clone())
                     ).ok()
                 }
             }
-            // Not filterable (caller guards); emit nothing.
             _ => return quote! {},
         };
 
@@ -1179,11 +792,6 @@ impl ApiGenerator {
         }
     }
 
-    /// Is this field compared for change-detection in the live-query diff (#84)?
-    /// Everything the record actually stores/serializes — scalars, `json`,
-    /// `decimal`, enums, `char(N)`, structs, and FK scalars — but NOT the virtual
-    /// relation collections (one-to-many / many-to-many) or component refs, which
-    /// map to `()` and carry no per-record value.
     fn is_comparable_field(field_type: &forgedb_parser::FieldType) -> bool {
         use forgedb_parser::{FieldType, RelationType};
         match field_type {
@@ -1195,12 +803,6 @@ impl ApiGenerator {
         }
     }
 
-    /// Generate `<model>_record_changed(a, b) -> bool` — a **typed, per-field**
-    /// change detector for the live-query `Updated` diff (#84), replacing the old
-    /// whole-record `serde_json` stringify comparison.  `f64` fields compare by
-    /// `to_bits()` (deterministic — two `NaN`s are equal, so an unchanged record
-    /// never reports a spurious update); every other stored field compares with
-    /// `==`.  Returns `true` on the first differing field.
     fn generate_record_changed(model: &forgedb_parser::Model) -> TokenStream {
         use forgedb_parser::FieldType;
         let model_name = format_ident!("{}", model.name);
@@ -1232,7 +834,6 @@ impl ApiGenerator {
             .collect();
 
         quote! {
-            /// Typed per-field change detector for the live-query `Updated` diff (#84).
             fn #changed_fn(a: &super::#model_name, b: &super::#model_name) -> bool {
                 #(#field_cmps)*
                 false
@@ -1240,12 +841,6 @@ impl ApiGenerator {
         }
     }
 
-    /// Generate the change-feed WebSocket subscription handler + per-model filter
-    /// for a model (#62 Direction A).  The handler subscribes to the shared feed,
-    /// keeps only this model's `Inserted` signals, materializes the typed record
-    /// from the broadcast row index, applies the generated filter, and streams a
-    /// `<Model>Inserted` JSON event.  The substrate never inspects a field: model
-    /// routing is by name and filtering is field-by-field in this generated code.
     fn generate_subscription(model: &forgedb_parser::Model) -> TokenStream {
         let model_name = format_ident!("{}", model.name);
         let inserted_name = format_ident!("{}Inserted", model.name);
@@ -1256,13 +851,8 @@ impl ApiGenerator {
         let subscribe_fn = format_ident!("subscribe_{}", snake);
         let handle_fn = format_ident!("handle_{}_subscription", snake);
         let filter_fn = format_ident!("{}_event_matches", snake);
-        // The `&'static str` the generated `insert` emits for this model.
         let model_name_str = &model.name;
 
-        // One TYPED equality check per declared scalar field — named explicitly so
-        // the set of filterable keys is closed and per-model (never a generic
-        // scan).  Each check parses the string param into the field's Rust type
-        // and compares typed values (#84), not fragile `serde_json` stringify.
         let field_checks: Vec<_> = model
             .fields
             .iter()
@@ -1270,28 +860,10 @@ impl ApiGenerator {
             .map(|f| Self::generate_filter_check(f, false))
             .collect();
 
-        // Typed per-field change detector for the live-query `Updated` diff (#84),
-        // defined here (once per model) and reused by `generate_live_query`.
         let record_changed = Self::generate_record_changed(model);
 
-        let filter_doc = format!(
-            "Per-model change-feed filter for `{}` (#62): narrow by exact-match \
-             `?field=value` query params. Each declared scalar field is checked by \
-             name in generated code, parsing the param into the field's type and \
-             comparing typed values (#84 — `?n=3` matches a stored `3.0`); the \
-             substrate feed never inspects a field. An empty param set matches \
-             everything; unknown keys are ignored.",
-            model.name
-        );
-        let subscribe_doc = format!(
-            "WebSocket subscription for `{}` changes (#62 Direction A + #66). Upgrades \
-             the connection and streams a typed `{}Inserted` / `{}Updated` / \
-             `{}Deleted` JSON event per change, optionally narrowed by `?field=value`.",
-            model.name, model.name, model.name, model.name
-        );
 
         quote! {
-            #[doc = #filter_doc]
             fn #filter_fn(record: &super::#model_name, params: &HashMap<String, String>) -> bool {
                 if params.is_empty() {
                     return true;
@@ -1302,7 +874,6 @@ impl ApiGenerator {
 
             #record_changed
 
-            #[doc = #subscribe_doc]
             async fn #subscribe_fn(
                 Query(params): Query<HashMap<String, String>>,
                 headers: axum::http::HeaderMap,
@@ -1310,10 +881,6 @@ impl ApiGenerator {
                 ws: WebSocketUpgrade,
                 State(db): State<Arc<RwLock<super::Database>>>,
             ) -> Response {
-                // #140: browsers neither preflight a WebSocket handshake nor
-                // apply CORS to it, so the CorsLayer does not cover this route —
-                // the handler has to check `Origin` itself. Refuse before
-                // `on_upgrade`, so a disallowed page never gets a socket.
                 if !allowed.permits(__origin_of(&headers)) {
                     return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
                 }
@@ -1325,8 +892,6 @@ impl ApiGenerator {
                 db: Arc<RwLock<super::Database>>,
                 params: HashMap<String, String>,
             ) {
-                // Subscribe without holding the DB lock across the stream: the feed
-                // is Clone (shares the channel), so take a receiver and release.
                 let mut rx = { db.read().await.changefeed.subscribe() };
                 loop {
                     match rx.recv().await {
@@ -1334,11 +899,6 @@ impl ApiGenerator {
                             if event.model != #model_name_str {
                                 continue;
                             }
-                            // Materialize the typed record from the row index (brief lock).
-                            // Every model-change kind emits a materializable row: Inserted
-                            // / Updated point at the new live version; Deleted carries the
-                            // pre-delete row so the deleted record is still readable.
-                            // `Linked` (M2M) is not a model-row change → skip.
                             let record = { db.read().await.#storage_field.read_at(event.row_index) };
                             let Some(record) = record else { continue; };
                             if !#filter_fn(&record, &params) {
@@ -1358,7 +918,7 @@ impl ApiGenerator {
                             };
                             let Ok(text) = text else { continue; };
                             if socket.send(Message::Text(text.into())).await.is_err() {
-                                break; // client disconnected
+                                break;
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -1369,26 +929,8 @@ impl ApiGenerator {
         }
     }
 
-    /// Generate the durable replication WebSocket endpoint (#82 Direction C).
-    ///
-    /// One schema-wide handler (the broker carries a single global offset across
-    /// all models).  A follower connects with `?after=<offset>` (its last applied
-    /// offset, or omitted / `0` when cold) and receives a resumable stream of
-    /// **field-blind binary frames** ([`PersistedEvent::to_wire`]): first the
-    /// durably-retained frames it missed, then the live tail.  The handler NEVER
-    /// decodes a frame — it forwards opaque `(model, row_index, kind, offset,
-    /// bytes)` verbatim; typed materialization is the follower's generated code.
-    ///
-    /// Identity: this is Class-2 transport glue over the Class-1 broker.  Routing
-    /// is by opaque model name and the apply order is the opaque global offset —
-    /// no `match model_name { ... field ... }`, no per-model branch.  Sits behind
-    /// the same `forgedb-auth` tenant guard as the CRUD/WS routes (it is added to
-    /// `__data_routes`), so a follower receives only its own tenant's stream.
     fn generate_replication_handler() -> TokenStream {
         quote! {
-            /// Upgrade to a replication stream.  `?after=<offset>` resumes from the
-            /// follower's last applied offset (default `0` = cold / from the start
-            /// of the retained log).  Tenant-scoped by the router's auth guard.
             async fn __replicate(
                 Query(params): Query<HashMap<String, String>>,
                 headers: axum::http::HeaderMap,
@@ -1396,10 +938,6 @@ impl ApiGenerator {
                 ws: WebSocketUpgrade,
                 State(db): State<Arc<RwLock<super::Database>>>,
             ) -> Response {
-                // #140: browsers neither preflight a WebSocket handshake nor
-                // apply CORS to it, so the CorsLayer does not cover this route —
-                // the handler has to check `Origin` itself. Refuse before
-                // `on_upgrade`, so a disallowed page never gets a socket.
                 if !allowed.permits(__origin_of(&headers)) {
                     return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
                 }
@@ -1416,38 +954,28 @@ impl ApiGenerator {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0);
 
-                // Clone the shared broker handle out, releasing the DB read lock
-                // immediately (the broker is an independent Arc<Mutex<..>>).
                 let broker = { db.read().await.broker.clone() };
                 let Some(broker) = broker else {
-                    // Durable replication is not enabled on this process (e.g. a
-                    // `Database::new()` standalone path); close cleanly.
                     let _ = socket.send(Message::Close(None)).await;
                     return;
                 };
 
-                // Race-free resume: subscribe to the live tail AND read the durable
-                // replay under ONE brief lock (single-writer, so no `record`
-                // interleaves).  Everything > `boundary` is guaranteed to arrive live.
                 let catch = match broker.lock() {
                     Ok(b) => b.catch_up_from(after, usize::MAX),
-                    Err(_) => return, // poisoned lock: bail
+                    Err(_) => return,
                 };
                 let Ok(mut catch) = catch else { return };
 
-                // 1. Replay the durably-retained frames the follower missed.
                 for ev in &catch.replayed {
                     if socket
                         .send(Message::Binary(ev.to_wire().into()))
                         .await
                         .is_err()
                     {
-                        return; // follower disconnected
+                        return;
                     }
                 }
 
-                // 2. Stream the live tail, skipping any frame already covered by the
-                //    replay — idempotent by absolute offset (never by content).
                 let boundary = catch.boundary;
                 loop {
                     match catch.receiver.recv().await {
@@ -1460,12 +988,9 @@ impl ApiGenerator {
                                 .await
                                 .is_err()
                             {
-                                break; // follower disconnected
+                                break;
                             }
                         }
-                        // The follower fell behind the live ring buffer.  Durable
-                        // replay covers the gap, so close and let it reconnect with
-                        // `?after=<last applied offset>` to resume losslessly.
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             let _ = socket.send(Message::Close(None)).await;
                             break;
@@ -1477,31 +1002,6 @@ impl ApiGenerator {
         }
     }
 
-    /// Generate the live-query WebSocket handler for a model (#62 Direction B).
-    ///
-    /// A stateful, removal-aware result-set subscription.  On connect it runs a
-    /// **generated closed-set query** — the narrow `db.<model>.__with_scan(..)`
-    /// filtered by the generated per-model `__<model>_scan_matches` closed-set
-    /// filter (the SAME per-field checks as `<model>_event_matches` / the REST
-    /// `list` endpoint, only the operand is the narrow scan row — NO second
-    /// predicate parser), then full-materializes ONLY the matching rows (#160) —
-    /// sends an `Init` delta, and records membership as `id -> typed record`.  On
-    /// every change to this model it re-runs that same query, diffs by id, and
-    /// pushes typed `Added` / `Updated` / `Removed` deltas.
-    ///
-    /// Identity: the substrate feed is consulted **coarsely — only `event.model`**
-    /// (never `row_index`/`kind`), so no logical-row identity is resolved through
-    /// the substrate and no `ChangeEvent` widening is needed.  Re-evaluation runs
-    /// only generated code; the diff/membership plumbing is opaque ids + opaque
-    /// hashes.  This is "generated code re-executing generated code on a coarse
-    /// signal," not a runtime predicate interpreter.
-    ///
-    /// Honest limits: re-runs on every matched event per connection (no
-    /// coalescing/debounce yet — #83); single-process.  #160 narrows the re-run —
-    /// it scans only the filterable columns and full-materializes only the rows
-    /// that match the filter (not every column of every row) — but a broad filter
-    /// still materializes its whole matching set.  `Updated` detection uses a typed
-    /// per-field comparison (`<model>_record_changed`, #84).
     fn generate_live_query(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let model_name = format_ident!("{}", model.name);
         let delta_name = format_ident!("{}LiveDelta", model.name);
@@ -1509,41 +1009,16 @@ impl ApiGenerator {
         let storage_field = format_ident!("{}", snake);
         let subscribe_fn = format_ident!("subscribe_live_{}", snake);
         let handle_fn = format_ident!("handle_{}_live_query", snake);
-        // Typed per-field change detector (#84), also defined by
-        // `generate_subscription` — reused here so there is one change-detection
-        // body per model, never a second (stringify) path.
         let changed_fn = format_ident!("{}_record_changed", snake);
-        // #160: the narrow closed-set filter over the borrowed `<Model>ScanRef` (id
-        // + filterable columns), co-emitted with the list path. The live-query
-        // re-evaluation filters the CHEAP narrow scan and full-materializes only
-        // the matching rows, instead of full-decoding every column of every row.
-        // #224: it filters the BORROWED scan view, so a re-run rejects non-matching
-        // rows before their strings are copied — the re-run happens on every change
-        // to the model, so this is the hottest of the three call sites.
-        // #228: and a *matching* row no longer materializes either — the scope hands
-        // back only ids, which are then read through `get`.
         let scan_matches_fn = format_ident!("__{}_scan_matches", snake);
-        // #288: hoisted ONCE for the whole subscription, not per re-run and not per
-        // row. `params` is fixed for the life of the socket, so the question it
-        // answers cannot change — and this is the site where the per-row cost was
-        // paid repeatedly, on every changefeed event for the model.
         let is_unfiltered_fn = format_ident!("__{}_is_unfiltered", snake);
         let scan_ref_ident = format_ident!("{}ScanRef", model.name);
         let id_field = Self::id_field_ident(model);
         let id_type = Self::id_parse_type(schema, model);
         let model_name_str = &model.name;
 
-        let subscribe_doc = format!(
-            "Live-query WebSocket subscription for `{}` (#62 Direction B). Runs the \
-             generated closed-set query (narrow `__with_scan` + `__{}_scan_matches`, \
-             materializing only matches — #160), streams an initial \
-             `{}LiveDelta::Init`, then pushes removal-aware `Added` / `Updated` / \
-             `Removed` deltas as the matching set changes.",
-            model.name, snake, model.name
-        );
 
         quote! {
-            #[doc = #subscribe_doc]
             async fn #subscribe_fn(
                 Query(params): Query<HashMap<String, String>>,
                 headers: axum::http::HeaderMap,
@@ -1551,10 +1026,6 @@ impl ApiGenerator {
                 ws: WebSocketUpgrade,
                 State(db): State<Arc<RwLock<super::Database>>>,
             ) -> Response {
-                // #140: browsers neither preflight a WebSocket handshake nor
-                // apply CORS to it, so the CorsLayer does not cover this route —
-                // the handler has to check `Origin` itself. Refuse before
-                // `on_upgrade`, so a disallowed page never gets a socket.
                 if !allowed.permits(__origin_of(&headers)) {
                     return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
                 }
@@ -1566,21 +1037,12 @@ impl ApiGenerator {
                 db: Arc<RwLock<super::Database>>,
                 params: HashMap<String, String>,
             ) {
-                // #288: `params` is fixed for the life of this socket, so whether the
-                // query filters at all is answered once here rather than on every row
-                // of every re-run.
                 let __keep_all: bool = #is_unfiltered_fn(&params);
 
-                // Coarse change signal: take a feed receiver (Clone shares the
-                // channel), then release the DB lock.  We consult only event.model.
                 let mut rx = { db.read().await.changefeed.subscribe() };
 
-                // Result-set membership: id -> the typed record currently in the
-                // set.  Change-detection compares these field-by-field (#84).
                 let mut members: HashMap<#id_type, super::#model_name> = HashMap::new();
 
-                // Initial matching set via the GENERATED closed-set query (#160:
-                // filter the narrow scan, full-materialize only the matches).
                 {
                     let rows: Vec<super::#model_name> = {
                         let g = db.read().await;
@@ -1601,7 +1063,7 @@ impl ApiGenerator {
                     let init = super::#delta_name::Init { rows };
                     if let Ok(text) = serde_json::to_string(&init) {
                         if socket.send(Message::Text(text.into())).await.is_err() {
-                            return; // client disconnected
+                            return;
                         }
                     }
                 }
@@ -1609,14 +1071,10 @@ impl ApiGenerator {
                 loop {
                     match rx.recv().await {
                         Ok(event) => {
-                            // COARSE: any change to this model re-runs the query.
-                            // Only the model NAME is read — never row_index/kind.
                             if event.model != #model_name_str {
                                 continue;
                             }
 
-                            // Re-run the SAME generated closed-set query (#160:
-                            // narrow scan + filter, full-materialize only matches).
                             let current: Vec<super::#model_name> = {
                                 let g = db.read().await;
                                 let __ids = g.#storage_field.__with_scan(
@@ -1631,9 +1089,6 @@ impl ApiGenerator {
                                     .collect()
                             };
 
-                            // Diff by id over the typed records → removal-aware
-                            // deltas.  `Updated` fires only when a stored field
-                            // actually changed (typed compare, #84 — no stringify).
                             let mut next: HashMap<#id_type, super::#model_name> = HashMap::new();
                             let mut deltas: Vec<super::#delta_name> = Vec::new();
                             for r in current {
@@ -1657,7 +1112,7 @@ impl ApiGenerator {
                             for d in deltas {
                                 let Ok(text) = serde_json::to_string(&d) else { continue; };
                                 if socket.send(Message::Text(text.into())).await.is_err() {
-                                    return; // client disconnected
+                                    return;
                                 }
                             }
                         }
@@ -1669,17 +1124,7 @@ impl ApiGenerator {
         }
     }
 
-    /// Generate the operational endpoints (Phase 5 — observability):
-    /// `/health` (liveness), `/ready` (readiness), `/metrics` (minimal JSON
-    /// metrics).  Identity: `/health` and `/ready` are schema-agnostic and byte
-    /// identical across apps; `/metrics` is generated per-schema only in that it
-    /// names each model's storage field to report its `row_count()` — no schema
-    /// is read at runtime.  All three are wired UNAUTHENTICATED in the router so
-    /// infra probes/scrapers reach them without a tenant JWT (documented; a
-    /// process serves one tenant, so `/metrics` leaks only that tenant's counts).
     fn generate_ops_handlers(schema: &Schema) -> TokenStream {
-        // Per-model `"model": db.<field>.row_count()` entries — used by both
-        // `/metrics` and the `/snapshot` watermark map, so kept unconditional.
         let metric_entries: Vec<_> = schema
             .models
             .iter()
@@ -1690,11 +1135,6 @@ impl ApiGenerator {
             })
             .collect();
 
-        // #151 (Tier A): gate the `/metrics` handler on `[server].metrics`. When
-        // off, neither the handler nor (below) its route is emitted; `/snapshot`
-        // — which reuses `metric_entries` — is unaffected. `sum_fields` /
-        // `model_count` are built INSIDE the branch so they aren't unused locals
-        // when metrics is off.
         let metrics_handler = if Self::active_cfg().metrics {
             let sum_fields: Vec<_> = schema
                 .models
@@ -1703,9 +1143,6 @@ impl ApiGenerator {
                 .collect();
             let model_count = schema.models.len();
             quote! {
-                /// Minimal metrics (Phase 5): per-model live row counts + totals,
-                /// as JSON.  Generated per-schema by naming each model's storage field;
-                /// no schema is interpreted at runtime.
                 async fn __metrics(
                     State(db): State<Arc<RwLock<super::Database>>>,
                 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -1725,17 +1162,10 @@ impl ApiGenerator {
         };
 
         quote! {
-            /// Liveness probe (Phase 5): 200 as long as the process is up and
-            /// the async runtime is scheduling.  Never touches the database, so it
-            /// never blocks on a write lock — the correct signal for a k8s
-            /// `livenessProbe` / load-balancer health check.
             async fn __health() -> (StatusCode, Json<serde_json::Value>) {
                 (StatusCode::OK, Json(json!({ "status": "ok" })))
             }
 
-            /// Readiness probe (Phase 5): acquires a read lock on the database
-            /// and returns 200 once obtained, proving the store opened and the
-            /// lock is not wedged — the correct signal for a k8s `readinessProbe`.
             async fn __ready(
                 State(db): State<Arc<RwLock<super::Database>>>,
             ) -> (StatusCode, Json<serde_json::Value>) {
@@ -1745,18 +1175,6 @@ impl ApiGenerator {
 
             #metrics_handler
 
-            /// Snapshot token (#85): the current per-model row-count **watermark**
-            /// of every model, captured atomically under one read guard on the
-            /// single writer — a coherent "as of now" instant.  The client freezes
-            /// this map and passes a model's watermark back as `?as_of=<w>` to that
-            /// model's list/get for a point-in-time read.  Read-side peer of
-            /// `/metrics`: opaque `usize` watermarks, a fixed per-schema key set,
-            /// no field/relation/value decoded — so it is wired unauthenticated
-            /// alongside the other ops routes (a process serves one tenant).  These
-            /// watermarks are valid only within a compaction epoch: an in-process
-            /// `compact()` renumbers physical rows, after which an older token is
-            /// no longer comparable (the client must discard pinned tokens on a
-            /// detected reopen).
             async fn __snapshot(
                 State(db): State<Arc<RwLock<super::Database>>>,
             ) -> (StatusCode, Json<serde_json::Value>) {
@@ -1767,9 +1185,7 @@ impl ApiGenerator {
         }
     }
 
-    /// Generate OpenAPI documentation struct
     fn generate_openapi_doc(schema: &Schema) -> Result<TokenStream> {
-        // Collect all handler functions
         let list_handlers: Vec<_> = schema
             .models
             .iter()
@@ -1800,7 +1216,6 @@ impl ApiGenerator {
             .map(|model| format_ident!("delete_{}", Self::to_snake_case(&model.name)))
             .collect();
 
-        // Collect all model schemas
         let model_schemas: Vec<_> = schema
             .models
             .iter()
@@ -1826,7 +1241,6 @@ impl ApiGenerator {
             )]
             pub struct ApiDoc;
 
-            /// Get OpenAPI specification as JSON
             pub fn openapi_json() -> String {
                 ApiDoc::openapi().to_json().unwrap()
             }
@@ -1835,16 +1249,12 @@ impl ApiGenerator {
         Ok(tokens)
     }
 
-    /// Generate router function
     fn generate_router(schema: &Schema) -> Result<TokenStream> {
-        // #151 (Tier A): emit the `/metrics` route only when the handler is
-        // emitted (`[server].metrics`); otherwise omit it entirely.
         let metrics_route = if Self::active_cfg().metrics {
             quote! { .route("/metrics", get(__metrics)) }
         } else {
             quote! {}
         };
-        // Generate route registrations
         let routes: Vec<_> = schema
             .models
             .iter()
@@ -1863,80 +1273,40 @@ impl ApiGenerator {
                 quote! {
                     .route(concat!("/api/", #route_path), get(#list_fn))
                     .route(concat!("/api/", #route_path), post(#create_fn))
-                    // GET/PUT/DELETE by id (#69): PUT = whole-record replace, DELETE = tombstone.
                     .route(
                         concat!("/api/", #route_path, "/{id}"),
                         get(#get_fn).put(#update_fn).delete(#delete_fn),
                     )
-                    // Change-feed WebSocket subscription (#62 Direction A).
                     .route(concat!("/subscribe/", #route_path), get(#subscribe_fn))
-                    // Live-query WebSocket subscription (#62 Direction B).
                     .route(concat!("/live-query/", #route_path), get(#live_query_fn))
                 }
             })
             .collect();
 
         let tokens = quote! {
-            /// The data-plane routes (CRUD + WS subscriptions) with the database
-            /// state still unbound.  Factored out so the tenant-auth guard can wrap
-            /// ONLY these routes, leaving the operational endpoints unauthenticated
-            /// (Phase 5).
             fn __data_routes() -> Router<Arc<RwLock<super::Database>>> {
                 Router::new()
                     #(#routes)*
-                    // Durable replication stream (#82 Direction C): one schema-wide
-                    // endpoint behind the tenant-auth guard, so a follower receives
-                    // only its own tenant's frames.
                     .route("/replicate", get(__replicate))
             }
 
-            /// The operational routes (Phase 5): liveness / readiness / minimal
-            /// metrics.  Never behind the tenant-auth guard so infra probes and
-            /// metric scrapers reach them without a JWT.
             fn __ops_routes() -> Router<Arc<RwLock<super::Database>>> {
                 Router::new()
                     .route("/health", get(__health))
                     .route("/ready", get(__ready))
                     #metrics_route
-                    // Snapshot "as of now" token (#85): per-model watermarks.
                     .route("/snapshot", get(__snapshot))
             }
 
-            /// Create the API router with all endpoints (no auth).  A
-            /// `tower_http::trace::TraceLayer` wraps every route so each request is
-            /// logged as a structured `tracing` span (level via `RUST_LOG`) — the
-            /// server-side half of Phase 5 observability; the scaffold
-            /// `main.rs` installs the subscriber.
             pub fn create_router(db: Arc<RwLock<super::Database>>) -> Router {
                 create_router_with_options(db, HttpOptions::default())
             }
 
-            /// Process-start HTTP options (#140, epic #126 Tier C).
-            ///
-            /// Deployment identity, never baked at generate time: the same generated
-            /// binary is promoted to localhost, staging, and production with
-            /// different allowed origins, so baking them would make one build
-            /// undeployable to two environments.
             #[derive(Debug, Clone, Default)]
             pub struct HttpOptions {
-                /// Origins allowed to call this API cross-origin.
-                ///
-                /// `None` — the default — emits **no** `CorsLayer` and applies **no**
-                /// WebSocket origin check, which is byte-identical to the behavior
-                /// before #140. `None` is not the same as `Some(vec![])`: an empty
-                /// `CorsLayer` still answers preflight `OPTIONS` with 200, whereas
-                /// these routes answer 405.
                 pub allowed_origins: Option<Vec<String>>,
             }
 
-            /// Parse a comma-separated origin list, as read from
-            /// `FORGEDB_CORS_ORIGINS`.
-            ///
-            /// Empty or all-whitespace input is `Ok(None)` — "not configured", not an
-            /// error. Entries are trimmed. Returns `Err` for an entry that is not a
-            /// valid header value, and for `*` mixed with explicit origins: that
-            /// combination has two defensible readings and picking one silently is a
-            /// security-relevant coin flip.
             pub fn parse_origins(raw: &str) -> Result<Option<Vec<String>>, String> {
                 let parts: Vec<String> = raw
                     .split(',')
@@ -1963,24 +1333,10 @@ impl ApiGenerator {
                 Ok(Some(parts))
             }
 
-            /// The origin allow-list as the WebSocket handlers see it.
-            ///
-            /// Always present in request extensions — `AllowedOrigins(None)` when
-            /// unconfigured — so the handlers can take it unconditionally and the
-            /// "unconfigured means accept" branch lives in exactly one place.
             #[derive(Debug, Clone)]
             pub struct AllowedOrigins(pub Option<Arc<Vec<String>>>);
 
             impl AllowedOrigins {
-                /// Whether a handshake carrying `origin` may proceed.
-                ///
-                /// Unconfigured accepts everything (today's behavior, preserved). An
-                /// absent `Origin` header is accepted even when configured: native
-                /// `/replicate` followers, CLI tools and tests send none, rejecting
-                /// them would break them, and it buys nothing — an attacker who
-                /// controls the client controls the header. Origin checking defends
-                /// the *browser* threat model, where the browser sets the header and
-                /// the page cannot forge it.
                 pub fn permits(&self, origin: Option<&str>) -> bool {
                     match (&self.0, origin) {
                         (None, _) => true,
@@ -1992,22 +1348,10 @@ impl ApiGenerator {
                 }
             }
 
-            /// Read the `Origin` header, if the request carries a valid one.
             fn __origin_of(headers: &axum::http::HeaderMap) -> Option<&str> {
                 headers.get(axum::http::header::ORIGIN).and_then(|v| v.to_str().ok())
             }
 
-            /// Build the CORS layer for `origins`, or `None` when unconfigured.
-            ///
-            /// Methods are exactly the set the generated router registers; there is no
-            /// `PATCH` route. Headers are `content-type` (JSON bodies) and
-            /// `authorization` (bearer tokens when auth is on).
-            ///
-            /// **No `allow_credentials`.** ForgeDB auth is a bearer token in a header,
-            /// not a cookie, so credentials mode is unnecessary — and because nothing
-            /// is auto-attached by the browser, an explicit `*` does not create a CSRF
-            /// vector here. It also avoids tower-http's wildcard-plus-credentials
-            /// conflict. Anyone later adding cookie auth must revisit this.
             fn __cors_layer(origins: &Option<Arc<Vec<String>>>) -> Option<tower_http::cors::CorsLayer> {
                 let list = origins.as_ref()?;
                 let methods = [
@@ -2033,21 +1377,6 @@ impl ApiGenerator {
                 Some(layer.allow_origin(parsed))
             }
 
-            /// Apply the origin-dependent layers to an otherwise-finished router.
-            ///
-            /// The `Extension` is applied unconditionally so the WS handlers can take
-            /// it without an optional extractor; the `CorsLayer` only when configured,
-            /// because an empty one would change `OPTIONS` from 405 to 200 for every
-            /// existing deployment.
-            ///
-            /// Layer order is inverted from reading order — a layer applied later
-            /// wraps outer — so this runs **after** the `TraceLayer`, putting CORS
-            /// outermost. That is load-bearing: browsers send preflight `OPTIONS`
-            /// without an `Authorization` header, so a CORS layer inside the tenant
-            /// guard would have its preflight rejected 401 and the browser would
-            /// report an opaque CORS failure. Outermost also means error responses
-            /// (401/403/422) carry the CORS headers the browser needs in order to let
-            /// the page read the status.
             fn __apply_origin_layers(router: Router<Arc<RwLock<super::Database>>>, opts: HttpOptions)
                 -> Router<Arc<RwLock<super::Database>>>
             {
@@ -2060,13 +1389,6 @@ impl ApiGenerator {
                 }
             }
 
-            /// Create the API router with process-start [`HttpOptions`] (#140).
-            ///
-            /// `create_router` is this with the defaults, kept as a separate function
-            /// with its original signature because the scaffold writes `src/main.rs`
-            /// **once** at `forgedb init` and never regenerates it — changing the
-            /// arity of the existing constructors would break every existing project
-            /// the next time it ran `forgedb generate`.
             pub fn create_router_with_options(
                 db: Arc<RwLock<super::Database>>,
                 opts: HttpOptions,
@@ -2077,24 +1399,6 @@ impl ApiGenerator {
                 __apply_origin_layers(router, opts).with_state(db)
             }
 
-            /// Create the API router with the tenant-auth guard layered over the
-            /// data routes (#59).  Each data request must carry a bearer JWT whose
-            /// configured tenant claim equals this process's tenant — the
-            /// `forgedb-auth` substrate verifies the signature (asymmetric,
-            /// JWKS/static key, algorithm-pinned) and cross-checks the tenant,
-            /// rejecting with 401 (auth failure) or 403 (wrong tenant) before any
-            /// handler runs; on success the verified `forgedb_auth::Principal` is
-            /// injected into request extensions.  `auth` is built from deployment
-            /// config (`forgedb.toml` / env), never from the `.forge` schema — the
-            /// guard is a signed-string cross-check, not a schema-reading policy
-            /// engine.
-            ///
-            /// The guard covers the WS `/subscribe`, `/live-query`, and
-            /// `/replicate` routes (WS clients must send the token in the
-            /// `Authorization` header — a documented limitation); it does NOT cover
-            /// the operational
-            /// `/health` / `/ready` / `/metrics` routes, which are merged in
-            /// AFTER the guard so infra probes stay unauthenticated (Phase 5).
             pub fn create_router_with_auth(
                 db: Arc<RwLock<super::Database>>,
                 auth: Arc<forgedb_auth::Authenticator>,
@@ -2102,11 +1406,6 @@ impl ApiGenerator {
                 create_router_with_auth_and_options(db, auth, HttpOptions::default())
             }
 
-            /// The tenant-auth router with process-start [`HttpOptions`] (#140).
-            ///
-            /// The CORS layer is applied **outside** the tenant guard — see
-            /// `__apply_origin_layers` for why that placement is load-bearing rather
-            /// than incidental.
             pub fn create_router_with_auth_and_options(
                 db: Arc<RwLock<super::Database>>,
                 auth: Arc<forgedb_auth::Authenticator>,
@@ -2126,7 +1425,6 @@ impl ApiGenerator {
         Ok(tokens)
     }
 
-    /// Convert PascalCase to snake_case
     fn to_snake_case(s: &str) -> String {
         let mut result = String::new();
         for (i, c) in s.chars().enumerate() {
@@ -2138,7 +1436,6 @@ impl ApiGenerator {
         result
     }
 
-    /// Convert PascalCase to kebab-case
     fn to_kebab_case(s: &str) -> String {
         let mut result = String::new();
         for (i, c) in s.chars().enumerate() {

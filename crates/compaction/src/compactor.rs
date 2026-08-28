@@ -6,7 +6,6 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// Performs compaction operations on database storage
 pub struct Compactor {
     data_dir: PathBuf,
     config: CompactionConfig,
@@ -20,14 +19,6 @@ impl Compactor {
         }
     }
 
-    /// Read the authoritative row count from the tombstone file length.
-    ///
-    /// `tombstones.bin` stores 1 byte/row and is appended last in each insert
-    /// (#65), so its byte length is the count of physically-committed rows — the
-    /// same anchor generated `open()`/reopen uses.  No manifest required
-    /// (generated databases do not write one).  Guessing element sizes from the
-    /// first fixed column file is unreliable and corrupts columns with different
-    /// widths (the original C1 fix), so the tombstone length is authoritative.
     fn read_row_count(model_dir: &Path) -> Result<usize, String> {
         let tombstone_path = model_dir.join("tombstones.bin");
         if !tombstone_path.exists() {
@@ -42,15 +33,6 @@ impl Compactor {
             .map_err(|e| format!("Failed to stat {:?}: {}", tombstone_path, e))
     }
 
-    /// Refresh the per-model `manifest.json` `row_count` after compaction, if a
-    /// manifest exists.
-    ///
-    /// Best-effort: generated databases anchor on the tombstone file (which
-    /// compaction already rewrote to the active count), so a missing manifest is
-    /// not an error — there is simply nothing to refresh.  Substrate-`Database`
-    /// dirs that do carry a manifest keep its `row_count` hint current.
-    /// Preserves all other fields.  Written via a temp file + rename so a crash
-    /// mid-write does not corrupt the manifest.
     fn update_manifest_row_count(model_dir: &Path, new_row_count: usize) -> Result<(), String> {
         let manifest_path = model_dir.join("manifest.json");
         if !manifest_path.exists() {
@@ -71,28 +53,6 @@ impl Compactor {
         Ok(())
     }
 
-    /// Compact a specific model (tombstone-based, **DEPRECATED** — see #105).
-    ///
-    /// Unsafe against the #66 generated mutation surface: it reclaims nothing
-    /// from superseding-version updates and RESURRECTS deleted rows (a delete
-    /// tombstones a *marker* row, not the old data row).  Use
-    /// [`Compactor::compact_model_keeping`] — the keep-set primitive the
-    /// generated in-process `Database::compact()` (#92) drives.  Retained (not
-    /// `#[deprecated]`) only to keep the published `forgedb-compaction 0.1.0`
-    /// API stable; the offline `forgedb compact` CLI no longer calls it.
-    ///
-    /// # Crash safety (C2)
-    ///
-    /// All compacted column files are written as `.tmp` siblings first.  Only
-    /// after every write succeeds are they renamed to their final paths.  The
-    /// manifest `row_count` is updated last so it acts as a logical commit
-    /// record: if the process dies before the manifest rename, the column files
-    /// are already consistent and a re-run is idempotent.
-    ///
-    /// **Residual window**: individual file renames are atomic but not grouped
-    /// — a crash between two column-file renames leaves those columns at
-    /// different post-compaction versions.  Full directory-level atomicity is
-    /// deferred.
     pub fn compact_model(&self, model_name: &str) -> Result<CompactionResult, String> {
         let model_dir = self.data_dir.join(model_name);
 
@@ -100,34 +60,13 @@ impl Compactor {
             return Err(format!("Model directory not found: {:?}", model_dir));
         }
 
-        // --- C1: read row count from the tombstone file length; no guessing (#65) ---
         let row_count = Self::read_row_count(&model_dir)?;
 
-        // Tombstone-derived drop mask: a row is dropped iff its tombstone byte is
-        // set.  NOTE this is the classic model — it reclaims *deleted* rows only.
-        // It CANNOT reclaim the superseding-version dead rows the #66 mutation
-        // surface leaves behind (those are orphaned but NOT tombstoned), and it is
-        // unsafe against #66 deletes (which tombstone a *marker* row, not the old
-        // data row) — see `compact_model_keeping`, which the generated in-process
-        // path (#92) uses instead.  Kept for the schema-agnostic CLI path.
         let tombstone_path = model_dir.join("tombstones.bin");
         let drop_mask = self.read_tombstone_bitmap(&tombstone_path, row_count)?;
         self.compact_with_drop_mask(model_name, &model_dir, drop_mask)
     }
 
-    /// Compact a model keeping EXACTLY the physical rows named in `keep`
-    /// (any order; out-of-range indices ignored), dropping every other row and
-    /// renumbering the survivors densely.
-    ///
-    /// Schema-agnostic: the CALLER decides which rows are live and hands over an
-    /// opaque set of row indices — this substrate only rewrites bytes, it reads no
-    /// schema.  This is the reclaim primitive the generated in-process auto-
-    /// compaction (#92) drives: for the #66 superseding-version mutation surface,
-    /// the generated code passes the newest non-tombstoned row per live id, so
-    /// orphaned old versions AND deleted rows are simply omitted from `keep`.  It
-    /// exists because the tombstone-only `compact_model` cannot express "this
-    /// non-tombstoned row is a superseded dead version" and would resurrect #66
-    /// deletes.
     pub fn compact_model_keeping(
         &self,
         model_name: &str,
@@ -141,7 +80,6 @@ impl Compactor {
 
         let row_count = Self::read_row_count(&model_dir)?;
 
-        // Build the drop mask: drop everything, then un-drop each kept row.
         let mut drop_mask = vec![true; row_count];
         for &r in keep {
             if r < row_count {
@@ -151,11 +89,6 @@ impl Compactor {
         self.compact_with_drop_mask(model_name, &model_dir, drop_mask)
     }
 
-    /// Shared compaction core: given a per-row drop mask (`true` = drop), stage a
-    /// rewrite of every column + the tombstone file dropping those rows, commit
-    /// the renames, and update the manifest row_count.  Both `compact_model`
-    /// (tombstone-derived mask) and `compact_model_keeping` (keep-set-derived
-    /// mask) funnel through here, so the atomic-rename staging logic lives once.
     fn compact_with_drop_mask(
         &self,
         model_name: &str,
@@ -164,25 +97,14 @@ impl Compactor {
     ) -> Result<CompactionResult, String> {
         let start_time = Instant::now();
 
-        // Collect stats before compaction (needs manifest row_count too)
         let collector = StatsCollector::new(&self.data_dir);
         let stats_before = collector.collect_model_stats(model_name)?;
         let bytes_before = stats_before.total_disk_bytes;
 
         let tombstone_path = model_dir.join("tombstones.bin");
 
-        // --- C2: stage all writes before committing any ---
         let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
 
-        // Stage variable columns.  A variable *data* file is any `*.bin` whose
-        // name contains `_data`; its paired offsets file is the same name with
-        // `_data` → `_offsets`.  This matches BOTH the generated layout
-        // (`string_data_<idx>.bin` / `string_offsets_<idx>.bin`) and the older
-        // `<col>_data.bin` / `<col>_offsets.bin` convention.  (The prior
-        // `ends_with("_data.bin")` check silently skipped every generated variable
-        // column — `string_data_1.bin` does NOT end with `_data.bin` — so variable
-        // columns were never compacted, and reopen then truncated them to a wrong
-        // prefix, scrambling rows across columns.)
         let variable_dir = model_dir.join("variable");
         if variable_dir.exists() {
             let entries = fs::read_dir(&variable_dir).map_err(|e| e.to_string())?;
@@ -207,7 +129,6 @@ impl Compactor {
             }
         }
 
-        // Stage fixed columns
         let fixed_dir = model_dir.join("fixed");
         if fixed_dir.exists() {
             let entries = fs::read_dir(&fixed_dir).map_err(|e| e.to_string())?;
@@ -222,29 +143,21 @@ impl Compactor {
             }
         }
 
-        // Stage tombstone bitmap
         staged.push(Self::stage_tombstones_write(&tombstone_path, &tombstones)?);
 
-        // --- Commit: rename all staged temp files ---
-        // Residual window documented on this function.
         for (tmp, target) in &staged {
             fs::rename(tmp, target).map_err(|e| {
                 format!("Failed to commit {:?}: {}", target, e)
             })?;
         }
 
-        // Update manifest row_count to the post-compaction active count.
-        // This is the logical commit record (last rename so it confirms all column
-        // renames above have completed).
         let active_count = tombstones.iter().filter(|&&t| !t).count();
         Self::update_manifest_row_count(model_dir, active_count)?;
 
-        // Record compaction timestamp
         let compaction_marker = model_dir.join(".last_compaction");
         fs::write(&compaction_marker, Utc::now().timestamp().to_string())
             .map_err(|e| e.to_string())?;
 
-        // Collect stats after compaction
         let stats_after = collector.collect_model_stats(model_name)?;
         let bytes_after = stats_after.total_disk_bytes;
 
@@ -262,7 +175,6 @@ impl Compactor {
         })
     }
 
-    /// Compact all models in the database
     pub fn compact_all(&self) -> Result<Vec<CompactionResult>, String> {
         let entries = fs::read_dir(&self.data_dir).map_err(|e| e.to_string())?;
         let mut results = Vec::new();
@@ -297,7 +209,6 @@ impl Compactor {
         Ok(results)
     }
 
-    /// Compact only models that exceed the dead space threshold
     pub fn compact_needed(&self) -> Result<Vec<CompactionResult>, String> {
         let collector = StatsCollector::new(&self.data_dir);
         let db_stats = collector.collect_database_stats()?;
@@ -326,10 +237,6 @@ impl Compactor {
         Ok(results)
     }
 
-    /// Compact a single variable-length column.
-    ///
-    /// Writes a temp file and renames atomically.  Part of the public API for
-    /// direct per-column use; `compact_model` uses the staging variant instead.
     pub fn compact_variable_column(
         &self,
         data_path: &Path,
@@ -344,10 +251,6 @@ impl Compactor {
         Ok(())
     }
 
-    /// Compact a single fixed-size column.
-    ///
-    /// Writes a temp file and renames atomically.  Part of the public API for
-    /// direct per-column use; `compact_model` uses the staging variant instead.
     pub fn compact_fixed_column(
         &self,
         column_path: &Path,
@@ -360,19 +263,6 @@ impl Compactor {
         fs::rename(&tmp, &target).map_err(|e| e.to_string())
     }
 
-    // -----------------------------------------------------------------------
-    // Private staging helpers (write-only, no rename)
-    // -----------------------------------------------------------------------
-
-    /// Write compacted variable column data to temp files.
-    ///
-    /// Returns `[(data_tmp, data_target), (offset_tmp, offset_target)]`.
-    ///
-    /// # Errors (C3)
-    ///
-    /// Returns `Err` if any row's `(offset, length)` references bytes outside
-    /// the data file.  Silently skipping out-of-range rows would cause data
-    /// loss; an error lets the caller decide how to handle corruption.
     fn stage_variable_column_write(
         data_path: &Path,
         offset_path: &Path,
@@ -393,7 +283,6 @@ impl Compactor {
             if i < tombstones.len() && !tombstones[i] {
                 let start = offset as usize;
                 let end = start + length as usize;
-                // C3: inconsistent offset/length is data corruption — return Err
                 if end > data.len() {
                     return Err(format!(
                         "Variable column data corruption at row {}: \
@@ -407,7 +296,6 @@ impl Compactor {
             }
         }
 
-        // Write compacted data to temp file
         let temp_data_path = data_path.with_extension("bin.tmp");
         let mut data_file =
             fs::File::create(&temp_data_path).map_err(|e| e.to_string())?;
@@ -415,7 +303,6 @@ impl Compactor {
         data_file.sync_all().map_err(|e| e.to_string())?;
         drop(data_file);
 
-        // Write compacted offsets to temp file
         let temp_offset_path = offset_path.with_extension("bin.tmp");
         let mut offset_file =
             fs::File::create(&temp_offset_path).map_err(|e| e.to_string())?;
@@ -436,13 +323,6 @@ impl Compactor {
         ])
     }
 
-    /// Write compacted fixed column data to a temp file.
-    ///
-    /// Returns `(temp_path, target_path)`.
-    ///
-    /// `element_size` is derived as `data.len() / tombstones.len()`.  This is
-    /// correct only when `tombstones` has been trimmed to the true row count (as
-    /// guaranteed by `read_tombstone_bitmap` after the C1 manifest fix).
     fn stage_fixed_column_write(
         column_path: &Path,
         tombstones: &[bool],
@@ -453,10 +333,6 @@ impl Compactor {
             .read_to_end(&mut data)
             .map_err(|e| e.to_string())?;
 
-        // tombstones.len() == row_count (guaranteed by manifest-based read_tombstone_bitmap)
-        // so element_size is always the correct per-column width. An EMPTY column
-        // (0 rows — e.g. compacting a database with an untouched model) has no width
-        // to derive and nothing to keep: guard the division and emit an empty file.
         let element_size = if tombstones.is_empty() { 0 } else { data.len() / tombstones.len() };
 
         let mut new_data = Vec::new();
@@ -479,19 +355,11 @@ impl Compactor {
         Ok((temp_path, column_path.to_path_buf()))
     }
 
-    /// Write a compacted tombstone file to a temp file.
-    ///
-    /// The storage layer (`forgedb_storage::Tombstones`) uses one byte per row
-    /// (`0x00` = alive, non-zero = deleted).  Write exactly `active_count` bytes,
-    /// all `0x00` — no deleted rows after compaction.
-    ///
-    /// Returns `(temp_path, target_path)`.
     fn stage_tombstones_write(
         tombstone_path: &Path,
         tombstones: &[bool],
     ) -> Result<(PathBuf, PathBuf), String> {
         let active_count = tombstones.iter().filter(|&&t| !t).count();
-        // One byte per surviving row, all 0x00 (alive).
         let new_bitmap = vec![0u8; active_count];
 
         let temp_path = tombstone_path.with_extension("bin.tmp");
@@ -503,41 +371,22 @@ impl Compactor {
         Ok((temp_path, tombstone_path.to_path_buf()))
     }
 
-    // -----------------------------------------------------------------------
-    // Private helpers
-    // -----------------------------------------------------------------------
-
-    /// Read the tombstone file and return exactly `row_count` booleans.
-    ///
-    /// The storage layer (`forgedb_storage::Tombstones`) writes one byte per row:
-    /// `0x00` = alive, any non-zero value = deleted.  Reads exactly `row_count`
-    /// bytes and maps each to a bool.  Pads with `false` if the file is shorter
-    /// than `row_count` (defensively handles partially-written files).
-    ///
-    /// Uses the authoritative `row_count` from the manifest; the previous
-    /// heuristic (try element sizes [16,8,4,1] on the first fixed column file)
-    /// was removed because it guesses wrong for models with mixed column widths,
-    /// corrupting the element_size calculation for every column.
     fn read_tombstone_bitmap(
         &self,
         path: &Path,
         row_count: usize,
     ) -> Result<Vec<bool>, String> {
         if !path.exists() {
-            // No tombstone file → all rows are alive
             return Ok(vec![false; row_count]);
         }
 
         let bytes = fs::read(path).map_err(|e| e.to_string())?;
-        // One byte per row: 0x00 = alive, non-zero = deleted.
         let mut tombstones: Vec<bool> =
             bytes.iter().take(row_count).map(|&b| b != 0).collect();
-        // Pad with false if the file is shorter than expected.
         tombstones.resize(row_count, false);
         Ok(tombstones)
     }
 
-    /// Read an offset file into `(offset, length)` pairs.
     fn read_offsets_impl(path: &Path) -> Result<Vec<(u64, u64)>, String> {
         let bytes = fs::read(path).map_err(|e| e.to_string())?;
         let mut offsets = Vec::new();
