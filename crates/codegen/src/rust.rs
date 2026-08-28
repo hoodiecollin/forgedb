@@ -1,7 +1,3 @@
-//! Rust database code generator
-//!
-//! Generates optimized Rust code with columnar storage for ForgeDB schemas.
-
 use crate::config::GenConfig;
 use crate::{CodegenError, GeneratedCode, Result};
 use forgedb_parser::Schema;
@@ -9,72 +5,20 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
 thread_local! {
-    /// The generate-time runtime-behavior config (epic #126) active for the
-    /// current `generate*` call. `GenConfig` is `Copy`, so a `Cell` suffices.
-    ///
-    /// Threading `&GenConfig` through the ~10 static helpers that emit
-    /// config-dependent literals (WAL interval, fsync policy, broker attach,
-    /// compaction trigger, cascade depth) would be invasive; instead each
-    /// `generate*` entry point sets this at the top of the call and the emission
-    /// sites read it via `active_cfg()`. Safe under parallel test execution:
-    /// every entry point sets the value on *its own* thread before emitting.
     static ACTIVE_CONFIG: std::cell::Cell<GenConfig> = const { std::cell::Cell::new(GenConfig::DEFAULT) };
 }
 
-/// Rust code generator
 pub struct RustGenerator;
 
-/// The four emitted pieces of a buffered column gather over one field set.
-///
-/// Every buffered read in the generated crate — the scan scope (#228), the page
-/// scope (#226), and each `@projection`'s live `all_<proj>` (#113/#168) — is the
-/// same four things: a holder struct field per stored column, its `gather_buffered`
-/// initializer, the per-row decode statement, and the struct field initializer that
-/// consumes the decode's binding.  They were open-coded per site; #226 needed a
-/// third copy, which is where a repetition becomes a drift vector — the page gather
-/// has to decode its fields **exactly** as the positional `read_at` does, or the
-/// list response's bytes change on one field class and nothing says so.
-///
-/// `values` carries one entry per input field, in the input order, whether or not
-/// the field had a column — so it zips back against the field slice the caller
-/// passed, which is how the page scope interleaves scan-sourced and gather-sourced
-/// fields in model declaration order instead of concatenating them.
 struct BufferedGather {
-    /// `<field>_col: forgedb_storage::Buffered{Fixed,Variable}Column`
     decls: Vec<TokenStream>,
-    /// `<field>_col: self.<field>_col.gather_buffered(&<rows>).expect(..)`
     inits: Vec<TokenStream>,
-    /// The per-row decode, binding `<field>_value`.
     reads: Vec<TokenStream>,
-    /// `<field>: <field>_value` — or a default for a field with no column.
     values: Vec<TokenStream>,
 }
 
-/// A `@min`/`@max` bound literal as written in the schema (#239).
-///
-/// `Frac` keeps the **verbatim lexeme** rather than an `f64`, so the conversion
-/// ForgeDB's current on-disk **engine** generation (#254).
-///
-/// Distinct from the app's schema-migration serial: this counts *ForgeDB's* byte
-/// format, covering both value reinterpretation and physical layout. It is baked
-/// into generated code as `EXPECTED_ENGINE_VERSION`, stamped into every manifest
-/// the generated code writes, and compared by the generated `open()` guard.
-///
-/// | gen | change | issue |
-/// |---|---|---|
-/// | 1 | baseline — everything written before the field existed | — |
-/// | 2 | timestamp values are microseconds, not seconds | #254 |
-///
-/// **Generations are assigned at merge order, not at design time.** Two engine
-/// format changes in one cycle would otherwise both claim the next number, and
-/// whichever landed second would silently redefine the other's meaning. Bumping
-/// this constant obliges a hop in the engine-migration generator
-/// (`crate::engine`), because every existing data dir is now stale.
 pub const CURRENT_ENGINE_VERSION: u32 = 2;
 
-/// happens against the known field type: exact for `decimal`, correctly rounded
-/// for `f64`. Parsing to a float earlier would round before anything knew which
-/// of those two applied.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum BoundLiteral {
     Int(i64),
@@ -82,8 +26,6 @@ pub(crate) enum BoundLiteral {
 }
 
 impl BoundLiteral {
-    /// The bound as it should read in a violation message — the author's own
-    /// spelling, so `must be >= 0.01` rather than a re-rendered float.
     fn render(&self) -> String {
         match self {
             BoundLiteral::Int(n) => n.to_string(),
@@ -91,15 +33,8 @@ impl BoundLiteral {
         }
     }
 
-    /// Split a numeric lexeme into `(mantissa, scale)` so it can be emitted as an
-    /// exact `Decimal`: `-2.50` → `(-250, 2)`, `7` → `(7, 0)`.
-    ///
-    /// `None` if the digits do not fit an `i128`. Whether the result is
-    /// representable as a `Decimal` (≤ 28 fractional digits, 96-bit mantissa) is
-    /// checked in validation, so a schema that reaches codegen is already sound.
     pub(crate) fn decimal_parts(lexeme: &str) -> Option<(i128, u32)> {
         let (int_part, frac_part) = lexeme.split_once('.').unwrap_or((lexeme, ""));
-        // A lone `-` sign must not survive concatenation as `-` + digits alone.
         let digits = format!("{int_part}{frac_part}");
         digits
             .parse::<i128>()
@@ -108,47 +43,18 @@ impl BoundLiteral {
     }
 }
 
-/// On-delete referential-integrity policy for a relation FK field (delete
-/// semantics).  Declared via `@on_delete(...)`; `Restrict` is the default when
-/// the directive is absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OnDeletePolicy {
-    /// Refuse to delete a parent that still has any live child referencing it
-    /// (→ `ValidationError::ReferencedByChildren`, 409).  The safe default.
     Restrict,
-    /// Deleting the parent recursively deletes every referencing child (their
-    /// own on-delete rules fire in turn).
     Cascade,
-    /// Deleting the parent sets each referencing child's (optional) FK to `None`.
     SetNull,
 }
 
 impl RustGenerator {
-    /// Generate Rust database implementation from schema
-    ///
-    /// # Arguments
-    ///
-    /// * `schema` - Parsed schema AST
-    ///
-    /// # Returns
-    ///
-    /// Generated Rust code as a string
     pub fn generate(schema: &Schema) -> Result<GeneratedCode> {
-        // Baseline on-disk format version (#74 Phase 1): a schema with no migration
-        // lineage is at version 1.  The CLI threads the lineage-derived version via
-        // `generate_with_schema_version`; snapshot tests use this baseline so their
-        // output is stable.
         Self::generate_with_schema_version(schema, 1)
     }
 
-    /// Generate the Rust database implementation, baking the app's schema serial into the
-    /// app's `EXPECTED_SCHEMA_VERSION` (#74 Phase 1/2).  The version is **derived
-    /// from the committed migration lineage** by the `generate` CLI command (red
-    /// line #8: lineage-sourced, never hand-edited); it is an opaque integer the
-    /// generated open guard compares and refuses on mismatch — nothing more.
-    ///
-    /// Uses the default generate-time runtime config (`GenConfig::DEFAULT`) — see
-    /// `generate_with_config` for the #126 configurable-behavior knobs.
     pub fn generate_with_schema_version(
         schema: &Schema,
         schema_version: u32,
@@ -156,14 +62,6 @@ impl RustGenerator {
         Self::generate_with_config(schema, schema_version, GenConfig::DEFAULT)
     }
 
-    /// Generate with an explicit **engine** generation as well as the app's
-    /// schema serial (#254).
-    ///
-    /// The only caller that needs this is the engine-migration generator, which
-    /// emits the *same* schema twice — once baked at the origin generation to
-    /// read the stale dir, once at the destination generation to write the new
-    /// one. Every other caller wants [`CURRENT_ENGINE_VERSION`] and gets it from
-    /// the shorter constructors.
     pub fn generate_with_versions(
         schema: &Schema,
         schema_version: u32,
@@ -177,12 +75,6 @@ impl RustGenerator {
         )
     }
 
-    /// Generate the Rust database implementation with an explicit generate-time
-    /// runtime-behavior config (epic #126). The config tailors emitted
-    /// consts/branches (WAL checkpoint interval, fsync policy, compaction trigger,
-    /// changefeed capacity, cascade depth) and gates the replication-broker attach
-    /// (Tier A). `GenConfig::DEFAULT` reproduces the pre-#126 output byte-for-byte
-    /// except the broker (default OFF — G6 sanctioned exception).
     pub fn generate_with_config(
         schema: &Schema,
         schema_version: u32,
@@ -196,8 +88,6 @@ impl RustGenerator {
         )
     }
 
-    /// The one real entry point: both version counters plus the generate-time
-    /// config. Everything above delegates here.
     pub fn generate_with_config_and_engine(
         schema: &Schema,
         schema_version: u32,
@@ -216,14 +106,6 @@ impl RustGenerator {
         })
     }
 
-    /// The generate-time runtime-behavior config (#126) active for the current
-    /// `generate*` call. Read at each config-dependent emission site.
-    /// A `#[schema(..)]` attribute, or nothing when there is no web surface.
-    ///
-    /// `schema` is utoipa's attribute and only exists where `ToSchema` is
-    /// derived — leaving one behind when the derive is gated out is
-    /// `cannot find attribute 'schema' in this scope`, not a harmless no-op.
-    /// Every production of one routes through here so the two cannot disagree.
     fn schema_attr(attr: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
         if Self::active_cfg().needs_utoipa() {
             attr
@@ -232,21 +114,6 @@ impl RustGenerator {
         }
     }
 
-    /// The `, ToSchema` fragment of a derive list, or nothing (#335 §10).
-    ///
-    /// Reads [`crate::GenConfig::needs_utoipa`] — the ONE condition (#445). The
-    /// `utoipa` pin in `core/Cargo.toml` reads that same one, and it has to:
-    /// this derive is what makes the pin necessary, and a manifest deciding it
-    /// separately is `error[E0432]: unresolved import 'utoipa'`.
-    ///
-    /// Gated on the app declaring a web surface, because once `database.rs` and
-    /// `api.rs` are separate crates the derive lands in `core` while its
-    /// `#[openapi(components(schemas(...)))]` consumer lands in `server` — and
-    /// the ORPHAN RULE means `server` cannot supply the impl, both trait and type
-    /// being foreign to it. So it must be decided at generate time or not at all.
-    ///
-    /// Emitted as a leading-comma fragment so the derive lists it joins stay
-    /// readable at their call sites.
     fn to_schema_derive() -> proc_macro2::TokenStream {
         if Self::active_cfg().needs_utoipa() {
             quote! { , ToSchema }
@@ -259,30 +126,16 @@ impl RustGenerator {
         ACTIVE_CONFIG.with(|c| c.get())
     }
 
-    /// The `forgedb_wal::FsyncPolicy::<variant>` token for the active fsync mode
-    /// (#129, Tier B). Default `Always` — byte-identical. `Never` is a
-    /// durability-weakening opt-in (guardrail G7); the substrate still matches the
-    /// policy per-write, so this is Tier B (a baked value), not the Tier-A
-    /// `sync_all`-removed form (a substrate follow-up noted on #129).
     fn wal_fsync_policy_tokens() -> TokenStream {
         let variant = format_ident!("{}", Self::active_cfg().fsync.wal_policy_variant());
         quote! { forgedb_wal::FsyncPolicy::#variant }
     }
 
-    /// Whether a field can appear in a `@projection` (#113): it must have a
-    /// storage column, i.e. be a stored scalar, char/array/struct, or FK scalar.
-    /// Relation collections (`OneToMany`/`ManyToMany`), virtual `()` relation
-    /// fields, and component refs have no column and are NOT projectable — this
-    /// is exactly the set for which `field_read_stmt` returns `None`.
     fn is_projectable(schema: &Schema, field: &forgedb_parser::Field) -> bool {
         Self::is_variable_column_type(&field.field_type)
             || Self::is_fixed_size_type(schema, &field.field_type)
     }
 
-    /// Compile-time validation of `@projection` directives (#113, PM constraint 2):
-    /// every projected field must resolve to a projectable (column-backed) field.
-    /// The parser already guarantees the field exists and names are unique; here
-    /// we reject relation / virtual / component fields with a clear error.
     fn validate_projections(schema: &Schema) -> Result<()> {
         for model in &schema.models {
             for proj in &model.projections {
@@ -311,13 +164,6 @@ impl RustGenerator {
         Ok(())
     }
 
-    /// The on-delete referential-integrity policy declared on a relation FK field
-    /// via `@on_delete(...)` (delete semantics).  Absent → `Restrict` (the safe
-    /// default: refuse to delete a parent that still has live children).
-    ///
-    /// Read purely from `field.constraints` — `@on_delete(cascade)` parses as a
-    /// generic directive (bare-identifier arg), so re-introducing it needs no
-    /// parser change; the policy lives entirely in generated code.
     fn on_delete_policy(field: &forgedb_parser::ast::Field) -> OnDeletePolicy {
         for c in &field.constraints {
             if c.name == "on_delete" {
@@ -333,12 +179,6 @@ impl RustGenerator {
         OnDeletePolicy::Restrict
     }
 
-    /// Compile-time validation of `@on_delete(...)` directives (delete semantics):
-    /// - the value must be one of `restrict` / `cascade` / `set_null`;
-    /// - `@on_delete` is only meaningful on a relation FK field (`*Target` /
-    ///   `?Target`) — reject it elsewhere;
-    /// - `set_null` is only valid on an OPTIONAL FK (`?Target`) — a required
-    ///   `*Target` cannot be nulled, so this is a HARD codegen error.
     fn validate_on_delete(schema: &Schema) -> Result<()> {
         for model in &schema.models {
             for field in &model.fields {
@@ -390,43 +230,23 @@ impl RustGenerator {
         Ok(())
     }
 
-    /// Generate the Rust code as a string
     fn generate_code(schema: &Schema, schema_version: u32, engine_version: u32) -> Result<String> {
         Self::validate_projections(schema)?;
         Self::validate_on_delete(schema)?;
 
         let mut tokens = TokenStream::new();
 
-        // File header comments
         let header = quote! {
-            //! Generated by ForgeDB
-            //! DO NOT EDIT - This file is auto-generated
         };
         tokens.extend(header);
 
-        // Attributes and imports
         let inline_str_import = Self::inline_str_import(schema);
-        // #335 §10 / #445: the utoipa import and every `ToSchema` derive read
-        // `GenConfig::needs_utoipa` — the same one condition
-        // `CorePackage::cargo_toml` reads for the pin, because this import is
-        // precisely what makes that pin necessary. Once `database.rs` and
-        // `api.rs` are separate crates the derive and its consumer are in
-        // different crates and the ORPHAN RULE blocks supplying the impl from
-        // `server`, so this cannot be decided later. Default is ON, so existing
-        // output is byte-identical.
         let utoipa_import = if Self::active_cfg().needs_utoipa() {
             quote! { use utoipa::ToSchema; }
         } else {
             quote! {}
         };
         let imports = quote! {
-            // `irrefutable_let_patterns`: the WAL recovery path matches
-            // `WalOperation::Raw` via `if let` — currently the only variant, so
-            // the pattern is irrefutable, but the `if let` stays forward-compatible
-            // if the op set ever grows again (#89 durable write path).
-            // `unused_mut`: `create_*` takes `mut record` to synthesize `+` auto
-            // fields (#187); a model with no synthesizable auto field never mutates
-            // it, so the `mut` is conditionally unused.
             #![allow(dead_code, unused_imports, irrefutable_let_patterns, unused_mut)]
 
             use std::collections::HashMap;
@@ -441,62 +261,21 @@ impl RustGenerator {
 
         let cfg = Self::active_cfg();
 
-        // WAL checkpoint interval (#89 step 2 — bound the WAL).  After this many
-        // WAL-recorded mutations a storage fsyncs its columns and truncates its
-        // WAL, so the WAL never grows without limit and reopen never replays a
-        // huge WAL.  Configurable at generate time (#131, epic #126) via
-        // `[storage].wal_checkpoint_interval`; default 1000 (byte-identical).
-        // Bounds the WAL to ~this many records between checkpoints (bytes are
-        // bounded by interval × max row size).
         let __wal_checkpoint_interval =
             proc_macro2::Literal::u64_unsuffixed(cfg.wal_checkpoint_interval);
         tokens.extend(quote! {
             const WAL_CHECKPOINT_INTERVAL: u64 = #__wal_checkpoint_interval;
         });
 
-        // Compaction trigger threshold (#92 Phase 4 — bound column storage).
-        // Each update/delete leaves a dead (superseded/tombstoned) row version
-        // behind (#66); once this many accumulate since the last compaction, the
-        // storage compacts IN-PROCESS under the single-writer lock, reclaiming the
-        // dead bytes.  Configurable at generate time (#133, epic #126) via
-        // `[storage].compaction_threshold`; default 1000 (byte-identical).
-        // Storage is bounded to roughly this many dead versions between
-        // compactions.  (The auto-trigger that reads this const is itself gated by
-        // `[storage].compaction` — #134; when off the const is unused but harmless.)
         let __compaction_threshold =
             proc_macro2::Literal::u64_unsuffixed(cfg.compaction_threshold);
         tokens.extend(quote! {
             const COMPACTION_DEAD_THRESHOLD: u64 = #__compaction_threshold;
-            // #162-A: the soft threshold above only RECORDS that a compaction is
-            // due (`compaction_due`) so the triggering write does not stall on the
-            // rewrite+remap — `Database::maintain()` runs it off the hot write turn.
-            // This hard ceiling is the growth-bounding safety net: if `maintain()`
-            // is never called, an inline compaction is forced once dead versions
-            // reach `COMPACTION_DEAD_THRESHOLD * COMPACTION_DEAD_CEILING_FACTOR`, so
-            // storage stays bounded regardless of the deferral.
             const COMPACTION_DEAD_CEILING_FACTOR: u64 = 4;
         });
 
-        // On-disk format version this binary was generated for (#74 Phase 1 —
-        // version guard).  An OPAQUE lineage-derived integer: it is compared, on
-        // open, against the schema serial stamped in each collection's
-        // `manifest.json`, and a mismatch is a fail-fast refusal — never a
-        // self-healing reshape (red line DV-6: the guard reads ONE integer and
-        // refuses; it never inspects column names/types to adapt).  A migration
-        // bin (the offline transformer, #74 Phase 3) is what rewrites a data dir
-        // from an old version to a new one; the app never migrates in place.
-        // Derived from the committed migration lineage (#74 Phase 2 — the CLI
-        // threads `MigrationLineage::current_schema_version`); baseline `1` for a
-        // schema with no lineage.  A fresh data dir is stamped with exactly this
-        // value, so a dir this binary wrote always matches its own expectation.
         let __expected_schema_version =
             proc_macro2::Literal::u32_unsuffixed(schema_version);
-        // ForgeDB's own on-disk **engine** generation (#254), the counter
-        // orthogonal to the schema serial above.  A schema mismatch means the
-        // app's schema changed; an engine mismatch means ForgeDB's byte format
-        // did.  They have different remedies, so they are compared separately
-        // and reported separately — conflating them would send a user to
-        // regenerate a schema that is already correct.
         let __expected_engine_version =
             proc_macro2::Literal::u32_unsuffixed(engine_version);
         tokens.extend(quote! {
@@ -504,29 +283,11 @@ impl RustGenerator {
             const EXPECTED_ENGINE_VERSION: u32 = #__expected_engine_version;
         });
 
-        // serde default for an omitted `+timestamp` auto field (#187): a zero
-        // sentinel that `create_*` replaces with `Timestamp::now()`.  `Timestamp`
-        // is a substrate newtype that cannot derive `Default` in generated code
-        // (orphan rule), so `#[serde(default = ...)]` on auto timestamp fields
-        // points here.  Unused when a schema has no `+timestamp`; the module-level
-        // `#![allow(dead_code)]` covers that.
         tokens.extend(quote! {
             fn __forgedb_default_ts() -> Timestamp {
                 Timestamp::from_micros(0)
             }
 
-            /// Build an opaque MVCC conflict key from its components (#257).
-            ///
-            /// Each part is length-prefixed, so no component list can ever encode
-            /// to the same bytes as a different one.  A bare concatenation cannot
-            /// promise that: `("User", "12")` and `("User1", "2")` are the same
-            /// bytes, which would make two unrelated writes conflict.  The leading
-            /// discriminant part additionally keeps a row key and a unique-claim
-            /// key in separate spaces.
-            ///
-            /// Identity: the caller assembles the parts; this only frames bytes.
-            /// The sequencer and the coordinator still compare for equality and
-            /// never decode (`forgedb-txn` / `forgedb-coordinator` unchanged).
             fn __forgedb_ws_key(parts: &[&[u8]]) -> Vec<u8> {
                 let mut k = Vec::with_capacity(
                     parts.iter().map(|p| p.len() + 4).sum::<usize>(),
@@ -539,34 +300,8 @@ impl RustGenerator {
             }
         });
 
-        // serde for generated arrays past serde's built-in ceiling (#243).  serde
-        // implements `Serialize`/`Deserialize` for `[T; N]` only up to N = 32, so an
-        // oversized array made the derive on the model/struct fail to resolve —
-        // generated code that did not compile.  It was never only an *index*
-        // problem: a plain, unindexed field broke it just the same, because the
-        // derive is on the struct.
-        //
-        // Three shapes reach it, and nothing else can: nested fixed arrays do not
-        // parse (`[[u32; 4]; 3]` is rejected at the type position), so a fixed
-        // array's element is always a scalar, a `bytes(N)`, or a struct.
-        //
-        //   `bytes(N)`, N > 32   -> `[u8; N]`        -> `__forgedb_big_bytes`
-        //   `[T; M]`,   M > 32   -> `[T; M]`         -> `__forgedb_big_array`
-        //   `[bytes(N); M]`, N>32 -> `[[u8; N]; M]`  -> `__forgedb_big_bytes::array`
-        //
-        // Every wire form is byte-identical to serde's own array impl (a JSON array,
-        // via `serialize_tuple`), so a field's representation does not change at the
-        // N = 32 boundary — only which impl produces it.
-        //
-        // Emitted ONLY when some field needs it.  `#![allow(dead_code)]` would let it
-        // ride along unused, but a schema should not carry this machinery for a width
-        // it never declares — generated code is tailored to the schema, and this
-        // keeps output byte-identical for every schema that stays under 32.
         if Self::schema_needs_big_array_serde(schema) {
             tokens.extend(quote! {
-                /// serde for arrays past serde's built-in ceiling of N = 32 (#243).
-                /// Wire form matches serde's own array impl exactly; these exist only
-                /// because that impl stops at 32.
                 mod __forgedb_big_array {
                     use serde::de::{Error as _, SeqAccess, Visitor};
                     use serde::ser::SerializeTuple;
@@ -606,10 +341,6 @@ impl RustGenerator {
                         where
                             A: SeqAccess<'de>,
                         {
-                            // Collected then converted rather than built in place:
-                            // `[T; N]` has no `Default` past N = 32 either, and the
-                            // alternative is `MaybeUninit`.  This is the JSON wire
-                            // boundary, not a storage path, so the temporary is fine.
                             let mut items = Vec::with_capacity(N);
                             while let Some(item) = seq.next_element::<T>()? {
                                 if items.len() == N {
@@ -636,14 +367,9 @@ impl RustGenerator {
                         )
                     }
 
-                    /// `#[serde(with = "__forgedb_big_array::option")]` for a
-                    /// nullable oversized array.
                     pub mod option {
                         use serde::{Deserialize, Deserializer, Serializer};
 
-                        /// Carrier so the nullable form defers to serde's own
-                        /// `Option` handling, which is what keeps `null` round-
-                        /// tripping as `None`.
                         struct Wrap<T, const N: usize>([T; N]);
 
                         impl<T: serde::Serialize, const N: usize> serde::Serialize
@@ -694,9 +420,6 @@ impl RustGenerator {
                     }
                 }
 
-                /// serde for `bytes(N)` where N > 32, and for a fixed array of them
-                /// (#243).  Separate from `__forgedb_big_array` because `[u8; N]` has
-                /// no `Serialize` at that width, so it cannot be that module's `T`.
                 mod __forgedb_big_bytes {
                     use serde::de::{Error as _, SeqAccess, Visitor};
                     use serde::ser::SerializeTuple;
@@ -754,8 +477,6 @@ impl RustGenerator {
                         deserializer.deserialize_tuple(N, BytesVisitor::<N>)
                     }
 
-                    /// Carrier giving `[u8; N]` the serde impls it lacks, so the
-                    /// nullable and array forms can compose over it.
                     struct Wrap<const N: usize>([u8; N]);
 
                     impl<const N: usize> Serialize for Wrap<N> {
@@ -770,7 +491,6 @@ impl RustGenerator {
                         }
                     }
 
-                    /// `#[serde(with = "__forgedb_big_bytes::option")]` for `bytes(N)?`.
                     pub mod option {
                         use serde::{Deserialize, Deserializer, Serializer};
 
@@ -798,9 +518,6 @@ impl RustGenerator {
                         }
                     }
 
-                    /// `#[serde(with = "__forgedb_big_bytes::array")]` for
-                    /// `[bytes(N); M]` with N > 32 — the outer array is fine at any M,
-                    /// but its element is what serde cannot describe.
                     pub mod array {
                         use serde::de::{Error as _, SeqAccess, Visitor};
                         use serde::ser::SerializeTuple;
@@ -865,45 +582,8 @@ impl RustGenerator {
             });
         }
 
-        // Total-order index key for `f64` (#242).  `f64` has no `Ord`, and its
-        // JSON rendering has no form at all for the non-finites — the key used to
-        // run through `serde_json::Number::from_f64`, whose `None` (exactly the
-        // NaN/±Inf case) fell through to the null tag `\u{0}`.  So NaN and both
-        // infinities were not merely lumped together, they were indistinguishable
-        // from an *unset* optional or an unlinked FK.  The ordered index (#169)
-        // meanwhile excluded `f64` outright, since `f64: !Ord` cannot key a
-        // `BTreeMap`, so `^f64` silently had no range method.
-        //
-        // Both are one problem — no total order over `f64` — so one encoding fixes
-        // both.  Flipping the sign bit of a non-negative float lifts it into the
-        // upper half of `u64`; inverting every bit of a negative one both reverses
-        // the ordering within the negatives (correct: IEEE magnitude runs backwards
-        // there) and drops them into the lower half.  The result orders
-        // `-Inf < negatives < ±0 < positives < +Inf < NaN` under plain `u64: Ord`,
-        // and being a bijection on bit patterns it hands each non-finite its own
-        // key for free.
-        //
-        // Two values must be canonicalized first, or the bijection is *too* faithful:
-        //
-        //   * `0.0 == -0.0` is true, so they must key alike — their bit patterns
-        //     differ, so without this a probe of `0.0` misses a row stored as `-0.0`.
-        //   * NaN has 2^53-ish bit patterns that all compare equal (to nothing,
-        //     including themselves).  Folding them to one keeps a NaN row findable
-        //     by any NaN.
-        //
-        // Both live here rather than in the `index_value_expr` pre-transform,
-        // because the ordered path does not go through it — `ordered_key_expr` is
-        // applied standalone at the maintenance and rehydrate sites.
-        //
-        // Emitted only when the schema indexes an `f64`, so output stays
-        // byte-identical for every schema that does not (same discipline as the
-        // oversized-array serde above).
         if Self::schema_needs_f64_key(schema) {
             tokens.extend(quote! {
-                /// Total-order `u64` key for an `f64` index value (#242): orders
-                /// `-Inf < negatives < ±0 < positives < +Inf < NaN`, and gives each
-                /// non-finite a distinct key.  `-0.0` folds to `0.0` and every NaN
-                /// folds to one bit pattern, so equal values key equal.
                 fn __forgedb_f64_key(__v: f64) -> u64 {
                     let __v = if __v == 0.0 {
                         0.0
@@ -919,10 +599,6 @@ impl RustGenerator {
             });
         }
 
-        // Inline-string prefix decoder (#238).  Emitted only when some column
-        // actually carries a prefix, so a schema whose inline strings are all
-        // `string(N!)` — the prefix-free shape — carries no prefix machinery at
-        // all (same discipline as the `f64` key above).
         if Self::needs_inline_str(schema) {
             tokens.extend(Self::generate_identity_alphabet_helper());
         }
@@ -930,59 +606,32 @@ impl RustGenerator {
             tokens.extend(Self::generate_inline_len_helper());
         }
 
-        // Data-integrity error type (#91 Phase 3).  Generated once per schema; a
-        // generic *shape* (three integrity classes) but every field name, rule,
-        // and message is filled in by generated per-field checks — there is no
-        // runtime schema-reading validator.  Carried out of `insert`/`update`
-        // (and the `Database::create_*`/`update_*` wrappers) so a write that would
-        // violate integrity is refused, not committed.
         tokens.extend(quote! {
-            /// A rejected write (#91).  `status_code()` maps each class to the
-            /// HTTP status the generated REST boundary returns.
             #[derive(Debug, Clone, PartialEq)]
             pub enum ValidationError {
-                /// A `&unique` field already holds this value on another row → 409.
                 Unique { model: &'static str, field: &'static str },
-                /// A required/optional foreign key points at a non-existent row → 409.
                 DanglingReference {
                     model: &'static str,
                     field: &'static str,
                     target: &'static str,
                 },
-                /// A `delete` was refused because live child rows still reference
-                /// this parent under an `@on_delete(restrict)` FK (the default
-                /// on-delete policy) → 409.
                 ReferencedByChildren { model: &'static str, field: &'static str },
-                /// A field-level constraint (`@min`/`@max`/`@length`/`@email`/`@url`)
-                /// was violated → 422.
                 Constraint {
                     model: &'static str,
                     field: &'static str,
                     rule: &'static str,
                     message: String,
                 },
-                /// A `+u32`/`+u64` auto-increment field ran out of values (#187) →
-                /// 500.  Refused rather than wrapped: wrapping would re-issue `0`,
-                /// which is also the "allocate one for me" sentinel, and then
-                /// collide with every value already handed out.
-                ///
-                /// A server-side exhaustion, not a bad request — which is why it is
-                /// the one `ValidationError` class that maps to 5xx.
                 SequenceExhausted { model: &'static str, field: &'static str },
             }
 
             impl ValidationError {
-                /// The HTTP status the generated API boundary returns for this class:
-                /// integrity conflicts (unique / dangling FK) → 409, field-constraint
-                /// violations → 422.
                 pub fn status_code(&self) -> u16 {
                     match self {
                         ValidationError::Unique { .. }
                         | ValidationError::DanglingReference { .. }
                         | ValidationError::ReferencedByChildren { .. } => 409,
                         ValidationError::Constraint { .. } => 422,
-                        // Not the caller's fault and not retryable by changing the
-                        // request: the id space itself is spent (#187).
                         ValidationError::SequenceExhausted { .. } => 500,
                     }
                 }
@@ -1025,23 +674,10 @@ impl RustGenerator {
             impl std::error::Error for ValidationError {}
         });
 
-        // Replication apply error (#110 browser read-replica follower).  The
-        // follower decodes an opaque `PersistedEvent` and replays it through the
-        // SAME generated mutation surface the server uses (`insert`/`update`/
-        // `delete`); this is the union of what that replay can fail with.  Like
-        // `ValidationError` it is a fixed *shape* — no schema is read at runtime.
         tokens.extend(quote! {
-            /// An error applying a replicated change frame on the read-replica
-            /// follower (#110 Milestone C).  Emitted by the generated
-            /// `<Model>Storage::apply` / `Database::apply_frame`.
             #[derive(Debug)]
             pub enum ApplyError {
-                /// The opaque row bytes did not deserialize into the model record
-                /// (a corrupt frame, or a schema skew between server and replica).
                 Decode(String),
-                /// The replayed write failed the generated integrity validators.
-                /// Should not happen for a faithful replica of already-valid data,
-                /// but is surfaced rather than silently dropped.
                 Validation(ValidationError),
             }
 
@@ -1067,48 +703,21 @@ impl RustGenerator {
             }
         });
 
-        // Transaction error type (MVCC Tier 1, #83).  A transaction's scoped
-        // write methods call the SAME generated validated write path
-        // (`validate_<model>` + FK / `&unique` checks), so a `?` on any staged
-        // write propagates a #91 `ValidationError` and the transaction rolls back
-        // — one validator, no second copy.  `Io` surfaces a WAL/journal write
-        // failure; `Conflict` is reserved for Tier 2 optimistic concurrency (the
-        // `try_commit` loser) and is unused in Tier 1.
         tokens.extend(quote! {
-            /// A rejected or failed transaction (MVCC Tier 1, #83).  Wraps the #91
-            /// `ValidationError` (so `?` on a scoped write rolls the txn back),
-            /// plus an `Io` variant for a durable-write failure and a `Conflict`
-            /// variant reserved for Tier 2 optimistic concurrency.
             #[derive(Debug)]
             pub enum TxError {
-                /// A staged write failed the generated integrity validators
-                /// (field constraints / `&unique` / FK existence).  The whole
-                /// transaction rolls back.
                 Validation(ValidationError),
-                /// A durable-write failure while committing (WAL/journal fsync).
                 Io(String),
-                /// A write-write conflict lost the serialized commit (Tier 2).
-                /// Never produced by Tier 1's single-writer transactions.
                 Conflict,
-                /// The Tier-3 commit coordinator is unreachable — either
-                /// `Database::connect` could not establish the turn-channel, or a
-                /// live commit exhausted its retries against a down/stuck
-                /// coordinator.  The data dir is NOT opened lock-free unless the
-                /// coordinator is live (MVCC spec T3-5 / PM re-gate #84), so this
-                /// never leaves an unserialized writer running.
                 CoordinatorUnavailable(String),
             }
 
             impl TxError {
-                /// The HTTP status a generated boundary would return: a validation
-                /// failure maps to its #91 status (409/422); an I/O or conflict
-                /// failure is a 500/409 server-side condition.
                 pub fn status_code(&self) -> u16 {
                     match self {
                         TxError::Validation(e) => e.status_code(),
                         TxError::Io(_) => 500,
                         TxError::Conflict => 409,
-                        // Coordinator down ⇒ writes are temporarily unavailable.
                         TxError::CoordinatorUnavailable(_) => 503,
                     }
                 }
@@ -1136,161 +745,90 @@ impl RustGenerator {
             }
         });
 
-        // Generate embedded struct definitions before the models that reference
-        // them.  Models store structs as raw fixed-size bytes, so the struct
-        // types must exist for the emitted `size_of`/`read_unaligned` code to
-        // compile (without this, struct-typed fields fail with E0425).
         for struct_def in &schema.structs {
             let struct_tokens = Self::generate_struct(schema, struct_def);
             tokens.extend(struct_tokens);
         }
 
-        // Generate user-declared enum definitions (#enum) before the models that
-        // reference them.  Each becomes a fieldless Rust enum (serialized as its
-        // variant name string) plus a private `__to_u8`/`__from_u8` pair that maps
-        // the variant to/from its 1-byte stored discriminant (`0..N` in declaration
-        // order) — the encode/decode path in `insert`/`read_at` calls these so the
-        // variant list lives in exactly one place.
         for enum_def in &schema.enums {
             tokens.extend(Self::generate_enum(enum_def)?);
         }
 
-        // Generate models
         for model in &schema.models {
             let model_tokens = Self::generate_model(model, schema)?;
             tokens.extend(model_tokens);
         }
 
-        // Generate per-model change-feed event structs (#62 Direction A + #66
-        // mutation surface): the typed payloads the WS handler emits.  The substrate
-        // feed only carries (model, row_index, kind); generated code turns that into
-        // `<Model>Inserted` / `<Model>Updated` / `<Model>Deleted`.
         for model in &schema.models {
             tokens.extend(Self::generate_change_event_structs(model));
         }
 
-        // Generate per-model live-query delta enums (#62 Direction B): the typed,
-        // removal-aware result-set deltas the `/live-query/<model>` WS handler
-        // pushes (`Init` / `Added` / `Removed` / `Updated`).  Typed model records
-        // + the model's own id type — never an arbitrary runtime value.
         for model in &schema.models {
             tokens.extend(Self::generate_live_delta_enum(schema, model));
         }
 
-        // Generate M2M junction storage structs (referenced by the Database
-        // struct fields, so emitted before it).
         let junction_tokens = Self::generate_junction_structs(schema);
         tokens.extend(junction_tokens);
 
-        // Generate database struct
         let db_tokens = Self::generate_database(schema)?;
         tokens.extend(db_tokens);
 
-        // Generate relation-traversal helpers (forward FK getters, reverse
-        // one-to-many collections, and many-to-many link/query methods) as a
-        // second `impl Database` block.
         let traversal_tokens = Self::generate_traversal_impl(schema);
         tokens.extend(traversal_tokens);
 
-        // Generate the Database-level validated write wrappers (#91 Phase 3):
-        // create_<model> / update_<model>, which add foreign-key existence checks
-        // (sibling-collection access) on top of the storage-level field + unique
-        // validation, then delegate.  The REST boundary routes through these.
         let validated_writes = Self::generate_validated_writes(schema);
         tokens.extend(validated_writes);
 
-        // Generate the transaction surface (MVCC Tier 1, #83): the `TxHandle`
-        // struct + its scoped per-model write/read methods, `Database::transaction`,
-        // and the commit/rollback machinery (atomic multi-model commit journal,
-        // deferred-maintenance run, buffered changefeed/broker emit).
         let transaction_impl = Self::generate_transaction_impl(schema);
         tokens.extend(transaction_impl);
 
-        // Generate the Tier 2 concurrent-prepare surface (#83): SharedDatabase +
-        // ConcurrentTxHandle for genuine concurrent prepare (multiple threads prepare
-        // concurrently, commit is serialized under the exclusive write lock).
         let shared_db_impl = Self::generate_shared_database_impl(schema);
         tokens.extend(shared_db_impl);
 
-        // Generate the snapshot-scoped M2M traversal on the read-only
-        // `DatabaseReader` (#56 Direction B), so a concurrent reader can resolve
-        // cross-table many-to-many links consistently as of its snapshot.
         let reader_traversal_tokens = Self::generate_reader_traversal_impl(schema);
         tokens.extend(reader_traversal_tokens);
 
-        // Generate eager-load typed structs (`<Model>WithRelations`) plus their
-        // Database getters, which resolve a record's forward references in one call.
         let eager_tokens = Self::generate_eager_load(schema);
         tokens.extend(eager_tokens);
 
-        // Generate the Tier 3 coordinator client surface (#84): CoordinatedDatabase
-        // wraps SharedDatabase and routes the serialized commit section through the
-        // coordinator socket instead of the in-process sequencer.
         let coord_tokens = Self::generate_coordinated_client(schema);
         tokens.extend(coord_tokens);
 
-        // Parse and format with prettyplease
         let syntax_tree = syn::parse_file(&tokens.to_string())
             .map_err(|e| crate::CodegenError::GenerationFailed(format!("Failed to parse generated code: {}", e)))?;
 
         Ok(prettyplease::unparse(&syntax_tree))
     }
 
-    /// Generate a single model struct
     fn generate_model(model: &forgedb_parser::Model, schema: &Schema) -> Result<TokenStream> {
         let model_name = format_ident!("{}", model.name);
         let storage_name = format_ident!("{}Storage", model.name);
-        let model_doc = format!("{} model", model.name);
-        let storage_doc = format!("Storage for {} model", model.name);
 
-        // Generate field definitions
         let fields: Vec<_> = model
             .fields
             .iter()
             .map(|f| Self::model_struct_field(schema, f, true, Self::is_inline_key_field(schema, model, f)))
             .collect();
 
-        // Generate columnar storage fields
         let storage_fields = Self::generate_storage_fields(schema, model);
 
-        // Generate storage initialization
         let storage_inits = Self::generate_storage_inits(model, schema);
 
-        // The model's identity type (Uuid for uuid PKs, u64/u32 for integer PKs).
         let id_type = Self::id_type_tokens(schema, model);
 
-        // Generate the field-constraint validator (#91 Phase 3), a free fn the
-        // generated insert/update call before committing.
         let field_validation = Self::generate_field_validation(model);
 
-        // Generate insert logic
         let insert_logic = Self::generate_insert_logic(schema, model);
 
-        // Generate mutation surface (#66): superseding-version `update` / `delete`.
-        // `None` (skipped) for a model with no id field, which cannot be mutated by
-        // id (and cannot `insert` either).
         let mutation_methods = match (
             Self::generate_update_logic(schema, model),
             Self::generate_delete_logic(schema, model),
         ) {
             (Some(update_logic), Some(delete_logic)) => quote! {
-                /// Append a superseding version of an existing record (#66).
-                /// Reads resolve newest-version-wins; the prior version's bytes are
-                /// never mutated, so append-only (and thus backup / snapshots) hold.
-                /// Validates field constraints + `&unique` FIRST (#91): a rejected
-                /// update commits nothing and returns `Err(ValidationError)`.
-                /// `Ok(false)` if `id` is absent; `Ok(true)` on a successful update.
-                /// Storage grows with each update until compaction reclaims versions.
-                /// (Foreign-key existence is checked by `Database::update_<model>`,
-                /// which has sibling-collection access this storage-scoped method lacks.)
                 pub fn update(&mut self, id: #id_type, record: #model_name) -> Result<bool, ValidationError> {
                     #update_logic
                 }
 
-                /// Logically delete a record by appending a tombstoned superseding
-                /// version (#66).  `get` then reads the row as absent.  Returns
-                /// `false` if `id` is already absent.  Prior versions stay committed
-                /// (backup-faithful) until compaction reclaims them.
                 pub fn delete(&mut self, id: #id_type) -> bool {
                     #delete_logic
                 }
@@ -1298,92 +836,43 @@ impl RustGenerator {
             _ => quote! {},
         };
 
-        // Replication apply surface (#110 Milestone C): the follower's per-model
-        // entry point, replaying an opaque frame through the same insert/update/
-        // delete above.  `None` (skipped) for a model with no id (cannot mutate).
         let apply_method = Self::generate_apply_method(model).unwrap_or_else(|| quote! {});
-        // Additive commit (#110): flush every column + tombstone (native fsync;
-        // wasm arena no-op — durability is the transport's IndexedDB/OPFS write).
         let commit_method = Self::generate_commit_method(schema, model);
 
-        // Snapshot-scoped newest-version resolution (#66 + #56): read the id at a
-        // physical row so `get_at` / `all_at` can resolve the newest version
-        // *within a watermark* — a snapshot captured before an update/delete still
-        // sees the version live as-of capture.  Present only for id-bearing models.
         let row_index_ident = format_ident!("row_index");
         let id_read_at_row =
             Self::generate_id_read_expr(schema, model, &quote! { self }, &row_index_ident);
 
-        // Generate the snapshot accessors (`get_at` / `all_at`).  For an id-bearing
-        // model they resolve newest-within-watermark (mutation-aware); a model with
-        // no id keeps the plain prefix scan (it cannot be mutated, so no duplicate
-        // versions ever exist).
         let snapshot_accessors = Self::generate_snapshot_accessors(
             &id_type,
             &model_name,
             id_read_at_row.as_ref(),
         );
 
-        // Generate the shared read-by-row-index logic (feeds get / get_at / all_at)
         let read_at_logic = Self::generate_read_at_logic(schema, model);
 
-        // Generate declared column projections (#113): per @projection, a tailored
-        // struct + narrow reads that touch only PK + selected columns.  Reuses the
-        // shared `field_read_stmt` decode (one read path) and the id-at-row
-        // expression for the snapshot `_at` variants.
         let (projection_structs, projection_methods) =
             Self::generate_projections(schema, model, &id_type, id_read_at_row.as_ref());
 
-        // #160: internal narrow scan record + reads for the list endpoint (filter/
-        // sort touch only filterable/sortable columns; the page is materialized
-        // fully).  Empty for a model with no id field.
         let (scan_struct, scan_methods) = Self::generate_list_scan(schema, model);
 
-        // Generate the secondary-index probe methods (#90): find_by_* / get_by_*
-        // (+ snapshot `_at` variants) for each `^index` / `&unique` field.
         let index_lookups = Self::generate_index_lookups(schema, model);
 
-        // Generate the columnar-export helpers (language bindings #51/#52): live
-        // physical row indices + per Arrow-exportable column `export_col_<f>` that
-        // gathers exactly those rows.  Consumed by the FFI `..._export_arrow` ops.
         let columnar_export = Self::generate_columnar_export(schema, model);
 
-        // Generate reopen/rehydration logic (#65): rebuild the in-memory
-        // `row_count` + `id_to_row` index from the persisted columns so a fresh
-        // process can read data written by a previous one.
         let rehydrate_logic = Self::generate_rehydrate_logic(schema, model);
 
-        // Generate crash-recovery (#89): torn-tail repair + WAL replay, run in
-        // `new_at` before the identity-index rebuild so `id_to_row` reflects the
-        // recovered rows.
         let recover_method = Self::generate_recover_method(schema, model);
 
-        // Generate the WAL checkpoint (#89 step 2): fsync columns + truncate the
-        // WAL so it stays bounded and reopen replays only the post-checkpoint tail.
         let checkpoint_method = Self::generate_checkpoint_method(schema, model);
 
-        // Generate in-process compaction (#92 Phase 4): reclaim dead row versions
-        // under the writer lock, then reopen to rebuild the in-memory maps.
         let compact_method = Self::generate_compact_method(model);
 
-        // Generate the transaction storage helpers (MVCC Tier 1, #83): the
-        // `__stage_append` low-level staged-write path (WAL + columns + row_count,
-        // NO id_to_row / index / changefeed / broker) the `TxHandle` uses, plus
-        // `run_deferred_maintenance` (runs a checkpoint/compaction that the txn
-        // guard deferred).  `None`-skipped for a model with no id (cannot mutate).
         let txn_storage_methods = Self::generate_txn_storage_methods(schema, model);
 
-        // Generate the per-model layout manifest writer (#57): physical column
-        // layout + row-count anchor, written at open, read by schema-blind backup.
         let write_manifest = Self::generate_write_manifest(schema, model);
         let autoseq_methods = Self::generate_autoseq_methods(schema, model);
 
-        // #187: apply the persisted high-water marks as a FLOOR after the reopen
-        // scan has run. `max(persisted, scanned)` — the scan is authoritative for
-        // everything still on disk, and the manifest covers only what compaction
-        // physically removed. That ordering is what makes a lost tip safe: a crash
-        // before the manifest write falls back to the scan, which never
-        // over-issues, only under-issues into a range compaction already freed.
         let autoseq_floor = {
             let loads: Vec<TokenStream> = Self::sequence_auto_fields(model)
                 .iter()
@@ -1412,27 +901,13 @@ impl RustGenerator {
             }
         };
 
-        // Read-only reader handle (#56 Direction B): a per-model bundle of
-        // read-only column views sharing the writer's file descriptors, so many
-        // `&self` readers read the committed prefix lock-free while the single
-        // `&mut self` writer keeps appending.  It reuses the *exact* `read_at` /
-        // `get_at` / `all_at` token streams as the writer storage — identical
-        // tailored column-decode, just reading through the shared-fd reader
-        // columns — so there is no second decode path to drift.
         let reader_name = format_ident!("{}StorageReader", model.name);
         let reader_fields = Self::generate_reader_storage_fields(schema, model);
         let reader_inits = Self::generate_reader_inits(schema, model);
-        // Reader index probes (#103): `_at`-only (no live `get` on a reader).
         let reader_index_probes = Self::generate_index_probes(schema, model, false);
-        let reader_doc = format!(
-            "Read-only, lock-free reader handle for {} storage (#56 Direction B)",
-            model.name
-        );
 
-        // Generate the model struct, storage struct, and implementation
         let to_schema_derive = Self::to_schema_derive();
         let tokens = quote! {
-            #[doc = #model_doc]
             #[repr(C)]
             #[derive(Debug, Clone, Serialize, Deserialize #to_schema_derive)]
             pub struct #model_name {
@@ -1443,68 +918,31 @@ impl RustGenerator {
 
             #scan_struct
 
-            #[doc = #storage_doc]
             pub struct #storage_name {
                 #storage_fields
             }
 
             impl #storage_name {
-                /// Open the model's storage, rehydrating the in-memory identity
-                /// index from disk.  The column files are append-only and persist
-                /// across processes; this reconstructs `row_count` and `id_to_row`
-                /// so a fresh process reads data written by a previous one (#65).
-                ///
-                /// The row-count anchor is the tombstone file length (1 byte/row,
-                /// appended last per insert), so a torn insert (columns written
-                /// but the process died before the tombstone append) is excluded
-                /// and its orphaned column tail is overwritten by the next insert.
                 pub fn new() -> Self {
                     Self::new_at(std::path::Path::new("."))
                 }
 
-                /// Open the model's storage rooted at `root` (#59): every column
-                /// and the tombstone file is joined under it.  `new()` passes `.`
-                /// (the historical CWD-relative layout); a per-tenant process
-                /// passes that tenant's data dir, so filesystem isolation is the
-                /// directory boundary — no query logic, no schema read at runtime.
                 pub fn new_at(root: &std::path::Path) -> Self {
                     let mut db = Self {
                         #storage_inits
                     };
-                    // Crash recovery (#89): repair any torn column tail and replay
-                    // the WAL BEFORE rebuilding the identity index, so `row_count`
-                    // and `id_to_row` below reflect the recovered committed rows.
                     db.recover_from_wal();
                     #rehydrate_logic
                     #autoseq_floor
-                    // Refresh the physical-layout manifest on open (#57): cheap,
-                    // off the insert hot path, gives schema-blind backup/inspector
-                    // a current column map + row-count anchor.  Advisory here — the
-                    // counter this run allocates from is already correct in memory,
-                    // and the floor is re-persisted before anything destructive.
                     let _ = db.write_manifest(root);
                     db
                 }
 
-                /// Reopen the column handles + recover `row_count`, WITHOUT the
-                /// O(rows × indexes) rehydrate scan (#162-C).  `compact()` uses this:
-                /// after the compaction rewrite renames every file, the open fds are
-                /// stale (a Unix rename leaves them on the old, now-unlinked inode),
-                /// so the handles must be reopened — but the in-memory maps are
-                /// remapped in place (a dense row renumber that needs no column
-                /// reads), so rebuilding them from a full rescan would be wasted work.
                 fn new_at_no_rehydrate(root: &std::path::Path) -> Self {
                     let mut db = Self {
                         #storage_inits
                     };
-                    // Same crash-recovery anchor as `new_at` (sets `row_count` from
-                    // the tombstone length; the WAL was truncated by the pre-compact
-                    // checkpoint, so the replay is a no-op) — but no `#rehydrate_logic`.
                     db.recover_from_wal();
-                    // Advisory, and deliberately so: this runs from `compact()` with
-                    // every counter freshly zeroed.  The max-merge in `write_manifest`
-                    // makes that harmless, and the live tip is re-persisted by the
-                    // caller once the saved counters are reinstalled.
                     let _ = db.write_manifest(root);
                     db
                 }
@@ -1513,17 +951,10 @@ impl RustGenerator {
 
                 #autoseq_methods
 
-                /// Attach a shared change feed (#62 Direction A).  Called by
-                /// `Database::new()`; afterwards each `insert` emits a field-blind
-                /// `(model, row_index)` signal into the feed.
                 pub fn attach_changefeed(&mut self, feed: forgedb_changefeed::ChangeFeed) {
                     self.changefeed = Some(feed);
                 }
 
-                /// Attach the shared durable replication broker (#82 Direction C).
-                /// Called by `Database::open_at()`; afterwards each mutation is
-                /// durably recorded (with the opaque row bytes + a global offset)
-                /// for a resumable follower, in addition to the change-feed emit.
                 pub fn attach_broker(
                     &mut self,
                     broker: Option<std::sync::Arc<std::sync::Mutex<forgedb_changefeed::durable::DurableBroker>>>,
@@ -1531,11 +962,6 @@ impl RustGenerator {
                     self.broker = broker;
                 }
 
-                /// Insert a record.  Validates field constraints + `&unique` FIRST
-                /// (#91 Phase 3): a rejected insert commits nothing and returns
-                /// `Err(ValidationError)`; on success returns `Ok(id)`.  (Foreign-key
-                /// existence is checked by `Database::create_<model>`, which has the
-                /// sibling-collection access this storage-scoped method lacks.)
                 pub fn insert(&mut self, record: #model_name) -> Result<#id_type, ValidationError> {
                     #insert_logic
                 }
@@ -1554,11 +980,6 @@ impl RustGenerator {
 
                 #txn_storage_methods
 
-                /// Materialize the record at a physical row index, or `None` if
-                /// the row is tombstoned.  Shared read path (#56): `get`,
-                /// `get_at`, and `all_at` all funnel through here.  Public so the
-                /// generated change-feed WS handler (#62) can turn a broadcast
-                /// `(model, row_index)` signal into a typed record.
                 pub fn read_at(&self, row_index: usize) -> Option<#model_name> {
                     #read_at_logic
                 }
@@ -1568,25 +989,16 @@ impl RustGenerator {
                     self.read_at(row_index)
                 }
 
-                /// The number of physically committed rows (the snapshot
-                /// watermark).  Append-only storage guarantees a row's index is
-                /// stable for life, so this count fully defines a read view.
                 pub fn row_count(&self) -> usize {
                     self.row_count
                 }
 
-                /// Capture a read snapshot at the current committed row count
-                /// (#56, Direction A).  Rows appended after this call are
-                /// invisible to accessors passed the returned snapshot.
                 pub fn snapshot(&self) -> forgedb_storage::Snapshot {
                     forgedb_storage::Snapshot::new(self.row_count)
                 }
 
                 #snapshot_accessors
 
-                /// Return every live (non-deleted) record.  Used by generated
-                /// reverse-relation traversal helpers, which filter this by a
-                /// foreign key.  Order is unspecified (follows the id map).
                 pub fn all(&self) -> Vec<#model_name> {
                     let mut records = Vec::new();
                     for id in self.id_to_row.keys() {
@@ -1599,23 +1011,12 @@ impl RustGenerator {
 
                 #index_lookups
 
-                // Columnar-export helpers (#51/#52): live row indices + per
-                // Arrow-exportable column gather, consumed by the FFI Arrow ops.
                 #columnar_export
 
-                // Declared column projections (#113): narrow reads over PK +
-                // selected columns, plus their snapshot `_at` variants.
                 #projection_methods
 
-                // #160: internal narrow scan reads for the list endpoint.
                 #scan_methods
 
-                /// Open a read-only handle over this storage (#56 Direction B).
-                /// The handle shares this storage's column files via independent
-                /// (`try_clone`d) descriptors, so it reads the committed prefix
-                /// lock-free — concurrently with, and never blocking, the single
-                /// `&mut self` writer.  Pair it with a `DatabaseSnapshot` captured
-                /// on the writer for a cross-model-consistent read view.
                 pub fn reader(&self) -> #reader_name {
                     #reader_name {
                         #reader_inits
@@ -1623,56 +1024,36 @@ impl RustGenerator {
                 }
             }
 
-            #[doc = #reader_doc]
             pub struct #reader_name {
                 #reader_fields
             }
 
             impl #reader_name {
-                /// Materialize the record at a physical row index (or `None` if
-                /// tombstoned) — the same shared read path as the writer storage,
-                /// reading through the shared-fd reader columns (#56 Direction B).
                 pub fn read_at(&self, row_index: usize) -> Option<#model_name> {
                     #read_at_logic
                 }
 
                 #snapshot_accessors
 
-                // Snapshot-only index probes (#103): `find_by_*_at` / `get_by_*_at`
-                // over the cloned index maps, resolved through this reader's
-                // `get_at`.  No live `find_by_*` — a reader has no live `get`.
                 #reader_index_probes
             }
 
-            // Field-constraint validator (#91), called by insert/update.
             #field_validation
         };
 
         Ok(tokens)
     }
 
-    /// Generate the typed change-feed event structs for a model: `<Model>Inserted`
-    /// (#62 Direction A) plus `<Model>Updated` / `<Model>Deleted` (#66 mutation
-    /// surface).  Each is `{ <model_snake>: <Model> }` — the WS handler materializes
-    /// the record from the broadcast row index and serializes the matching struct to
-    /// JSON.  All are `Deserialize` too so subscribers/tests can round-trip them.
-    /// A `Deleted` event carries the record as it was *before* the delete (the
-    /// emitter passes the pre-delete row index, which is still materializable).
     fn generate_change_event_structs(model: &forgedb_parser::Model) -> TokenStream {
         let model_name = format_ident!("{}", model.name);
         let field_name = format_ident!("{}", Self::to_snake_case(&model.name));
 
-        let variants = [
-            ("Inserted", format!("Change-feed event: a `{}` was inserted (#62).", model.name)),
-            ("Updated", format!("Change-feed event: a `{}` was updated (#66); carries the new version.", model.name)),
-            ("Deleted", format!("Change-feed event: a `{}` was deleted (#66); carries the record as it was before deletion.", model.name)),
-        ];
+        let variants = ["Inserted", "Updated", "Deleted"];
 
-        let structs = variants.iter().map(|(suffix, doc)| {
+        let structs = variants.iter().map(|suffix| {
             let event_name = format_ident!("{}{}", model.name, suffix);
             let to_schema_derive = Self::to_schema_derive();
             quote! {
-                #[doc = #doc]
                 #[derive(Debug, Clone, Serialize, Deserialize #to_schema_derive)]
                 pub struct #event_name {
                     pub #field_name: #model_name,
@@ -1683,63 +1064,27 @@ impl RustGenerator {
         quote! { #(#structs)* }
     }
 
-    /// Generate the typed live-query delta enum for a model (#62 Direction B).
-    ///
-    /// The `/live-query/<model>` WS handler tracks the result set of a generated
-    /// closed-set query and pushes these removal-aware deltas as membership
-    /// changes: `Init` (the full initial set), `Added` / `Updated` (a typed
-    /// record entered or changed within the set), `Removed` (an id left the set —
-    /// now expressible because the mutation surface (#66) makes `all()` exclude
-    /// retracted rows).  Every payload is a *generated* typed record or the
-    /// model's own id type — never an arbitrary runtime value.  Tagged JSON
-    /// (`{"kind":"added","row":{…}}`) so a client can dispatch on `kind`.
     fn generate_live_delta_enum(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let model_name = format_ident!("{}", model.name);
         let delta_name = format_ident!("{}LiveDelta", model.name);
         let id_type = Self::id_type_tokens(schema, model);
-        // #254: a timestamp identity reaches `ToSchema` here too. The identity's
-        // own declared type is what the enum carries, so ask about that rather
-        // than assuming the id is uuid- or integer-shaped.
         let id_schema_attr = model.identity_field()
             .and_then(|f| Self::schema_value_type(schema, &f.field_type, true))
             .map(|vt| Self::schema_attr(quote! { #[schema(value_type = #vt)] }))
             .unwrap_or_default();
-        let doc = format!(
-            "Live-query result-set delta for `{}` (#62 Direction B): removal-aware \
-             membership changes over a generated closed-set query.",
-            model.name
-        );
         let to_schema_derive = Self::to_schema_derive();
         quote! {
-            #[doc = #doc]
             #[derive(Debug, Clone, Serialize, Deserialize #to_schema_derive)]
             #[serde(tag = "kind", rename_all = "lowercase")]
             pub enum #delta_name {
-                /// The full matching set at subscription time.
                 Init { rows: Vec<#model_name> },
-                /// A record newly entered the matching set.
                 Added { row: #model_name },
-                /// A record already in the set changed.
                 Updated { row: #model_name },
-                /// An id left the matching set (deleted, or no longer matches).
                 Removed { #id_schema_attr id: #id_type },
             }
         }
     }
 
-    /// Generate the snapshot-scoped read accessors (`get_at` / `all_at`) for a model
-    /// (#56 watermark reads, made mutation-aware by #66).
-    ///
-    /// - **Id-bearing models** (`id_read` = `Some`) resolve **newest-version-within-
-    ///   the-watermark** per id.  Under superseding-version append an id can have
-    ///   several physical rows; a raw prefix scan would return duplicate versions
-    ///   (`all_at`) or the wrong version relative to the snapshot (`get_at`).  Reading
-    ///   the id at each row and keeping the highest row `< watermark` gives each
-    ///   snapshot the row state as-of capture — so a snapshot taken *before* a later
-    ///   update/delete still sees the old value, the property in-place mutation could
-    ///   not provide.
-    /// - **Models without an id** (`id_read` = `None`) cannot be mutated, so no
-    ///   superseding versions ever exist and the plain prefix scan is already correct.
     fn generate_snapshot_accessors(
         id_type: &TokenStream,
         model_name: &proc_macro2::Ident,
@@ -1747,51 +1092,23 @@ impl RustGenerator {
     ) -> TokenStream {
         match id_read {
             Some(_id_read) => quote! {
-                /// Snapshot-scoped point read (#56 + #66): resolve the newest version
-                /// of `id` committed as of `snap`.  A snapshot captured before a later
-                /// update/delete still resolves the version live as-of capture; a
-                /// tombstoned newest reads as `None` (deleted as-of the snapshot).
-                ///
-                /// #159: binary-search the id's ascending version list for the newest
-                /// physical row `< watermark` — O(log versions), not an O(watermark)
-                /// id-column scan (which made the FK snapshot-probe quadratic).
                 pub fn get_at(&self, snap: &forgedb_storage::Snapshot, id: #id_type) -> Option<#model_name> {
                     let watermark = snap.watermark();
                     let versions = self.id_versions.get(&id)?;
-                    // `versions` is sorted ascending (appended in row order); the
-                    // newest visible version is the last element `< watermark`.
                     let pos = versions.partition_point(|&r| r < watermark);
                     if pos == 0 {
-                        return None; // no version of this id committed as of `snap`
+                        return None;
                     }
                     self.read_at(versions[pos - 1])
                 }
 
-                /// Return every live record committed as of `snap` (#56 + #66).
-                /// Resolves the newest version per id, so an updated row appears once
-                /// (its newest version) and a deleted row is excluded — no duplicate
-                /// physical versions leak into the view.
-                ///
-                /// #159: resolve each id via its version list (O(distinct_ids × log v))
-                /// instead of two O(watermark) passes; a tombstoned newest is filtered
-                /// by `read_at`.
-                ///
-                /// #457: rows come back in **ascending physical row order**, which for
-                /// an append-only store is insertion order — the same order the live
-                /// list endpoint returns, and the same order the no-id `all_at` below
-                /// gets for free from `0..watermark`.  The sort is what makes
-                /// `?as_of=` pageable: `id_versions` is a `HashMap`, its iteration
-                /// order is seeded per process, and without this the row order of a
-                /// snapshot read is a different random permutation in every process.
-                /// Paging then silently skips and repeats rows across a restart or a
-                /// second replica while each page is individually well-formed.
                 pub fn all_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<#model_name> {
                     let watermark = snap.watermark();
                     let mut rows = Vec::new();
                     for versions in self.id_versions.values() {
                         let pos = versions.partition_point(|&r| r < watermark);
                         if pos == 0 {
-                            continue; // id not yet present as of `snap`
+                            continue;
                         }
                         rows.push(versions[pos - 1]);
                     }
@@ -1806,9 +1123,6 @@ impl RustGenerator {
                 }
             },
             None => quote! {
-                /// Snapshot-scoped point read (#56).  This model has no id field and
-                /// so cannot be mutated; a row's index is stable and unique, so the
-                /// live-index lookup clamped to the watermark is correct.
                 pub fn get_at(&self, snap: &forgedb_storage::Snapshot, id: #id_type) -> Option<#model_name> {
                     let row_index = *self.id_to_row.get(&id)?;
                     if !snap.visible(row_index) {
@@ -1817,9 +1131,6 @@ impl RustGenerator {
                     self.read_at(row_index)
                 }
 
-                /// Return every live record committed as of `snap` (#56).  With no
-                /// mutation there are no superseding versions, so the plain prefix
-                /// scan `0..watermark` is already a consistent point-in-time view.
                 pub fn all_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<#model_name> {
                     let mut records = Vec::new();
                     for row_index in 0..snap.watermark() {
@@ -1833,40 +1144,8 @@ impl RustGenerator {
         }
     }
 
-    /// How many identity hops [`fk_backing_type`] will follow (#266).
-    ///
-    /// An identity may itself be a foreign key (`Order { id: *Customer }`), so
-    /// the resolution is a walk, and a walk over a *cycle* diverges.  A chain
-    /// this deep is already an identity-cycle validation error, so the bound is
-    /// never reached by a schema that validates — it exists so a caller that
-    /// skipped validation (the LSP, a direct generator call) degrades to `None`
-    /// instead of exhausting the generator's stack with no diagnostic.
     const FK_RESOLVE_DEPTH: u32 = 16;
 
-    /// The `FieldType` a foreign-key field is physically and logically backed by:
-    /// **the target model's identity type** (#266).  `?Model` backs onto
-    /// `Nullable(that)`.
-    ///
-    /// This is the boundary the whole change turns on.  Resolving here means the
-    /// physical helpers (`map_field_type_ident`, `type_name`,
-    /// `column_value_size_expr`, `storage_column_type_tokens`,
-    /// `is_fixed_size_type`, `index_key_body`, …) do not each grow a
-    /// schema-aware FK branch — their FK arms are *deleted*, because after
-    /// resolution an FK is no longer a special shape.  The invariant that buys:
-    ///
-    /// > An FK column is physically identical to the column the target's
-    /// > identity field itself occupies.
-    ///
-    /// Same file path, same `ColumnType`, same value size, same `append_*` /
-    /// `read_*` method, same index-key body — produced by the same code path,
-    /// not merely similar to it.  For the conventional `id: +uuid` target that
-    /// resolves to `Uuid`, whose arms are byte-for-byte what the FK arms
-    /// hardcoded, so no existing schema's output moves.
-    ///
-    /// `None` when the target is unknown, has no identity, or the resolution
-    /// cycles — all three are validation errors.  Codegen falls back to the
-    /// pre-#266 `Uuid` (see [`resolved_type`](Self::resolved_type)) so a
-    /// validation-skipping caller degrades rather than panics.
     pub(crate) fn fk_backing_type(
         schema: &Schema,
         field_type: &forgedb_parser::FieldType,
@@ -1887,19 +1166,13 @@ impl RustGenerator {
         let (target, optional) = match field_type {
             FieldType::Relation(RelationType::RequiredReference(t)) => (t, false),
             FieldType::Relation(RelationType::OptionalReference(t)) => (t, true),
-            // `[Model]` / many-to-many / component are virtual: no column, and
-            // nothing to back onto.
             _ => return None,
         };
         let identity = schema.find_model(target)?.identity_field()?;
         let key = match &identity.field_type {
-            // The target's identity is itself a foreign key — resolve through it.
             it @ FieldType::Relation(_) => Self::fk_backing_type_bounded(schema, it, depth - 1)?,
             other => other.clone(),
         };
-        // An identity always has a value, so strip any optionality picked up on
-        // the way (an `id: ?Owner` is nonsense, but it parses; without this the
-        // FK below would nest `Option<Option<_>>`).
         let key = match key {
             FieldType::Nullable(inner) => *inner,
             k => k,
@@ -1911,13 +1184,6 @@ impl RustGenerator {
         })
     }
 
-    /// [`fk_backing_type`](Self::fk_backing_type) where it applies, `field_type`
-    /// unchanged otherwise — the single call every physical helper makes on
-    /// entry (#266).
-    ///
-    /// The `Uuid` fallback is what an unresolvable FK produced before this
-    /// change, so a schema that skipped validation generates exactly what it
-    /// used to rather than something new and worse.
     pub(crate) fn resolved_type(
         schema: &Schema,
         field_type: &forgedb_parser::FieldType,
@@ -1935,13 +1201,6 @@ impl RustGenerator {
         }
     }
 
-    /// A model's identity `FieldType`, resolved through any identity-FK chain
-    /// (#266) — the key type callers key maps, parameters and return types on.
-    ///
-    /// `None` for a model with no identity field.  Note the direction: this is
-    /// the *inverse* of the deleted `is_uuid_pk`, whose `None => true` reported
-    /// an identity-less model as UUID-keyed and so left a `true` default on a
-    /// predicate whose false branch removed code.
     pub(crate) fn identity_type(
         schema: &Schema,
         model: &forgedb_parser::Model,
@@ -1953,18 +1212,6 @@ impl RustGenerator {
         }
     }
 
-    /// The identity type a many-to-many junction keys an endpoint on (#266), or
-    /// `None` if the model cannot be a junction endpoint.
-    ///
-    /// #266 replaced the old blanket "uuid PK only" gate with the *physical*
-    /// requirement the junction actually has: it stores each endpoint's id in a
-    /// `FixedColumn`, indexes it in a `HashMap`, and frames it in a fixed-width
-    /// replication record — so the key must be fixed-width, hashable and totally
-    /// equatable.  The admitted set lives on the AST as
-    /// `FieldType::is_junction_key`, because the parser's validator needs the
-    /// SAME predicate to report a schema outside it as an error — if the two ever
-    /// disagreed a relation would silently vanish again, which is the failure
-    /// #266 exists to remove.
     pub(crate) fn junction_key_type(
         schema: &Schema,
         model: &forgedb_parser::Model,
@@ -1973,16 +1220,6 @@ impl RustGenerator {
         ty.is_junction_key().then_some(ty)
     }
 
-    /// Many-to-many relations that can be generated.
-    ///
-    /// #266 replaced the UUID-key filter that used to sit here: the junction's
-    /// two columns are now each endpoint's own key width, so a mixed pair (a
-    /// `+u64` model linked to a `+uuid` one) generates.  What remains is the
-    /// physical floor — see `junction_key_type` — and a schema that trips it is
-    /// a validation *error*, so this filter never silently swallows a relation
-    /// the user wrote.  Kept as a named helper because *every* junction consumer
-    /// must agree on the same list (junction structs, `Database` fields, the
-    /// delete wrapper's cascade-unlink, the replication replay arms).
     pub(crate) fn valid_m2m(schema: &Schema) -> Vec<forgedb_parser::ast::ManyToManyRelation> {
         schema
             .detect_many_to_many_relations()
@@ -2000,27 +1237,16 @@ impl RustGenerator {
             .collect()
     }
 
-    /// The on-disk width of a junction endpoint key (#266).  A plain `usize`
-    /// rather than a token expression so the emitted junction reads as
-    /// `24usize`, not `16usize + 8usize` — the widths are known at generation
-    /// time and the frame check is easier to read (and to spot-check) folded.
     fn junction_key_width(ty: &forgedb_parser::FieldType) -> usize {
         use forgedb_parser::FieldType as FT;
         match ty {
             FT::U32 | FT::I32 => 4,
             FT::U64 | FT::I64 | FT::Timestamp(_) => 8,
-            // #252: a `string(N)` key is exactly N bytes — `@utf8` is a
-            // validation error on an identity, and the exact spelling carries no
-            // length prefix, so the slot IS the value. The at-most spelling pads
-            // with zeros, which is what makes both spellings one width.
             FT::StringN { chars, .. } => *chars as usize,
-            // `junction_key_type` admits nothing else.
             _ => 16,
         }
     }
 
-    /// The two endpoint key types of a junction, left then right (#266).
-    /// Both are `Some` for every relation `valid_m2m` returns.
     fn junction_key_pair(
         schema: &Schema,
         m: &forgedb_parser::ast::ManyToManyRelation,
@@ -2034,9 +1260,6 @@ impl RustGenerator {
         (of(&m.model1), of(&m.model2))
     }
 
-    /// The two endpoint key **type tokens** of a junction, left then right
-    /// (#266) — what every non-Rust surface needs to decode an id argument as
-    /// the key it actually is.
     pub(crate) fn junction_key_idents(
         schema: &Schema,
         m: &forgedb_parser::ast::ManyToManyRelation,
@@ -2048,9 +1271,6 @@ impl RustGenerator {
         )
     }
 
-    /// Append an endpoint id to a junction column, in the SAME encoding the
-    /// endpoint model's own id column uses (#266) — so a junction column is
-    /// byte-compatible with the id column it mirrors.
     fn junction_append_expr(
         schema: &Schema,
         ty: &forgedb_parser::FieldType,
@@ -2062,9 +1282,6 @@ impl RustGenerator {
             forgedb_parser::FieldType::Timestamp(_) => {
                 quote! { #col.append_timestamp(i64::from(#val)) }
             }
-            // #252: exactly N bytes, zero-padded — byte-identical to the way the
-            // endpoint model's own `string(N!)` id column is packed, which is the
-            // invariant that lets a junction column mirror an id column.
             forgedb_parser::FieldType::StringN { chars, .. } => {
                 let n = *chars as usize;
                 quote! {
@@ -2083,8 +1300,6 @@ impl RustGenerator {
         }
     }
 
-    /// Read an endpoint id back out of a junction column (#266) — the inverse of
-    /// `junction_append_expr`, yielding the key-typed value.
     fn junction_read_expr(
         schema: &Schema,
         ty: &forgedb_parser::FieldType,
@@ -2098,9 +1313,6 @@ impl RustGenerator {
             forgedb_parser::FieldType::Timestamp(_) => quote! {
                 Timestamp::from(#col.read_timestamp(#row).expect("Failed to read link"))
             },
-            // #252: the inverse of the pack above. The zero padding is stripped
-            // by `trim_end_matches`, not by a length prefix — the junction column
-            // carries none, exactly as a `string(N!)` id column does not.
             ty @ forgedb_parser::FieldType::StringN { .. } => {
                 let key_ty = Self::key_type_ident(schema, ty);
                 quote! {
@@ -2122,8 +1334,6 @@ impl RustGenerator {
         }
     }
 
-    /// Decode an endpoint id back out of a durable replication frame (#82) —
-    /// the inverse of `junction_frame_stmt` (#266).
     fn junction_frame_decode(
         schema: &Schema,
         ty: &forgedb_parser::FieldType,
@@ -2137,10 +1347,6 @@ impl RustGenerator {
                     Uuid::from_bytes(__b)
                 }
             },
-            // NOTE the parentheses: `#slice` is itself a borrow expression
-            // (`&ev.bytes[a..b]`), and `&x.try_into()` parses as `&(x.try_into())`
-            // — which type-checks as a reference to an array and fails. The
-            // snapshot tests could not have caught this; the compile check did.
             forgedb_parser::FieldType::Timestamp(_) => quote! {
                 Timestamp::from(i64::from_le_bytes(
                     (#slice).try_into().expect("junction frame slot is the key width"),
@@ -2168,9 +1374,6 @@ impl RustGenerator {
         }
     }
 
-    /// Push an endpoint id onto the durable replication frame (#82) in the
-    /// junction column's own little-endian encoding, so the frame is exactly
-    /// `left_width + right_width` bytes (#266).
     fn junction_frame_stmt(
         ty: &forgedb_parser::FieldType,
         buf: &TokenStream,
@@ -2183,9 +1386,6 @@ impl RustGenerator {
             forgedb_parser::FieldType::Timestamp(_) => {
                 quote! { #buf.extend_from_slice(&i64::from(#val).to_le_bytes()); }
             }
-            // #252: the frame slot is fixed-width like every other, so a shorter
-            // key is zero-padded to N. Same encoding as the junction column, so
-            // the frame and the column agree byte for byte.
             forgedb_parser::FieldType::StringN { chars, .. } => {
                 let n = *chars as usize;
                 quote! {
@@ -2201,13 +1401,10 @@ impl RustGenerator {
         }
     }
 
-    /// Junction struct identifier for an M2M pair, e.g. `AuthorBookLink`.
     fn junction_struct_ident(m: &forgedb_parser::ast::ManyToManyRelation) -> proc_macro2::Ident {
         format_ident!("{}{}Link", m.model1, m.model2)
     }
 
-    /// Database field / storage-path name for an M2M junction, e.g.
-    /// `author_book_link`.
     pub(crate) fn junction_field_ident(
         m: &forgedb_parser::ast::ManyToManyRelation,
     ) -> proc_macro2::Ident {
@@ -2218,61 +1415,21 @@ impl RustGenerator {
         )
     }
 
-    /// The Rust type used as a model's primary-key / identity type.
-    ///
-    /// Derived from the `id` field (or the first auto-generate field). UUID PKs
-    /// yield `Uuid`; integer PKs (`id: +u64` / `+u32`) yield the matching integer
-    /// type.  Keeping this in one place makes the `id_to_row` map key, the
-    /// `insert` return type, and the `get` parameter type all agree with
-    /// `record.id` — otherwise an integer PK fails with `expected Uuid, found u64`.
     pub(crate) fn id_type_tokens(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         match model.identity_field() {
-            // A key position (#252): `string(N)` renders as the `Copy`
-            // `InlineStr<N>` here, where an ordinary column of the same declared
-            // type renders as a `String`.
             Some(f) => Self::key_type_ident(schema, &f.field_type),
             None => quote! { Uuid },
         }
     }
 
-    /// The name of `model`'s identity field, for the per-field renderers that
-    /// must give the key its [`key_type_ident`](Self::key_type_ident) type while
-    /// an ordinary column of the same declared type keeps `map_field_type_ident`.
-    ///
-    /// A name rather than a reference so it can be carried into helpers that
-    /// receive a field *slice* (projections) rather than the model.
     pub(crate) fn identity_field_name(model: &forgedb_parser::Model) -> Option<&str> {
         model.identity_field().map(|f| f.name.as_str())
     }
 
-    /// Is `field` this model's identity? Compared by name, because a projection
-    /// renders from a field *slice* whose elements are the model's own fields but
-    /// whose provenance the renderer no longer has.
     pub(crate) fn is_identity(model: &forgedb_parser::Model, field: &forgedb_parser::Field) -> bool {
         Self::identity_field_name(model) == Some(field.name.as_str())
     }
 
-    /// The Arrow C-Data-Interface `format` string for a field whose column can be
-    /// exported **without a per-element transform** — i.e. a copy of the physical
-    /// column bytes is already a valid Arrow buffer. `Some(fmt)` iff exportable.
-    ///
-    /// The single source of truth shared by the columnar-export codegen: the Rust
-    /// generator emits `export_col_<f>` iff this is `Some`, and the FFI generator
-    /// emits `forgedb_<m>_<f>_export_arrow` for the SAME set (using the returned
-    /// format), so the two can never drift.
-    ///
-    /// Only **non-null fixed-width** types where our on-disk layout already IS the
-    /// Arrow layout qualify. Numerics are stored little-endian (`to_le_bytes`), so
-    /// a contiguous copy is a valid Arrow primitive buffer on any host; `uuid` and
-    /// a required FK are raw `[u8; 16]` → Arrow `FixedSizeBinary(16)`; `timestamp`
-    /// is an `i64` **microseconds** column → Arrow `int64` (#254 changed the unit,
-    /// not the layout: the export is a copy of the physical column bytes, which
-    /// never went through serde, so the RFC 3339 wire form does not reach it). Deliberately excluded (each
-    /// needs a transform, a later increment): `bool` (Arrow bit-packs; we store 1
-    /// byte), any nullable field (Arrow validity bitmap vs our presence tag),
-    /// `string`/`json` (variable → offsets), `decimal` (rust_decimal's internal
-    /// 16-byte repr ≠ Arrow decimal128), `enum` (1-byte discriminant loses the
-    /// variant-name mapping), `char(N)` / `struct` / arrays.
     pub(crate) fn arrow_export_format(
         schema: &Schema,
         ft: &forgedb_parser::FieldType,
@@ -2293,14 +1450,6 @@ impl RustGenerator {
         }
     }
 
-    /// Generate the per-model columnar-export helpers consumed by the FFI Arrow
-    /// export (language bindings #51/#52): `export_live_indices()` (the live
-    /// physical row indices, the same live set `all()` materializes — a row is
-    /// live iff its newest version, the one `id_to_row` points at, is not
-    /// tombstoned) and, per Arrow-exportable non-null fixed-width column, an
-    /// `export_col_<f>(indices)` that hands the private column's class-1 `gather`
-    /// the caller-computed opaque indices. The live-set decision stays in
-    /// generated code (as `all()` does); `gather` reads only byte ranges.
     fn generate_columnar_export(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let col_gathers: Vec<TokenStream> = model
             .fields
@@ -2310,14 +1459,6 @@ impl RustGenerator {
                 let field_col_name = format_ident!("{}_col", f.name);
                 let method = format_ident!("export_col_{}", f.name);
                 quote! {
-                    /// Export this column's bytes at the given physical row indices
-                    /// (the Arrow columnar-export path). Returns a
-                    /// `forgedb_storage::ColumnExport` that is a **zero-copy mmap
-                    /// alias** of the on-disk column when `indices` is a dense
-                    /// prefix `[0, n)` (no updates/tombstones) and a gathered copy
-                    /// otherwise — the ABI is identical either way. The alias-or-copy
-                    /// decision over the opaque indices is the storage primitive's;
-                    /// the live-set decision stays here (`export_live_indices`).
                     pub fn #method(&self, indices: &[usize]) -> std::io::Result<forgedb_storage::ColumnExport> {
                         self.#field_col_name.export(indices)
                     }
@@ -2330,15 +1471,6 @@ impl RustGenerator {
         }
 
         quote! {
-            /// The live physical row indices (newest, non-tombstoned version per
-            /// id) in **ascending physical order** — the row set the Arrow
-            /// columnar export reads. Same liveness as `all()`, but tombstone-only
-            /// (no full-record decode). Sorting is load-bearing: on a clean table
-            /// (all inserts, no updates/deletes) the live set is exactly the dense
-            /// prefix `[0, n)`, which lets `export_col_<f>` take the zero-copy
-            /// `mmap` alias fast path; an update/delete-scattered live set sorts to
-            /// a non-prefix and falls back to a gathered copy. Deterministic and
-            /// consistent across every `export_col_*` call within one export batch.
             pub fn export_live_indices(&self) -> Vec<usize> {
                 let mut indices = Vec::new();
                 for &row in self.id_to_row.values() {
@@ -2354,16 +1486,8 @@ impl RustGenerator {
         }
     }
 
-    /// Generate a fixed-size embedded struct definition.
-    ///
-    /// Structs are referenced by models via `StructType` / `OptionalStructType`
-    /// and persisted as raw fixed-size bytes, so they are `#[repr(C)]`.  The
-    /// parser guarantees struct fields are all fixed-size, so the same rendering
-    /// rules as model fields apply: `Timestamp` needs a `#[schema(value_type)]`
-    /// annotation for utoipa, and nullable fields get an `Option<>` wrapper.
     fn generate_struct(schema: &Schema, struct_def: &forgedb_parser::Struct) -> TokenStream {
         let struct_name = format_ident!("{}", struct_def.name);
-        let struct_doc = format!("{} embedded struct", struct_def.name);
 
         let fields: Vec<_> = struct_def
             .fields
@@ -2372,9 +1496,6 @@ impl RustGenerator {
                 let field_name = format_ident!("{}", field.name);
                 let field_type = Self::map_field_type_ident(schema, &field.field_type);
 
-                // An inline struct carries the same `#[derive(Serialize,
-                // Deserialize)]` as a model, so an oversized array breaks it exactly
-                // the same way (#243) and takes exactly the same attributes.
                 let (schema_attr, serde_attr) = if let Some(vt) =
                     Self::timestamp_schema_value_type(schema, &field.field_type)
                 {
@@ -2395,10 +1516,7 @@ impl RustGenerator {
 
         let to_schema_derive = Self::to_schema_derive();
         quote! {
-            #[doc = #struct_doc]
             #[repr(C)]
-            // `PartialEq` (not `Eq` — a struct may hold `f64`) so a struct-typed
-            // field participates in the live-query typed change detector (#84).
             #[derive(Debug, Clone, PartialEq, Serialize, Deserialize #to_schema_derive)]
             pub struct #struct_name {
                 #(#fields),*
@@ -2406,19 +1524,6 @@ impl RustGenerator {
         }
     }
 
-    /// Generate a user-declared enum (#enum): a fieldless Rust enum plus the
-    /// private discriminant codec used by the storage path.
-    ///
-    /// * The derives match the surrounding generated types and add what an enum
-    ///   used as an index/sort key needs — `Copy`+`Eq`+`Hash`+`Ord` — while the
-    ///   default serde derive serializes each variant as its NAME string (so
-    ///   REST / TS / JSON all agree on `"Active"`).
-    /// * Variants map to `0..N` in declaration order.  `__to_u8`/`__from_u8`
-    ///   localize that mapping to one place; the generated 1-byte fixed column
-    ///   stores `__to_u8()` and reads back through `__from_u8()` (which hard-fails
-    ///   on an out-of-range byte — a corrupt column / schema skew).
-    /// * A hard codegen error if the enum has more than 256 variants — the
-    ///   discriminant must fit in one byte (u8 = `0..=255`).
     fn generate_enum(enum_def: &forgedb_parser::EnumDef) -> Result<TokenStream> {
         if enum_def.variants.len() > 256 {
             return Err(CodegenError::InvalidSchema(format!(
@@ -2430,7 +1535,6 @@ impl RustGenerator {
         }
 
         let enum_name = format_ident!("{}", enum_def.name);
-        let enum_doc = format!("{} enum (#enum)", enum_def.name);
 
         let variant_idents: Vec<_> = enum_def
             .variants
@@ -2438,7 +1542,6 @@ impl RustGenerator {
             .map(|v| format_ident!("{}", v))
             .collect();
 
-        // `__to_u8`: variant -> declaration-order discriminant.
         let to_arms: Vec<_> = variant_idents
             .iter()
             .enumerate()
@@ -2448,7 +1551,6 @@ impl RustGenerator {
             })
             .collect();
 
-        // `__from_u8`: discriminant -> variant (panics on an out-of-range byte).
         let from_arms: Vec<_> = variant_idents
             .iter()
             .enumerate()
@@ -2458,10 +1560,6 @@ impl RustGenerator {
             })
             .collect();
 
-        // `__as_str`: variant -> its NAME, the same string the serde derive
-        // produces.  The monomorphic index key (#230) needs the name as a
-        // `&'static str` without routing the value through `serde_json::Value`
-        // to get it back out of a `Value::String`.
         let name_arms: Vec<_> = variant_idents
             .iter()
             .zip(enum_def.variants.iter())
@@ -2472,31 +1570,24 @@ impl RustGenerator {
 
         let to_schema_derive = Self::to_schema_derive();
         Ok(quote! {
-            #[doc = #enum_doc]
             #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize #to_schema_derive)]
             pub enum #enum_name {
                 #(#variant_idents),*
             }
 
             impl #enum_name {
-                /// This variant's 1-byte stored discriminant (declaration order).
                 fn __to_u8(&self) -> u8 {
                     match self {
                         #(#to_arms),*
                     }
                 }
 
-                /// This variant's NAME — identical to what the serde derive
-                /// serializes it as, so the index key (#230) and the REST / TS /
-                /// JSON representations cannot drift apart.
                 fn __as_str(&self) -> &'static str {
                     match self {
                         #(#name_arms),*
                     }
                 }
 
-                /// Decode a stored discriminant back to a variant.  Panics on an
-                /// out-of-range byte (a corrupt column or server/replica schema skew).
                 fn __from_u8(__b: u8) -> #enum_name {
                     match __b {
                         #(#from_arms,)*
@@ -2510,61 +1601,6 @@ impl RustGenerator {
         })
     }
 
-    // ---- Secondary indexes (#90) --------------------------------------------
-    //
-    // An index is in-memory derived state, exactly like `id_to_row`: a
-    // `HashMap<String, HashSet<Id>>` mapping a field's canonical string key to
-    // the set of logical ids whose *current* (newest-version) value equals it.
-    // It is maintained after the #89 WAL commit boundary on insert/update/delete
-    // and rebuilt from the committed rows on reopen (folded into the same scan
-    // that rebuilds `id_to_row`).  Probes resolve candidate ids back through the
-    // version-aware read path (`get` / `get_at`), so they never bypass the
-    // superseding-version (#66) / watermark (#56) semantics the rest of the read
-    // path enforces — the index only narrows the candidate set, it does not
-    // short-circuit version resolution.
-
-    /// The scalar fields of a model that carry a secondary index.  Three sources:
-    ///   * **explicit** `^index` / `&unique` scalar fields (#90) — now including
-    ///     `Nullable(_)` scalars (#102), keyed null-distinctly by `index_key_expr`;
-    ///   * **foreign-key** scalars `*Target` (`RequiredReference` → `Uuid`) and
-    ///     `?Target` (`OptionalReference` → `Option<Uuid>`) (#100) — always indexed
-    ///     (a reverse one-to-many getter that would otherwise scan always exists),
-    ///     so the index intent is the relation itself, no `^`/`&` needed.
-    ///
-    /// Excludes the **identity** field (already covered by `id_to_row`).  Empty
-    /// when the model has no id/auto field (it cannot be inserted, so nothing to
-    /// index).
-    ///
-    /// #258: the exclusion is the *identity* field specifically — NOT "any
-    /// auto-generate field", which is what it used to say.  Skipping the identity
-    /// is correct: `id_to_row` is a map keyed by id, so its uniqueness is already
-    /// enforced structurally and a second index would be pure redundancy (schema
-    /// validation warns and suggests dropping the modifier).  But that reasoning
-    /// does not extend to a *non-identity* `+` field: in
-    /// `Event { id: +uuid, ref_id: &+uuid }` the identity is `id`, and `ref_id` is
-    /// an ordinary field that merely happens to be server-populated.  Excluding it
-    /// meant `&` built no index and enforced no uniqueness, and `^` built no index
-    /// — silently, with no warning, on `+uuid`/`+timestamp` fields that synthesize
-    /// today.  Composite indexes never applied the exclusion, so the same field was
-    /// indexable via `@index(a, b)` but not via `^`.
-    /// The model's `+u32` / `+u64` fields — the ones that allocate from a counter
-    /// (#187).  `+uuid` draws from a random space and `+timestamp` from the clock;
-    /// neither needs one, so neither appears here.
-    ///
-    /// Empty for every schema in the corpus but `iot-sensors`, which is what makes
-    /// this the switch that keeps #187 from changing any other model's output.
-    /// The model's `+timestamp` **identity**, if it has one (#254).
-    ///
-    /// A `+timestamp` is identity-eligible only when the field is named `id`
-    /// (res 6): 148 of 148 `+timestamp` fields in the example corpus are
-    /// `created_at`-style stamps, so inferring a timestamp key from the `+` alone
-    /// would silently mis-key a model that merely wanted a creation stamp. The
-    /// asymmetry against `+u32`/`+u64` is deliberate — the *only* reason to write
-    /// an integer auto is to get an allocated sequence, so an auto integer is
-    /// unambiguously key-ish.
-    ///
-    /// Validation additionally requires the declared precision to be `us`, so a
-    /// field reaching here is always `Timestamp(Micros)`.
     fn timestamp_key_field(model: &forgedb_parser::Model) -> Option<&forgedb_parser::Field> {
         model.fields.iter().find(|f| {
             f.name == "id"
@@ -2573,27 +1609,14 @@ impl RustGenerator {
         })
     }
 
-    /// Every field backed by the #187 per-field allocation counter: the integer
-    /// autos, plus a `+timestamp` identity.
-    ///
-    /// A `+timestamp` identity is structurally an integer auto-increment whose
-    /// seed is the clock instead of `0` — precision does not make it unique,
-    /// monotonic allocation does — so it reuses the same `AtomicU64`, the same
-    /// `Manifest.auto_sequences` floor and the same reopen scan, and only the
-    /// allocation expression differs.
     fn sequence_auto_fields(model: &forgedb_parser::Model) -> Vec<&forgedb_parser::Field> {
         let mut fields = Self::integer_auto_fields(model);
         fields.extend(Self::timestamp_key_field(model));
         fields
     }
 
-    /// The `u64` view of `expr` for the shared counter. The counter is one type
-    /// for every sequence field, so each field type says how it projects into it.
     fn autoseq_to_u64(field: &forgedb_parser::Field, expr: TokenStream) -> TokenStream {
         if matches!(field.field_type, forgedb_parser::FieldType::Timestamp(_)) {
-            // Micros since the epoch. Clamped at 0 because the counter is
-            // unsigned and a pre-epoch id cannot be allocated anyway — the
-            // allocator's floor is `now`, which is not in 1969.
             quote! { (#expr).as_micros().max(0) as u64 }
         } else {
             quote! { (#expr) as u64 }
@@ -2614,13 +1637,6 @@ impl RustGenerator {
             .collect()
     }
 
-    /// Integer autos that are **neither the identity nor `&unique`** (#260).
-    ///
-    /// These are the only fields that need a sequence claim key: an identity
-    /// already contributes a row key (`b"r"`) to the opaque write-set and a
-    /// `&unique` field a unique-claim key (`b"u"`), so a third claim would be
-    /// redundant work on every insert. Empty for every schema that was legal
-    /// before #260, which is what keeps the generated output byte-identical.
     fn bare_integer_auto_fields(model: &forgedb_parser::Model) -> Vec<&forgedb_parser::Field> {
         let identity = model.identity_field().map(|f| f.name.as_str());
         Self::integer_auto_fields(model)
@@ -2629,23 +1645,10 @@ impl RustGenerator {
             .collect()
     }
 
-    /// Whether any model needs sequence-claim staging.
-    ///
-    /// Gates the `staged_sequence_keys` field, which lives on the **schema-level**
-    /// `TxHandle` / `ConcurrentTxHandle` rather than per model. Emitting it
-    /// unconditionally would add a field to every generated crate — and diff every
-    /// snapshot — for a feature the schema does not use.
     fn schema_has_bare_integer_auto(schema: &Schema) -> bool {
         schema.models.iter().any(|m| !Self::bare_integer_auto_fields(m).is_empty())
     }
 
-    /// Stage a sequence claim for each bare integer auto on `record`.
-    ///
-    /// Keyed off the record's **final** value, so an explicitly-supplied one is
-    /// claimed too: #187 decision 5 lets a non-zero value through (it advances the
-    /// counter via `fetch_max` instead of allocating), and an explicit `7` racing an
-    /// allocated `7` is the same collision. Claim-only — unlike the `&unique` path
-    /// there is no index to validate against, so there is nothing to check here.
     fn generate_sequence_claim_staging(model: &forgedb_parser::Model) -> TokenStream {
         let mtag = model.name.as_str();
         let stmts: Vec<TokenStream> = Self::bare_integer_auto_fields(model)
@@ -2665,39 +1668,12 @@ impl RustGenerator {
         quote! { #(#stmts)* }
     }
 
-    /// Re-derive the counter when a sequence claim loses a turn (#260).
-    ///
-    /// Without this a retry merely re-runs the prepare closure, which allocates the
-    /// *next* value — so a writer N values behind a peer needs N attempts and a
-    /// bounded retry budget is exhausted long before it converges.
-    ///
-    /// It cannot lean on step 0's peer refresh: `CoordinatorClient::last_known_lsn`
-    /// advances only on this client's own `Ack`, so a `Nack` never trips that gate.
-    ///
-    /// **Why a refresh rather than reading the value out of the key.** The
-    /// coordinator returns the key that *collided*, which is the key **we** sent —
-    /// so it carries the value we proposed, not the one the winner holds.
-    /// `fetch_max` against our own proposal is a no-op and the writer still walks.
-    /// What the `Nack` really proves is that a peer committed rows we have not
-    /// folded in, and `__peer_refresh` is exactly the routine that folds them —
-    /// re-reading the shared columns and `fetch_max`ing the counter to the true
-    /// committed maximum, so the next attempt starts past every value in play.
-    ///
-    /// The decode is still used, as a **predicate**: only a lost sequence claim
-    /// warrants the column re-read, so a `&unique` or row-key conflict does not pay
-    /// for it. That is generated code reading a format generated code produced —
-    /// the substrate never looks inside a write-set key. `__forgedb_ws_key` is
-    /// length-prefixed, so parts are walked by length rather than scanned for a tag
-    /// (a value's bytes can contain anything, including `b"s"`).
     fn generate_sequence_fastforward(schema: &Schema) -> TokenStream {
         if !Self::schema_has_bare_integer_auto(schema) {
             return quote! {};
         }
         quote! {
             {
-                /// Split a length-prefixed write-set key back into its parts.
-                /// Mirrors `__forgedb_ws_key`; malformed input yields no parts
-                /// rather than panicking, since this only gates an optimization.
                 fn __forgedb_ws_parts(key: &[u8]) -> Vec<&[u8]> {
                     let mut parts: Vec<&[u8]> = Vec::new();
                     let mut i = 0usize;
@@ -2718,8 +1694,6 @@ impl RustGenerator {
                 if let forgedb_txn::CommitOutcome::Conflict { key: __ckey } = &__outcome {
                     let __parts = __forgedb_ws_parts(__ckey);
                     if __parts.len() == 4 && __parts[0] == b"s" {
-                        // A sequence claim lost, so a peer holds committed values we
-                        // have not seen.  Fold them in before reallocating.
                         let mut __db = __inner.write().unwrap();
                         __db.__peer_refresh();
                     }
@@ -2728,15 +1702,6 @@ impl RustGenerator {
         }
     }
 
-    /// The gated pieces of sequence-claim plumbing (#260), as
-    /// `(struct field, initializer, write-set loop)`.
-    ///
-    /// All three are empty when no model has a bare integer auto, which is what
-    /// keeps every pre-#260 schema's output byte-identical.
-    ///
-    /// `recv` is the handle the loop reads from (`self` or `__tx`), `sink` the
-    /// key vector, and `boxed` selects `OpaqueKey` (Tier 1/2, a boxed slice) versus
-    /// the coordinator's plain `Vec<u8>`.
     fn sequence_claim_plumbing(
         schema: &Schema,
         recv: &TokenStream,
@@ -2747,13 +1712,6 @@ impl RustGenerator {
             return (quote! {}, quote! {}, quote! {});
         }
         let field = quote! {
-            /// Sequence claims staged by this transaction (#260):
-            /// `(model, field, allocated value)`.
-            ///
-            /// An integer auto that is neither the identity nor `&unique` enters
-            /// the opaque write-set through this set and nothing else — without it
-            /// two coordinated writers deriving the same value both commit and
-            /// neither notices.
             staged_sequence_keys:
                 std::collections::BTreeSet<(&'static str, &'static str, u64)>,
         };
@@ -2783,9 +1741,6 @@ impl RustGenerator {
             }
         };
         let ws = quote! {
-            // Sequence-claim keys (#260): the third class, for integer autos that
-            // are neither the identity nor unique.  `u32` values are widened to
-            // `u64` so one encoding (and one decoder, on `Nack`) covers both.
             for (__mtag, __fname, __val) in &#recv.staged_sequence_keys {
                 let __val: u64 = *__val;
                 #push
@@ -2794,26 +1749,15 @@ impl RustGenerator {
         (field, init, ws)
     }
 
-    /// The storage-struct field holding one auto-integer field's counter.
-    ///
-    /// `__autoseq_`, deliberately NOT `__seq_`: the generated Tier-2 / Tier-3
-    /// commit path already binds locals named `__seq`, `__seq_arc` and
-    /// `__seq_start`, so a model with a field named `arc` or `start` would emit a
-    /// counter indistinguishable from one of them in the generated source.
     fn autoseq_field_ident(field: &forgedb_parser::Field) -> proc_macro2::Ident {
         format_ident!("__autoseq_{}", field.name)
     }
 
-    /// The allocator method for one auto-integer field: `fetch_add(1)` plus the
-    /// width guard that makes overflow an error instead of a wrap back to `0`.
     fn autoseq_alloc_ident(field: &forgedb_parser::Field) -> proc_macro2::Ident {
         format_ident!("__alloc_{}", field.name)
     }
 
     fn indexed_fields(model: &forgedb_parser::Model) -> Vec<&forgedb_parser::Field> {
-        // A model with no identity cannot be inserted, so there is nothing to
-        // index.  (Same predicate codegen uses to *find* the identity, so this
-        // cannot disagree with `identity_field` about whether one exists.)
         let Some(identity) = model.identity_field().map(|f| f.name.as_str()) else {
             return Vec::new();
         };
@@ -2836,8 +1780,6 @@ impl RustGenerator {
             .collect()
     }
 
-    /// Whether a field type is a non-relation scalar an index / REST filter can
-    /// key on.  Mirrors `ApiGenerator::is_filterable_field` (kept in sync).
     fn is_filterable_scalar(field_type: &forgedb_parser::FieldType) -> bool {
         use forgedb_parser::FieldType;
         match field_type {
@@ -2850,14 +1792,8 @@ impl RustGenerator {
             | FieldType::Uuid
             | FieldType::Timestamp(_)
             | FieldType::String
-            // #238: an inline string is a `String` in the record, so it is `Ord` +
-            // `Hash` on exactly the same terms as a bare one.
             | FieldType::StringN { .. }
-            // decimal is `Ord` + `Hash`, so it is filterable / sortable / indexable
-            // (index keyed scale-invariantly via `index_value_expr`).
             | FieldType::Decimal
-            // enum derives `Ord` + `Hash`, so it is filterable / sortable /
-            // indexable (index key = the variant name string, via `index_key_expr`).
             | FieldType::Enum(_)
             | FieldType::Bytes(_) => true,
             FieldType::Nullable(inner) => Self::is_filterable_scalar(inner),
@@ -2865,14 +1801,6 @@ impl RustGenerator {
         }
     }
 
-    /// Whether a field type is (or wraps) a numeric scalar `@min`/`@max` can bound.
-    ///
-    /// `Decimal` is included (#239): it is the exact-money type, which makes it the
-    /// type most likely to carry a bound and the one where dropping that bound costs
-    /// the most.  It was previously absent, and because both `@min`/`@max` arms are
-    /// gated on this predicate a bound on a `decimal` field parsed, was carried
-    /// through the AST, and then emitted **no check at all** — a silent no-op with
-    /// no error and no warning.
     fn is_numeric_type(field_type: &forgedb_parser::FieldType) -> bool {
         use forgedb_parser::FieldType;
         match field_type {
@@ -2887,12 +1815,6 @@ impl RustGenerator {
         }
     }
 
-    /// A `@min`/`@max` bound as written: the literal, plus whether it is exclusive.
-    ///
-    /// `None` when the constraint carries no usable bound. Validation has already
-    /// rejected the shapes that are errors (a fractional or exclusive bound on an
-    /// integer field, a mismatched operator), so by the time codegen runs, anything
-    /// present here is meant to be emitted.
     fn constraint_bound(c: &forgedb_parser::ast::Constraint) -> Option<(BoundLiteral, bool)> {
         use forgedb_parser::ast::ConstraintParam as P;
         fn literal(p: &P) -> Option<BoundLiteral> {
@@ -2908,26 +1830,6 @@ impl RustGenerator {
         })
     }
 
-    /// The `(lhs, rhs)` operands for a `@min`/`@max` comparison, in a domain that
-    /// can represent both the field's value and the bound exactly (#239).
-    ///
-    /// The bound literal is an `i64`; the field is not.  The original form compared
-    /// `(*__v as f64) < #n as f64`, which is lossy in two ways that matter:
-    ///
-    /// - **`decimal`** cannot cast to `f64` at all (it is a struct, not a primitive),
-    ///   and routing an exact fixed-point value through a binary float would defeat
-    ///   the entire point of the type.  It compares against `Decimal::from(i64)`,
-    ///   which is exact for every bound the grammar can express.
-    /// - **64-bit integers** beyond f64's 53-bit mantissa round *before* the compare,
-    ///   so a `u64`/`i64` bound near the top of the range could admit a value that
-    ///   violates it.  `i128` holds all of `u64` and `i64` losslessly, so the compare
-    ///   is exact for every integer field.
-    ///
-    /// `f64` fields keep the float compare — the field's own domain *is* binary
-    /// float, so there is nothing more exact to promote to.
-    ///
-    /// Returns `None` for a non-numeric type; callers are already gated on
-    /// [`Self::is_numeric_type`], so `None` means the two have drifted apart.
     fn numeric_bound_operands(
         field_type: &forgedb_parser::FieldType,
         bound: &BoundLiteral,
@@ -2941,23 +1843,15 @@ impl RustGenerator {
             (FieldType::F64, BoundLiteral::Int(n)) => {
                 Some((quote! { (*__v as f64) }, quote! { (#n as f64) }))
             }
-            // `#n` interpolates as an `i64`-suffixed literal, so this resolves to
-            // `From<i64> for Decimal` with no annotation and no cast.
             (FieldType::Decimal, BoundLiteral::Int(n)) => Some((
                 quote! { (*__v) },
                 quote! { rust_decimal::Decimal::from(#n) },
             )),
-            // A fractional bound on an `f64` field rounds into the field's own
-            // domain, which is inherent rather than lossy — there is nothing more
-            // exact for an `f64` to be compared against.
             (FieldType::F64, BoundLiteral::Frac(lex)) => {
                 let v: f64 = lex.parse().ok()?;
                 let lit = proc_macro2::Literal::f64_suffixed(v);
                 Some((quote! { (*__v as f64) }, quote! { #lit }))
             }
-            // The exact case, and the reason the lexeme is carried this far: the
-            // literal is reconstructed as mantissa + scale, so `0.01` is the
-            // Decimal `1e-2` and never passes through a binary float.
             (FieldType::Decimal, BoundLiteral::Frac(lex)) => {
                 let (mantissa, scale) = BoundLiteral::decimal_parts(lex)?;
                 Some((
@@ -2965,8 +1859,6 @@ impl RustGenerator {
                     quote! { rust_decimal::Decimal::from_i128_with_scale(#mantissa, #scale) },
                 ))
             }
-            // A fractional bound on an integer field is a validation error, so it
-            // never reaches here; refusing it again keeps the drift guard honest.
             (
                 FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64,
                 BoundLiteral::Frac(_),
@@ -2976,7 +1868,6 @@ impl RustGenerator {
         }
     }
 
-    /// The `i64` params of a constraint, in order (skips string params).
     fn constraint_numbers(c: &forgedb_parser::ast::Constraint) -> Vec<i64> {
         c.params
             .iter()
@@ -2987,7 +1878,6 @@ impl RustGenerator {
             .collect()
     }
 
-    /// The value of a named numeric param, `@d(name: 3)` (#235).
     fn constraint_named_number(c: &forgedb_parser::ast::Constraint, want: &str) -> Option<i64> {
         c.params.iter().find_map(|p| match p {
             forgedb_parser::ast::ConstraintParam::Named { name, value } if name == want => {
@@ -3000,7 +1890,6 @@ impl RustGenerator {
         })
     }
 
-    /// The first string param of a constraint (`@pattern("...")`/`@default("...")`).
     fn constraint_first_string(c: &forgedb_parser::ast::Constraint) -> Option<&str> {
         c.params.iter().find_map(|p| match p {
             forgedb_parser::ast::ConstraintParam::String(s) => Some(s.as_str()),
@@ -3008,25 +1897,11 @@ impl RustGenerator {
         })
     }
 
-    /// Generate the per-model field-constraint validator (#91 Phase 3):
-    /// `validate_<snake>(record) -> Result<(), ValidationError>`, enforcing the
-    /// declared `@min`/`@max` (numeric), `@length`/`@email`/`@url`/`@pattern`/`@regex`
-    /// (string) directives.  Every check is generated from a specific field +
-    /// directive — there is no runtime constraint interpreter.  Nullable fields are
-    /// validated only when `Some` (a `None` value violates no value-constraint).
-    ///
-    /// `@pattern`/`@regex` (#104) are aliases: the value must match a schema-declared
-    /// regex, compiled once into a per-(model,field) `LazyLock<regex::Regex>` static.
     fn generate_field_validation(model: &forgedb_parser::Model) -> TokenStream {
         let fn_name = format_ident!("validate_{}", Self::to_snake_case(&model.name));
         let model_name = format_ident!("{}", model.name);
-        // #257: a field is identified by (model, field), never by field alone —
-        // two models may declare the same field name, and an error naming only
-        // `code` says nothing about which row was rejected.
         let mtag = model.name.as_str();
 
-        // `LazyLock<Regex>` statics for each `@pattern`/`@regex` field (#104),
-        // compiled once and shared across every validate call.
         let pattern_statics = std::cell::RefCell::new(Vec::<TokenStream>::new());
 
         let field_blocks: Vec<_> = model
@@ -3039,34 +1914,9 @@ impl RustGenerator {
 
                 let mut checks: Vec<TokenStream> = Vec::new();
 
-                // #238: the inline-string column's own constraints, and they go
-                // FIRST — before `@length`, `@pattern`, `@email`, `@url`.
-                //
-                // Two reasons, and the first is the one that matters. The ASCII
-                // restriction is the only check here that can make a *later* one
-                // report a cause that is not the real one: a `@pattern` run over a
-                // value containing `é` fails, and the message says the value did
-                // not match the regex, when what actually happened is that the
-                // column does not admit that character without `@utf8`. Second, it
-                // is a property of the column rather than of the value's content,
-                // which is the order an author debugs in.
-                //
-                // Both are *value* constraints, enforced on every insert and
-                // update (422) — the same class as `@pattern` and `@length`, not a
-                // validation-time-only check.
                 if let Some((chars, exact)) = Self::inline_string_params(&field.field_type) {
                     let n = chars as usize;
-                    // #252: a KEY carries a narrower rule than a column, and it
-                    // replaces the ASCII check rather than joining it — the
-                    // path-segment alphabet is a strict subset of ASCII, and the
-                    // ASCII diagnostic's `add @utf8` advice is *wrong* for an
-                    // identity, where `@utf8` is a validation error (res 3).
                     if Self::is_identity(model, field) {
-                        // Non-empty FIRST (res 5), so `""` reports "a key cannot
-                        // be empty" rather than the width rule or a phantom
-                        // offending character. `/docs/` routes to the LIST
-                        // endpoint, not to a row, so an empty key is not merely
-                        // ugly — it is unaddressable.
                         checks.push(quote! {
                             if __v.is_empty() {
                                 return Err(ValidationError::Constraint {
@@ -3112,7 +1962,6 @@ impl RustGenerator {
                             }
                         });
                     }
-                    // N counts CHARACTERS (res 3), consistent with `@length`.
                     if exact {
                         let msg = format!("must be exactly {n} characters");
                         checks.push(quote! {
@@ -3138,8 +1987,6 @@ impl RustGenerator {
 
                 for c in &field.constraints {
                     match c.name.as_str() {
-                        // `@min(n)` rejects `v < n`; the exclusive `@min(>n)` rejects
-                        // `v <= n`. `@max` mirrors it (#239).
                         "min" | "max" if is_numeric => {
                             if let Some((bound, exclusive)) = Self::constraint_bound(c)
                                 && let Some((lhs, rhs)) =
@@ -3152,8 +1999,6 @@ impl RustGenerator {
                                     (false, false) => quote! { > },
                                     (false, true) => quote! { >= },
                                 };
-                                // The message states the *satisfying* relation, so
-                                // it is the mirror of the rejecting comparison.
                                 let rel = match (is_min, exclusive) {
                                     (true, false) => ">=",
                                     (true, true) => ">",
@@ -3172,20 +2017,6 @@ impl RustGenerator {
                                 });
                             }
                         }
-                        // `@length` (#235).  Five spellings, and the bound's unit is
-                        // characters (`chars().count()`, not bytes) for `string`.
-                        //
-                        //   @length(min: n)        -> at least n
-                        //   @length(max: n)        -> at most n
-                        //   @length(min: a, max: b)-> between a and b
-                        //   @length(a, b)          -> between a and b  (unchanged)
-                        //   @length(n)             -> EXACTLY n        (was: at most n)
-                        //
-                        // The single-arg meaning change is invisible everywhere else —
-                        // it parses and compiles either way — so the parser emits a
-                        // one-release warning naming both replacement spellings.
-                        // Argument names are validated in the parser, so anything
-                        // reaching here is well-formed.
                         "length" if is_string => {
                             let named_min = Self::constraint_named_number(c, "min");
                             let named_max = Self::constraint_named_number(c, "max");
@@ -3278,12 +2109,6 @@ impl RustGenerator {
                                 }
                             });
                         }
-                        // `@pattern("...")` / `@regex("...")` are aliases (#104): the
-                        // value must match the declared regex.  The pattern is authored
-                        // at schema-write time, so it is compiled ONCE into a per-(model,
-                        // field) `LazyLock<Regex>` static; the whole value is tested with
-                        // `is_match` (a match anywhere unless the pattern is anchored,
-                        // consistent with common regex-constraint semantics).
                         "pattern" | "regex" if is_string => {
                             if let Some(pat) = Self::constraint_first_string(c) {
                                 let rname = format!(
@@ -3318,8 +2143,6 @@ impl RustGenerator {
                     return None;
                 }
                 let fident = format_ident!("{}", field.name);
-                // `__v` is always `&T` (numeric derefs via `*__v`; string methods
-                // take `&self`).  Nullable fields validate only their `Some` value.
                 if field.is_nullable() {
                     Some(quote! {
                         if let Some(__v) = &record.#fident {
@@ -3340,9 +2163,6 @@ impl RustGenerator {
         let pattern_statics = pattern_statics.into_inner();
 
         quote! {
-            /// Field-constraint validation (#91): reject a record whose values
-            /// violate a declared `@min`/`@max`/`@length`/`@email`/`@url`/`@pattern`
-            /// directive.
             fn #fn_name(record: &#model_name) -> Result<(), ValidationError> {
                 #(#pattern_statics)*
                 #(#field_blocks)*
@@ -3351,12 +2171,6 @@ impl RustGenerator {
         }
     }
 
-    /// Generate the `&unique` enforcement checks (#91) for insert/update, run
-    /// before the commit.  Probes the Phase-2 unique index (`<field>_index`):
-    /// on insert any non-empty bucket for the key is a conflict; on update a
-    /// bucket entry for a *different* id is a conflict (the record's own id may
-    /// already be present with an unchanged value — index maintenance runs AFTER
-    /// commit, so the pre-commit index still keys the old value to `id`).
     fn generate_unique_checks(schema: &Schema, model: &forgedb_parser::Model, exclude_self: bool) -> Vec<TokenStream> {
         let mtag = model.name.as_str();
         Self::indexed_fields(model)
@@ -3394,22 +2208,10 @@ impl RustGenerator {
             .collect()
     }
 
-    /// The in-memory index field name for an indexed field, e.g. `email_index`.
     fn index_field_ident(field: &forgedb_parser::Field) -> proc_macro2::Ident {
         format_ident!("{}_index", field.name)
     }
 
-    /// The parameter type a `find_by_<field>` / `get_by_<field>` probe accepts:
-    ///   * `string`               → `&str` (ergonomic)
-    ///   * `string?`              → `Option<&str>` (#102 — `None` probes the unset bucket)
-    ///   * `T?` (other scalar)    → `Option<T>` (#102)
-    ///   * `*Target` FK           → `Uuid` (#100 — the FK is a plain `Uuid`)
-    ///   * `?Target` FK           → `Option<Uuid>` (#100 — `None` probes unlinked rows)
-    ///   * other scalar           → the (Copy) mapped type by value
-    ///
-    /// The arg-side key (`index_key_expr(.., value)`) and record-side key
-    /// (`index_key_expr(.., record.field)`) must serialize identically; the `Option<_>`
-    /// param types above are exactly the record field types, so both agree.
     fn index_param_type(schema: &Schema, field: &forgedb_parser::Field) -> TokenStream {
         use forgedb_parser::FieldType;
         let resolved = Self::resolved_type(schema, &field.field_type);
@@ -3427,15 +2229,6 @@ impl RustGenerator {
         }
     }
 
-    /// The argument expression for a `find_by_<fk>` probe run over a parent key
-    /// bound to `id` (#252).
-    ///
-    /// [`Self::index_param_type`] gives a string-semantic column a `&str`
-    /// parameter — ergonomic, and the reason a probe can be called with a
-    /// literal. A `string(N)` key is string-semantic but arrives at these
-    /// internal call sites *by value* (`InlineStr<N>` is `Copy`), so it has to
-    /// be borrowed here. Every other key type is passed by value, exactly as
-    /// before.
     fn fk_probe_arg(schema: &Schema, parent_model: &str, required: bool) -> TokenStream {
         let borrows = schema
             .find_model(parent_model)
@@ -3449,32 +2242,6 @@ impl RustGenerator {
         }
     }
 
-    /// Pre-transform a field value expression before it is fed to `index_key_expr`,
-    /// so the resulting index key is **scale-invariant** for `decimal` fields.
-    ///
-    /// `rust_decimal::Decimal` preserves scale (`1.0` != `1.00` in `to_string()` /
-    /// serde form) even though they are `Ord`-equal; feeding them raw into
-    /// `index_key_expr` would bucket them separately (the same key-collision class
-    /// #102 fixed for nullable).  `Decimal::normalize()` collapses trailing-zero
-    /// scale, so normalizing both the stored value and the probe argument keys them
-    /// identically.  Nullable decimal normalizes through `.map(...)`; every other
-    /// field type is returned unchanged.
-    /// The quantum a `timestamp` field's values are floored to, when flooring is not
-    /// the identity (#389).
-    ///
-    /// ONE definition, because the quantum is needed by three sites that must agree:
-    /// `index_value_expr` (hash-index key), `ordered_key_expr` (ordered-index key and
-    /// range bounds), and — mirrored, not shared, since it is a different crate —
-    /// `ApiGenerator::generate_filter_check`. Three copies of "what does this field
-    /// floor to" is exactly how the record side and the probe side came to disagree
-    /// in the first place.
-    ///
-    /// `None` for a non-timestamp, and for `timestamp(us)`, whose quantum is 1:
-    /// `floor_to_micros(1)` is a no-op, and the write gate emits no statement for it
-    /// either, so emitting one here would be noise that reads as meaningful.
-    ///
-    /// Unwraps `Nullable` so an optional timestamp gets the same treatment; the
-    /// caller decides whether to apply it through `.map`.
     fn timestamp_floor_quantum(field_type: &forgedb_parser::FieldType) -> Option<i64> {
         let precision = match field_type {
             forgedb_parser::FieldType::Timestamp(p) => p,
@@ -3488,8 +2255,6 @@ impl RustGenerator {
         (quantum > 1).then_some(quantum)
     }
 
-    /// Apply [`Self::timestamp_floor_quantum`] to a value expression, threading
-    /// through `Option` when the field is nullable.
     fn timestamp_floored(
         field_type: &forgedb_parser::FieldType,
         value_expr: TokenStream,
@@ -3510,66 +2275,10 @@ impl RustGenerator {
             forgedb_parser::FieldType::Nullable(inner) if Self::is_decimal_type(inner) => {
                 quote! { (#value_expr).map(|__d| __d.normalize()) }
             }
-            // #389: a `timestamp` field's stored value is floored to its declared
-            // quantum by the write gate, but the PROBE argument was not — so a row
-            // written at 1_234_567_890us was filed under 1_234_567_000 and looked up
-            // as 1_234_567_890, and `find_by_*` returned `[]` for the very value that
-            // had just been written. Silently, which is what made it a data bug rather
-            // than an error.
-            //
-            // Flooring here rather than beside the write gate is what fixes it once:
-            // this hook is applied to the record side AND the probe side of every hash
-            // index, so the two are self-consistent by construction. On the record side
-            // it is a no-op — the value is already aligned and `floor_to_micros` is
-            // idempotent — which is the same reason the `Decimal::normalize` arm above
-            // is safe on both sides.
             _ => Self::timestamp_floored(field_type, value_expr.clone()).unwrap_or(value_expr),
         }
     }
 
-    /// Canonical, **null-distinct** string key for a field value expression.  A
-    /// leading tag byte encodes the JSON type class so values that stringify alike
-    /// can never collide across classes — critically `None` (`\u{0}`) vs the
-    /// literal string `"null"` (`\u{1}null`), the collision that made #90 gate
-    /// nullable/optional-FK fields out (#102).  The tags:
-    ///   `\u{0}`        → JSON null (a `None` / unset optional / unlinked FK)
-    ///   `\u{1}` + raw  → JSON string (raw contents, incl. uuid hyphenated form)
-    ///   `\u{2}` + text → any other scalar (number / bool / byte array) as JSON
-    ///
-    /// The key is internal to the index probes — it is NOT the value the REST
-    /// filter (`<model>_event_matches`) compares by — so tagging is free of any
-    /// cross-path constraint.  Computing it identically for the stored field value
-    /// and the probe argument is what keeps an index hit self-consistent.
-    ///
-    /// # Monomorphic per field type (#230)
-    ///
-    /// This used to emit one type-blind expression for every field: run the value
-    /// through `serde_json::to_value` and `match` the resulting `Value` variant.
-    /// For a `string` field that was three allocations plus a serde dispatch to
-    /// produce a key whose tag was decided at generate time — a runtime match over
-    /// `Value` variants inside *generated* code, which is the shape this project
-    /// exists to avoid.  The emission is now chosen per field type; the key bytes
-    /// were unchanged by that switch, which `tests/index_key_parity_test.rs` proved
-    /// at the time.  That comparison has since been retired (#381) — the keys are
-    /// in-memory and rebuilt at open, so nothing depends on their bytes matching a
-    /// superseded form.
-    ///
-    /// Two arms of the old match were not what they looked like:
-    ///
-    /// * `Err(_) => '\u{3}'` was **dead**.  `to_value` does not fail on a
-    ///   non-finite float — it maps NaN and ±Inf to `Value::Null`, so they took the
-    ///   `\u{0}` arm.  Preserved exactly: a NaN-valued `^f64` keys into the same
-    ///   bucket as `None`.  That is a pre-existing quirk, not one introduced here.
-    /// * `char(N)` is `[u8; N]`, which serde renders as a JSON **array**, so its
-    ///   key is `\u{2}[104,101,...]` — the `other` arm, not a string.  (It also
-    ///   could not compile at all past N = 32, since serde has no `Serialize` for
-    ///   longer arrays.  Nothing here needs `Serialize`, so that limit is gone.)
-    ///
-    /// The `value_expr` is used for BOTH the record side (`record.f`, owning) and
-    /// the probe side (the `index_param_type` argument, borrowing) — `String` vs
-    /// `&str`, `Option<String>` vs `Option<&str>`.  Binding through `&(...)` lets
-    /// deref coercion resolve both, which is why one emitted form serves each side
-    /// and no generic bound or helper function is needed.
     fn index_key_expr(
         schema: &Schema,
         field_type: &forgedb_parser::FieldType,
@@ -3578,19 +2287,12 @@ impl RustGenerator {
         use forgedb_parser::FieldType;
         let field_type = &Self::resolved_type(schema, field_type);
 
-        // Two distinct schema shapes both land in Rust as `Option<_>`: an explicit
-        // `T?` (`Nullable`), and an optional FK `?Target`.  #266 folds the second
-        // into the first — `resolved_type` backs a `?Target` onto
-        // `Nullable(<target key>)` — so the one arm covers both and there is no
-        // second shape left to forget.
         let optional_inner: Option<FieldType> = match field_type {
             FieldType::Nullable(inner) => Some((**inner).clone()),
             _ => None,
         };
 
         if let Some(inner) = optional_inner {
-            // Match on `&Option<_>`, so the bound value is a reference and the
-            // inner emission is identical to the non-nullable one.
             let some_arm = Self::index_key_body(schema, &inner);
             return quote! {
                 match &(#value_expr) {
@@ -3609,34 +2311,17 @@ impl RustGenerator {
         }
     }
 
-    /// The tagged-key body for a **non-nullable** field type, with `__v` already
-    /// bound to a reference to the value.  Split out of [`index_key_expr`] so the
-    /// nullable path reuses it verbatim for its `Some` arm.
-    ///
-    /// Each arm originally reproduced byte-for-byte what `serde_json` produced for
-    /// that type through the pre-#230 expression.  That is history, not a live
-    /// constraint (#381): these keys are in-memory and rebuilt at open, so an arm may
-    /// change shape freely as long as the record side and the probe side keep
-    /// agreeing.  What holds it in place now is the shape assertions in
-    /// `codegen_snapshots.rs` (what is emitted) plus `tests/index_test.rs` (that a
-    /// stored row is still found through the generated `find_by_*`).
     fn index_key_body(schema: &Schema, field_type: &forgedb_parser::FieldType) -> TokenStream {
         use forgedb_parser::FieldType;
         let field_type = &Self::resolved_type(schema, field_type);
 
         match field_type {
-            // --- JSON string class (tag \u{1}) --------------------------------
-            // #238: `string(N)` keys IDENTICALLY to a bare `string` of the same
-            // content, so a column that is later widened (or narrowed) keeps its
-            // index semantics and its existing keys stay meaningful.
             FieldType::String | FieldType::StringN { .. } => quote! {
                 let mut __k = String::with_capacity(1 + __v.len());
                 __k.push('\u{1}');
                 __k.push_str(__v);
                 __k
             },
-            // A uuid renders hyphenated lowercase.  `encode_lower` writes into a
-            // stack buffer, so the key costs one allocation rather than two.
             FieldType::Uuid => quote! {
                 let mut __buf = [0u8; 36];
                 let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
@@ -3645,17 +2330,12 @@ impl RustGenerator {
                 __k.push_str(__s);
                 __k
             },
-            // `rust_decimal` serializes as a string whose contents are its
-            // `Display` form (scale-preserving — normalized upstream by
-            // `index_value_expr`), so write it straight in.
             FieldType::Decimal => quote! {
                 use std::fmt::Write as _;
                 let mut __k = String::from('\u{1}');
                 let _ = write!(__k, "{}", __v);
                 __k
             },
-            // The serde derive serializes an enum as its variant NAME; `__as_str`
-            // is that same name, so the two cannot drift.
             FieldType::Enum(_) => quote! {
                 let __s = __v.__as_str();
                 let mut __k = String::with_capacity(1 + __s.len());
@@ -3664,17 +2344,12 @@ impl RustGenerator {
                 __k
             },
 
-            // --- JSON non-string scalar class (tag \u{2}) ---------------------
             FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64 => quote! {
                 use std::fmt::Write as _;
                 let mut __k = String::from('\u{2}');
                 let _ = write!(__k, "{}", __v);
                 __k
             },
-            // Keyed on the raw microseconds, NOT on the RFC 3339 rendering
-            // (#254).  The wire form changed; storage and index keys did not —
-            // the key is generated on both sides, so it is internal, and micros
-            // keep it fixed-width-comparable and free of a date format.
             FieldType::Timestamp(_) => quote! {
                 use std::fmt::Write as _;
                 let mut __k = String::from('\u{2}');
@@ -3687,20 +2362,12 @@ impl RustGenerator {
                 __k.push_str(if *__v { "true" } else { "false" });
                 __k
             },
-            // Floats key off their total-order `u64` encoding (#242), NOT their
-            // JSON rendering.  JSON has no form for a non-finite, so the old
-            // `serde_json::Number::from_f64` path returned `None` for NaN/±Inf and
-            // fell through to the null tag — putting them in the same bucket as an
-            // unset optional.  The encoding is total, so there is no fall-through
-            // arm here at all; and it makes `-0.0`/`0.0` and every NaN payload key
-            // alike, which the JSON form did not.
             FieldType::F64 => quote! {
                 use std::fmt::Write as _;
                 let mut __k = String::from('\u{2}');
                 let _ = write!(__k, "{}", __forgedb_f64_key(*__v));
                 __k
             },
-            // `char(N)` is `[u8; N]`, which serde renders as a JSON array.
             FieldType::Bytes(_) => quote! {
                 use std::fmt::Write as _;
                 let mut __k = String::from('\u{2}');
@@ -3715,10 +2382,6 @@ impl RustGenerator {
                 __k
             },
 
-            // Not reachable for anything `indexed_fields` admits (it filters on
-            // `is_filterable_scalar` plus the two FK relations, all covered above).
-            // Falling back to the pre-#230 generic form rather than guessing keeps
-            // an unforeseen type correct-but-slow instead of silently mis-keyed.
             _ => quote! {
                 match serde_json::to_value(__v) {
                     Ok(serde_json::Value::Null) => String::from('\u{0}'),
@@ -3738,13 +2401,6 @@ impl RustGenerator {
         }
     }
 
-    /// The field key token for index maintenance (#157 part B): reuse a hoisted
-    /// per-field key local (`__ik_*`, a `String`) when the field participates in
-    /// **more than one** index structure (single + composites), else derive it
-    /// inline. Hoisting a shared field's key computes the expensive
-    /// `serde_json::to_value` + tagged-string derivation ONCE per mutation and
-    /// reuses it (a cheap `String` clone) across every index that needs it; a
-    /// field in only one structure stays inline (byte-identical, no clone).
     fn field_key_token(
         schema: &Schema,
         field: &forgedb_parser::Field,
@@ -3760,11 +2416,6 @@ impl RustGenerator {
         }
     }
 
-    /// Fields whose per-mutation index key is derived more than once — i.e. fields
-    /// appearing in ≥2 index structures (a single index counts as one, each
-    /// composite it's a component of counts as one). These are exactly the fields
-    /// worth hoisting (#157 part B); a field in a single structure has no
-    /// redundancy to eliminate. Returns them in `model.fields` order.
     fn shared_index_key_fields(model: &forgedb_parser::Model) -> Vec<&forgedb_parser::Field> {
         let singles: std::collections::HashSet<&str> =
             Self::indexed_fields(model).iter().map(|f| f.name.as_str()).collect();
@@ -3783,10 +2434,6 @@ impl RustGenerator {
             .collect()
     }
 
-    /// Emit the hoisted `let __ik_… = { <key> };` bindings for a mutation's shared
-    /// index-key fields (#157 part B), keyed off `record_expr`, plus the name→ident
-    /// map `field_key_token` consults. `prefix` disambiguates the add-direction
-    /// (new values) from the remove-direction (old values) within one `update`.
     fn hoist_index_keys(
         schema: &Schema,
         model: &forgedb_parser::Model,
@@ -3806,12 +2453,6 @@ impl RustGenerator {
         (binds, map)
     }
 
-    /// Emit an "add `id` under `key_token`" statement for one index (#157: the key
-    /// is pre-built by the caller — hoisted or inline — not derived here).
-    ///
-    /// #158: the index map is `Arc`-shared with outstanding readers, so a mutation
-    /// goes through `Arc::make_mut` — copy-on-write (clones the map once iff a
-    /// reader still holds the prior snapshot, otherwise mutates in place).
     fn index_add_block(
         receiver: &TokenStream,
         index_ident: &proc_macro2::Ident,
@@ -3826,9 +2467,6 @@ impl RustGenerator {
         }
     }
 
-    /// Emit a "remove `id` from `key_token`" statement for one index, pruning the
-    /// bucket when it empties (structured to avoid a double mutable borrow).
-    /// `Arc::make_mut` gives copy-on-write against outstanding readers (#158).
     fn index_remove_block(
         receiver: &TokenStream,
         index_ident: &proc_macro2::Ident,
@@ -3851,30 +2489,6 @@ impl RustGenerator {
         }
     }
 
-    // --- #169: ordered (range/top-N) secondary index ------------------------
-    //
-    // The hash index above keys by a tagged `String` (exact-match only — string
-    // order ≠ value order, so it cannot serve a range or ordered top-N). For
-    // ordered-eligible fields we additionally build a PARALLEL `BTreeMap` keyed
-    // by the field's **typed value**, which sorts in value order and serves
-    // `WHERE x >= lo [AND x <= hi] ORDER BY x [DESC] LIMIT n` in O(matches). It
-    // is parallel (not a replacement): the exact-match hash path stays untouched
-    // (load-bearing for `&unique` / FK / reverse-FK / scan-pushdown), and the
-    // extra per-write `BTreeMap` insert is negligible against the fsync barrier.
-
-    /// The Rust type an ordered index's `BTreeMap` is **keyed by** for `field`, or
-    /// `None` if the field is not ordered-eligible. Eligible: non-nullable
-    /// `u32/u64/i32/i64/timestamp/decimal/f64`. Excluded: nullable (deferred),
-    /// strings/uuid/enum/bool/json/FK (either unordered or exact-match by nature).
-    ///
-    /// For every type but `f64` this is the field's own value type. `f64` has no
-    /// `Ord`, so it is keyed by its total-order `u64` encoding (#242) — which is
-    /// why this is *not* also the range methods' parameter type; see
-    /// [`ordered_param_type`](Self::ordered_param_type).
-    ///
-    /// Must agree with `FieldType::supports_range_queries` in `forgedb-parser`,
-    /// which reports the same answer to users as migration prose. The drift guard
-    /// `ordered_key_type_agrees_with_parser_range_support` pins them together.
     fn ordered_key_type(field: &forgedb_parser::Field) -> Option<TokenStream> {
         use forgedb_parser::FieldType;
         if field.is_nullable() {
@@ -3887,20 +2501,11 @@ impl RustGenerator {
             FieldType::I64 => Some(quote! { i64 }),
             FieldType::Timestamp(_) => Some(quote! { Timestamp }),
             FieldType::Decimal => Some(quote! { rust_decimal::Decimal }),
-            // Keyed by `__forgedb_f64_key(v)`, not by the float itself.
             FieldType::F64 => Some(quote! { u64 }),
             _ => None,
         }
     }
 
-    /// The type an ordered-index range method takes its `min`/`max` bounds in —
-    /// what the *caller* passes, as opposed to what the map is keyed by.
-    ///
-    /// These are the same for every type except `f64`, whose key is an encoded
-    /// `u64` (#242): a range method taking `Option<u64>` bit patterns would be
-    /// unusable, so the bound stays an `f64` and is encoded on the way in. That is
-    /// sound because the encoding is monotonic — a bound comparison over encoded
-    /// keys answers the same question as one over the floats.
     fn ordered_param_type(field: &forgedb_parser::Field) -> Option<TokenStream> {
         match &field.field_type {
             forgedb_parser::FieldType::F64 if !field.is_nullable() => Some(quote! { f64 }),
@@ -3908,8 +2513,6 @@ impl RustGenerator {
         }
     }
 
-    /// The indexed fields that also get an ordered index (#169) — the subset of
-    /// `indexed_fields` whose type is ordered-eligible.
     fn ordered_index_fields(model: &forgedb_parser::Model) -> Vec<&forgedb_parser::Field> {
         Self::indexed_fields(model)
             .into_iter()
@@ -3917,36 +2520,18 @@ impl RustGenerator {
             .collect()
     }
 
-    /// The ordered index map identifier for `field` (`<field>_ordered`).
     fn ordered_index_ident(field: &forgedb_parser::Field) -> proc_macro2::Ident {
         format_ident!("{}_ordered", field.name)
     }
 
-    /// The typed ordered-index key for a field value expression — the value
-    /// itself, `decimal` normalized (scale-invariant, matching the hash index's
-    /// `index_value_expr`) so `1.0` and `1.00` share a bucket / bound, and `f64`
-    /// run through its total-order encoding (#242) since it has no `Ord`.
-    ///
-    /// This is applied to the stored value AND to each range bound, which is what
-    /// keeps a bound comparable to what it is bounding.
     fn ordered_key_expr(field_type: &forgedb_parser::FieldType, value_expr: TokenStream) -> TokenStream {
         match field_type {
             forgedb_parser::FieldType::Decimal => quote! { (#value_expr).normalize() },
             forgedb_parser::FieldType::F64 => quote! { __forgedb_f64_key(#value_expr) },
-            // #389, the ordered peer. Only the `min` bound actually moves: stored keys
-            // are all multiples of the quantum, so `Included(t)` and `Included(floor(t))`
-            // admit exactly the same multiples at the `max` end. At the `min` end they do
-            // not — `Included(t)` excludes the bucket `floor(t)` sits in — which is why
-            // `find_by_t_at_range(Some(t), Some(t), ..)` returned `[]` for the same value
-            // `find_by_t_at(t)` missed. Applied to the stored value and to each bound, so
-            // a bound stays comparable to what it is bounding.
             _ => Self::timestamp_floored(field_type, value_expr.clone()).unwrap_or(value_expr),
         }
     }
 
-    /// Add `id` under `field`'s typed value to its ordered index (#169), the
-    /// `BTreeMap`/`BTreeSet` peer of `index_add_block`.  `Arc::make_mut` gives the
-    /// same copy-on-write-against-readers discipline (#158).
     fn ordered_index_add_block(
         receiver: &TokenStream,
         index_ident: &proc_macro2::Ident,
@@ -3963,8 +2548,6 @@ impl RustGenerator {
         }
     }
 
-    /// Remove `id` from `field`'s ordered index bucket (#169), pruning an emptied
-    /// bucket — the `BTreeMap` peer of `index_remove_block`.
     fn ordered_index_remove_block(
         receiver: &TokenStream,
         index_ident: &proc_macro2::Ident,
@@ -3987,9 +2570,6 @@ impl RustGenerator {
         }
     }
 
-    /// Ordered-index ADD blocks (#169), one per ordered-eligible field, keyed by
-    /// the field's typed value read from `record_expr` (e.g. `record` / `__rec`).
-    /// The `BTreeMap` peer of the single-field `index_add_block` maintenance loop.
     fn ordered_index_add_maint(
         model: &forgedb_parser::Model,
         recv: &TokenStream,
@@ -4007,8 +2587,6 @@ impl RustGenerator {
             .collect()
     }
 
-    /// Ordered-index REMOVE blocks (#169), one per ordered-eligible field, keyed by
-    /// the field's typed value read from `record_expr` (the pre-mutation record).
     fn ordered_index_remove_maint(
         model: &forgedb_parser::Model,
         recv: &TokenStream,
@@ -4026,12 +2604,6 @@ impl RustGenerator {
             .collect()
     }
 
-    /// The composite `@index(a, b, …)` indexes of a model (#101), resolved to their
-    /// component `&Field`s.  A composite is emitted only when the model has an
-    /// identity field, has ≥2 components, and **every** component resolves to an
-    /// indexable scalar or FK field (same eligibility as a single-field index);
-    /// an unresolvable or non-scalar component skips the whole composite (the
-    /// schema validator is the place to hard-error — here we skip defensively).
     fn composite_indexes(
         model: &forgedb_parser::Model,
     ) -> Vec<(proc_macro2::Ident, Vec<&forgedb_parser::Field>)> {
@@ -4063,9 +2635,6 @@ impl RustGenerator {
             .collect()
     }
 
-    /// Whether a field type may be a component of a composite index: the same set
-    /// a single-field index accepts — a filterable scalar (incl. `Nullable`, #102)
-    /// or an FK reference (`*Target` / `?Target`, #100).
     fn is_composite_component(field_type: &forgedb_parser::FieldType) -> bool {
         Self::is_filterable_scalar(field_type)
             || matches!(
@@ -4077,7 +2646,6 @@ impl RustGenerator {
             )
     }
 
-    /// The base name of a composite index probe, e.g. `find_by_status_and_created_at`.
     fn composite_probe_ident(components: &[&forgedb_parser::Field]) -> proc_macro2::Ident {
         let joined = components
             .iter()
@@ -4087,9 +2655,6 @@ impl RustGenerator {
         format_ident!("find_by_{}", joined)
     }
 
-    /// Build a collision-free composite key from N per-component key expressions.
-    /// Each component's null-distinct `index_key_expr` string is length-prefixed
-    /// (`<byte-len>:<key>`), so `("ab","c")` and `("a","bc")` can never collide.
     fn composite_key_build(part_key_exprs: &[TokenStream]) -> TokenStream {
         let pushes = part_key_exprs.iter().map(|k| {
             quote! {
@@ -4110,8 +2675,6 @@ impl RustGenerator {
         }
     }
 
-    /// Emit an "add `id` under the composite key" statement (#157: the per-part
-    /// key tokens are pre-built by the caller — hoisted or inline).
     fn composite_add_block(
         receiver: &TokenStream,
         index_ident: &proc_macro2::Ident,
@@ -4127,8 +2690,6 @@ impl RustGenerator {
         }
     }
 
-    /// Emit a "remove `id` from the composite key" statement, pruning empty buckets.
-    /// `Arc::make_mut` gives copy-on-write against outstanding readers (#158).
     fn composite_remove_block(
         receiver: &TokenStream,
         index_ident: &proc_macro2::Ident,
@@ -4152,7 +2713,6 @@ impl RustGenerator {
         }
     }
 
-    /// Generate storage field declarations for columnar storage
     fn generate_storage_fields(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let mut column_fields = Vec::new();
 
@@ -4168,18 +2728,10 @@ impl RustGenerator {
                     #field_col_name: VariableColumn
                 });
             }
-            // Skip relations and other non-storage types
         }
 
         let id_type = Self::id_type_tokens(schema, model);
 
-        // Secondary index fields (#90): one `value-key -> {id}` map per `^index`
-        // / `&unique` scalar field, maintained alongside `id_to_row`.
-        //
-        // #158: each map is `Arc`-wrapped so `reader()` shares it structurally
-        // (O(1) `Arc::clone`) instead of deep-cloning O(rows) per capture; the
-        // writer mutates via `Arc::make_mut` (copy-on-write only while a reader
-        // still holds the previous snapshot — see `index_add_block`).
         let index_fields: Vec<_> = Self::indexed_fields(model)
             .iter()
             .map(|f| {
@@ -4190,9 +2742,6 @@ impl RustGenerator {
             })
             .collect();
 
-        // Composite `@index(a, b)` fields (#101): same `key -> {id}` shape, keyed
-        // by the collision-free length-prefixed composite key.  Same `Arc` share
-        // discipline as the single-field maps (#158).
         let composite_fields: Vec<_> = Self::composite_indexes(model)
             .iter()
             .map(|(ident, _comps)| {
@@ -4202,8 +2751,6 @@ impl RustGenerator {
             })
             .collect();
 
-        // #169: parallel ordered index — a `BTreeMap` keyed by the field's typed
-        // value (value order, not string order) so it serves range + top-N.
         let ordered_fields: Vec<_> = Self::ordered_index_fields(model)
             .iter()
             .map(|f| {
@@ -4215,24 +2762,12 @@ impl RustGenerator {
             })
             .collect();
 
-        // #159: per-id ascending list of that id's physical row versions.  Snapshot
-        // reads (`get_at`/`all_at`/`find_by_*_at`) binary-search it for the newest
-        // version `< watermark` — O(log versions) instead of an O(watermark) id
-        // scan (which made the FK snapshot-probe O(candidates × watermark)).
-        // Appended in lockstep with `id_to_row` (monotonic row_count ⇒ each vec
-        // stays sorted for free); Arc-shared into readers (#158).  Id-bearing only.
         let id_versions_field = if model.identity_field().is_some() {
             quote! { id_versions: std::sync::Arc<HashMap<#id_type, Vec<usize>>>, }
         } else {
             quote! {}
         };
 
-        // #187: one monotonic counter per `+u32`/`+u64` field.  `Arc<AtomicU64>`
-        // for the same reason the index maps are `Arc`ed — `compact()` does
-        // `*self = Self::new_at_no_rehydrate(..)`, and the counter has to be
-        // carried across that reset rather than silently rebuilt at zero.
-        // Always `u64` regardless of the field's width; the width only decides
-        // where `__alloc_*` refuses to go further.
         let autoseq_fields: Vec<_> = Self::sequence_auto_fields(model)
             .iter()
             .map(|f| {
@@ -4251,63 +2786,22 @@ impl RustGenerator {
             #(#ordered_fields,)*
             #(#autoseq_fields,)*
             tombstones: forgedb_storage::Tombstones,
-            // Write-ahead log (#89 durable write path): every mutation records an
-            // opaque row blob here + fsync BEFORE touching columns, so a crash
-            // mid-append is recovered on reopen.  The WAL stores bytes only — it
-            // never decodes a field (identity: schema-agnostic substrate).
             wal: forgedb_wal::WalManager,
-            // Mutations recorded to the WAL since the last checkpoint (#89 step
-            // 2).  When it reaches `WAL_CHECKPOINT_INTERVAL`, `checkpoint()` runs:
-            // columns are fsync'd and the WAL is truncated, bounding it.
             writes_since_checkpoint: u64,
-            // Data root this storage was opened at (#92 Phase 4).  Remembered so
-            // in-process compaction can rewrite this model's files under it and
-            // then reopen the column handles from the compacted files.
             root: std::path::PathBuf,
-            // Dead (superseded/tombstoned) row versions accumulated since the last
-            // compaction (#92 Phase 4).  When it reaches `COMPACTION_DEAD_THRESHOLD`,
-            // `compact()` reclaims them under the writer lock.  Incremented by
-            // update/delete only — an insert creates no dead version.
             dead_since_compaction: u64,
-            // Transaction critical-section guard (MVCC Tier 1, #83).  Set while a
-            // `TxHandle` stages into this collection.  Auto-checkpoint (#96) and
-            // auto-compaction (#92) MUST NOT fire mid-transaction — a checkpoint
-            // would truncate the per-model WAL underneath the rollback, and a
-            // compaction would renumber rows underneath the rollback marks.  While
-            // set, the auto-triggers only RECORD that they are due (`*_deferred`
-            // below); `TxHandle::commit`/rollback runs any pending trigger once
-            // after the critical section closes.
             in_transaction: bool,
-            // A checkpoint became due while `in_transaction`; deferred (#96).
             checkpoint_deferred: bool,
-            // A compaction became due while `in_transaction`; deferred (#92) so it
-            // never renumbers rows a live transaction's marks refer to.
             compact_deferred: bool,
-            // #162-A: a compaction became due on the normal (non-transaction) write
-            // path but was NOT run inline — the soft threshold now only RECORDS that
-            // reclaim is due and returns, so the triggering write does not eat the
-            // rewrite+remap stall.  `Database::maintain()` runs it off the hot write
-            // turn; a hard ceiling (`COMPACTION_DEAD_THRESHOLD * COMPACTION_DEAD_CEILING_FACTOR`)
-            // still forces an inline compaction as a growth-bounding safety net if
-            // `maintain()` is never called.
             compaction_due: bool,
-            // Change-feed handle (#62 Direction A): `None` for standalone use;
-            // `Database::new()` attaches a shared feed so `insert` can emit.
             changefeed: Option<forgedb_changefeed::ChangeFeed>,
-            // Durable replication broker (#82 Direction C): `None` for standalone
-            // use; `Database::open_at()` attaches a shared, offset-addressed broker
-            // so each mutation is durably recorded for a resumable follower (#110).
-            // Shared across every collection behind an `Arc<Mutex<..>>` so one
-            // global offset sequences changes across models.
             broker: Option<std::sync::Arc<std::sync::Mutex<forgedb_changefeed::durable::DurableBroker>>>,
         }
     }
 
-    /// Generate storage initialization code
     fn generate_storage_inits(model: &forgedb_parser::Model, schema: &Schema) -> TokenStream {
         let mut inits = Vec::new();
         let mut column_index = 0usize;
-        // Namespace all storage paths under the model name to prevent collision
         let model_snake = Self::to_snake_case(&model.name);
 
         for field in &model.fields {
@@ -4320,7 +2814,6 @@ impl RustGenerator {
                     Self::type_name(schema, &field.field_type),
                     column_index
                 );
-                // C3: emit size_of in generated code so column size matches the Rust type
                 let value_size_expr =
                     Self::column_value_size_expr(schema, &field.field_type, Self::is_utf8_field(field));
 
@@ -4345,16 +2838,9 @@ impl RustGenerator {
             }
         }
 
-        // Every column/tombstone path is joined under `root` — the data-dir the
-        // enclosing `new_at(root)` was handed.  `new()` passes `.` (CWD), so the
-        // no-arg path is byte-for-byte the old CWD-relative behavior; a per-tenant
-        // process (#59) passes that tenant's dir.  `root` is a plain value threaded
-        // through generated code — the substrate never learns the word "tenant".
         let tombstones_path = format!("{}/tombstones.bin", model_snake);
         let wal_path = format!("{}/wal.log", model_snake);
 
-        // Empty secondary indexes (#90); `new_at` rebuilds them from committed
-        // rows via `#rehydrate_logic` right after recovery.
         let index_inits: Vec<_> = Self::indexed_fields(model)
             .iter()
             .map(|f| {
@@ -4363,7 +2849,6 @@ impl RustGenerator {
             })
             .collect();
 
-        // Composite index maps (#101), also rebuilt by `#rehydrate_logic`.
         let composite_inits: Vec<_> = Self::composite_indexes(model)
             .iter()
             .map(|(ident, _comps)| {
@@ -4371,7 +2856,6 @@ impl RustGenerator {
             })
             .collect();
 
-        // Empty ordered indexes (#169), also rebuilt by `#rehydrate_logic`.
         let ordered_inits: Vec<_> = Self::ordered_index_fields(model)
             .iter()
             .map(|f| {
@@ -4380,21 +2864,14 @@ impl RustGenerator {
             })
             .collect();
 
-        // WAL fsync policy (#129, epic #126): default `Always` (byte-identical);
-        // configurable via `[storage].fsync`.
         let wal_fsync = Self::wal_fsync_policy_tokens();
 
-        // #159: empty per-id version index, rebuilt by `#rehydrate_logic` on reopen.
         let id_versions_init = if model.identity_field().is_some() {
             quote! { id_versions: std::sync::Arc::new(HashMap::new()), }
         } else {
             quote! {}
         };
 
-        // #187: counters start at 0 (nothing allocated).  `new_at` seeds them from
-        // `max(manifest floor, scanned max)` in `#rehydrate_logic`; the
-        // no-rehydrate constructor leaves them here at 0 and `compact()` reinstalls
-        // the live values across its `*self =` reset.
         let autoseq_inits: Vec<_> = Self::sequence_auto_fields(model)
             .iter()
             .map(|f| {
@@ -4415,19 +2892,13 @@ impl RustGenerator {
             tombstones: forgedb_storage::Tombstones::new(
                 root.join(#tombstones_path)
             ).expect("Failed to create tombstones"),
-            // One WAL per model, namespaced under the same data root (#89).
-            // The fsync policy (`Always` by default) makes each commit record
-            // durable before the columns are appended — the crash-durability
-            // boundary.
             wal: forgedb_wal::WalManager::open(
                 root.join(#wal_path),
                 #wal_fsync,
             ).expect("Failed to open WAL"),
             writes_since_checkpoint: 0,
-            // Remember the data root so `compact()` can rewrite + reopen files (#92).
             root: root.to_path_buf(),
             dead_since_compaction: 0,
-            // Not in a transaction on open; the txn guard sets these (MVCC Tier 1).
             in_transaction: false,
             checkpoint_deferred: false,
             compact_deferred: false,
@@ -4437,13 +2908,6 @@ impl RustGenerator {
         }
     }
 
-    /// Generate the read-only reader column field declarations (#56 Direction B).
-    ///
-    /// Mirrors `generate_storage_fields` field-for-field, but every column is the
-    /// read-only `*Reader` variant sharing the writer's file descriptor.  No
-    /// `row_count` / `changefeed` (a reader never appends and never emits); it
-    /// keeps `id_to_row` only because a no-id model's `get_at` consults it (an
-    /// id-bearing model's snapshot reads scan the id column instead).
     fn generate_reader_storage_fields(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let mut column_fields = Vec::new();
         for field in &model.fields {
@@ -4459,15 +2923,6 @@ impl RustGenerator {
             }
         }
         let id_type = Self::id_type_tokens(schema, model);
-        // Index maps (#103): the reader carries a point-in-time snapshot of every
-        // secondary + composite index, captured on the writer at `reader()` time
-        // (same instant its column readers open), so its `_at` probes are O(1)
-        // like the writer's.  Same field names/types as the writer storage.
-        //
-        // #158: shared via `Arc` (not a deep clone) — the reader's snapshot is the
-        // exact map the writer held at capture, made immutable by structural
-        // sharing; a later writer mutation copies-on-write, leaving this snapshot
-        // untouched.  Probe reads (`.get`) deref straight through the `Arc`.
         let index_fields: Vec<_> = Self::indexed_fields(model)
             .iter()
             .map(|f| {
@@ -4485,8 +2940,6 @@ impl RustGenerator {
                 }
             })
             .collect();
-        // #159: the reader shares the per-id version index too (Arc, #158), so its
-        // snapshot `_at` probes binary-search like the writer's.  Id-bearing only.
         let id_versions_field = if model.identity_field().is_some() {
             quote! { id_versions: std::sync::Arc<HashMap<#id_type, Vec<usize>>>, }
         } else {
@@ -4502,9 +2955,6 @@ impl RustGenerator {
         }
     }
 
-    /// Build a `*StorageReader` literal from `&self` writer storage (#56
-    /// Direction B): each column shares the writer's fd via `col.reader()`;
-    /// `id_to_row` is cloned so a no-id model's `get_at` still resolves.
     fn generate_reader_inits(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let mut inits = Vec::new();
         for field in &model.fields {
@@ -4518,12 +2968,6 @@ impl RustGenerator {
                 });
             }
         }
-        // Share every index map (#103/#158) — captured on the single writer, off
-        // the mutation path (same discipline as `id_to_row` and
-        // `DatabaseSnapshot::snapshot()`), so the reader's view is coherent with
-        // its column readers.  `Arc::clone` is O(1) (a refcount bump, no data
-        // copy); the map became immutable to this reader the instant it was
-        // captured — a later writer mutation copies-on-write (`Arc::make_mut`).
         let index_clones: Vec<_> = Self::indexed_fields(model)
             .iter()
             .map(|f| {
@@ -4537,8 +2981,6 @@ impl RustGenerator {
                 quote! { #ident: self.#ident.clone() }
             })
             .collect();
-        // #159: share the per-id version index (Arc, O(1) capture) so the reader's
-        // snapshot probes binary-search like the writer's.  Id-bearing only.
         let id_versions_clone = if model.identity_field().is_some() {
             quote! { id_versions: self.id_versions.clone(), }
         } else {
@@ -4555,9 +2997,6 @@ impl RustGenerator {
         }
     }
 
-    /// Emit a `size_of`-based expression for the column's value size so it matches
-    /// the actual Rust type layout (C3).  For complex/struct types we defer to
-    /// `std::mem::size_of::<T>()` evaluated at compile time in the generated code.
     fn column_value_size_expr(
         schema: &Schema,
         field_type: &forgedb_parser::FieldType,
@@ -4565,11 +3004,6 @@ impl RustGenerator {
     ) -> TokenStream {
         let field_type = &Self::resolved_type(schema, field_type);
         match field_type {
-            // #238: an inline string's width is the ONE case that depends on a
-            // directive as well as the type — hence the `utf8` argument. It is
-            // matched before the `Nullable` arm below, which would otherwise
-            // compute `size_of::<Option<String>>()` (24) for a nullable one:
-            // a plausible-looking number, silently unrelated to the column.
             forgedb_parser::FieldType::StringN { chars, exact } => {
                 let (slot, _, _) = Self::inline_string_layout(*chars, *exact, utf8);
                 quote! { #slot }
@@ -4581,15 +3015,9 @@ impl RustGenerator {
                     unreachable!("guarded by the matches! above")
                 };
                 let (slot, _, _) = Self::inline_string_layout(chars, exact, utf8);
-                // One leading presence byte, so `None` and `Some("")` round-trip
-                // distinctly — the same encoding every other nullable column on
-                // this path uses.
                 let slot = slot + 1;
                 quote! { #slot }
             }
-            // enum: a 1-byte discriminant column (`__to_u8`/`__from_u8`), or a
-            // 2-byte `[present, disc]` column for nullable enum — both stored via
-            // an explicit `append_bytes`/`read_bytes` path (never `read_unaligned`).
             _ if Self::is_enum_type(field_type) => {
                 if matches!(field_type, forgedb_parser::FieldType::Nullable(_)) {
                     quote! { 2usize }
@@ -4610,37 +3038,27 @@ impl RustGenerator {
                 quote! { std::mem::size_of::<Option<#inner_tokens>>() }
             }
             _ => {
-                // For all other fixed-size types the constant is authoritative
                 let size = match field_type {
                     forgedb_parser::FieldType::U32 | forgedb_parser::FieldType::I32 => 4usize,
                     forgedb_parser::FieldType::U64 | forgedb_parser::FieldType::I64 => 8,
                     forgedb_parser::FieldType::F64 => 8,
                     forgedb_parser::FieldType::Bool => 1,
-                    // enum = 1-byte u8 discriminant.
                     forgedb_parser::FieldType::Enum(_) => 1,
                     forgedb_parser::FieldType::Uuid => 16,
-                    // decimal = rust_decimal::Decimal, a fixed 16-byte value
-                    // (Decimal::serialize() -> [u8; 16]).
                     forgedb_parser::FieldType::Decimal => 16,
                     forgedb_parser::FieldType::Timestamp(_) => 8,
                     forgedb_parser::FieldType::Bytes(n) => *n,
                     forgedb_parser::FieldType::FixedArray(inner, count) => {
-                        // Fall back to map_field_type_ident for array sizing
                         let inner_tokens = Self::map_field_type_ident(schema, inner);
                         return quote! { std::mem::size_of::<[#inner_tokens; #count]>() };
                     }
-                    _ => 8, // Default
+                    _ => 8,
                 };
                 quote! { #size }
             }
         }
     }
 
-    /// Map a field type to the substrate `ColumnType` for the per-model layout
-    /// manifest (#57).  Primitives map to their exact variant; every other
-    /// fixed-size type (char(N), fixed array, struct, nullable-fixed, optional
-    /// FK) is a `FixedBytes(width)` — a physical byte-width fact, never schema
-    /// semantics.  Variable strings are handled by the caller (`ColumnType::String`).
     fn storage_column_type_tokens(
         schema: &Schema,
         field_type: &forgedb_parser::FieldType,
@@ -4657,7 +3075,6 @@ impl RustGenerator {
             FieldType::Bool => quote! { forgedb_storage::ColumnType::Bool },
             FieldType::Uuid => quote! { forgedb_storage::ColumnType::Uuid },
             FieldType::Timestamp(_) => quote! { forgedb_storage::ColumnType::Timestamp },
-            // Any remaining fixed-size type is opaque fixed bytes of its width.
             _ => {
                 let size = Self::column_value_size_expr(schema, field_type, utf8);
                 quote! { forgedb_storage::ColumnType::FixedBytes(#size) }
@@ -4665,36 +3082,6 @@ impl RustGenerator {
         }
     }
 
-    /// Generate the per-model layout `manifest.json` writer (#57).  Emits a
-    /// `write_manifest` method describing *physical* column layout only —
-    /// index, `ColumnType`, `value_size`, fixed/variable kind, and the file
-    /// path relative to the model dir — plus a `row_anchor` naming the file
-    /// whose length counts committed rows (`tombstones.bin`, 1 byte/row).  It
-    /// carries **no** schema semantics (no relations/directives/validation).
-    /// Called from `new()`, off the insert hot path; the manifest's first
-    /// reader is schema-blind backup (#57) / the inspector (#63).
-    ///
-    /// INCREMENTAL-BACKUP CHAIN TOKEN (#76): `compaction_epoch` is the
-    /// chain-validity generation counter.  Within one epoch the columns are
-    /// strictly append-only, so an incremental backup can ship just the byte
-    /// tail appended since the base.  A compaction renumbers rows and so *breaks*
-    /// the chain — `compact()` bumps the epoch, and an incremental against a base
-    /// in a different epoch is refused.  Because `write_manifest` runs on *every*
-    /// reopen, it must NOT hardcode the epoch (that would clobber a bumped epoch
-    /// back to 0 on the next open and silently corrupt a chain); instead it
-    /// *loads any existing manifest and preserves* its `compaction_epoch`,
-    /// stamping the baseline `0` only for a fresh directory.
-    /// Per-field allocators for `+u32`/`+u64` fields (#187).
-    ///
-    /// A compare-exchange loop rather than `fetch_add`, because `fetch_add`
-    /// **wraps**: at `u64::MAX` it would silently roll to `0` — which is also the
-    /// allocate sentinel — and start colliding with every value ever issued. The
-    /// loop refuses at the field's own width instead, so a `+u32` stops at
-    /// `u32::MAX` rather than at the counter's.
-    ///
-    /// Lock-free by necessity, not preference: Tier 2's `transaction_concurrent`
-    /// runs its prepare closure with **no write lock held**, so two threads are
-    /// genuinely inside this at once.
     fn generate_autoseq_methods(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let model_name = &model.name;
         let timestamp_methods: Vec<TokenStream> = Self::timestamp_key_field(model)
@@ -4702,21 +3089,7 @@ impl RustGenerator {
             .map(|f| {
                 let alloc = Self::autoseq_alloc_ident(f);
                 let seq = Self::autoseq_field_ident(f);
-                let doc = format!(
-                    "Allocate the next `{}.{}` value (#254): `max(now_micros, last + 1)`.\n\n\
-                     Precision does NOT make a timestamp key unique — at any \
-                     precision two rows created in the same tick read the same \
-                     clock, and ForgeDB resolves duplicate ids as superseding \
-                     versions, so a collision is a SILENT overwrite. Monotonic \
-                     allocation is what guarantees uniqueness; the declared \
-                     precision only governs how far the counter drifts ahead of \
-                     the wall clock under a burst, which is fidelity, not \
-                     correctness. Never rewinds, so the clock has to catch up in \
-                     real time — the argument for the `us` floor.",
-                    model.name, f.name
-                );
                 quote! {
-                    #[doc = #doc]
                     fn #alloc(&self) -> Result<Timestamp, ValidationError> {
                         use std::sync::atomic::Ordering;
                         let mut __cur = self.#seq.load(Ordering::SeqCst);
@@ -4744,14 +3117,7 @@ impl RustGenerator {
                 let seq = Self::autoseq_field_ident(f);
                 let field_name = &f.name;
                 let ty = Self::map_field_type_ident(schema, &f.field_type);
-                let doc = format!(
-                    "Allocate the next `{}.{}` value (#187). Monotonic and unique, \
-                     never contiguous — a rolled-back or `Nack`ed attempt burns its \
-                     number, the same contract Postgres and MySQL offer.",
-                    model.name, f.name
-                );
                 quote! {
-                    #[doc = #doc]
                     fn #alloc(&self) -> Result<#ty, ValidationError> {
                         use std::sync::atomic::Ordering;
                         const __LIMIT: u64 = #ty::MAX as u64;
@@ -4813,8 +3179,6 @@ impl RustGenerator {
                 col_entries.push(quote! {
                     forgedb_storage::ColumnMetadata {
                         name: #name.to_string(),
-                        // Physical-layout tag only (variable-length column); `json`
-                        // and `string` share the same on-disk representation.
                         column_type: forgedb_storage::ColumnType::String,
                         column_index: #column_index,
                         value_size: 0usize,
@@ -4826,8 +3190,6 @@ impl RustGenerator {
             }
         }
 
-        // One max-merge per auto-integer field (#187).  Empty for every model
-        // with no `+u32`/`+u64` field, which is why this changes no other output.
         let autoseq_merges: Vec<TokenStream> = Self::sequence_auto_fields(model)
             .iter()
             .map(|f| {
@@ -4846,46 +3208,15 @@ impl RustGenerator {
             .collect();
 
         quote! {
-            /// Write the physical-layout manifest for this model (#57).  Layout
-            /// metadata only — schema-blind backup/inspector read it; it carries
-            /// no `.forge` semantics.  Written at open, off the insert hot path.
-            ///
-            /// Returns the write result rather than swallowing it (#187): for a
-            /// model with an integer auto this file is no longer advisory — it
-            /// carries the allocation floor, and the pre-compaction caller must be
-            /// able to refuse the destructive rewrite when it cannot be persisted.
-            /// Callers for whom it *is* advisory discard the result explicitly.
             fn write_manifest(&self, root: &std::path::Path) -> std::io::Result<()> {
                 let columns = vec![ #(#col_entries),* ];
                 let __manifest_abs = root.join(#manifest_path);
-                // Preserve the incremental-backup chain token (#76): load any
-                // existing manifest and carry its `compaction_epoch` forward, so a
-                // reopen never clobbers a bumped epoch back to 0.  Baseline 0 for a
-                // fresh directory (no manifest yet).
                 let __compaction_epoch = forgedb_storage::Manifest::load_from(&__manifest_abs)
                     .map(|m| m.compaction_epoch)
                     .unwrap_or(0);
-                // Preserve the on-disk format version (#74 Phase 1) exactly as the
-                // `compaction_epoch` above: a reopen must NOT clobber a version a
-                // migration bumped (that would silently defeat the open-time guard
-                // and let stale bytes be mis-decoded).  A fresh directory is stamped
-                // with this binary's `EXPECTED_SCHEMA_VERSION` baseline, so a dir
-                // this binary writes always matches its own expectation.
                 let __schema_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
                     .map(|m| m.schema_version)
                     .unwrap_or(EXPECTED_SCHEMA_VERSION);
-                // Auto-increment high-water marks (#187).  This is a **max-merge**,
-                // NOT the carry-forward the two fields above do — and the
-                // difference is load-bearing.
-                //
-                // `compact()` does `*self = Self::new_at_no_rehydrate(&root)`, and
-                // that constructor calls this method while every counter is still
-                // freshly zeroed.  A carry-forward would be fine there but would
-                // lose a live tip elsewhere; a plain write of `self` would clobber
-                // the persisted value with `0` and re-issue every id after the next
-                // restart.  Taking the max makes the stored number a hint that only
-                // ever moves up, so the zeroed intermediate write is harmless and
-                // no ordering discipline is required of the caller.
                 let __persisted_seqs = forgedb_storage::Manifest::load_from(&__manifest_abs)
                     .map(|m| m.auto_sequences)
                     .unwrap_or_default();
@@ -4896,17 +3227,9 @@ impl RustGenerator {
                     row_count: self.row_count,
                     columns,
                     wal_enabled: false,
-                    // Observability only (#89 step 2): rows durable on disk at open
-                    // (== row_count — recovery already realigned the columns).  NOT
-                    // load-bearing for recovery, which reads the column lengths.
                     last_checkpoint: self.row_count as u64,
                     compaction_epoch: __compaction_epoch,
                     schema_version: __schema_version,
-                    // Stamped, not carried forward (#254).  The open-guard above
-                    // has already established that this dir is at THIS binary's
-                    // generation or is fresh, so there is nothing older to
-                    // preserve — and no migration bumps the generation in place:
-                    // `forgedb migrate engine` writes a new dir.
                     engine_version: EXPECTED_ENGINE_VERSION,
                     row_anchor: Some(forgedb_storage::RowAnchor {
                         relative_path: "tombstones.bin".to_string(),
@@ -4917,11 +3240,6 @@ impl RustGenerator {
                 manifest.save_to(&__manifest_abs)
             }
 
-            /// Bump this model's `compaction_epoch` (#76): compaction renumbers
-            /// rows, breaking the append-only byte-tail chain incremental backups
-            /// rely on, so the epoch is incremented to invalidate any incremental
-            /// taken against a pre-compaction base.  Reads + rewrites the manifest
-            /// (temp + rename via `save_to`); best-effort, off the hot path.
             fn bump_compaction_epoch(&self, root: &std::path::Path) {
                 let __manifest_abs = root.join(#manifest_path);
                 if let Ok(mut __m) = forgedb_storage::Manifest::load_from(&__manifest_abs) {
@@ -4932,15 +3250,6 @@ impl RustGenerator {
         }
     }
 
-    /// Generate insert method logic
-    /// Generate the per-field column-append statements for one row.
-    ///
-    /// Reads each stored field from a local `record` binding and appends it to the
-    /// matching column, in declared order.  Shared by `insert` (appends the new
-    /// record), `update` (appends the superseding version), and `delete` (re-appends
-    /// the current values under a tombstone) so all three stay byte-for-byte
-    /// consistent about column encoding — the whole point of the append-only /
-    /// superseding-version model (#66).
     fn generate_append_statements(schema: &Schema, model: &forgedb_parser::Model) -> Vec<TokenStream> {
         let mut append_statements = Vec::new();
 
@@ -4950,17 +3259,6 @@ impl RustGenerator {
 
             if Self::is_json_type(&field.field_type) {
                 if field.is_nullable() {
-                    // Nullable json (`json?` -> Option<serde_json::Value>).  Encode
-                    // with a 1-byte presence tag so `None` and `Some(Value::Null)`
-                    // round-trip distinctly (0x00 = None, 0x01 = Some), then store
-                    // the serialized JSON (always valid UTF-8) as a variable-length
-                    // string — the same column machinery `string` uses.
-                    //
-                    // `append_tagged` writes the tag byte and the value from their
-                    // own slices (#231), so neither arm allocates a tagged copy —
-                    // the `None` arm writes one known byte and nothing else.  The
-                    // stored bytes are identical to the concatenation this used to
-                    // build.
                     append_statements.push(quote! {
                         {
                             match &record.#field_name {
@@ -4987,14 +3285,6 @@ impl RustGenerator {
             } else if let Some((chars, exact)) =
                 Self::inline_string_column_params(schema, &field.field_type)
             {
-                // Inline `string(N)` (#238): pack the value into its fixed slot.
-                // #252: *resolved*, so an FK to a string-keyed model packs its
-                // key here too rather than falling through to the generic fixed
-                // path below, whose typed-method arm would name a column method
-                // (`append_inline_string`) that does not exist.
-                // This branch must precede the generic fixed-size one below, whose
-                // `needs_byte_conversion` path transmutes the Rust value's bytes —
-                // which for a `String` would persist a pointer.
                 let utf8 = Self::is_utf8_field(field);
                 let (slot, _, _) = Self::inline_string_layout(chars, exact, utf8);
                 if field.is_nullable() {
@@ -5036,15 +3326,6 @@ impl RustGenerator {
                 }
             } else if Self::is_variable_string_type(&field.field_type) {
                 if field.is_nullable() {
-                    // Nullable string (`string?` -> Option<String>).  Encode with a
-                    // 1-byte presence tag so `None` and `Some("")` round-trip
-                    // distinctly (0x00 = None, 0x01 = Some), then store as an
-                    // ordinary variable-length string.
-                    //
-                    // `append_tagged` writes the tag byte and the value from their
-                    // own slices (#231), so the `Some` arm no longer allocates and
-                    // copies the whole string just to prepend a byte, and the
-                    // `None` arm allocates nothing at all.  Stored bytes unchanged.
                     append_statements.push(quote! {
                         {
                             match &record.#field_name {
@@ -5061,9 +3342,6 @@ impl RustGenerator {
                     });
                 }
             } else if Self::is_enum_type(&field.field_type) {
-                // Enum (#enum): store the 1-byte discriminant via the generated
-                // `__to_u8`.  Nullable enum stores a 2-byte `[present, disc]` so
-                // `None` and `Some(variant-0)` round-trip distinctly.
                 if field.is_nullable() {
                     append_statements.push(quote! {
                         {
@@ -5082,10 +3360,6 @@ impl RustGenerator {
                     });
                 }
             } else if Self::is_fixed_size_type(schema, &field.field_type) {
-                // Complex types that persist as a raw byte blob.  #266: an
-                // optional FK is not named here any more — `resolved_type` backs
-                // it onto `Nullable(<target key>)`, so it arrives as an ordinary
-                // nullable column.
                 let needs_byte_conversion = matches!(
                     &Self::resolved_type(schema, &field.field_type),
                     forgedb_parser::FieldType::Bytes(_)
@@ -5096,7 +3370,6 @@ impl RustGenerator {
                 );
 
                 if needs_byte_conversion {
-                    // C3: use size_of_val so the byte count matches the column size
                     append_statements.push(quote! {
                         {
                             let bytes = unsafe {
@@ -5110,21 +3383,14 @@ impl RustGenerator {
                         }
                     });
                 } else {
-                    // For primitives, use typed method
                     let append_method = Self::get_append_method(schema, &field.field_type);
 
-                    // A uuid stores a raw [u8; 16].  #266: an FK to a uuid-keyed
-                    // model RESOLVES to `Uuid` and takes this path unchanged; an
-                    // FK to any other key takes its own key's path.
                     let is_uuid_like = matches!(
                         &Self::resolved_type(schema, &field.field_type),
                         forgedb_parser::FieldType::Uuid
                     );
-                    // Timestamp is a newtype over i64; append_timestamp expects i64
                     let is_timestamp =
                         matches!(&Self::resolved_type(schema, &field.field_type), forgedb_parser::FieldType::Timestamp(_));
-                    // Non-null decimal: a fixed 16-byte column stored via
-                    // Decimal::serialize() -> [u8; 16], on the raw uuid byte path.
                     let is_decimal =
                         matches!(&Self::resolved_type(schema, &field.field_type), forgedb_parser::FieldType::Decimal);
 
@@ -5156,9 +3422,6 @@ impl RustGenerator {
         append_statements
     }
 
-    /// The field identifier used as a model's identity, e.g. `id`.  Falls back to
-    /// `id` when no explicit id / auto-generate field is present (matching the
-    /// historical `insert` behavior).
     fn id_field_ident(model: &forgedb_parser::Model) -> proc_macro2::Ident {
         match model.identity_field() {
             Some(f) => format_ident!("{}", f.name),
@@ -5166,14 +3429,6 @@ impl RustGenerator {
         }
     }
 
-    /// Generate an expression that reads a model's id at a physical row via
-    /// `#receiver.<id_col>.read_*(#row_var)`, yielding the id-typed value.
-    ///
-    /// `None` when the model has no id / auto-generate field (such a model cannot
-    /// `insert`, `update`, or `delete`).  Used by reopen rehydration (receiver
-    /// `db`, row `i`) and by the snapshot newest-version resolution added for the
-    /// mutation surface (receiver `self`, row `row_index`) so both read the id the
-    /// same way (#66 + #56).
     fn generate_id_read_expr(
         schema: &Schema,
         model: &forgedb_parser::Model,
@@ -5208,16 +3463,6 @@ impl RustGenerator {
                 #receiver.#col.read_string(#row_var).expect("Failed to read id column")
             }
         } else if let Some((chars, exact)) = Self::inline_string_params(&f.field_type) {
-            // A `string(N)` identity (#238 makes the type legal; #252 gives it a
-            // `Copy` key). Same slot decode as any other inline string column —
-            // an id is never nullable, so there is no presence byte — but it
-            // materializes the KEY type, because this expression feeds the
-            // `id_to_row` rebuild on reopen.
-            //
-            // `@utf8` is a validation error on an identity (#252 res 3), so the
-            // width here is always exactly N; `is_utf8_field` is still consulted
-            // rather than hardcoded `false`, so the layout stays derived from one
-            // place if that ever changes.
             let bytes = Self::inline_string_bytes_expr(
                 chars,
                 exact,
@@ -5246,13 +3491,6 @@ impl RustGenerator {
         Some(expr)
     }
 
-    /// #159: the per-id version-index push paired with an `id_to_row` insert.
-    /// Records `row_expr` as the newest physical version of `id_expr`, so snapshot
-    /// reads binary-search `id_versions[id]` for the newest version `< watermark`
-    /// instead of scanning the id column.  Row indices are appended in monotonic
-    /// order (each mutation appends at the current `row_count`), so each vec stays
-    /// sorted ascending with a plain `push` — no sort.  Emitted only for id-bearing
-    /// models (a no-id model has no `id_versions` field and cannot be mutated).
     fn id_versions_push_stmt(
         model: &forgedb_parser::Model,
         receiver: &TokenStream,
@@ -5269,27 +3507,10 @@ impl RustGenerator {
         }
     }
 
-    /// Emit the WAL commit record for one mutation (#89 durable write path).
-    ///
-    /// The generated code serializes the row (`serde_json`) and hands the WAL
-    /// opaque bytes via the schema-agnostic `Raw` op — the WAL never decodes a
-    /// field.  Layout: `[row_index: u64 LE][deleted: u8][serde_json(record)]`.
-    /// The absolute `row_index` makes replay idempotent (recovery skips a record
-    /// whose row is already materialized).  Emitted BEFORE the column appends, so
-    /// with `FsyncPolicy::Always` the row is durable in the WAL before it is
-    /// applied; a crash mid-append is recovered from the WAL on reopen.  Assumes
-    /// a `record` binding (the row's values) is in scope.
     fn generate_wal_record_write(model: &forgedb_parser::Model, deleted: bool) -> TokenStream {
         Self::generate_wal_record_write_impl(model, deleted, false)
     }
 
-    /// Like `generate_wal_record_write` but appends via the WAL's **buffered**
-    /// (no per-record fsync) path (#170 group commit).  Used ONLY by the MVCC
-    /// Tier-1 `__stage_append`: staged rows are invisible (past the watermark) and
-    /// journal-driven recovery drops any uncommitted tail, so deferring their
-    /// durability to the ONE `wal.flush()` at `TxHandle::commit` is correct — a
-    /// transaction of N rows pays one barrier instead of N.  The committed
-    /// insert/update/delete path keeps the per-op fsync (`write`).
     fn generate_wal_record_write_buffered(model: &forgedb_parser::Model, deleted: bool) -> TokenStream {
         Self::generate_wal_record_write_impl(model, deleted, true)
     }
@@ -5315,11 +3536,6 @@ impl RustGenerator {
                 let mut __wal_payload = Vec::new();
                 __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
                 __wal_payload.push(#deleted_tok);
-                // #157: reuse the once-serialized `__record_json` (emitted by
-                // `generate_shared_record_json` before this block) instead of
-                // re-serializing the whole record. The WAL frames it with an 8-byte
-                // row-index + 1-byte deleted header, so it copies the bytes into its
-                // own payload; the broker later MOVES `__record_json` (no clone).
                 __wal_payload.extend_from_slice(&__record_json);
                 self.wal
                     .#write_call(&forgedb_wal::WalEntry::raw(#model_name_str, __wal_payload))
@@ -5328,13 +3544,6 @@ impl RustGenerator {
         }
     }
 
-    /// Emit `let __record_json = serde_json::to_vec(&record)…` — the single
-    /// serialization of the record shared by the WAL payload and the durable
-    /// broker record (#157). Placed at the top of each mutation (before the WAL
-    /// write), so both consumers reuse it and the record need not survive the
-    /// column appends. Records are composed of primitive/serde fields, so
-    /// serialization cannot fail in practice — `expect` matches the WAL's prior
-    /// durability semantics (the stricter of the two old call sites).
     fn generate_shared_record_json() -> TokenStream {
         quote! {
             let __record_json = serde_json::to_vec(&record)
@@ -5342,29 +3551,10 @@ impl RustGenerator {
         }
     }
 
-    /// Emit the durable replication record for one mutation (#82 Direction C).
-    ///
-    /// Alongside the best-effort in-process change-feed emit, record the change to
-    /// the durable, offset-addressed broker so a cross-process / browser follower
-    /// (#110) can resume from a watermark. The broker is **field-blind**: it is
-    /// handed the model name (an opaque routing tag), the absolute `row_index` of
-    /// the appended physical row, the `kind`, and the **opaque serialized row
-    /// bytes** — the same `serde_json(record)` bytes the WAL journals. The broker
-    /// assigns the global offset and never interprets the bytes.
-    ///
-    /// Assumes `record` (the row's values) and `row_index` (the appended physical
-    /// row) are in scope — true at every mutation emit site (insert / update /
-    /// delete). `None` on the standalone `Database::new()` path where no broker is
-    /// attached; a per-tenant `open_at` process attaches one.
     fn generate_broker_record(model: &forgedb_parser::Model, kind: TokenStream) -> TokenStream {
         let model_name_str = model.name.clone();
         quote! {
             if let Some(__broker) = &self.broker {
-                // #157: MOVE the once-serialized `__record_json` (shared with the
-                // WAL, which only borrowed it) into the broker — no re-serialize,
-                // no clone. The broker is the last consumer of these bytes. When
-                // replication is off (#130 default) this block is never entered and
-                // `__record_json` is simply dropped after the WAL borrowed it.
                 if let Ok(mut __b) = __broker.lock() {
                     let _ = __b.record(
                         #model_name_str,
@@ -5377,14 +3567,6 @@ impl RustGenerator {
         }
     }
 
-    /// The column append for a resolved `@default` (#374 step 4) — the second
-    /// of [`crate::default_fill`]'s two lowerings.
-    ///
-    /// Every arm mirrors the encoding `generate_append_statements` uses for a
-    /// real record value of the same type, because a backfilled row and an
-    /// inserted row are read by the same decoder. `FillValue` only exists for
-    /// non-nullable fields whose encoding is settled, which is why there is no
-    /// presence-tag branch here.
     fn backfill_append_of(
         schema: &Schema,
         field: &forgedb_parser::Field,
@@ -5398,8 +3580,6 @@ impl RustGenerator {
                 self.#col.#append_method(#b).expect("Failed to backfill column default");
             },
             FillValue::Int(n) => {
-                // Unsuffixed so it infers to the column's own integer type,
-                // exactly as the `0` literal in the type-zero arm does.
                 let lit = proc_macro2::Literal::i64_unsuffixed(*n);
                 quote! {
                     self.#col.#append_method(#lit).expect("Failed to backfill column default");
@@ -5429,50 +3609,21 @@ impl RustGenerator {
         }
     }
 
-    /// Emit one "append a default entry" statement per storage-backed field —
-    /// the same column encoding as `generate_append_statements`, but with the
-    /// field's type default instead of a record value.  Used to backfill a newly
-    /// added column so existing rows keep a well-formed value (#92 Phase 4 additive
-    /// migration).
-    ///
-    /// A field carrying a `@default` the differ can resolve
-    /// ([`crate::default_fill`]) backfills **that value**; every other field
-    /// backfills its type zero (nullable → None, string → "", numeric → 0,
-    /// uuid/FK → nil).
-    ///
-    /// # Why the `@default` arm is here and not only in the transformer (#374)
-    ///
-    /// A newly-added required field reaches existing rows two ways — this
-    /// backfill on reopen, and the offline transformer's hop — and they used to
-    /// disagree, because this one wrote the type zero unconditionally while the
-    /// hop wrote the recorded default. `status: string @default("pending")`
-    /// therefore produced `""` in one dir and `"pending"` in the other for the
-    /// same schema edit, decided by which command the operator ran.
-    /// `default_fill` is the ONE definition both lowerings derive from; this is
-    /// the second lowering and `FillValue::json_literal` is the first.
     fn generate_backfill_appends(schema: &Schema, model: &forgedb_parser::Model) -> Vec<(proc_macro2::Ident, TokenStream)> {
         let mut out = Vec::new();
         for field in &model.fields {
             let col = format_ident!("{}_col", field.name);
-            // #374: a resolvable `@default` wins over the type zero, and does so
-            // BEFORE the per-type branches below so there is exactly one place
-            // the decision is made.
             if let Some(fill) = crate::default_fill::default_fill(schema, field) {
                 out.push((col, Self::backfill_append_of(schema, field, &fill)));
                 continue;
             }
             if Self::is_json_type(&field.field_type) {
                 let one = if field.is_nullable() {
-                    // Nullable json: the 1-byte presence tag `0x00` = None (#231 —
-                    // one known byte, no allocation).
                     quote! {
                         self.#col.append_tagged(0u8, "")
                             .expect("Failed to backfill json column");
                     }
                 } else {
-                    // Non-null json backfill: the serialized form of
-                    // `serde_json::Value::Null` (`"null"`), so a read decodes to
-                    // `Value::Null` — the meaningful zero for a JSON column.
                     quote! {
                         self.#col.append_string("null")
                             .expect("Failed to backfill json column");
@@ -5480,8 +3631,6 @@ impl RustGenerator {
                 };
                 out.push((col, one));
             } else if Self::is_enum_type(&field.field_type) {
-                // enum backfill: nullable → `[0, 0]` (None); non-null → `[0]`
-                // (variant 0, the meaningful zero — matches the append encoding).
                 let one = if field.is_nullable() {
                     quote! {
                         self.#col.append_bytes(&[0u8, 0u8])
@@ -5495,14 +3644,7 @@ impl RustGenerator {
                 };
                 out.push((col, one));
             } else if Self::is_inline_string_type(&Self::resolved_type(schema, &field.field_type)) {
-                // Inline `string(N)` backfill (#238; resolved for an FK, #252): a
-                // zeroed slot. That decodes
-                // to `None` when nullable, and otherwise to the empty string —
-                // except under `string(N!)`, where the prefix-free slot decodes to
-                // N NUL characters, which is exactly N characters and therefore
-                // still satisfies the column. Either way it is the meaningful
-                // zero and it matches the append encoding byte for byte.
-                let value_size = Self::column_value_size_expr(schema, 
+                let value_size = Self::column_value_size_expr(schema,
                     &field.field_type,
                     Self::is_utf8_field(field),
                 );
@@ -5513,8 +3655,6 @@ impl RustGenerator {
                 out.push((col, one));
             } else if Self::is_variable_string_type(&field.field_type) {
                 let one = if field.is_nullable() {
-                    // Nullable string: the 1-byte presence tag `0x00` = None (#231 —
-                    // one known byte, no allocation).
                     quote! {
                         self.#col.append_tagged(0u8, "")
                             .expect("Failed to backfill string column");
@@ -5536,9 +3676,6 @@ impl RustGenerator {
                         | forgedb_parser::FieldType::Nullable(_)
                 );
                 let one = if needs_byte_conversion {
-                    // Byte-blob types (char(N), arrays, inline struct, nullable /
-                    // optional-FK) backfill as zeroed bytes of the column width —
-                    // decodes to None / all-zero, matching the append encoding.
                     let value_size =
                         Self::column_value_size_expr(schema, &field.field_type, Self::is_utf8_field(field));
                     quote! {
@@ -5556,8 +3693,6 @@ impl RustGenerator {
                     let is_decimal =
                         matches!(&Self::resolved_type(schema, &field.field_type), forgedb_parser::FieldType::Decimal);
                     if is_decimal {
-                        // Non-null decimal backfills to Decimal::ZERO (its 16-byte
-                        // serialized form), so a read decodes to `0` — the zero value.
                         quote! {
                             self.#col.append_uuid(rust_decimal::Decimal::ZERO.serialize())
                                 .expect("Failed to backfill column");
@@ -5595,19 +3730,6 @@ impl RustGenerator {
         out
     }
 
-    /// Emit `recover_from_wal(&mut self)` (#89): torn-tail repair + WAL replay on
-    /// reopen — plus additive-field backfill (#92 Phase 4).  The tombstone file is
-    /// the authoritative committed row count (appended LAST in every insert, so it
-    /// never over-counts).  Realign every column to that anchor: a column SHORTER
-    /// than the anchor is a newly-added field (the schema was regenerated with an
-    /// extra field) — backfill it with the field's default so existing rows stay
-    /// intact; a column LONGER than the anchor is a torn insert tail — truncate it.
-    /// Then replay the WAL, re-driving every record whose absolute row index is
-    /// `>= row_count`.  Because `FsyncPolicy::Always` made each record durable
-    /// before its columns were touched, a row acked to the client survives even if
-    /// its column append was lost to the page cache.  Recovery decode is generated
-    /// per-model here (the columns are baked in) — the WAL crate stays field-blind,
-    /// and there is no runtime `model_name` dispatch.  Emits no change-feed events.
     fn generate_recover_method(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let model_name = format_ident!("{}", model.name);
         let append_statements = Self::generate_append_statements(schema, model);
@@ -5621,8 +3743,6 @@ impl RustGenerator {
             .map(|f| format_ident!("{}_col", f.name))
             .collect();
 
-        // Additive-migration backfill (#92 Phase 4): for each column shorter than
-        // the anchor, append its default until it reaches the anchor.
         let backfill_loops: Vec<_> = Self::generate_backfill_appends(schema, model)
             .into_iter()
             .map(|(col, append_default)| {
@@ -5636,13 +3756,8 @@ impl RustGenerator {
 
         quote! {
             fn recover_from_wal(&mut self) {
-                // The tombstone file is the authoritative committed row count.
                 let __anchor = self.tombstones.len();
-                // Backfill newly-added (short) columns up to the anchor so existing
-                // rows keep a well-formed default value (#92 additive migration).
                 #(#backfill_loops)*
-                // Drop any torn / ahead column tail so all columns realign at the
-                // anchor (a crash can leave one column ahead of the tombstone).
                 #(
                     self.#col_idents
                         .truncate_to_rows(__anchor)
@@ -5650,7 +3765,6 @@ impl RustGenerator {
                 )*
                 self.row_count = __anchor;
 
-                // Replay the WAL, re-driving records the columns don't yet have.
                 let __entries = self
                     .wal
                     .replay(|_| -> std::io::Result<()> { Ok(()) })
@@ -5663,7 +3777,6 @@ impl RustGenerator {
                         let mut __ri = [0u8; 8];
                         __ri.copy_from_slice(&payload[0..8]);
                         let __row_index = u64::from_le_bytes(__ri) as usize;
-                        // Already materialized in the columns — idempotent skip.
                         if __row_index < self.row_count {
                             continue;
                         }
@@ -5683,32 +3796,11 @@ impl RustGenerator {
         }
     }
 
-    /// Emit the follower's per-model `apply(kind, bytes)` (#110 Milestone C).
-    ///
-    /// The browser read-replica receives an opaque `PersistedEvent` frame and,
-    /// once `Database::apply_frame` has dispatched by the field-blind model tag,
-    /// hands the row bytes here.  This method decodes them into the typed record
-    /// and **replays through the SAME generated `insert` / `update` / `delete`**
-    /// the server uses — no second write path, so there is no drift risk.  On a
-    /// follower the change feed and durable broker are `None` and the WAL is the
-    /// in-memory wasm variant, so those side effects are inert; the replay is
-    /// purely the column-append + `id_to_row` + index maintenance the server did.
-    ///
-    /// Idempotent by absolute row position for a from-zero replay: applying the
-    /// frames in offset order reproduces the server's exact physical layout.
-    /// `None` (no method emitted) for a model with no id — it cannot be mutated
-    /// and so is never replicated.
     fn generate_apply_method(model: &forgedb_parser::Model) -> Option<TokenStream> {
         model.identity_field()?;
         let model_name = format_ident!("{}", model.name);
         let id_field = Self::id_field_ident(model);
         Some(quote! {
-            /// Apply a replicated change for this model on the read-replica
-            /// follower (#110).  Decodes the opaque row bytes the server journaled
-            /// and replays through the same generated mutation surface.  The
-            /// follower never decodes a field to *route* — `Database::apply_frame`
-            /// already dispatched by the model tag; this only materializes the
-            /// typed record to *apply* it.
             pub fn apply(
                 &mut self,
                 kind: forgedb_changefeed::ChangeKind,
@@ -5733,8 +3825,6 @@ impl RustGenerator {
                         self.delete(id);
                     }
                     forgedb_changefeed::ChangeKind::Linked => {
-                        // A junction link is not a model event; it is applied by
-                        // `Database::apply_frame` on the junction table directly.
                     }
                 }
                 Ok(())
@@ -5742,14 +3832,6 @@ impl RustGenerator {
         })
     }
 
-    /// Emit the additive `commit(&mut self)` (#110 Milestone C).
-    ///
-    /// Flushes every column + the tombstone file.  Natively this is an `fsync`
-    /// (the same durability boundary `checkpoint` uses, minus the WAL truncate);
-    /// on the wasm arena backend `flush` is a no-op and durability instead comes
-    /// from the transport writing the arena blobs to IndexedDB/OPFS after this
-    /// returns (`forgedb_storage_web::dump`).  Target-agnostic generated code —
-    /// the difference lives entirely in the storage facade.
     fn generate_commit_method(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let col_idents: Vec<_> = model
             .fields
@@ -5761,12 +3843,7 @@ impl RustGenerator {
             .map(|f| format_ident!("{}_col", f.name))
             .collect();
         quote! {
-            /// Flush this model's columns + tombstones (#110 additive commit).
-            /// Native fsync; wasm arena no-op (durability at the transport's
-            /// IndexedDB/OPFS write boundary).
             pub fn commit(&mut self) -> std::io::Result<()> {
-                // Coalesced durability (#153): push every column to the drive
-                // cache, then ONE device barrier (native); both no-ops on wasm.
                 #(
                     self.#col_idents.sync_to_drive()?;
                 )*
@@ -5777,16 +3854,6 @@ impl RustGenerator {
         }
     }
 
-    /// Emit `checkpoint(&mut self)` (#89 step 2 — bound the WAL).  Makes every
-    /// column + the tombstone file durable (`flush()` == `sync_all`), THEN
-    /// truncates the WAL.  The order is load-bearing: the WAL is discarded only
-    /// after the data it protects is durable, so a crash *between* the two leaves
-    /// the (not-yet-truncated) WAL able to replay, and a crash *after* leaves
-    /// durable columns and an empty WAL.  Recovery derives the durable prefix
-    /// from the column file lengths themselves (`recover_from_wal`), so no
-    /// persisted checkpoint marker is load-bearing — this only bounds the WAL and
-    /// shortens reopen.  Single-writer only, and called between mutations, so all
-    /// columns are aligned at `row_count` when it runs.
     fn generate_checkpoint_method(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let col_idents: Vec<_> = model
             .fields
@@ -5799,13 +3866,7 @@ impl RustGenerator {
             .collect();
 
         quote! {
-            /// Force a WAL checkpoint (#89 step 2): fsync this model's columns,
-            /// then truncate its WAL.  Bounds the WAL and shortens reopen; not
-            /// required for correctness (recovery reads the column lengths).
             pub fn checkpoint(&mut self) {
-                // 1. Push every column + the tombstones to the drive cache — the
-                //    cheap flush, NO device barrier (#153). On macOS a barrier
-                //    (F_FULLFSYNC) is ~3.5 ms; a plain fsync is ~27 µs.
                 #(
                     self.#col_idents
                         .sync_to_drive()
@@ -5814,15 +3875,9 @@ impl RustGenerator {
                 self.tombstones
                     .sync_to_drive()
                     .expect("Failed to sync tombstones to drive on checkpoint");
-                // 2. ONE device barrier makes ALL of the above durable on media
-                //    (#153): F_FULLFSYNC flushes the whole drive cache, covering
-                //    every column pushed in step 1 — 1 barrier per checkpoint, not
-                //    N. (On the wasm arena backend both steps are no-ops; durability
-                //    is at the transport's IndexedDB/OPFS write boundary.)
                 self.tombstones
                     .barrier()
                     .expect("Failed to issue checkpoint device barrier");
-                // 3. Only now that the data is durable, discard the redundant WAL.
                 self.wal
                     .truncate()
                     .expect("Failed to truncate WAL on checkpoint");
@@ -5831,48 +3886,9 @@ impl RustGenerator {
         }
     }
 
-    /// Emit `compact(&mut self)` (#92 Phase 4 — bound column storage).  Reclaims
-    /// the dead (superseded/tombstoned) row versions the mutation surface (#66)
-    /// leaves behind, IN-PROCESS under the single-writer discipline.  Never a
-    /// background thread: #89's `DirLock` makes single-writer the durability
-    /// contract, so compaction must run on the writer, between mutations.
-    ///
-    /// Order is load-bearing:
-    /// 1. `checkpoint()` first — fsync columns + truncate the WAL, so no
-    ///    index-relative WAL tail (#89, which replays by *absolute* row index)
-    ///    survives the row renumbering compaction is about to do.
-    /// 2. Generated code computes the LIVE physical-row set from `id_to_row` +
-    ///    tombstone liveness (the field-aware decision) and hands that opaque set
-    ///    to `forgedb_compaction::Compactor::compact_model_keeping`, which keeps
-    ///    exactly those rows and drops the rest.  The substrate is schema-blind
-    ///    byte GC keyed by the model *directory name* + a list of row indices — it
-    ///    reads no `.forge`, no field types.  (Only `compact_model_keeping` is
-    ///    linked — never `BackgroundCompactor`, which would compact off the writer
-    ///    lock.)  The keep-set model — not `compact_model`'s tombstone model — is
-    ///    load-bearing: #66 leaves superseded update-versions orphaned but NOT
-    ///    tombstoned, and marks a delete with a *new* tombstoned marker row, so a
-    ///    tombstone-driven drop reclaims nothing from updates and would resurrect
-    ///    deletes.
-    /// 3. Compaction renumbers surviving rows, invalidating every physical-row
-    ///    reference in `id_to_row` / `id_versions`.  Rather than a full rescan
-    ///    (`new_at`), reopen ONLY the column handles (stale after the rename) and
-    ///    REMAP the maps in place (#162-C): each surviving id's dense new row is
-    ///    `keep_sorted.partition_point(|&r| r < old_row)`; the secondary index maps
-    ///    are keyed value→id (never by physical row) and are already current, so
-    ///    they carry over verbatim — no column reads.
-    ///
-    /// Best-effort: a compaction error leaves the (still-correct) un-compacted
-    /// files in place and retries after the next interval — it never corrupts
-    /// live state.
     fn generate_compact_method(model: &forgedb_parser::Model) -> TokenStream {
         let model_snake = Self::to_snake_case(&model.name);
 
-        // #162-C: the secondary index maps (single + composite) are keyed
-        // value→id, so a physical-row renumber leaves them correct — save each
-        // Arc across the column-handle reopen and reinstall it verbatim.
-        // #169: the ordered indexes are value→id keyed too, so a physical-row
-        // renumber leaves them correct — save + reinstall each Arc verbatim
-        // alongside the hash + composite maps.
         let index_idents: Vec<proc_macro2::Ident> = Self::indexed_fields(model)
             .iter()
             .map(|f| Self::index_field_ident(f))
@@ -5894,21 +3910,6 @@ impl RustGenerator {
             })
             .collect();
 
-        // #187 — the auto-increment counters get the SAME save/reinstall treatment
-        // as the index `Arc`s above, and for a sharper reason.
-        //
-        // Compaction is the one operation a pure rescan cannot survive: it
-        // physically drops dead rows, so a later reopen derives a *lower* maximum
-        // than was actually issued and hands the same value out a second time.
-        // `*self = Self::new_at_no_rehydrate(..)` below would reset the live
-        // counter to 0, and `write_manifest` (called from inside that constructor)
-        // max-merges — so the on-disk floor survives, but the in-memory tip
-        // accumulated since open would be lost without this.
-        //
-        // Both halves are required. With only the max-merge, the process keeps
-        // allocating from 0 until it passes the floor and re-issues live ids; with
-        // only the save/reinstall, the floor is never written. Miss either and it
-        // reads as working until the second run after a compaction.
         let autoseq_idents: Vec<_> = Self::sequence_auto_fields(model)
             .iter()
             .map(|f| Self::autoseq_field_ident(f))
@@ -5927,9 +3928,6 @@ impl RustGenerator {
                 quote! { self.#ident = #saved; }
             })
             .collect();
-        // Re-persist AFTER reinstalling: the constructor's own `write_manifest`
-        // ran while the counters were zeroed, so the floor it merged is only as
-        // high as the previous write. This one carries the live tip.
         let repersist_autoseqs = if autoseq_idents.is_empty() {
             quote! {}
         } else {
@@ -5945,25 +3943,6 @@ impl RustGenerator {
             }
         };
 
-        // ...and persist it BEFORE the destructive rewrite too.
-        //
-        // The floor on disk is only ever written at open and here, so between them
-        // it holds the counter as of *process open*. `compact_model_keeping`
-        // physically drops the dead rows — which, for every value allocated since
-        // open, are the only remaining record that the value was ever issued. A
-        // crash between that rewrite and the re-persist above therefore leaves a
-        // reopen deriving a LOWER maximum than was actually handed out, and it
-        // re-issues the difference. That is precisely the case the floor exists to
-        // prevent, so "the scan is always a safe fallback" holds only while
-        // compaction has not run.
-        //
-        // Writing early is unconditionally safe: the floor is a hint that only
-        // moves up, and over-reserving costs nothing because gaps are the contract.
-        //
-        // If it cannot be written, ABORT rather than proceed. Compaction is a
-        // reclaim optimization and is always safe to retry later; re-issuing an id
-        // is not recoverable, and it escapes the database through the replication
-        // log, backups, and any URL holding the value.
         let prepersist_autoseqs = if autoseq_idents.is_empty() {
             quote! {}
         } else {
@@ -5982,9 +3961,6 @@ impl RustGenerator {
             }
         };
 
-        // #162-C: `id_versions` (#159) references physical rows, so rebuild it to a
-        // single-element `[new_row]` per surviving id (compaction collapses every id
-        // to its one kept version).  Omitted for an id-less model (no such field).
         let remap_versions = if model.identity_field().is_some() {
             quote! { __new_id_versions.insert(__id, vec![__new_row]); }
         } else {
@@ -6005,75 +3981,36 @@ impl RustGenerator {
         };
 
         quote! {
-            /// Reclaim dead row versions in-process (#92 Phase 4): checkpoint,
-            /// rewrite this model's files dropping dead rows, then reopen the column
-            /// handles and remap `id_to_row` / `id_versions` in place (#162-C) — the
-            /// secondary indexes (value→id keyed) carry over unchanged.
             pub fn compact(&mut self) {
-                // MVCC Tier 1 (#83, M1d): never compact mid-transaction — the
-                // renumbering below would invalidate a live transaction's rollback
-                // marks (physical row lengths) and could reclaim a version the
-                // transaction's read snapshot still needs.  Record it as due and
-                // run it after the transaction closes (`run_deferred_maintenance`).
                 if self.in_transaction {
                     self.compact_deferred = true;
                     return;
                 }
-                // 1. Make columns durable + discard the WAL tail (no index-relative
-                //    replay may survive the renumbering below).
                 self.checkpoint();
-                // 2. Compute the LIVE physical-row set — the field-aware decision,
-                //    made here in generated code, never in the substrate.  For the
-                //    superseding-version mutation surface (#66), `id_to_row` maps
-                //    each id to its newest physical row: a live id's newest row is
-                //    non-tombstoned; a deleted id's newest row is the tombstoned
-                //    marker, which we OMIT so the delete is truly reclaimed (and
-                //    never resurrected).  Orphaned old versions are absent from
-                //    `id_to_row.values()` entirely, so they drop out too.
                 let mut __keep: Vec<usize> = Vec::with_capacity(self.id_to_row.len());
                 for &__row in self.id_to_row.values() {
-                    // Keep-on-error: an unclassifiable row is retained (never lost),
-                    // and reopen's version-resolving read still reads it correctly —
-                    // worst case it is simply reclaimed on a later pass.
                     if !self.tombstones.is_deleted(__row).unwrap_or(false) {
                         __keep.push(__row);
                     }
                 }
-                // 2b. Persist the auto-increment floor (#187) BEFORE step 3 destroys
-                //     the rows that are the only other evidence of what was issued.
                 #prepersist_autoseqs
-                // 3. Hand the opaque live-row set to the schema-blind byte GC.
                 let __config = forgedb_compaction::CompactionConfig::default();
                 let __compactor = forgedb_compaction::Compactor::new(&self.root, __config);
                 if __compactor.compact_model_keeping(#model_snake, &__keep).is_ok() {
-                    // 4. In-place remap (#162-C) — NOT a full rehydrate rescan.
-                    //    The compactor rewrites survivors in ascending physical
-                    //    order and renumbers them densely, so a kept row's new index
-                    //    is the count of kept rows before it.  Sort the keep set once
-                    //    for the O(log n) `partition_point` lookup.
                     let mut __keep_sorted = __keep;
                     __keep_sorted.sort_unstable();
-                    // Preserve the maps across the column-handle reopen: index maps
-                    // are value→id keyed (renumber-invariant, already current), so
-                    // save + reinstall them verbatim; `id_to_row` is remapped below.
                     let __old_id_to_row = std::sync::Arc::clone(&self.id_to_row);
                     #(#save_indexes)*
                     #(#save_autoseqs)*
                     let __root = self.root.clone();
                     let __feed = self.changefeed.take();
                     let __broker = self.broker.take();
-                    // Reopen ONLY the column handles (stale fds after the rename);
-                    // skip the O(rows × indexes) rehydrate scan — remap follows.
                     *self = Self::new_at_no_rehydrate(&__root);
                     self.changefeed = __feed;
                     self.broker = __broker;
                     #(#reinstall_indexes)*
                     #(#reinstall_autoseqs)*
                     #repersist_autoseqs
-                    // Remap `id_to_row` (and rebuild the single-version
-                    // `id_versions`) from the dense keep-set positions.  An id whose
-                    // newest row was tombstoned is absent from `__keep` and so is
-                    // dropped here — the delete is fully reclaimed.
                     let mut __new_id_to_row: std::collections::HashMap<_, usize> =
                         std::collections::HashMap::with_capacity(__old_id_to_row.len());
                     #decl_versions
@@ -6086,27 +4023,12 @@ impl RustGenerator {
                     }
                     self.id_to_row = std::sync::Arc::new(__new_id_to_row);
                     #assign_versions
-                    // 5. Break the incremental-backup chain (#76): renumbering moved
-                    //    every row's bytes, so a byte-tail delta computed against a
-                    //    pre-compaction base is invalid.  Bump the epoch AFTER the
-                    //    reopen (which rewrote the manifest preserving the old epoch)
-                    //    so an incremental across this boundary is refused rather
-                    //    than silently corrupt.
                     self.bump_compaction_epoch(&__root);
                 }
-                // Reset unconditionally: a failed compaction waits a full interval
-                // rather than re-attempting on every subsequent mutation.  #162-A:
-                // clear the deferred-due flag too (this reclaim satisfied it).
                 self.dead_since_compaction = 0;
                 self.compaction_due = false;
             }
 
-            /// Run a compaction the write path deferred off the hot turn (#162-A).
-            /// The soft dead-row threshold only sets `compaction_due` so a user
-            /// write never stalls on the rewrite+remap; an operator / coordinator
-            /// idle turn calls `Database::maintain()`, which routes here — so the
-            /// reclaim happens off the write path.  A no-op when nothing is due (or
-            /// mid-transaction, where `compact()` would itself defer).
             pub fn maintain(&mut self) {
                 if self.compaction_due && !self.in_transaction {
                     self.compaction_due = false;
@@ -6116,32 +4038,12 @@ impl RustGenerator {
         }
     }
 
-    /// Generate the transaction storage helpers on a model's `*Storage` (MVCC
-    /// Tier 1, #83): `__stage_append` (the low-level staged write the `TxHandle`
-    /// drives) and `run_deferred_maintenance` (runs a checkpoint/compaction the
-    /// txn guard deferred).  `None`-skipped for a model without an id (which
-    /// cannot be mutated, so it is never touched by a transaction).
-    ///
-    /// `__stage_append` is deliberately the SAME column + WAL write as the
-    /// committed `insert`/`update`/`delete` path (it reuses the shared
-    /// `generate_append_statements` and `generate_wal_record_write`), but it does
-    /// **not** advance `id_to_row`, maintain indexes, emit the changefeed / broker,
-    /// or checkpoint.  That is
-    /// exactly the split the note requires: staged rows are physically appended
-    /// (past the public watermark) and durable in the per-model WAL, but invisible
-    /// to outside readers and unindexed until the transaction's commit applies the
-    /// buffered index ops and advances the watermark.  Read-your-writes inside the
-    /// txn comes from `get_at` with the watermark raised to the staged length — one
-    /// decode path, no fork.
     fn generate_txn_storage_methods(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         if !model.has_identity() {
             return quote! {};
         }
         let model_name = format_ident!("{}", model.name);
         let append_statements = Self::generate_append_statements(schema, model);
-        // #170: staged rows use the buffered (no-fsync) WAL append — durability is
-        // the single `wal.flush()` at `TxHandle::commit`, so a whole transaction
-        // pays one barrier instead of one per staged row.
         let wal_write_live = Self::generate_wal_record_write_buffered(model, false);
         let wal_write_deleted = Self::generate_wal_record_write_buffered(model, true);
         let shared_record_json = Self::generate_shared_record_json();
@@ -6154,9 +4056,6 @@ impl RustGenerator {
             })
             .map(|f| format_ident!("{}_col", f.name))
             .collect();
-        // Reindex body: clear every in-memory map, then rebuild `id_to_row` +
-        // secondary indexes from the committed prefix via the SAME narrow decode
-        // path `new_at` uses (one body, no drift) — but on `self` in place.
         let clear_indexes: Vec<_> = Self::indexed_fields(model)
             .iter()
             .map(|f| {
@@ -6168,25 +4067,13 @@ impl RustGenerator {
             }))
             .collect();
         let rehydrate_self = Self::generate_rehydrate_body(schema, model, &quote! { self });
-        // #159: the version index is rebuilt by `#rehydrate_self` too; clear it first.
         let clear_versions = if model.identity_field().is_some() {
             quote! { std::sync::Arc::make_mut(&mut self.id_versions).clear(); }
         } else {
             quote! {}
         };
-        // #161-B: the incremental delta variant of `__reindex_committed` for the
-        // coordinated peer-refresh hot path (folds only new rows, no full rebuild).
         let reindex_delta = Self::generate_reindex_delta_method(schema, model);
         quote! {
-            /// Rebuild `id_to_row` + secondary indexes from the committed prefix
-            /// in place (MVCC Tier 1, #83).  A transaction stages rows via
-            /// `__stage_append`, which deliberately does NOT touch the identity or
-            /// secondary index maps; its `commit` calls this once per touched
-            /// collection to make the newly-visible rows resolvable.  It clears the
-            /// maps and re-runs the SAME reopen-rehydration body `new_at` uses
-            /// (last-write-wins per id, tombstone-gated index keys), so the maps
-            /// end up exactly as a fresh reopen would build them — no incremental
-            /// remove-old/add-new bookkeeping to drift.
             pub fn __reindex_committed(&mut self) {
                 std::sync::Arc::make_mut(&mut self.id_to_row).clear();
                 #clear_versions
@@ -6196,18 +4083,6 @@ impl RustGenerator {
 
             #reindex_delta
 
-            /// Refresh EVERY column + the tombstone's in-memory `row_count` from
-            /// the on-disk file lengths, then adopt the peer-visible row count
-            /// (MVCC Tier 3, #84 — peer read-currency).  Reads are positional and
-            /// bounded by each column's cached `row_count`; a *peer* process's
-            /// appended rows stay invisible until this re-derives those counts
-            /// from the shared files.  Syncing ONLY the tombstone (as an earlier
-            /// cut did) bumps the row count but leaves every data column bounded
-            /// at its open-time length, so `get`/`read_at` of a peer row reads out
-            /// of bounds — this syncs them all.  Uses the additive
-            /// `*::sync_from_disk` substrate (`storage-native`); writes nothing
-            /// (T3-8: generated data-plane read-refresh, no column append/flush).
-            /// Caller pairs this with `__reindex_committed` to rebuild the maps.
             pub fn __sync_columns_from_disk(&mut self) {
                 #(
                     let _ = self.#col_idents.sync_from_disk();
@@ -6216,11 +4091,6 @@ impl RustGenerator {
                 self.row_count = self.tombstones.len();
             }
 
-            /// Truncate every column + the tombstone back to `rows` (MVCC Tier 1,
-            /// #83).  The transaction rollback primitive: erases staged ahead-rows
-            /// so the collection returns to its pre-txn physical length.  Reuses the
-            /// published `truncate_to_rows` on each column type (no substrate change).
-            /// A no-op past the current length (nothing staged).
             pub fn __truncate_all_to(&mut self, rows: usize) -> std::io::Result<()> {
                 #(
                     self.#col_idents.truncate_to_rows(rows)?;
@@ -6229,17 +4099,6 @@ impl RustGenerator {
                 Ok(())
             }
 
-            /// Journal-driven recovery to a committed row-count (MVCC Tier 1, #83,
-            /// M1b).  Called at `open_at` when the `_txn_journal` names a committed
-            /// length for this model that is BELOW the length the columns/WAL
-            /// recovered to — i.e. a transaction staged rows into this collection
-            /// but its journal commit record never landed (a torn / aborted
-            /// commit).  Truncate every column + the tombstone back to
-            /// `committed_len` (erasing the aborted ahead-rows), discard the WAL
-            /// (the committed prefix is already durable in the columns, and the
-            /// aborted staged WAL records must not replay), then reopen to rebuild
-            /// `id_to_row` + secondary indexes from the truncated committed prefix.
-            /// A no-op when `committed_len >= row_count` (nothing aborted).
             pub fn __recover_to_committed(&mut self, committed_len: usize) {
                 if committed_len >= self.row_count {
                     return;
@@ -6253,14 +4112,9 @@ impl RustGenerator {
                     .truncate_to_rows(committed_len)
                     .expect("Failed to truncate tombstones on journal recovery");
                 self.row_count = committed_len;
-                // Discard the WAL: its committed prefix is durable in the columns
-                // (which we just made authoritative at `committed_len`), and its
-                // aborted staged tail must NOT replay on the reopen below.
                 self.wal
                     .truncate()
                     .expect("Failed to truncate WAL on journal recovery");
-                // Reopen to rebuild the in-memory maps from the committed prefix,
-                // preserving the shared feed / broker (as compaction's reopen does).
                 let __root = self.root.clone();
                 let __feed = self.changefeed.take();
                 let __broker = self.broker.take();
@@ -6269,30 +4123,14 @@ impl RustGenerator {
                 self.broker = __broker;
             }
 
-            /// Stage one physically-appended row for a transaction (MVCC Tier 1,
-            /// #83).  WAL-records the row (durable, `FsyncPolicy::Always`) then
-            /// appends every column + the tombstone at the current physical row
-            /// index, bumps `row_count`, and returns that index — WITHOUT touching
-            /// `id_to_row`, secondary indexes, the change feed, the broker, or the
-            /// checkpoint counter.  The transaction's `commit` applies those
-            /// deferred effects once, atomically; a `rollback` truncates every
-            /// staged row + the staged WAL tail back to the pre-txn mark.  The row
-            /// is invisible to outside readers (whose `get`/`all` clamp at the
-            /// public watermark) until commit advances the watermark past it.
             pub fn __stage_append(&mut self, record: #model_name, deleted: bool) -> usize {
                 let row_index = self.row_count;
-                // #157: serialize the record once (this path has no broker — the
-                // WAL is the only consumer — so it is just borrowed).
                 #shared_record_json
-                // Durability boundary (#89): WAL-record the row before any column
-                // is touched, so a crash mid-stage is repaired on reopen and the
-                // aborted tail is dropped by journal-driven recovery.
                 if deleted {
                     #wal_write_deleted
                 } else {
                     #wal_write_live
                 }
-                // Append all columns from `record`, then the tombstone flag.
                 #(#append_statements)*
                 self.tombstones
                     .append(deleted)
@@ -6301,12 +4139,6 @@ impl RustGenerator {
                 row_index
             }
 
-            /// Run any checkpoint/compaction the transaction guard deferred (MVCC
-            /// Tier 1, #83).  Called by `TxHandle::commit`/rollback once the
-            /// critical section closes and `in_transaction` is cleared, so the
-            /// #96/#92 auto-maintenance still runs — just after the transaction,
-            /// never underneath its rollback marks.  Compaction subsumes a
-            /// checkpoint, so if both are due only compaction runs.
             pub fn run_deferred_maintenance(&mut self) {
                 if self.compact_deferred {
                     self.compact_deferred = false;
@@ -6320,25 +4152,7 @@ impl RustGenerator {
         }
     }
 
-    /// Emit `__reindex_delta(&mut self, from: usize)` (#161-B): the incremental
-    /// counterpart to `__reindex_committed` for the coordinated peer-refresh hot
-    /// path.  After `__sync_columns_from_disk` bumps `row_count` to include a
-    /// peer's newly-committed rows, this folds ONLY the rows in `[from..row_count)`
-    /// into the existing maps — instead of clearing every map and rescanning all
-    /// rows.  Cost is O(new rows), not O(all rows × indexes).
-    ///
-    /// Each new row is a superseding version (`insert`/`update`/`delete`) of some
-    /// id.  The per-row maintenance is EXACTLY the live update/delete path's
-    /// remove-old / add-new (it reuses the same `index_remove_block` /
-    /// `index_add_block` builders, keyed off `__old_rec` = the version resolved
-    /// *before* this row and `__new_rec` = the row itself), so there is one index-
-    /// maintenance source and no drift.  Rows are processed in ascending physical
-    /// order, so within the range a later version of an id correctly supersedes an
-    /// earlier one: `self.get(id)` at row R resolves the version last folded (or
-    /// the pre-`from` state), whose keys are removed before R's are added.
     fn generate_reindex_delta_method(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
-        // Guarded by the caller (`generate_txn_storage_methods` returns early for
-        // an id-less model), but keep the None-guard local so the helper is safe.
         let row_var = format_ident!("__r");
         let id_read = match Self::generate_id_read_expr(schema, model, &quote! { self }, &row_var) {
             Some(expr) => expr,
@@ -6350,8 +4164,6 @@ impl RustGenerator {
         let composites = Self::composite_indexes(model);
         let has_index = !indexed.is_empty() || !composites.is_empty();
 
-        // Remove side — the SAME blocks the live update/delete path builds, keyed
-        // off `__old_rec` (the record resolved before this row, via `self.get(id)`).
         let old = quote! { __old_rec };
         let (rem_hoist, rem_map) = Self::hoist_index_keys(schema, model, &old, "rem");
         let single_removes: Vec<_> = indexed
@@ -6370,11 +4182,8 @@ impl RustGenerator {
                 Self::composite_remove_block(&recv, ident, &parts, &id_tok)
             })
             .collect();
-        // #169 ordered-index remove side (keyed off `__old_rec`).
         let ordered_removes: Vec<_> = Self::ordered_index_remove_maint(model, &recv, &old, &id_tok);
 
-        // Add side — the SAME blocks the live update/insert path builds, keyed off
-        // `__new_rec` (the row being folded, via `self.read_at(__r)`).
         let rec = quote! { __new_rec };
         let (add_hoist, add_map) = Self::hoist_index_keys(schema, model, &rec, "add");
         let single_adds: Vec<_> = indexed
@@ -6385,7 +4194,6 @@ impl RustGenerator {
                 Self::index_add_block(&recv, &ident, key, &id_tok)
             })
             .collect();
-        // #169 ordered-index add side (keyed off `__new_rec`).
         let ordered_adds: Vec<_> = Self::ordered_index_add_maint(model, &recv, &rec, &id_tok);
         let composite_adds: Vec<_> = composites
             .iter()
@@ -6396,8 +4204,6 @@ impl RustGenerator {
             })
             .collect();
 
-        // Only decode/resolve the old + new records when there is an index to
-        // maintain — an index-free model just repoints `id_to_row` + `id_versions`.
         let remove_old = if has_index {
             quote! {
                 if let Some(__old_rec) = self.get(id) {
@@ -6425,17 +4231,6 @@ impl RustGenerator {
         let versions_push =
             Self::id_versions_push_stmt(model, &recv, &id_tok, &quote! { __r });
 
-        // #187 — this is how a Tier-3 peer's allocations become visible.
-        //
-        // Coordinated clients open lock-free and each derive their own counter, so
-        // a peer's commits are invisible until refresh. `__peer_refresh` already
-        // runs before each coordinated prepare whenever the coordinator's LSN
-        // advanced, and routes through here — so folding the max into this delta
-        // closes peer staleness with no new mechanism, and a `Nack`ed writer
-        // re-derives past the winner's value before it retries.
-        //
-        // Ungated by tombstones, for the same reason the reopen scan is: a peer's
-        // deleted row still spent its number.
         let autoseq_delta = {
             let identity = model.identity_field().map(|f| f.name.as_str());
             let folds: Vec<TokenStream> = Self::sequence_auto_fields(model)
@@ -6443,7 +4238,6 @@ impl RustGenerator {
                 .map(|f| {
                     let seq = Self::autoseq_field_ident(f);
                     if Some(f.name.as_str()) == identity {
-                        // `id` is already decoded at the top of the loop body.
                         let as_u64 = Self::autoseq_to_u64(f, quote! { id });
                         quote! {
                             self.#seq.fetch_max(#as_u64, std::sync::atomic::Ordering::SeqCst);
@@ -6467,25 +4261,15 @@ impl RustGenerator {
         };
 
         quote! {
-            /// Fold only the rows in `[from..row_count)` into the in-memory maps
-            /// (#161-B).  Reuses the live update/delete index maintenance per row,
-            /// so the maps end up exactly as `__reindex_committed` would rebuild
-            /// them — but in O(new rows), not O(all rows × indexes).  A no-op when
-            /// `from >= row_count`.
             pub fn __reindex_delta(&mut self, from: usize) {
                 let __n = self.row_count;
                 for __r in from..__n {
                     let id = #id_read;
-                    // Drop the pre-row version's keys (the update/delete remove).
                     #remove_old
                     let __deleted = self.tombstones.is_deleted(__r).unwrap_or(false);
-                    // Repoint the id at this newest physical row (live or tombstone,
-                    // exactly as the live update/delete path does).
                     std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, __r);
                     #versions_push
                     #autoseq_delta
-                    // A live row adds its keys; a tombstoned row adds none (its keys
-                    // were removed above and stay absent — a delete).
                     if !__deleted {
                         #add_new
                     }
@@ -6494,19 +4278,10 @@ impl RustGenerator {
         }
     }
 
-    /// Emit the tail every mutation runs after its columns are appended and
-    /// `row_count` is bumped: count the write and checkpoint once the interval is
-    /// reached.  Placed AFTER the append + increment so the checkpoint always sees
-    /// a consistent, fully-appended column prefix.
     fn generate_maybe_checkpoint() -> TokenStream {
         quote! {
-            // Bound the WAL (#89 step 2): after enough mutations, fsync columns
-            // and truncate the WAL so it never grows without limit.
             self.writes_since_checkpoint += 1;
             if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
-                // MVCC Tier 1 (#83): a checkpoint mid-transaction would truncate
-                // the per-model WAL underneath the rollback — defer it to after
-                // the transaction commits/rolls back (`run_deferred_maintenance`).
                 if self.in_transaction {
                     self.checkpoint_deferred = true;
                 } else {
@@ -6516,50 +4291,23 @@ impl RustGenerator {
         }
     }
 
-    /// Emit the tail an update/delete runs after its dead-version bookkeeping:
-    /// count the dead row and compact once enough accumulate (#92 Phase 4).  Only
-    /// update/delete emit this — an insert produces no dead version.  Placed AFTER
-    /// `#maybe_checkpoint` so a compaction (which itself checkpoints) sees a
-    /// consistent, bounded WAL.
     fn generate_maybe_compact() -> TokenStream {
-        // #134 (Tier A, epic #126): when `[storage].compaction = false`, OMIT the
-        // auto-compaction trigger entirely — the `>= COMPACTION_DEAD_THRESHOLD`
-        // check and `compact()` call are simply not emitted, so the compiler
-        // optimizes as if in-process auto-compaction did not exist. The dead-row
-        // counter is still incremented (kept live for observability / the explicit
-        // `Database::compact()` path, which reclaims on demand).
         if !Self::active_cfg().compaction {
             return quote! {
-                // Auto-compaction disabled at generate time (#134): track the dead
-                // version for observability, but never auto-reclaim — the operator
-                // drives reclaim via the explicit `Database::compact()`.
                 self.dead_since_compaction += 1;
             };
         }
         quote! {
-            // Bound column storage (#92 Phase 4): this mutation left a dead
-            // (superseded/tombstoned) row version behind; once enough accumulate,
-            // reclaim them in-process under the writer lock.
             self.dead_since_compaction += 1;
             if self.dead_since_compaction >= COMPACTION_DEAD_THRESHOLD {
-                // MVCC Tier 1 (#83): compaction renumbers physical rows, which
-                // would invalidate a live transaction's rollback marks (physical
-                // lengths).  Defer it to after commit/rollback.
                 if self.in_transaction {
                     self.compact_deferred = true;
                 } else if self.dead_since_compaction
                     >= COMPACTION_DEAD_THRESHOLD * COMPACTION_DEAD_CEILING_FACTOR
                 {
-                    // #162-A hard ceiling: `maintain()` was not called and dead
-                    // versions reached the growth bound — compact inline now (the
-                    // safety net) so storage stays bounded regardless of deferral.
                     self.compaction_due = false;
                     self.compact();
                 } else {
-                    // #162-A soft threshold: do NOT stall this write on the
-                    // rewrite+remap — just record that reclaim is due.  An operator
-                    // / coordinator idle turn runs `Database::maintain()`, which
-                    // reclaims off the hot write path.
                     self.compaction_due = true;
                 }
             }
@@ -6575,22 +4323,13 @@ impl RustGenerator {
         let broker_record =
             Self::generate_broker_record(model, quote! { forgedb_changefeed::ChangeKind::Inserted });
         let maybe_checkpoint = Self::generate_maybe_checkpoint();
-        // Data-integrity gate (#91): validate field constraints + `&unique` BEFORE
-        // any durable side effect, so a rejected insert commits absolutely nothing.
         let validate_fn = format_ident!("validate_{}", Self::to_snake_case(&model.name));
         let unique_checks = Self::generate_unique_checks(schema, model, false);
-        // #254: precision floor + RFC 3339 range, ahead of the constraint gate.
         let ts_gate = Self::generate_timestamp_write_gate(schema, model);
 
-        // Secondary-index maintenance (#90): after the row is committed and the id
-        // is mapped, add this id under each indexed field's value key.  Sequenced
-        // after the WAL commit + `id_to_row` insert so the index only ever keys a
-        // durable row.
         let recv = quote! { self };
         let id_tok = quote! { id };
         let rec = quote! { record };
-        // #157 part B: hoist the key of any field used in ≥2 index structures so
-        // it is derived once and reused across the single + composite adds.
         let (add_hoist, add_map) = Self::hoist_index_keys(schema, model, &rec, "add");
         let index_adds: Vec<_> = Self::indexed_fields(model)
             .iter()
@@ -6600,9 +4339,7 @@ impl RustGenerator {
                 Self::index_add_block(&recv, &ident, key, &id_tok)
             })
             .collect();
-        // #169 ordered-index maintenance: same timing, keyed by the typed value.
         let ordered_adds: Vec<_> = Self::ordered_index_add_maint(model, &recv, &rec, &id_tok);
-        // Composite-index maintenance (#101): same timing, keyed by the tuple.
         let composite_adds: Vec<_> = Self::composite_indexes(model)
             .iter()
             .map(|(ident, comps)| {
@@ -6613,55 +4350,36 @@ impl RustGenerator {
                 Self::composite_add_block(&recv, ident, &parts, &id_tok)
             })
             .collect();
-        // #159: record this row as the newest version of `id` for snapshot reads.
         let versions_push = Self::id_versions_push_stmt(model, &recv, &id_tok, &quote! { row_index });
 
         quote! {
             #ts_gate
-            // Integrity gate (#91): field constraints, then `&unique`.  Both run
-            // before the WAL write, so a rejected insert leaves storage untouched.
             #validate_fn(&record)?;
             #(#unique_checks)*
 
             let row_index = self.row_count;
             let id = record.#id_field_name;
 
-            // #157: serialize the record ONCE; the WAL borrows it and the broker
-            // (if attached) moves it — no second serialize, no clone.
             #shared_record_json
 
-            // Durability boundary (#89): record + fsync the row in the WAL before
-            // any column is touched, so a crash mid-append is recovered on reopen.
             #wal_write
 
-            // Append all fields to their respective columns
             #(#append_statements)*
 
-            // Mark as not deleted
             self.tombstones.append(false).expect("Failed to append tombstone");
 
-            // Store ID mapping
             std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
             #versions_push
             self.row_count += 1;
 
-            // Secondary-index maintenance (#90): index the committed row.
-            // #157 part B: derive shared-field keys once, then reuse below.
             #(#add_hoist)*
             #(#index_adds)*
-            // Ordered-index maintenance (#169).
             #(#ordered_adds)*
-            // Composite-index maintenance (#101).
             #(#composite_adds)*
 
-            // Change-feed emit (#62 Direction A): this generated method knows a
-            // #model_name_str was inserted; the substrate feed only carries the
-            // field-blind (model, row_index) signal.  Best-effort, never blocks.
             if let Some(feed) = &self.changefeed {
                 feed.emit(#model_name_str, row_index, forgedb_changefeed::ChangeKind::Inserted);
             }
-            // Durable replication record (#82 Direction C): same field-blind signal
-            // plus the opaque row bytes + a global offset, for a resumable follower.
             #broker_record
 
             #maybe_checkpoint
@@ -6670,13 +4388,6 @@ impl RustGenerator {
         }
     }
 
-    /// Generate the body of `update(id, record)` (#66 mutation surface).
-    ///
-    /// Superseding-version append: the new field values are written at a fresh
-    /// physical row and the id is repointed to it.  Committed bytes are never
-    /// mutated in place, so append-only holds and backup / watermark snapshots
-    /// (#57 / #56) keep working unchanged.  Returns `false` if the id is absent.
-    /// `None` when the model has no id field (cannot be mutated by id).
     fn generate_update_logic(schema: &Schema, model: &forgedb_parser::Model) -> Option<TokenStream> {
         model.identity_field()?;
         let append_statements = Self::generate_append_statements(schema, model);
@@ -6687,22 +4398,12 @@ impl RustGenerator {
             Self::generate_broker_record(model, quote! { forgedb_changefeed::ChangeKind::Updated });
         let maybe_checkpoint = Self::generate_maybe_checkpoint();
         let maybe_compact = Self::generate_maybe_compact();
-        // Integrity gate (#91): validate field constraints + `&unique` (excluding
-        // the record's own id) before any durable side effect.
         let validate_fn = format_ident!("validate_{}", Self::to_snake_case(&model.name));
         let unique_checks = Self::generate_unique_checks(schema, model, true);
-        // #254: precision floor + RFC 3339 range, ahead of the constraint gate.
         let ts_gate = Self::generate_timestamp_write_gate(schema, model);
 
-        // Secondary-index maintenance (#90): an update that changes an indexed
-        // field must drop the OLD value key and add the NEW one, else the index
-        // keeps a stale hit pointing at a superseded row.  We remove using the
-        // pre-update record (`__old`, resolved before the repoint) and add using
-        // the incoming `record`.
         let indexed = Self::indexed_fields(model);
         let composites = Self::composite_indexes(model);
-        // Fetch the pre-update record when any index (single or composite) needs
-        // the old value keys to remove.
         let fetch_old = if indexed.is_empty() && composites.is_empty() {
             quote! {}
         } else {
@@ -6712,12 +4413,6 @@ impl RustGenerator {
         let id_tok = quote! { id };
         let rec = quote! { record };
         let old = quote! { __old_rec };
-        // #157 part B: hoist shared-field keys once per direction — the new-value
-        // keys (from `record`) and the old-value keys (from `__old_rec`) — so a
-        // field in a single index AND a composite derives each key once, not per
-        // index structure. Removes are grouped under one `if let Some(__old_rec)`
-        // (the old hoist lives inside it, since `__old_rec` is bound there); adds
-        // run unconditionally after.
         let (add_hoist, add_map) = Self::hoist_index_keys(schema, model, &rec, "add");
         let (rem_hoist, rem_map) = Self::hoist_index_keys(schema, model, &old, "rem");
         let single_removes: Vec<_> = indexed
@@ -6736,12 +4431,8 @@ impl RustGenerator {
                 Self::index_add_block(&recv, &ident, key, &id_tok)
             })
             .collect();
-        // #169 ordered-index update: remove the old typed value (from `__old_rec`),
-        // add the new one (from `record`).
         let ordered_removes: Vec<_> = Self::ordered_index_remove_maint(model, &recv, &old, &id_tok);
         let ordered_adds: Vec<_> = Self::ordered_index_add_maint(model, &recv, &rec, &id_tok);
-        // Composite-index update maintenance (#101): remove the old tuple key
-        // (from `__old`), add the new one (from `record`).
         let composite_removes: Vec<_> = composites
             .iter()
             .map(|(ident, comps)| {
@@ -6762,11 +4453,6 @@ impl RustGenerator {
                 Self::composite_add_block(&recv, ident, &parts, &id_tok)
             })
             .collect();
-        // The remove side runs only when there is a pre-update record to remove
-        // keys from — and `__old` is only bound (by `fetch_old`) when the model has
-        // an index. Emit the whole `if let Some(__old_rec)` block only then, so an
-        // index-free model neither references an undefined `__old` nor emits a dead
-        // empty guard.
         let index_remove_maint = if indexed.is_empty() && composites.is_empty() {
             quote! {}
         } else {
@@ -6774,14 +4460,11 @@ impl RustGenerator {
                 if let Some(__old_rec) = &__old {
                     #(#rem_hoist)*
                     #(#single_removes)*
-                    // Ordered-index maintenance (#169): drop the stale typed value.
                     #(#ordered_removes)*
-                    // Composite-index maintenance (#101): drop stale tuple keys.
                     #(#composite_removes)*
                 }
             }
         };
-        // #159: append the superseding version's row index to `id_versions[id]`.
         let versions_push = Self::id_versions_push_stmt(model, &recv, &id_tok, &quote! { row_index });
 
         Some(quote! {
@@ -6789,89 +4472,56 @@ impl RustGenerator {
                 return Ok(false);
             }
             #ts_gate
-            // Integrity gate (#91): validate the incoming record before touching
-            // storage; `&unique` excludes this id so an unchanged value is fine.
             #validate_fn(&record)?;
             #(#unique_checks)*
-            // Resolve the pre-update record (if live) for index removal.
             #fetch_old
             let row_index = self.row_count;
 
-            // #157: serialize the record once, shared by the WAL + broker.
             #shared_record_json
 
-            // Durability boundary (#89): WAL-record the superseding version first.
             #wal_write
 
-            // Append the superseding version's columns from `record`.
             #(#append_statements)*
 
-            // The new version is live (not a tombstone).
             self.tombstones.append(false).expect("Failed to append tombstone");
 
-            // Repoint the id at its newest physical row; the prior version's bytes
-            // remain committed (backup-faithful) until compaction reclaims them.
             std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
             #versions_push
             self.row_count += 1;
 
-            // Secondary-index maintenance (#90): drop stale value keys, add new.
-            // #157 part B: old-value key derivation is hoisted once inside the
-            // `if let Some(__old_rec)` guard; new-value keys once after.
             #index_remove_maint
             #(#add_hoist)*
             #(#single_adds)*
-            // Ordered-index maintenance (#169): add the new typed value.
             #(#ordered_adds)*
             #(#composite_adds)*
 
-            // #62: an Updated event carries the new live row index.
             if let Some(feed) = &self.changefeed {
                 feed.emit(#model_name_str, row_index, forgedb_changefeed::ChangeKind::Updated);
             }
-            // Durable replication record (#82): the superseding version's new live
-            // row index + its opaque bytes, at a fresh global offset.
             #broker_record
 
             #maybe_checkpoint
 
-            // Bound column storage (#92): this update superseded a live version,
-            // leaving a dead row behind — compact once enough accumulate.
             #maybe_compact
 
             Ok(true)
         })
     }
 
-    /// Generate the body of `delete(id)` (#66 mutation surface).
-    ///
-    /// Appends a *tombstoned* superseding version for the id.  The current values
-    /// are re-appended (their content is irrelevant — the row reads as absent) only
-    /// to keep every column aligned to the row count.  Reads resolve the newest
-    /// version, now tombstoned, so `get` returns `None`.  Returns `false` if the id
-    /// is already absent.  `None` when the model has no id field.
     fn generate_delete_logic(schema: &Schema, model: &forgedb_parser::Model) -> Option<TokenStream> {
         model.identity_field()?;
         let append_statements = Self::generate_append_statements(schema, model);
         let model_name_str = model.name.clone();
         let wal_write = Self::generate_wal_record_write(model, true);
         let shared_record_json = Self::generate_shared_record_json();
-        // The broker records the *tombstoned* physical row (`row_index`), so a
-        // follower applies the tombstone at the same position; `record` (the
-        // pre-delete values re-appended under the tombstone) supplies the bytes.
         let broker_record =
             Self::generate_broker_record(model, quote! { forgedb_changefeed::ChangeKind::Deleted });
         let maybe_checkpoint = Self::generate_maybe_checkpoint();
         let maybe_compact = Self::generate_maybe_compact();
 
-        // Secondary-index maintenance (#90): a delete appends a tombstoned
-        // superseding row, so the id's index entry must be DROPPED (the physical
-        // row still exists but the record reads as absent).  `record` below is
-        // the pre-delete live version — its field values are the keys to remove.
         let recv = quote! { self };
         let id_tok = quote! { id };
         let rec = quote! { record };
-        // #157 part B: hoist shared-field keys once (from the pre-delete `record`).
         let (rem_hoist, rem_map) = Self::hoist_index_keys(schema, model, &rec, "rem");
         let index_removes: Vec<_> = Self::indexed_fields(model)
             .iter()
@@ -6881,9 +4531,7 @@ impl RustGenerator {
                 Self::index_remove_block(&recv, &ident, key, &id_tok)
             })
             .collect();
-        // #169 ordered-index removal: drop the deleted id's typed value.
         let ordered_removes: Vec<_> = Self::ordered_index_remove_maint(model, &recv, &rec, &id_tok);
-        // Composite-index removal (#101): drop the deleted id's tuple key.
         let composite_removes: Vec<_> = Self::composite_indexes(model)
             .iter()
             .map(|(ident, comps)| {
@@ -6894,21 +4542,13 @@ impl RustGenerator {
                 Self::composite_remove_block(&recv, ident, &parts, &id_tok)
             })
             .collect();
-        // #159: the tombstoned version is the newest physical row for `id` — append
-        // it to `id_versions[id]` so a snapshot taken AFTER the delete resolves it
-        // (and reads absent via the tombstone), while an earlier snapshot still
-        // resolves the pre-delete version.
         let versions_push = Self::id_versions_push_stmt(model, &recv, &id_tok, &quote! { row_index });
 
         Some(quote! {
-            // Materialize the current live record; also gives the values to
-            // re-append.  A missing / already-deleted id resolves to `None`.
             let record = match self.get(id) {
                 Some(r) => r,
                 None => return false,
             };
-            // The pre-delete live row is still non-tombstoned, so a subscriber can
-            // materialize what was deleted from it (the new tombstoned row cannot).
             let deleted_row = *self
                 .id_to_row
                 .get(&id)
@@ -6916,73 +4556,42 @@ impl RustGenerator {
 
             let row_index = self.row_count;
 
-            // #157: serialize the record once, shared by the WAL + broker.
             #shared_record_json
 
-            // Durability boundary (#89): WAL-record the tombstoned version first.
             #wal_write
 
-            // Re-append the current column values under a tombstone.
             #(#append_statements)*
 
             self.tombstones.append(true).expect("Failed to append tombstone");
 
-            // Repoint the id at the tombstoned newest row so `get` reads absent.
             std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
             #versions_push
             self.row_count += 1;
 
-            // Secondary-index maintenance (#90): drop the deleted id's value keys.
-            // #157 part B: shared-field keys derived once, then reused.
             #(#rem_hoist)*
             #(#index_removes)*
-            // Ordered-index removal (#169).
             #(#ordered_removes)*
-            // Composite-index removal (#101).
             #(#composite_removes)*
 
-            // #62: a Deleted event carries the pre-delete row so the record is
-            // still materializable by a subscriber.
             if let Some(feed) = &self.changefeed {
                 feed.emit(#model_name_str, deleted_row, forgedb_changefeed::ChangeKind::Deleted);
             }
-            // Durable replication record (#82): the tombstoned physical row so a
-            // follower reproduces the delete by position.
             #broker_record
 
             #maybe_checkpoint
 
-            // Bound column storage (#92): this delete left a tombstoned dead row
-            // behind — compact once enough accumulate.
             #maybe_compact
 
             true
         })
     }
 
-    /// Generate the secondary-index probe methods on a model's storage (#90):
-    /// `find_by_<field>` (live) + `find_by_<field>_at` (snapshot) for every
-    /// `^index` / `&unique` field, plus `get_by_<field>` / `get_by_<field>_at`
-    /// for `&unique` fields (at most one match).
-    ///
-    /// A probe is O(1) in the index (candidate ids), NOT a scan.  It then
-    /// resolves each candidate through the version-aware read path — `get` (live
-    /// newest version) or `get_at` (the snapshot's version) — so it never
-    /// bypasses superseding-version (#66) / watermark (#56) resolution.  The
-    /// `_at` probe additionally post-filters on the resolved value, so a
-    /// candidate whose value changed *after* the snapshot is excluded.
     fn generate_index_lookups(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let probes = Self::generate_index_probes(schema, model, true);
         let ranges = Self::generate_ordered_range_methods(schema, model);
         quote! { #probes #ranges }
     }
 
-    /// #169: the ordered-index range + top-N query methods, one per
-    /// ordered-eligible field.  `find_by_<field>_range(min, max, descending,
-    /// limit)` walks the field's `BTreeMap` within `[min, max]` (inclusive; `None`
-    /// = unbounded) in value order (or reversed), resolving each id's live record,
-    /// stopping at `limit` — O(matches) top-N / range, not a full scan.  Writer
-    /// only (resolves via live `get`); the reader/`_at` ordered probe is deferred.
     fn generate_ordered_range_methods(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let model_name = format_ident!("{}", model.name);
         let methods: Vec<TokenStream> = Self::ordered_index_fields(model)
@@ -6990,27 +4599,12 @@ impl RustGenerator {
             .map(|f| {
                 let ident = Self::ordered_index_ident(f);
                 let kty = Self::ordered_key_type(f).expect("ordered_index_fields filtered");
-                // What the CALLER passes, which is the key type for every field
-                // but `f64` — whose key is an encoded `u64` the caller must never
-                // have to construct (#242).
                 let pty = Self::ordered_param_type(f).expect("ordered_index_fields filtered");
                 let id_type = Self::id_type_tokens(schema, model);
                 let range_fn = format_ident!("find_by_{}_range", f.name);
-                // Map each bound through the same transform as the stored key —
-                // decimal scale-invariant, f64 total-order encoded — so a bound is
-                // comparable to what it bounds.  Both are order-preserving, so the
-                // bound still selects the same values it names.
                 let lo_norm = Self::ordered_key_expr(&f.field_type, quote! { __v });
                 let hi_norm = Self::ordered_key_expr(&f.field_type, quote! { __v });
-                let doc = format!(
-                    "Ordered-index range + top-N over `{}`.`{}` (#169): live records \
-                     with the field in `[min, max]` (inclusive; `None` = unbounded), \
-                     ordered by the field (descending if `descending`), capped at \
-                     `limit` (`None` = all).  O(matches) via the BTreeMap, not a scan.",
-                    model.name, f.name
-                );
                 quote! {
-                    #[doc = #doc]
                     pub fn #range_fn(
                         &self,
                         min: Option<#pty>,
@@ -7020,8 +4614,6 @@ impl RustGenerator {
                     ) -> Vec<#model_name> {
                         let __lo_v: Option<#kty> = min.map(|__v| #lo_norm);
                         let __hi_v: Option<#kty> = max.map(|__v| #hi_norm);
-                        // An inverted range would panic `BTreeMap::range`; treat it
-                        // as empty.
                         if let (Some(__l), Some(__h)) = (__lo_v.as_ref(), __hi_v.as_ref()) {
                             if __l > __h {
                                 return Vec::new();
@@ -7036,8 +4628,6 @@ impl RustGenerator {
                             None => std::ops::Bound::Unbounded,
                         };
                         let mut __out: Vec<#model_name> = Vec::new();
-                        // Unify both scan directions behind one boxed iterator so the
-                        // resolve loop is written once.
                         let __iter: Box<dyn Iterator<Item = (&#kty, &std::collections::BTreeSet<#id_type>)> + '_> =
                             if descending {
                                 Box::new(self.#ident.range((__lo, __hi)).rev())
@@ -7064,19 +4654,10 @@ impl RustGenerator {
         quote! { #(#methods)* }
     }
 
-    /// Emit the secondary-index probe methods for a model's storage, factored so
-    /// the writer storage gets the full set (live `find_by`/`get_by` + snapshot
-    /// `_at`) while the read-only `*StorageReader` (#103) gets **only** the `_at`
-    /// forms — a reader has no live `get`, so a "live" probe would be meaningless.
-    /// Covers single-field indexes (#90/#100/#102) and composite indexes (#101).
-    ///
-    /// `include_live = true` → writer (has `get` + `get_at`); `false` → reader
-    /// (has `get_at` only, index maps cloned at `reader()` time).
     fn generate_index_probes(schema: &Schema, model: &forgedb_parser::Model, include_live: bool) -> TokenStream {
         let model_name = format_ident!("{}", model.name);
         let mut methods: Vec<TokenStream> = Vec::new();
 
-        // --- Single-field probes (#90 + #100 FK + #102 nullable) --------------
         for f in Self::indexed_fields(model) {
             let ident = Self::index_field_ident(f);
             let fname = format_ident!("{}", f.name);
@@ -7089,7 +4670,6 @@ impl RustGenerator {
             let key_from_rec = Self::index_key_expr(schema, &f.field_type, Self::index_value_expr(&f.field_type,
                 quote! { __rec.#fname },
             ));
-            let subject = format!("`{}`.`{}`", model.name, f.name);
             let unique = if f.unique {
                 Some((
                     format_ident!("get_by_{}", f.name),
@@ -7108,11 +4688,9 @@ impl RustGenerator {
                 &key_from_rec,
                 include_live,
                 unique.as_ref(),
-                &subject,
             ));
         }
 
-        // --- Composite probes (#101) — `find_by_<a>_and_<b>` (never unique) ---
         for (ident, comps) in Self::composite_indexes(model) {
             let find_fn = Self::composite_probe_ident(&comps);
             let find_at_fn = format_ident!("{}_at", find_fn);
@@ -7143,11 +4721,6 @@ impl RustGenerator {
                 .collect();
             let key_from_arg = Self::composite_key_build(&arg_keys);
             let key_from_rec = Self::composite_key_build(&rec_keys);
-            let subject = format!(
-                "`{}` composite ({})",
-                model.name,
-                comps.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ")
-            );
             methods.push(Self::emit_probe(
                 &model_name,
                 &ident,
@@ -7158,17 +4731,12 @@ impl RustGenerator {
                 &key_from_rec,
                 include_live,
                 None,
-                &subject,
             ));
         }
 
         quote! { #(#methods)* }
     }
 
-    /// Emit one index probe family: a `Vec` `find_by`/`find_by_at`, plus (for
-    /// `&unique` single-field indexes) an `Option` `get_by`/`get_by_at`.  Live
-    /// (`get`-based) forms are emitted only when `include_live` is set (writer);
-    /// the `_at` (`get_at`-based) forms are always emitted (writer + reader).
     #[allow(clippy::too_many_arguments)]
     fn emit_probe(
         model_name: &proc_macro2::Ident,
@@ -7180,24 +4748,11 @@ impl RustGenerator {
         key_from_rec: &TokenStream,
         include_live: bool,
         unique: Option<&(proc_macro2::Ident, proc_macro2::Ident)>,
-        subject: &str,
     ) -> TokenStream {
-        let find_at_doc = format!(
-            "Snapshot-scoped index probe for {subject} (#90/#56): O(1) candidate \
-             lookup, each resolved through `get_at` (the version live as of `snap`) \
-             and post-filtered so a candidate whose value changed after the snapshot \
-             is excluded.  Honest limit: a row whose value changed *away* between \
-             the snapshot and now is not in the (unversioned) index."
-        );
         let mut m = TokenStream::new();
 
         if include_live {
-            let find_doc = format!(
-                "Index probe for {subject} (#90): every live match for the argument(s). \
-                 O(1) candidate lookup + newest-version resolution, not a scan."
-            );
             m.extend(quote! {
-                #[doc = #find_doc]
                 pub fn #find_fn(&self, #params) -> Vec<#model_name> {
                     let __k: String = { #key_from_arg };
                     let __ids = match self.#index_ident.get(&__k) {
@@ -7210,7 +4765,6 @@ impl RustGenerator {
         }
 
         m.extend(quote! {
-            #[doc = #find_at_doc]
             pub fn #find_at_fn(
                 &self,
                 snap: &forgedb_storage::Snapshot,
@@ -7235,16 +4789,8 @@ impl RustGenerator {
         });
 
         if let Some((get_fn, get_at_fn)) = unique {
-            let get_at_doc = format!(
-                "Snapshot-scoped unique index probe for {subject} (#90/#56): the \
-                 at-most-one match as of `snap`."
-            );
             if include_live {
-                let get_doc = format!(
-                    "Unique index probe for {subject} (#90): the at-most-one live match."
-                );
                 m.extend(quote! {
-                    #[doc = #get_doc]
                     pub fn #get_fn(&self, #params) -> Option<#model_name> {
                         let __k: String = { #key_from_arg };
                         let __ids = self.#index_ident.get(&__k)?;
@@ -7253,7 +4799,6 @@ impl RustGenerator {
                 });
             }
             m.extend(quote! {
-                #[doc = #get_at_doc]
                 pub fn #get_at_fn(
                     &self,
                     snap: &forgedb_storage::Snapshot,
@@ -7280,32 +4825,6 @@ impl RustGenerator {
         m
     }
 
-    /// Generate the body of the shared `read_at(row_index)` accessor.
-    ///
-    /// This is the read path *below* identity resolution: given a physical row
-    /// index, check the tombstone and materialize the record.  Both `get(id)`
-    /// (live index lookup) and the snapshot accessors `get_at`/`all_at` (#56,
-    /// watermark-clamped) funnel through it, so there is exactly one place that
-    /// knows a model's column layout.
-    /// Emit the decode of ONE stored field at `row_index` from `receiver`, binding
-    /// a `<field>_value` local whose type is EXACTLY the model struct field's type.
-    /// Returns `None` for virtual/unstored fields (relations/components have no
-    /// column).
-    ///
-    /// This is the single per-field decode path shared by `read_at` (full record)
-    /// and the reopen index rebuild (`generate_rehydrate_logic`, which reads only
-    /// the indexed-field columns) — one body, so the two can never drift, and the
-    /// reopen path can fault in just the columns an index needs instead of the
-    /// whole record.
-    ///
-    /// `borrowed` selects the **string** decode only (#224): `false` binds an owned
-    /// `String` / `Option<String>` as before; `true` binds `&str` / `Option<&str>`
-    /// borrowed straight out of the buffered span via `read_str`, for the narrow
-    /// scan's borrowed row view.  Every other arm is emitted identically in both
-    /// modes — one decoder with two string arms, not two decoders (PM constraint 2).
-    /// Only a receiver that is a `BufferedVariableColumn` (the scan's `__bufs`
-    /// holder) can satisfy `borrowed = true`; the positional `VariableColumn` path
-    /// has no span to borrow from.
     fn field_read_stmt(
         schema: &Schema,
         field: &forgedb_parser::Field,
@@ -7318,9 +4837,6 @@ impl RustGenerator {
         let field_value_name = format_ident!("{}_value", field.name);
 
         if Self::is_enum_type(&field.field_type) {
-            // Enum (#enum): a 1-byte discriminant column (2 bytes for nullable —
-            // `[present, disc]`).  Decode via the generated `__from_u8`, which
-            // hard-fails on an out-of-range byte.
             let enum_ident = Self::enum_type_ident(&field.field_type)
                 .expect("enum field has an enum type");
             let stmt = if field.is_nullable() {
@@ -7347,9 +4863,6 @@ impl RustGenerator {
             Some((field_value_name, stmt))
         } else if Self::is_json_type(&field.field_type) {
             let stmt = if field.is_nullable() {
-                // Decode the 1-byte presence tag written by insert
-                // (0x01 = Some, anything else = None), then parse the JSON tail
-                // back into a `serde_json::Value`.
                 quote! {
                     let #field_value_name = {
                         let raw = #receiver.#field_col_name.read_string(#row_index)
@@ -7374,10 +4887,6 @@ impl RustGenerator {
             };
             Some((field_value_name, stmt))
         } else if Self::is_variable_string_type(&field.field_type) && borrowed {
-            // #224: borrow the slot out of the buffered span instead of allocating
-            // a `String` per field per row.  Same presence-tag decode as the owned
-            // arm below — the tag byte is `0x01`, so slicing at byte 1 is always a
-            // char boundary, exactly as `raw[1..].to_string()` relies on today.
             let stmt = if field.is_nullable() {
                 quote! {
                     let #field_value_name = {
@@ -7400,32 +4909,11 @@ impl RustGenerator {
         } else if let Some((chars, exact)) =
             Self::inline_string_column_params(schema, &field.field_type)
         {
-            // #252: an FK to a string-keyed model is an inline-string column and
-            // its Rust value is the key, so it decodes here and materializes the
-            // key type — the caller cannot know that, since it sees the model's
-            // identity only.
             let as_key =
                 as_key || Self::fk_backing_type(schema, &field.field_type).is_some();
-            // Inline `string(N)` (#238). Two shapes, and the difference is the
-            // whole point of the type:
-            //
-            //   borrowed (the scan) — the slot is borrowed out of the buffered
-            //     column and never copied. `read_str` when the slot IS the value
-            //     (`string(N!)`, no prefix); `read_slice` + a generated prefix
-            //     decode otherwise. Zero allocations per row, which is what makes
-            //     a fixed slot beat pointer storage at all (#261).
-            //   owned (`get`/`all`) — materializes a `String` anyway, so it reads
-            //     through `read_bytes` like every other fixed column. A borrow is
-            //     not available here: the live `FixedColumn` and `FixedColumnReader`
-            //     read through the file on every access and have nothing to lend.
             let utf8 = Self::is_utf8_field(field);
             let (_, prefix, _) = Self::inline_string_layout(chars, exact, utf8);
             let base = if field.is_nullable() { 1usize } else { 0 };
-            // #252: a key does not borrow. `InlineStr<N>` is `Copy` and owns its
-            // bytes, so the scan view holds it by value — which costs the scan
-            // nothing (no allocation, which is the only thing borrowing bought)
-            // and is what lets the id vector the scan scope returns outlive the
-            // buffers it was decoded from.
             let key_ty = if as_key {
                 Some(Self::key_type_ident(schema, &field.field_type))
             } else {
@@ -7439,8 +4927,6 @@ impl RustGenerator {
             };
             let stmt = if borrowed {
                 if !field.is_nullable() && prefix == 0 {
-                    // The substrate can do the whole read: the slot is exactly the
-                    // value, so there is no framing for generated code to decode.
                     if let Some(kt) = &key_ty {
                         quote! {
                             let #field_value_name = <#kt>::try_from(
@@ -7497,12 +4983,6 @@ impl RustGenerator {
                     base,
                     quote! { __slot_bytes },
                 );
-                // #252: in a key position the owned read materializes the `Copy`
-                // key type rather than a `String`. `try_from` cannot fail here —
-                // the slot is N bytes wide and the key is N bytes at most — but
-                // it is not `expect`ed away: a corrupt column would otherwise
-                // panic mid-read, and `unwrap_or_default` degrades a garbage row
-                // to the empty key, which `get` then simply does not find.
                 let decode = if as_key {
                     let key_ty = Self::key_type_ident(schema, &field.field_type);
                     quote! {
@@ -7542,8 +5022,6 @@ impl RustGenerator {
             Some((field_value_name, stmt))
         } else if Self::is_variable_string_type(&field.field_type) {
             let stmt = if field.is_nullable() {
-                // Decode the 1-byte presence tag written by insert
-                // (0x01 = Some, anything else = None).
                 quote! {
                     let #field_value_name = {
                         let raw = #receiver.#field_col_name.read_string(#row_index)
@@ -7563,10 +5041,6 @@ impl RustGenerator {
             };
             Some((field_value_name, stmt))
         } else if Self::is_fixed_size_type(schema, &field.field_type) {
-            // Complex types that persist as a raw byte blob.  #266: an optional
-            // FK is not named here any more — `resolved_type` backs it onto
-            // `Nullable(<target key>)`, so it arrives as an ordinary nullable
-            // column.
             let needs_byte_conversion = matches!(
                 &Self::resolved_type(schema, &field.field_type),
                 forgedb_parser::FieldType::Bytes(_)
@@ -7577,8 +5051,6 @@ impl RustGenerator {
             );
 
             let stmt = if needs_byte_conversion {
-                // C3: use the actual stored type (Option<T> for nullable/optional) for the
-                // type annotation and use ptr::read_unaligned to avoid UB on unaligned reads
                 let stored_type = Self::stored_type_tokens(schema, &field.field_type, field.is_nullable());
                 quote! {
                     let #field_value_name: #stored_type = {
@@ -7590,19 +5062,14 @@ impl RustGenerator {
                     };
                 }
             } else {
-                // For primitives, use typed method
                 let read_method = Self::get_read_method(schema, &field.field_type);
 
-                // A uuid reads a raw [u8; 16] — including an FK that resolved to
-                // one (#266).
                 let is_uuid_like = matches!(
                     &Self::resolved_type(schema, &field.field_type),
                     forgedb_parser::FieldType::Uuid
                 );
-                // read_timestamp returns i64; the struct field is Timestamp
                 let is_timestamp =
                     matches!(&Self::resolved_type(schema, &field.field_type), forgedb_parser::FieldType::Timestamp(_));
-                // Non-null decimal reads raw [u8; 16] then Decimal::deserialize.
                 let is_decimal =
                     matches!(&Self::resolved_type(schema, &field.field_type), forgedb_parser::FieldType::Decimal);
 
@@ -7642,23 +5109,6 @@ impl RustGenerator {
         }
     }
 
-    /// The `#[schema(value_type = …)]` payload a `Timestamp`-bearing field needs,
-    /// or `None` if the field carries no timestamp.
-    ///
-    /// `forgedb_types::Timestamp` deliberately does NOT implement
-    /// `utoipa::ToSchema` — the substrate does not depend on utoipa — so every
-    /// place a `Timestamp` reaches a `#[derive(ToSchema)]` type has to say what
-    /// the wire form is, and since #254 that form is the RFC 3339 **string**.
-    /// Announcing `i64` after the wire form changed would make the OpenAPI
-    /// document a liar about its own responses.
-    ///
-    /// One helper rather than a predicate repeated per site, because the sites
-    /// that were *missed* are the ones that hurt: a `#[derive(ToSchema)]` type
-    /// carrying an un-annotated `Timestamp` does not warn — it fails to compile
-    /// in the USER's crate, which is why the compile-and-run check exists. The
-    /// three that a bare `is_timestamp_type(&field.field_type)` cannot see are a
-    /// relation FK whose target is timestamp-keyed (#266), a `[timestamp; N]`,
-    /// and a live-query event enum keyed on a timestamp identity.
     pub(crate) fn timestamp_schema_value_type(
         schema: &Schema,
         field_type: &forgedb_parser::FieldType,
@@ -7666,15 +5116,6 @@ impl RustGenerator {
         Self::schema_value_type(schema, field_type, false)
     }
 
-    /// The `#[schema(value_type = …)]` payload for any field whose Rust type is a
-    /// substrate type utoipa cannot see through — today `Timestamp` (#254) and,
-    /// in a **key** position, `InlineStr<N>` (#252).
-    ///
-    /// `is_key` matters because it is the only thing that distinguishes the two
-    /// renderings of `string(N)`: as a key it is an `InlineStr<N>` and needs the
-    /// annotation, as an ordinary column it is a `String` and must not have one
-    /// (utoipa would document it correctly either way, but an annotation on a
-    /// type that already implements `ToSchema` is noise that drifts).
     pub(crate) fn schema_value_type(
         schema: &Schema,
         field_type: &forgedb_parser::FieldType,
@@ -7683,7 +5124,6 @@ impl RustGenerator {
         use forgedb_parser::FieldType;
         match &Self::resolved_type(schema, field_type) {
             FieldType::Timestamp(_) => Some(quote! { String }),
-            // Both spellings serialize as the JSON string `InlineStr` produces.
             FieldType::StringN { .. } if is_key => Some(quote! { String }),
             FieldType::Nullable(inner) => {
                 let inner = Self::schema_value_type(schema, inner, is_key)?;
@@ -7697,15 +5137,6 @@ impl RustGenerator {
         }
     }
 
-    /// Render one struct field (`pub name: Type`) exactly as the model struct
-    /// does, with the `utoipa` Timestamp `value_type` annotation and nullable
-    /// wrapping.  Shared by the model struct and every projection struct (#113)
-    /// so a projected field's type never drifts from the model's.
-    ///
-    /// `auto_default` adds the `+` auto-generate serde defaults (#187) so a
-    /// create body may omit those fields — emitted for the model struct, but NOT
-    /// for read-only projection structs (which are never deserialized from a
-    /// create body).
     fn model_struct_field(
         schema: &Schema,
         field: &forgedb_parser::Field,
@@ -7713,10 +5144,6 @@ impl RustGenerator {
         is_key: bool,
     ) -> TokenStream {
         let field_name = format_ident!("{}", field.name);
-        // #252: a key position renders `string(N)` as the `Copy` `InlineStr<N>`;
-        // an ordinary column of the same declared type stays a `String`. `is_key`
-        // is supplied by the caller because only the caller can see the model,
-        // and only the model knows which field is the identity.
         let field_type = if is_key {
             Self::key_type_ident(schema, &field.field_type)
         } else {
@@ -7725,16 +5152,6 @@ impl RustGenerator {
 
         let (schema_attr, serde_attr) = Self::field_wire_attrs(schema, field, is_key);
 
-        // `+` auto-generate fields (#187) may be omitted from a create body — the
-        // server synthesizes them (`create_*`) — so they deserialize with a serde
-        // default.  `Uuid` defaults to nil (its `Default`); `Timestamp` cannot
-        // derive `Default` in generated code, so its default points at the emitted
-        // `__forgedb_default_ts`; an integer auto defaults to `0`, which is exactly
-        // the allocate sentinel `generate_auto_synthesis` looks for.
-        //
-        // The three defaults are the same value each type's synthesis treats as
-        // "unset" — that correspondence is the contract, and breaking it silently
-        // turns an omitted field into a committed zero.
         let serde_default = if auto_default && field.auto_generate {
             match &field.field_type {
                 forgedb_parser::FieldType::Uuid
@@ -7756,28 +5173,6 @@ impl RustGenerator {
         }
     }
 
-    /// The `(#[schema(..)], #[serde(..)])` attribute pair one struct field carries
-    /// because its Rust type's own derives are not enough to describe it.
-    ///
-    /// Three cases, in this order:
-    ///
-    /// - **`Timestamp` / a key `InlineStr<N>`** — `forgedb_types` does not depend on
-    ///   utoipa, so these need a `value_type` telling the OpenAPI document the wire
-    ///   form is the RFC 3339 / plain string serde actually produces (#254/#252).
-    ///   Serde needs nothing: the substrate type's own `Serialize` is already right.
-    /// - **`decimal`** — `rust_decimal::Decimal` implements neither, and its wire
-    ///   form is a precision-preserving *string* (matching the TS SDK), so it needs
-    ///   both halves: a `value_type` and a `#[serde(with = ...)]`.
-    /// - **an array past serde's N = 32 ceiling** (#243) — without the `with` the
-    ///   derive does not resolve at all and the generated crate fails to compile.
-    ///
-    /// Factored out (#226) because `<Model>PageRef` has to reproduce the model
-    /// struct's bytes exactly while deriving only `Serialize`: it takes the serde
-    /// half and must NOT take the schema half (a `#[schema(..)]` on a type with no
-    /// `ToSchema` derive is a compile error, not inert). Two sites computing the
-    /// same attribute set independently is precisely how a field gains a serde
-    /// `with` on the model and not on the page view — a silent byte divergence on
-    /// one field class, invisible to a snapshot diff that only reads the model.
     fn field_wire_attrs(
         schema: &Schema,
         field: &forgedb_parser::Field,
@@ -7804,23 +5199,6 @@ impl RustGenerator {
         }
     }
 
-    /// Emit the `+` auto-generate value synthesis for a model's create path
-    /// (#187): for each `+` field, fill it in when the caller left it unset, so
-    /// `create_<model>` (Rust, and REST through it) generates the value rather
-    /// than requiring it in the body.  Operates on a `mut record`.
-    ///
-    /// Each type has its own "unset" sentinel: a nil UUID, a zero timestamp, and —
-    /// for `+u32`/`+u64` — **`0`**.  The integer case therefore carries a
-    /// user-visible consequence the others do not: `0` cannot be *inserted*
-    /// explicitly into an auto-integer field, because supplying it means "allocate
-    /// one for me".  Documented in `docs/SCHEMA.md` and the website modifiers page,
-    /// not only here.
-    ///
-    /// `recv` is the storage receiver, because unlike uuid/timestamp synthesis —
-    /// which is pure — integer allocation reads and advances per-model state. The
-    /// three create surfaces reach their storage differently (`Database` owns it,
-    /// `TxHandle` borrows the db, `ConcurrentTxHandle` holds an `Arc<RwLock<_>>`),
-    /// so the receiver is threaded in rather than assumed.
     fn generate_auto_synthesis(model: &forgedb_parser::Model, recv: &TokenStream) -> TokenStream {
         let stmts: Vec<TokenStream> = model
             .fields
@@ -7844,11 +5222,6 @@ impl RustGenerator {
                             if record.#name == 0 {
                                 record.#name = #recv.#alloc()?;
                             } else {
-                                // An explicitly supplied value advances the counter
-                                // past itself (#187 decision 5).  Required whether or
-                                // not compaction is in play: it is what stops a
-                                // restored backup or an imported dataset from
-                                // colliding with live rows on its very next insert.
                                 #recv.#seq.fetch_max(
                                     record.#name as u64,
                                     std::sync::atomic::Ordering::SeqCst,
@@ -7863,21 +5236,6 @@ impl RustGenerator {
         quote! { #(#stmts)* }
     }
 
-    /// The `+timestamp` half of [`Self::generate_auto_synthesis`] (#254).
-    ///
-    /// Two different jobs wear the same `+`:
-    ///
-    /// - **A stamp** (`created_at: +timestamp`) — the overwhelming case, 148 of
-    ///   148 in the corpus. Fill in `now()`, floored to the declared precision so
-    ///   the stored value actually honours what the schema says it records.
-    /// - **A key** (`id: +timestamp(us)`) — allocate monotonically off the #187
-    ///   counter instead of reading the clock, because the clock does not
-    ///   guarantee uniqueness at any precision.
-    ///
-    /// The `0` sentinel is shared with the integer autos and carries the same
-    /// user-visible consequence, which is sharper here: `0` is
-    /// 1970-01-01T00:00:00Z, a value someone might plausibly want to write, and
-    /// it cannot be inserted explicitly because supplying it means "generate one".
     fn timestamp_auto_synthesis(
         model: &forgedb_parser::Model,
         field: &forgedb_parser::Field,
@@ -7892,10 +5250,6 @@ impl RustGenerator {
                 if record.#name.as_micros() == 0 {
                     record.#name = #recv.#alloc()?;
                 } else {
-                    // An explicitly supplied key advances the counter past
-                    // itself, exactly as an explicit integer auto does (#187
-                    // decision 5) — otherwise an imported dataset collides with
-                    // live rows on its very next insert.
                     #recv.#seq.fetch_max(
                         record.#name.as_micros().max(0) as u64,
                         std::sync::atomic::Ordering::SeqCst,
@@ -7911,32 +5265,6 @@ impl RustGenerator {
         }
     }
 
-    /// The #254 write-path timestamp gate: floor every declared-precision
-    /// timestamp to its quantum, then reject any instant RFC 3339 cannot name.
-    ///
-    /// Emitted at the top of `Storage::insert` / `Storage::update` — *not* only in
-    /// the `Database::create_<model>` wrapper — because the storage-scoped methods
-    /// are a documented public path (#91) and a value that skipped the gate would
-    /// be stored at a finer resolution than the schema promises, which is exactly
-    /// the guarantee `timestamp(s)` sells.
-    ///
-    /// **Floor rather than reject** (res 5): precision constrains *how finely* a
-    /// legal instant is recorded, not *which* instants are legal — a 422 would
-    /// export the flooring to every client for no gain, and would push authors to
-    /// declare `timestamp(us)` everywhere to avoid it.  A `+timestamp` identity is
-    /// pinned to `us` (quantum 1) and so is skipped by the same predicate that
-    /// skips every other `us` field, with no special case.
-    ///
-    /// **Reject rather than floor for the range** (res 3): the wire form is RFC
-    /// 3339, which names years `0000`–`9999`.  `Timestamp` is an `i64` of
-    /// microseconds and reaches ±292 000 years, so an instant outside the RFC's
-    /// window is storable but not serializable — a row that could be written and
-    /// then fail on every read.  That is a 422 at the boundary instead.
-    ///
-    /// The walk is recursive so it reaches a nullable field, a `[timestamp; N]`
-    /// element, and a struct-nested timestamp.  A gate that silently skipped those
-    /// would be a capability hole, not a smaller feature: the schema would still
-    /// say `timestamp(s)` and the stored value would still be micros.
     fn generate_timestamp_write_gate(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let mtag = model.name.as_str();
         let mut stmts: Vec<TokenStream> = Vec::new();
@@ -7956,18 +5284,12 @@ impl RustGenerator {
             return quote! {};
         }
         quote! {
-            // #254: floor to the declared precision, then refuse an instant RFC
-            // 3339 cannot name.  Runs BEFORE the constraint/`&unique` gate so a
-            // `@min`/`@max` directive sees the value that will actually be stored.
             #[allow(unused_mut)]
             let mut record = record;
             #(#stmts)*
         }
     }
 
-    /// One leaf of [`Self::generate_timestamp_write_gate`].  `place` is an
-    /// assignable expression of the value at this position; `path` is its dotted
-    /// name for the diagnostic.
     fn timestamp_gate_walk(
         schema: &Schema,
         ty: &forgedb_parser::FieldType,
@@ -7978,8 +5300,6 @@ impl RustGenerator {
         depth: usize,
     ) {
         use forgedb_parser::FieldType;
-        // Struct references cannot legally cycle (validation rejects it), but the
-        // generator must not hang if one ever reaches it.
         if depth > 8 {
             return;
         }
@@ -7997,10 +5317,6 @@ impl RustGenerator {
                 );
                 out.push(quote! {
                     if !#place.is_rfc3339_representable() {
-                        // `Err(..)?` rather than `return Err(..)`: the same gate is
-                        // spliced into staging methods that return `TxError`, and
-                        // `?` applies the `From` conversion (reflexive when the
-                        // error type already IS `ValidationError`).
                         Err(ValidationError::Constraint {
                             model: #mtag,
                             field: #path_str,
@@ -8092,17 +5408,6 @@ impl RustGenerator {
         }
     }
 
-    /// Whether the server synthesizes this field's value on create, so it may be
-    /// omitted from a create body.  Mirrors `generate_auto_synthesis` +
-    /// `model_struct_field`'s `#[serde(default)]`: **every** `+` auto is filled in
-    /// server-side — `uuid`, `timestamp`, and (since #187) `u32`/`u64`.  A non-auto
-    /// `id` is not: nothing generates it, so it stays required.
-    ///
-    /// The REST-SDK generators use this to compute a `<Model>Create` input that
-    /// actually round-trips.  Note the generators that do NOT ask: the TS SDK
-    /// hard-codes `Omit<Model, 'id'>` and the OpenAPI `required` list derives from
-    /// non-`Option`ness, so both still misreport the create shape — that is #259,
-    /// a separate root cause this predicate cannot reach.
     pub(crate) fn is_server_synthesized(field: &forgedb_parser::Field) -> bool {
         field.auto_generate
             && matches!(
@@ -8114,8 +5419,6 @@ impl RustGenerator {
             )
     }
 
-    /// The fields a `create` body carries: every field the server does not
-    /// synthesize itself (see [`Self::is_server_synthesized`]).  Order preserved.
     pub(crate) fn creatable_fields(model: &forgedb_parser::Model) -> Vec<&forgedb_parser::Field> {
         model
             .fields
@@ -8124,8 +5427,6 @@ impl RustGenerator {
             .collect()
     }
 
-    /// PascalCase a snake_case projection name (`list_row` → `ListRow`) for the
-    /// generated struct suffix.
     pub(crate) fn projection_pascal(name: &str) -> String {
         name.split('_')
             .filter(|s| !s.is_empty())
@@ -8139,9 +5440,6 @@ impl RustGenerator {
             .collect()
     }
 
-    /// The ordered field set a projection materializes: the identity field
-    /// first (always, PM constraint 3), then each selected field in declared
-    /// order, de-duplicated (a projection may list `id` explicitly).
     pub(crate) fn projected_field_set<'a>(
         model: &'a forgedb_parser::Model,
         proj: &forgedb_parser::Projection,
@@ -8161,23 +5459,6 @@ impl RustGenerator {
         out
     }
 
-    /// #160/#224/#228: the internal narrow "scan view" for the REST list path — the
-    /// id field plus every filterable/sortable column (the only columns a `?field=`
-    /// filter or `?sort=` can touch; the sortable set is a subset of the filterable
-    /// set).  The list handler filters, sorts, counts and paginates these narrow
-    /// views and full-materializes ONLY the paginated page, instead of decoding
-    /// every column of every row through `all()`.  Stays internal: never wired to
-    /// REST `?projection=` / the TS SDK / OpenAPI.  Returns `(struct, methods)`;
-    /// empty for a model with no id field (no `all()`-driven list to optimize).
-    ///
-    /// #228 removed the *owned* twin of this view.  It existed only because the scan
-    /// returned its rows to the caller, so the borrowed strings had to be copied out
-    /// of the buffered span before it dropped — and nothing outside the scan ever
-    /// read them: the list handler used the rows for the sort comparator, `.len()`
-    /// and `.id`, then threw them away.  The scan is now a *scope*
-    /// (`__with_scan`) that runs the whole filter/sort/count/page pipeline while the
-    /// buffers are still alive and lets only `(total, ids)` escape, so a `String` is
-    /// never allocated for a scan row at all.
     fn generate_list_scan(
         schema: &Schema,
         model: &forgedb_parser::Model,
@@ -8186,23 +5467,11 @@ impl RustGenerator {
             return (quote! {}, quote! {});
         }
         let scan_fields = Self::scan_field_set(model);
-        // #160 (C): per eligible indexed field, a candidate-row resolver that goes
-        // through the secondary index instead of scanning every row — O(matches)
-        // not O(rows) when the list filters on an indexed field.
         let pushdown: Vec<_> = Self::scan_pushdown_fields(model)
             .into_iter()
             .map(|f| Self::generate_rows_by_index(schema, f))
             .collect();
 
-        // #224: the borrowed narrow view — every filterable column, with `string`
-        // borrowed straight out of the buffered span the scan already holds rather
-        // than copied into a `String`.  Since #228 this is the ONLY scan view: there
-        // is no owned form to materialize into.
-        //
-        // INTERNAL by decision (#224): never derived `Serialize`/`ToSchema`, never
-        // reachable from the REST/TS/OpenAPI surface, and never returned — it only
-        // ever appears behind a `&` in a closure argument, so no caller of the
-        // generated crate names its lifetime.
         let scan_ref_ident = format_ident!("{}ScanRef", model.name);
         let key_name = Self::identity_field_name(model);
         let ref_field_decls = scan_fields.iter().map(|f| {
@@ -8210,59 +5479,22 @@ impl RustGenerator {
             let fty = Self::scan_ref_field_type(schema, f, Some(f.name.as_str()) == key_name);
             quote! { pub #fname: #fty }
         });
-        let ref_doc = format!(
-            "Borrowed narrow scan view for `{}` (#224/#228): the id field plus every \
-             filterable/sortable column, with `string` fields borrowed from the \
-             buffered column span instead of copied into a `String`.  The list \
-             endpoint's whole filter/sort/paginate pipeline runs on these, inside \
-             the scan scope, so no scan row is ever allocated.  Internal — not a \
-             wire type, never exported, and never returned (it only appears behind \
-             a `&` in a closure argument).",
-            model.name
-        );
-        // #250: `'a` exists so `string` fields can borrow out of the buffered span.
-        // A model whose every scan field is fixed-size — any pure join/link row:
-        // identity, timestamps, foreign keys, no string — leaves it with nothing to
-        // attach to, and `error[E0392]: lifetime parameter 'a is never used` makes
-        // the generated crate fail to build.  A zero-sized `PhantomData` anchors it.
-        //
-        // Anchoring rather than emitting the lifetime conditionally is deliberate:
-        // every use site (here and in `api.rs`) names the view as `#ident<'_>`, so
-        // dropping the parameter would break all of them and force this predicate
-        // across the module boundary.  `PhantomData<&'a ()>` — the shared-reference
-        // form, so the view stays covariant over `'a` exactly as the real borrows
-        // are; `&'a mut ()` would make it invariant and reject sound callers.
         let ref_borrow_anchor = match Self::scan_ref_anchor(&scan_fields, key_name) {
             None => quote! {},
             Some(anchor) => quote! {
-                /// #250: anchors `'a` for a view whose every field is fixed-size.
-                /// Zero-sized — the struct's layout is unchanged.
                 pub #anchor: ::std::marker::PhantomData<&'a ()>,
             },
         };
-        // #226: the buffer slot the view was decoded at.  Not serialized — and
-        // that costs nothing to arrange, because this view has never derived
-        // `Serialize` (see the #224 note above): there is no serializer to skip it
-        // from, so a `#[serde(skip)]` here would not be a harmless no-op, it would
-        // fail to compile.
         let slot_field = Self::scan_slot_field(&scan_fields);
         let ref_struct_tokens = quote! {
-            #[doc = #ref_doc]
             #[derive(Debug, Clone)]
             pub struct #scan_ref_ident<'a> {
-                /// #226: the scan buffer slot this view was decoded at — the only
-                /// thing that survives the sort's reordering to say which physical
-                /// row it came from.  Internal; this view is not `Serialize`.
                 pub #slot_field: usize,
                 #(#ref_field_decls,)*
                 #ref_borrow_anchor
             }
         };
 
-        // #168/#224/#228: the buffered column scan, as a scope.  `@projection`'s
-        // live `all_<proj>` keeps using the owned emitter below (it returns rows to
-        // the user, so it has nothing to filter against and nothing to keep inside
-        // a scope).
         let buf_holder = format_ident!("__{}ScanBufs", model.name);
         let with_scan_method = Self::generate_scan_scope_method(
             schema,
@@ -8273,14 +5505,7 @@ impl RustGenerator {
             &slot_field,
         );
 
-        // #226: the borrowed FULL-record page view.  A second type rather than a
-        // `Serialize` on `ScanRef` — different field set, and #224's decision that
-        // the scan view is never a wire type stands.
         let page_ref_tokens = Self::generate_page_ref_struct(schema, model, &scan_fields, key_name);
-        // #226: and the scope that produces a page of them.  `__with_scan` is left
-        // exactly as it is — the two live-query sites need owned, retained,
-        // comparable `Model` values and have no pagination at all, so a borrowed
-        // page view cannot serve them.
         let with_page_method = Self::generate_page_scope_method(
             schema,
             model,
@@ -8291,10 +5516,6 @@ impl RustGenerator {
             &slot_field,
         );
 
-        // #281: the unfiltered/unsorted twin of `__with_page`.  Spliced AFTER it, and
-        // that order is load-bearing: `test_rust_generation_page_rows_map_through_
-        // the_recorded_slot` scopes its negative to `__with_page`'s body by slicing to
-        // the next `pub fn`, and #281's page slice is the very string it forbids.
         let with_fast_page_method =
             Self::generate_fast_page_scope_method(schema, model, &scan_fields, key_name);
 
@@ -8311,22 +5532,6 @@ impl RustGenerator {
         (structs, methods)
     }
 
-    /// The name of the #226 buffer-slot field on a scan view.
-    ///
-    /// `__with_page` filters, sorts and paginates the scan views before it gathers
-    /// the page's remaining columns.  After the sort, position in the vector says
-    /// nothing about which physical row a view came from — the sort is exactly what
-    /// destroys that correspondence — so the slot the view was decoded at has to
-    /// travel *on* the view.  Recovering it from anything else (re-deriving from
-    /// the identity, re-scanning) would be a second source of truth for the same
-    /// mapping.
-    ///
-    /// The name is *derived* rather than fixed for the same reason
-    /// [`Self::scan_ref_anchor`]'s is: `.forge` field names are only required to be
-    /// snake_case, so `__slot: u32` is a legal field, and a hardcoded name would
-    /// emit the struct field twice.  Underscores are appended until the name is
-    /// free, and both emission sites take the result as a parameter rather than
-    /// re-deriving it, so they cannot disagree.
     fn scan_slot_field(fields: &[&forgedb_parser::Field]) -> proc_macro2::Ident {
         let mut name = String::from("__slot");
         while fields.iter().any(|f| f.name == name) {
@@ -8335,10 +5540,6 @@ impl RustGenerator {
         format_ident!("{}", name)
     }
 
-    /// The struct-literal initializer for the #226 slot field, given the name
-    /// [`Self::scan_slot_field`] derived and the `__slot` loop variable the decode
-    /// runs under.  Field-init shorthand when the two coincide (the universal case),
-    /// the explicit form when a `__slot` field in the schema forced a longer name.
     fn slot_field_init(slot_field: &proc_macro2::Ident) -> TokenStream {
         if slot_field == "__slot" {
             quote! { #slot_field, }
@@ -8347,29 +5548,10 @@ impl RustGenerator {
         }
     }
 
-    /// The name of the #250 lifetime anchor for a scan view, or `None` when the
-    /// view already borrows and needs no anchor.
-    ///
-    /// Whether an anchor is needed mirrors [`Self::scan_ref_field_type`] exactly:
-    /// `string` is the only scan type that borrows (`&'a str` / `Option<&'a str>`);
-    /// every other filterable type is owned and fixed-size.  A view with no
-    /// borrowing field has nothing to attach `'a` to and will not compile without
-    /// the anchor.
-    ///
-    /// The name is *derived* rather than fixed because `.forge` field names are
-    /// only required to be snake_case — `__borrow: u32` is a legal field, and on a
-    /// string-free model a hardcoded anchor would collide with it and emit the
-    /// field twice.  Underscores are appended until the name is free, so the two
-    /// emission sites agree by construction.
     fn scan_ref_anchor(
         fields: &[&forgedb_parser::Field],
         key_name: Option<&str>,
     ) -> Option<proc_macro2::Ident> {
-        // #252: a `string(N)` *key* is held by value (`InlineStr<N>` is `Copy`),
-        // so it borrows nothing and cannot anchor `'a`. A model whose only
-        // string-semantic field is its own identity therefore still needs the
-        // PhantomData — miss this and the view fails to compile with E0392,
-        // which is the same class of break #250 fixed.
         if fields
             .iter()
             .any(|f| Self::is_string_semantic(&f.field_type) && Some(f.name.as_str()) != key_name)
@@ -8383,21 +5565,11 @@ impl RustGenerator {
         Some(format_ident!("{}", name))
     }
 
-    /// The borrowed scan-view type for one scan field (#224): `string` becomes
-    /// `&'a str` (`Option<&'a str>` when nullable), every other filterable type is
-    /// byte-for-byte the owned scan record's type.  Keeping the rest identical is
-    /// what lets the SAME generated filter checks compile against both views —
-    /// `&str: PartialEq<String>` and `Option<&str>: PartialEq<Option<String>>` are
-    /// both std, so `record.<field> == <parsed param>` needs no second form.
     fn scan_ref_field_type(
         schema: &Schema,
         field: &forgedb_parser::Field,
         is_key: bool,
     ) -> TokenStream {
-        // #252: the key is the one string-semantic field that does NOT borrow.
-        // `InlineStr<N>` is `Copy`, so holding it by value allocates nothing —
-        // the only thing the borrow bought — and it is what lets the vector of
-        // ids the scan scope returns outlive the buffers it decoded from.
         if is_key {
             return Self::key_type_ident(schema, &field.field_type);
         }
@@ -8416,12 +5588,6 @@ impl RustGenerator {
         }
     }
 
-    /// Is `field` one of the columns the narrow scan already decoded?
-    ///
-    /// The page view (#226) sources every such field from the `ScanRef` the scan
-    /// built — that redundancy is the whole point of the issue: phase A already
-    /// decodes each page row and today `get(id)` re-reads it from scratch.  The
-    /// complement is what the page's own gather has to fetch.
     fn page_field_from_scan(
         scan_fields: &[&forgedb_parser::Field],
         field: &forgedb_parser::Field,
@@ -8429,15 +5595,6 @@ impl RustGenerator {
         scan_fields.iter().any(|s| s.name == field.name)
     }
 
-    /// The page view's type for one field: the scan view's type when the scan
-    /// already decoded it (so the value can be taken straight off the `ScanRef` —
-    /// `&'a str` for a string, by-value for everything else), otherwise the *model
-    /// struct's* type, because the page gather materializes it exactly as
-    /// `read_at` does.
-    ///
-    /// Both halves are the existing emitters, not re-derivations: a page field's
-    /// Rust type is either `scan_ref_field_type`'s answer or `model_struct_field`'s,
-    /// and never a third one.
     fn page_ref_field_type(
         schema: &Schema,
         model: &forgedb_parser::Model,
@@ -8460,14 +5617,6 @@ impl RustGenerator {
         }
     }
 
-    /// The #250-style lifetime anchor for a page view, or `None` when it borrows
-    /// and needs no anchor.
-    ///
-    /// The *predicate* is [`Self::scan_ref_anchor`]'s, deliberately: a page view's
-    /// only borrows are the `&'a str`s it takes off the scan view, so it borrows
-    /// exactly when the scan view does.  Only the collision check differs — a page
-    /// view holds **every** model field, so the name has to be free among all of
-    /// them, not just the scan set.
     fn page_ref_anchor(
         model: &forgedb_parser::Model,
         scan_fields: &[&forgedb_parser::Field],
@@ -8482,34 +5631,6 @@ impl RustGenerator {
         })
     }
 
-    /// Emit `<Model>PageRef<'a>` (#226) — the borrowed **full-record** view the list
-    /// endpoint serializes its page from, in place of a `Vec<Model>` re-read through
-    /// `get(id)` one positional column read at a time.
-    ///
-    /// Three things about it are load-bearing, and each is a way to get byte-different
-    /// JSON out of a change that looks semantically identical:
-    ///
-    /// 1. **Field order is `model.fields` order.** `serde_json` emits struct fields in
-    ///    declaration order, so the page view's order *is* the wire contract.  It is
-    ///    NOT `scan_field_set`'s order (identity first, then filterable) with the
-    ///    remaining fields appended: on a model whose identity is declared second, or
-    ///    whose filterable columns are not contiguous, that produces a semantically
-    ///    equal, byte-different object.  `tests/api_wire_test.rs` is what catches it.
-    /// 2. **It is a different type from `ScanRef`**, not `ScanRef` with `Serialize`
-    ///    added — #224's "the scan view is never a wire type" decision stands, and
-    ///    the two have different field sets anyway.
-    /// 3. **`json` is not borrowed.** Its value is a `serde_json::Value` built by
-    ///    `from_str`, whose map is sorted, so today's read *normalizes* a stored
-    ///    object's key order.  Handing the stored text through as a `&str`/`RawValue`
-    ///    would emit the stored order instead and silently change the bytes of every
-    ///    json field.  `json` is not filterable, so it is never in the scan set; the
-    ///    page gather decodes it through the same owned `read_string` + `from_str`
-    ///    path `read_at` uses.
-    ///
-    /// Serde attributes come from [`Self::field_wire_attrs`] — the same function the
-    /// model struct uses — minus the `#[schema(..)]` half, which would not compile
-    /// on a type that does not derive `ToSchema`.  No `#[serde(default)]`: that is a
-    /// deserialize-side concern for create bodies and this view is write-only.
     fn generate_page_ref_struct(
         schema: &Schema,
         model: &forgedb_parser::Model,
@@ -8528,27 +5649,11 @@ impl RustGenerator {
         let anchor = match Self::page_ref_anchor(model, scan_fields, key_name) {
             None => quote! {},
             Some(anchor) => quote! {
-                /// #250/#226: anchors `'a` for a page view with no borrowing field.
-                /// `skip`ped, not merely zero-sized — `PhantomData` *does* implement
-                /// `Serialize` (as a unit, i.e. `null`), so without this it would add
-                /// a field to every row of every list response.
                 #[serde(skip)]
                 pub #anchor: ::std::marker::PhantomData<&'a ()>,
             },
         };
-        let doc = format!(
-            "Borrowed full-record page view for `{}` (#226): every field the model \
-             struct has, in the model's DECLARATION order, with `string` fields \
-             borrowed out of the buffered column span the scan already holds.  The \
-             list endpoint serializes its page from these instead of re-reading each \
-             page row through `get(id)` one positional column read per field.  \
-             Serializes byte-identically to `{}` — that is the contract, guarded by \
-             `tests/api_wire_test.rs`.  Internal: `Serialize` only, never \
-             `Deserialize`/`ToSchema`, never returned, never a REST/TS/OpenAPI type.",
-            model.name, model.name
-        );
         quote! {
-            #[doc = #doc]
             #[derive(serde::Serialize)]
             pub struct #page_ref_ident<'a> {
                 #(#field_decls,)*
@@ -8557,24 +5662,6 @@ impl RustGenerator {
         }
     }
 
-    /// Emit the [`BufferedGather`] pieces for `fields`.
-    ///
-    /// `recv` names the holder binding the decode reads through, `rows` the
-    /// `Vec<usize>` selection each column is gathered over, and `slot` the loop
-    /// variable indexing the resulting buffers — a *position within the selection*,
-    /// not a physical row (see `FixedColumn::gather_buffered`).  `borrowed` picks the
-    /// string decode: `true` borrows out of the buffered span (#224), `false`
-    /// materializes owned values exactly as the positional `read_at` does.
-    ///
-    /// A field with no storage column (a virtual relation, a component) contributes
-    /// no decl/init/read and a `default_for_unstored_field` value — the same arm
-    /// `generate_row_read_body` takes, so a full record built here matches one built
-    /// by `read_at` field for field.
-    ///
-    /// (`too_many_arguments`: every argument names a distinct axis of the emission
-    /// site — same reason `emit_probe` above carries the allow. Bundling them into a
-    /// struct would move the argument list, not shorten it, and the three call sites
-    /// share no subset of these values.)
     #[allow(clippy::too_many_arguments)]
     fn buffered_gather_pieces(
         schema: &Schema,
@@ -8604,7 +5691,7 @@ impl RustGenerator {
             {
                 Some(quote! { forgedb_storage::BufferedFixedColumn })
             } else {
-                None // relation/component: no storage column (see field_read_stmt None arm)
+                None
             };
             let as_key = Some(field.name.as_str()) == key_name;
             match (
@@ -8629,48 +5716,19 @@ impl RustGenerator {
         out
     }
 
-    /// The `let __rows: Vec<usize> = match sel { .. };` selection both scan scopes
-    /// open with (#160/#228): a pushdown candidate set, sorted, or every live row.
-    ///
-    /// Shared by `__with_scan` and `__with_page` so the two cannot come to disagree
-    /// about what "the selection" is — they are the same scan, differing only in
-    /// what they hand the caller.
     fn scan_row_selection() -> TokenStream {
         let live = Self::live_row_selection_expr();
         quote! {
             let __rows: Vec<usize> = match sel {
-                // Index pushdown (#160 C).  No tombstone read: delete removes
-                // the id from every secondary index, so a candidate resolved
-                // through one is live by construction.  Sorted anyway —
-                // `gather_buffered` bounds its reads to `[min, max]`, so
-                // ascending order is what keeps the spanned read tight and the
-                // column walk forward.
                 Some(mut __c) => {
                     __c.sort_unstable();
                     __c
                 }
-                // Live rows in ascending physical order — so a churn-free
-                // table's selection is exactly the dense prefix `[0, n)`
-                // (zero-copy mmap bulk load) and column reads march forward.
-                // `id_to_row` repoints a deleted id at its tombstoned row
-                // (delete appends a tombstone, #66), so filter those out with
-                // one bulk tombstone read.
                 None => #live
             };
         }
     }
 
-    /// "Every live row, ascending" — the selection with no `sel` to match on (#281).
-    ///
-    /// Split out of [`Self::scan_row_selection`]'s `None` arm when `__with_fast_page`
-    /// became a third site needing it.  `__with_fast_page` takes no `sel` at all (its
-    /// predicate holds only when nothing could have narrowed the rows), so it cannot
-    /// reuse the `match` — but it must not re-derive the arm either: the ascending
-    /// order is what makes `__rows[__start..__end]` the same window `__with_page`
-    /// selects, and a second definition that drifted would move rows silently.
-    ///
-    /// Emitted as a block expression so it splices into a match arm and into a `let`
-    /// unchanged.
     fn live_row_selection_expr() -> TokenStream {
         quote! {
             {
@@ -8682,37 +5740,6 @@ impl RustGenerator {
         }
     }
 
-    /// Emit the **page scope** (#226) — the list endpoint's single read path.
-    ///
-    /// `__with_scan` leaves the page materialization to the caller, which can only
-    /// take scalars out of the scope, so the list handler took `(total, Vec<Id>)` and
-    /// re-read every page row through `get(id)`: one positional `pread` per column
-    /// per row, for rows **phase A had already decoded and thrown away**.  Measured
-    /// at ~6.4 µs/row against the buffered scan's ~0.11 µs/row — a ~58× per-row
-    /// difference, and 21.8–91.8% of the request depending on page size and table
-    /// size.  This is not adding a fast path; it is deleting a redundant one.
-    ///
-    /// So the page is built inside the scope, where the scan's buffers are alive:
-    ///
-    /// 1. the scan gather + decode + `keep`, verbatim as `__with_scan` does it;
-    /// 2. `sort`, then the pagination slice;
-    /// 3. a **second** gather, over the page's physical rows only, for the columns
-    ///    the scan set does not carry (FKs, `json`, `[T; N]`, inline structs);
-    /// 4. one `<Model>PageRef` per page row — scan columns taken off the `ScanRef`
-    ///    that already holds them, the rest decoded from the page buffers.
-    ///
-    /// Both buffer sets are locals of this method, so both outlive `f`; only `R`
-    /// escapes, and it cannot name the views' lifetime.  The handler returns an
-    /// already-serialized `Response`, which is what dissolves that constraint.
-    ///
-    /// **The page's physical rows come from the ref's `__slot`, not from its position
-    /// in the vector.** `keep` filters and `sort` reorders, so after step 2 position
-    /// means nothing; mapping the page by position yields real rows in the wrong
-    /// order, which no assertion on `total` would catch.
-    ///
-    /// `sort` is a separate closure from `f` for the same reason `keep` is: it has to
-    /// run on the borrowed views, before the page is known, and the caller owns the
-    /// comparator.
     fn generate_page_scope_method(
         schema: &Schema,
         model: &forgedb_parser::Model,
@@ -8725,8 +5752,6 @@ impl RustGenerator {
         let page_ref_ident = format_ident!("{}PageRef", model.name);
         let page_holder = format_ident!("__{}PageBufs", model.name);
 
-        // Phase 1 — the scan, identical to `__with_scan`'s (same emitter, same
-        // arguments), so the two cannot drift in what they decode or how.
         let scan = Self::buffered_gather_pieces(
             schema,
             scan_fields,
@@ -8747,10 +5772,6 @@ impl RustGenerator {
         };
         let slot_init = Self::slot_field_init(slot_field);
 
-        // Phase 3 — the page-only gather, over the complement of the scan set.
-        // `borrowed = false`: these decode exactly as the positional `read_at` does,
-        // which is what keeps `json` on the `read_string` + `serde_json::Value`
-        // round-trip that normalizes a stored object's key order.
         let page_only: Vec<&forgedb_parser::Field> = model
             .fields
             .iter()
@@ -8770,17 +5791,6 @@ impl RustGenerator {
         let page_inits = &page.inits;
         let page_reads = &page.reads;
 
-        // Phase 4 — one view per page row, in MODEL DECLARATION ORDER.
-        //
-        // Interleaved, not concatenated: a scan column is taken off the ref that
-        // already holds it, the rest come from the page gather's own field
-        // initializers, and the two are woven together by walking `model.fields`.
-        // Concatenating (`scan_field_set` then the remainder) is gotcha 1 — it emits
-        // a semantically equal, byte-different object.
-        //
-        // `values` zips back against `page_only` because `buffered_gather_pieces`
-        // emits exactly one entry per input field in input order, including the
-        // no-column arm.
         let page_value_by_name: std::collections::HashMap<&str, &TokenStream> = page_only
             .iter()
             .map(|f| f.name.as_str())
@@ -8791,21 +5801,6 @@ impl RustGenerator {
             .iter()
             .map(|f| {
                 if Self::page_field_from_scan(scan_fields, f) {
-                    // Read the field out of the scan view by VALUE, with no
-                    // `.clone()`: every scan-view type is `Copy` — `&'a str` and
-                    // `Option<&'a str>` copy the reference (the `'a` lives in the
-                    // type, so the copy keeps the buffer borrow rather than
-                    // reborrowing from `__ref`), `InlineStr<N>` is `Copy` by
-                    // construction (#252), a generated enum derives `Copy`, and
-                    // everything else is a scalar or `[u8; N]`.
-                    //
-                    // `.clone()` here would be a no-op that rustc reports as
-                    // `noop_method_call` — 6 warnings in the user's own build for a
-                    // 5-model schema, and `database.rs`'s `allow` header does not
-                    // (and should not) cover it.  If a future scan-view type is ever
-                    // NOT `Copy`, this becomes a move out of a shared reference: a
-                    // compile error, which is the loud failure we want, not a
-                    // silently-materializing clone.
                     let fname = format_ident!("{}", f.name);
                     quote! { #fname: __ref.#fname }
                 } else {
@@ -8824,23 +5819,6 @@ impl RustGenerator {
         let row_selection = Self::scan_row_selection();
 
         quote! {
-            /// Run `f` over one **fully-decoded page** of this model (#226) — the
-            /// list endpoint's single read path.
-            ///
-            /// Filters and sorts the narrow scan views exactly as `__with_scan`
-            /// does, then gathers the page's remaining columns over the page's
-            /// physical rows only and hands `f` `(total, &[PageRef])`.  Replaces
-            /// `__with_scan` + a per-page-row `get(id)`, which re-read rows the scan
-            /// had already decoded — one positional `pread` per column per row.
-            ///
-            /// `sel` picks the rows exactly as `__with_scan`'s does. `offset`/`limit`
-            /// are applied with the same arithmetic as
-            /// `forgedb_query_params::Pagination::apply`, against the post-filter,
-            /// post-sort view count.
-            ///
-            /// Both buffer sets are locals here, so both outlive `f`; only `f`'s
-            /// return value escapes and it cannot borrow the views (their lifetime is
-            /// higher-ranked). The handler returns a serialized `Response`.
             pub fn __with_page<R>(
                 &self,
                 sel: Option<Vec<usize>>,
@@ -8861,9 +5839,6 @@ impl RustGenerator {
                     #(#scan_inits,)*
                 };
 
-                // One oversized allocation freed at the end, rather than ~log2(n)
-                // growth copies each memcpy-ing every view already accepted — the
-                // same trade `__with_scan` measured at ~5% on a 20 000-row scan.
                 let mut __refs: Vec<#ref_ident<'_>> = Vec::with_capacity(__n);
                 for __slot in 0..__n {
                     #(#scan_reads)*
@@ -8880,17 +5855,10 @@ impl RustGenerator {
                 let __total = __refs.len();
                 sort(&mut __refs);
 
-                // `forgedb_query_params::Pagination::apply`'s arithmetic, inlined
-                // because the slice has to be taken inside the scope: clamp both
-                // ends to the length, saturating the addition so a large `offset`
-                // cannot overflow.
                 let __start = offset.min(__total);
                 let __end = offset.saturating_add(limit).min(__total);
                 let __page = &__refs[__start..__end];
 
-                // The page's PHYSICAL rows.  Via `__slot`, never via position:
-                // `keep` and `sort` have both run, so a view's index in `__refs`
-                // says nothing about which row it came from.
                 let __page_rows: Vec<usize> = __page
                     .iter()
                     .map(|__r| __rows[__r.#slot_field])
@@ -8900,10 +5868,6 @@ impl RustGenerator {
                 struct #page_holder {
                     #(#page_decls,)*
                 }
-                // Bounded to the page: `limit` rows, not the table.  An empty page
-                // is legitimate (the filter matched nothing, or `offset` is past the
-                // end) and both column kinds return an empty buffer for an empty
-                // selection rather than erroring.
                 let __page_bufs = #page_holder {
                     #(#page_inits,)*
                 };
@@ -8921,42 +5885,6 @@ impl RustGenerator {
         }
     }
 
-    /// Emit the **fast page scope** (#281) — the unfiltered, unsorted list read.
-    ///
-    /// `__with_page` earns its full-table gather by having to *look* at every row:
-    /// `keep` and `sort` are opaque closures, so the callee cannot know they are
-    /// trivial and must decode every live row into a `ScanRef` before it can say
-    /// which `limit` of them survive.  When the request names no filter and no sort
-    /// that work is entirely wasted — `keep` accepts everything, `sort` reorders
-    /// nothing, and `__refs[i].__slot == i`, so the page was knowable from the
-    /// selection alone before a single column was read.
-    ///
-    /// This method is that path: derive the live rows, slice the page out of them,
-    /// and run **one** gather bounded to the page's rows.  The caller decides it is
-    /// applicable (the generated handler's `__<model>_is_unfiltered(&params) &&
-    /// qp.sort.is_none()`), which is why there is no `sel`, no `keep` and no `sort`
-    /// here — none of the three can be non-trivial when this is reachable.  `sel` in
-    /// particular is `None` *by construction*: index pushdown runs only over fields
-    /// `is_filterable_field` admits, so a request that names no filterable field
-    /// resolves no index.
-    ///
-    /// **Two things make this NOT a second copy of `__with_page`'s page phase.**
-    /// The selection is [`Self::live_row_selection_expr`], shared with
-    /// `scan_row_selection`.  And there is no *weave*: `__with_page` interleaves
-    /// scan-view fields with page-gather fields by walking `model.fields`, whereas
-    /// one gather over `model.fields` yields declaration order directly —
-    /// [`Self::buffered_gather_pieces`] emits exactly one value per input field in
-    /// input order.  That removes the divergence axis rather than duplicating it.
-    ///
-    /// `borrowed = true` is load-bearing and is not a free choice: it is the only
-    /// value that reproduces `PageRef`'s *declared* field types across a single
-    /// all-column gather.  `borrowed` is read by exactly two arms of
-    /// [`Self::field_read_stmt`] — variable-string and inline-string.  No **non-scan**
-    /// variable-string field can exist (`String` is filterable, so it is always in the
-    /// scan set), and the only non-scan inline-string field is an FK to a
-    /// string-keyed model, for which `field_read_stmt` forces `as_key` and both flag
-    /// values materialize the same `InlineStr<N>`.  Passing `false` is a compile
-    /// error in the user's crate, not a wrong value.
     fn generate_fast_page_scope_method(
         schema: &Schema,
         model: &forgedb_parser::Model,
@@ -8966,7 +5894,6 @@ impl RustGenerator {
         let page_ref_ident = format_ident!("{}PageRef", model.name);
         let holder = format_ident!("__{}FastPageBufs", model.name);
 
-        // ALL fields, in model declaration order — no complement, no interleave.
         let all_fields: Vec<&forgedb_parser::Field> = model.fields.iter().collect();
         let gather = Self::buffered_gather_pieces(
             schema,
@@ -8983,10 +5910,6 @@ impl RustGenerator {
         let reads = &gather.reads;
         let values = &gather.values;
 
-        // The same predicate `generate_page_ref_struct` uses, so the view is built
-        // with exactly the fields it declares.  It is a function of the SCAN set, not
-        // of `model.fields` — deciding it from the all-field gather here would
-        // disagree with the struct and fail to compile in the user's crate.
         let page_borrow_init = match Self::page_ref_anchor(model, scan_fields, key_name) {
             None => quote! {},
             Some(anchor) => quote! { #anchor: ::std::marker::PhantomData, },
@@ -8994,18 +5917,6 @@ impl RustGenerator {
         let live = Self::live_row_selection_expr();
 
         quote! {
-            /// Run `f` over one fully-decoded page **without scanning the table**
-            /// (#281) — the unfiltered, unsorted list read.
-            ///
-            /// Only valid when no filter and no sort applies, which the caller
-            /// establishes; there is deliberately no way to express one here.  The
-            /// rows, the page window and `total` are identical to
-            /// `__with_page(None, |_| true, |_| {}, offset, limit, f)` — that
-            /// equality is a test obligation, not a comment (`page_identity_test`).
-            ///
-            /// `offset`/`limit` use the same clamping arithmetic as `__with_page`,
-            /// against the live row count.  The buffers are locals, so they outlive
-            /// `f`; only `f`'s return value escapes.
             pub fn __with_fast_page<R>(
                 &self,
                 offset: usize,
@@ -9013,9 +5924,6 @@ impl RustGenerator {
                 f: impl FnOnce(usize, &[#page_ref_ident<'_>]) -> R,
             ) -> R {
                 let __rows: Vec<usize> = #live;
-                // With no `keep` and no `sort`, the post-filter view count IS the
-                // live row count, and the page is the same slice `__with_page`
-                // would have arrived at through `__refs[i].__slot == i`.
                 let __total = __rows.len();
                 let __start = offset.min(__total);
                 let __end = offset.saturating_add(limit).min(__total);
@@ -9024,9 +5932,6 @@ impl RustGenerator {
                 struct #holder {
                     #(#decls,)*
                 }
-                // Bounded to the page.  An empty page is legitimate (`offset` past
-                // the end, or an empty table) and both column kinds return an empty
-                // buffer for an empty selection rather than erroring.
                 let __bufs = #holder {
                     #(#inits,)*
                 };
@@ -9044,28 +5949,6 @@ impl RustGenerator {
         }
     }
 
-    /// Emit the narrow-scan **scope** (#228) — the single entry point to the list
-    /// path's column scan.
-    ///
-    /// Same bulk-load as [`Self::generate_buffered_scan_method`] — one
-    /// `gather_buffered` per column, hoisted out of the row loop — but nothing it
-    /// decodes ever leaves: the caller's `f` runs the whole filter/sort/count/page
-    /// pipeline while the buffers are alive, and only what `f` returns escapes.
-    ///
-    /// The shape is deliberate, and it is a constraint being committed to. #224
-    /// already decoded each slot into the borrowed view and ran the filter on it,
-    /// so a *rejected* row never allocated — but survivors were copied into owned
-    /// rows to hand back, and on an unfiltered `GET /model?limit=50` over 20 000
-    /// rows every row is a survivor.  Those copies were then read for exactly three
-    /// things (the sort comparator, `.len()`, `.id`) and dropped.  Keeping the
-    /// pipeline inside the scope removes the copy entirely; the price is that only
-    /// scalars can cross the boundary, so any future list feature wanting more than
-    /// ids out of a scan has to come inside the callback.
-    ///
-    /// `keep` stays a separate closure rather than folding into `f` for a reason:
-    /// applied during decode, a rejected row is never even pushed, so a selective
-    /// filter allocates a `Vec` of survivors rather than of every live row. That is
-    /// #224's win, preserved.
     fn generate_scan_scope_method(
         schema: &Schema,
         ref_ident: &proc_macro2::Ident,
@@ -9089,34 +5972,14 @@ impl RustGenerator {
         let buf_read_stmts = &gathered.reads;
         let buf_field_values = &gathered.values;
 
-        // #250: initialize the lifetime anchor iff the struct declares one.  Same
-        // derivation as the emission site, so the name cannot drift apart from it.
         let ref_borrow_init = match Self::scan_ref_anchor(fields, key_name) {
             None => quote! {},
             Some(anchor) => quote! { #anchor: ::std::marker::PhantomData, },
         };
-        // #226: the slot the view is being decoded at.  Field-init shorthand in the
-        // usual case; the long form only when a model declares its own `__slot`
-        // field and `scan_slot_field` had to pick a different name.
         let slot_init = Self::slot_field_init(slot_field);
         let row_selection = Self::scan_row_selection();
 
         quote! {
-            /// Run `f` inside a narrow column scan (#160/#168/#224/#228) — the list
-            /// endpoint's and live query's single scan entry point.
-            ///
-            /// `sel` picks the rows: `None` scans every live row; `Some(rows)` is an
-            /// index-pushdown candidate set from `__rows_by_*`.  Each scan column is
-            /// bulk-loaded once (`gather_buffered`), each selected row is decoded
-            /// into a borrowed view whose `string` fields point straight at that
-            /// buffer, and `keep` runs on it — so a row the filter rejects never
-            /// allocates.  Survivors are collected as borrowed views and handed to
-            /// `f`, which runs while the buffers are still alive.
-            ///
-            /// Only `f`'s return value escapes the scope, and it cannot borrow from
-            /// the scan (the view's lifetime is higher-ranked).  Callers return
-            /// scalars — `(total, Vec<Id>)` for the list page — and re-read the page
-            /// through `get`, so only `limit` rows ever pay a full decode.
             pub fn __with_scan<R>(
                 &self,
                 sel: Option<Vec<usize>>,
@@ -9134,12 +5997,6 @@ impl RustGenerator {
                     #(#buf_inits,)*
                 };
 
-                // Reserve for the whole selection even though a selective filter
-                // will not fill it: that is ONE oversized allocation, freed at the
-                // end, against ~log2(n) reallocations each memcpy-ing every view
-                // already accepted.  Measured on a 20 000-row unfiltered scan,
-                // dropping the reserve cost ~5% — the growth copy is not free at
-                // this row count.
                 let mut __refs: Vec<#ref_ident<'_>> = Vec::with_capacity(__n);
                 for __slot in 0..__n {
                     #(#buf_read_stmts)*
@@ -9157,25 +6014,12 @@ impl RustGenerator {
         }
     }
 
-    /// Emit a buffered narrow-scan method (#168): bulk-load each column of
-    /// `fields` once via `gather_buffered` (a zero-copy `mmap` alias of the dense
-    /// prefix in the churn-free common case, else one gathered copy), then decode
-    /// every live row from memory through the SAME `field_read_stmt` path
-    /// (receiver `__bufs`, slot index) that `read_at` uses — no second decoder
-    /// (PM constraint 2).  Because only the columns of `fields` are gathered and
-    /// decoded, a projected subset skips the unselected columns entirely — no
-    /// `gather_buffered`, no per-row heap alloc for them (e.g. a `views,published`
-    /// aggregate scan never touches the `title` `String` column).  Emits each
-    /// `@projection`'s live `all_<proj>` (#113 + #168 converged); the list path's
-    /// own scan is [`Self::generate_scan_scope_method`], which shares the bulk-load
-    /// but keeps everything it decodes inside the scope (#228).
     fn generate_buffered_scan_method(
         schema: &Schema,
         struct_ident: &proc_macro2::Ident,
         method: &proc_macro2::Ident,
         holder: &proc_macro2::Ident,
         fields: &[&forgedb_parser::Field],
-        doc: &str,
         key_name: Option<&str>,
     ) -> TokenStream {
         let gathered = Self::buffered_gather_pieces(
@@ -9194,13 +6038,7 @@ impl RustGenerator {
         let buf_field_values = &gathered.values;
 
         quote! {
-            #[doc = #doc]
             pub fn #method(&self) -> Vec<#struct_ident> {
-                // Live rows in ascending physical order — so a churn-free table's
-                // selection is exactly the dense prefix `[0, n)` (zero-copy mmap
-                // bulk load) and column reads march forward.  `id_to_row` repoints
-                // a deleted id at its tombstoned row (delete appends a tombstone,
-                // #66), so filter those out with one bulk tombstone read.
                 let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
                 __rows.sort_unstable();
                 let __rows = self.tombstones.live_indices(&__rows)
@@ -9227,13 +6065,6 @@ impl RustGenerator {
         }
     }
 
-    /// #160 (C): the single-field indexed columns a list `?field=value` filter can
-    /// be *pushed down* to — resolving candidates from the secondary index instead
-    /// of scanning every row.  Restricted to non-nullable, non-float, exactly
-    /// value-parseable scalars (string / uuid / required-FK / integer / bool /
-    /// decimal / timestamp / enum) so the string param maps cleanly to the index
-    /// key; anything else (nullable, char(N), float, optional FK) falls back to the
-    /// full narrow scan.  `pub(crate)` so the api handler emits the matching branch.
     pub(crate) fn scan_pushdown_fields(model: &forgedb_parser::Model) -> Vec<&forgedb_parser::Field> {
         use forgedb_parser::{FieldType, RelationType};
         Self::indexed_fields(model)
@@ -9258,27 +6089,10 @@ impl RustGenerator {
             .collect()
     }
 
-    /// Emit `__rows_by_<field>(&self, value: &str) -> Option<Vec<usize>>` for an
-    /// eligible indexed field (#160 C).  Parses the raw param, derives the SAME
-    /// index key as `find_by_<field>` (via `index_key_expr`/`index_value_expr` —
-    /// one derivation, so an index hit is self-consistent), probes the field index,
-    /// and returns the candidates' physical row positions.  Returns `None` when the
-    /// param does not parse (the caller falls back to the full scan, so a match is
-    /// never missed); `Some(vec![])` when the value parses but no row holds it.
-    ///
-    /// #228 reduced this to *row resolution*.  It used to decode the candidates
-    /// itself, one positional read per column per row (`__scan_row_at`), which is
-    /// why it was the one scan path that could not borrow — it held no buffered
-    /// span.  Handing the rows to `__with_scan` instead unifies the two paths on the
-    /// borrowed view and bulk-loads the candidates (one `gather_buffered` per
-    /// column), so the pushdown stops being the odd one out in both senses.
     fn generate_rows_by_index(schema: &Schema, field: &forgedb_parser::Field) -> TokenStream {
         use forgedb_parser::{FieldType, RelationType};
         let index_ident = Self::index_field_ident(field);
         let rows_by = format_ident!("__rows_by_{}", field.name);
-        // Parse the raw `value: &str` into the typed value the index key derives
-        // from, binding `__typed`.  String needs no parse (the key derives from the
-        // &str directly, matching `find_by`'s `&str` param).
         let (parse_stmt, key_value): (TokenStream, TokenStream) = match &field.field_type {
             FieldType::String => (quote! {}, quote! { value }),
             FieldType::Uuid | FieldType::Relation(RelationType::RequiredReference(_)) => (
@@ -9294,9 +6108,6 @@ impl RustGenerator {
                 quote! { let __typed = value.parse::<rust_decimal::Decimal>().ok()?; },
                 quote! { __typed },
             ),
-            // #254: the query-param form follows the wire form — an RFC 3339
-            // string, parsed by the type's own lenient `FromStr`.  A bare
-            // integer no longer names an instant anywhere a client can see.
             FieldType::Timestamp(_) => (
                 quote! { let __typed = value.parse::<Timestamp>().ok()?; },
                 quote! { __typed },
@@ -9312,15 +6123,10 @@ impl RustGenerator {
                     quote! { __typed },
                 )
             }
-            // scan_pushdown_fields guarantees eligibility; other types are excluded.
             _ => return quote! {},
         };
         let key = Self::index_key_expr(schema, &field.field_type, Self::index_value_expr(&field.field_type, key_value));
         quote! {
-            /// #160 (C): resolve list candidate ROWS for this indexed field from the
-            /// secondary index (O(matches)) rather than a full scan.  Feed the result
-            /// to `__with_scan` as its selection.  `None` ⇒ the param did not parse;
-            /// the caller falls back to a full scan, so a match is never missed.
             pub fn #rows_by(&self, value: &str) -> Option<Vec<usize>> {
                 #parse_stmt
                 let __k: String = { #key };
@@ -9339,10 +6145,6 @@ impl RustGenerator {
         }
     }
 
-    /// #160: the columns the list filter/sort can touch — the id field plus every
-    /// filterable field (mirrors the api-side `is_filterable_field` predicate, so
-    /// the scan record always carries exactly the fields the reused filter/sort
-    /// bodies access).  Deduped, in declared order.
     pub(crate) fn scan_field_set(model: &forgedb_parser::Model) -> Vec<&forgedb_parser::Field> {
         let mut out: Vec<&forgedb_parser::Field> = Vec::new();
         if let Some(id_field) = model.identity_field() {
@@ -9359,12 +6161,6 @@ impl RustGenerator {
         out
     }
 
-    /// Emit, for a model's `@projection` directives (#113), the projection
-    /// structs (top-level, alongside the model struct) and the read methods
-    /// (inside the `*Storage` impl).  Returns `(structs, methods)`.  Empty when
-    /// the model declares no projections.  `id_read` is the id-at-row expression
-    /// (`generate_id_read_expr`) used to resolve newest-version-within-watermark
-    /// for the snapshot `_at` variants; `None` for a model with no identity field.
     fn generate_projections(
         schema: &Schema,
         model: &forgedb_parser::Model,
@@ -9375,16 +6171,8 @@ impl RustGenerator {
             return (quote! {}, quote! {});
         }
 
-        // Per-model snapshot row-resolver helpers, emitted ONCE and reused by
-        // every projection's `_at` variant, so the newest-version scan is not
-        // duplicated per projection.  They mirror `get_at`/`all_at`'s resolution
-        // but return row indices (leaving the final read to the projected
-        // decoder).  Guarded on identity presence exactly like the accessors.
         let resolvers = match id_read {
             Some(_id_read) => quote! {
-                /// Resolve the newest committed row of `id` as of `snap`
-                /// (#113 projection `_at` support; same logic as `get_at`).
-                /// #159: binary-search the id's version list, not an O(watermark) scan.
                 fn __proj_resolve_at(&self, snap: &forgedb_storage::Snapshot, id: #id_type) -> Option<usize> {
                     let watermark = snap.watermark();
                     let versions = self.id_versions.get(&id)?;
@@ -9395,9 +6183,6 @@ impl RustGenerator {
                     Some(versions[pos - 1])
                 }
 
-                /// Row indices of every live record as of `snap` — the newest
-                /// version per id (#113; same logic as `all_at`).  #159: resolve via
-                /// each id's version list instead of two O(watermark) passes.
                 fn __proj_live_rows_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<usize> {
                     let watermark = snap.watermark();
                     let mut rows = Vec::new();
@@ -9408,22 +6193,17 @@ impl RustGenerator {
                         }
                         rows.push(versions[pos - 1]);
                     }
-                    // #457: ascending physical row order, matching the model-level
-                    // `all_at` and the `0..watermark` the no-id branch below returns.
-                    // `id_versions` iterates in a per-process-seeded order.
                     rows.sort_unstable();
                     rows
                 }
             },
             None => quote! {
-                /// Resolve `id`'s row clamped to `snap` (no-mutation model).
                 fn __proj_resolve_at(&self, snap: &forgedb_storage::Snapshot, id: #id_type) -> Option<usize> {
                     let row_index = *self.id_to_row.get(&id)?;
                     if !snap.visible(row_index) { return None; }
                     Some(row_index)
                 }
 
-                /// Every visible row as of `snap` (no-mutation model).
                 fn __proj_live_rows_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<usize> {
                     (0..snap.watermark()).collect()
                 }
@@ -9450,25 +6230,9 @@ impl RustGenerator {
 
             let read_body =
                 Self::generate_row_read_body(schema, &proj_ident, &fields, Self::identity_field_name(model));
-            let doc = format!(
-                "Projection `{}` of `{}` (#113): materializes only PK + \
-                 declared columns, leaving unselected columns unread.",
-                proj.name, model.name
-            );
 
-            // The live `all_<proj>` is a buffered narrow scan (#113 + #168
-            // converged): it bulk-loads only the projected columns, so an
-            // aggregate/scan over a projection never touches — nor allocates for —
-            // the unselected columns (the column-pruning win).  The snapshot
-            // `_at` variant keeps the per-row resolver (it clamps to a watermark).
             let proj_holder =
                 format_ident!("__{}{}ScanBufs", model.name, Self::projection_pascal(&proj.name));
-            let all_doc = format!(
-                "Every live record as projection `{}` (#113 + #168): buffered \
-                 narrow scan bulk-loading only the projected columns, skipping \
-                 unselected ones entirely.",
-                proj.name
-            );
             let all_method =
                 Self::generate_buffered_scan_method(
                     schema,
@@ -9476,13 +6240,11 @@ impl RustGenerator {
                     &all_name,
                     &proj_holder,
                     &fields,
-                    &all_doc,
                     Self::identity_field_name(model),
                 );
 
             let to_schema_derive = Self::to_schema_derive();
             structs.push(quote! {
-                #[doc = #doc]
                 #[derive(Debug, Clone, Serialize, Deserialize #to_schema_derive)]
                 pub struct #proj_ident {
                     #(#struct_field_defs),*
@@ -9490,13 +6252,10 @@ impl RustGenerator {
             });
 
             methods.push(quote! {
-                /// Read the projection at a physical row index (subset decode —
-                /// only the projected columns are touched).
                 pub fn #read_at_name(&self, row_index: usize) -> Option<#proj_ident> {
                     #read_body
                 }
 
-                /// Fetch the projection for `id` from the live newest version.
                 pub fn #get_name(&self, id: #id_type) -> Option<#proj_ident> {
                     let row_index = *self.id_to_row.get(&id)?;
                     self.#read_at_name(row_index)
@@ -9504,13 +6263,11 @@ impl RustGenerator {
 
                 #all_method
 
-                /// Snapshot-scoped projection point read (#56 + #113).
                 pub fn #get_at_name(&self, snap: &forgedb_storage::Snapshot, id: #id_type) -> Option<#proj_ident> {
                     let row_index = self.__proj_resolve_at(snap, id)?;
                     self.#read_at_name(row_index)
                 }
 
-                /// Snapshot-scoped projection scan (#56 + #113).
                 pub fn #all_at_name(&self, snap: &forgedb_storage::Snapshot) -> Vec<#proj_ident> {
                     let mut records = Vec::new();
                     for row_index in self.__proj_live_rows_at(snap) {
@@ -9531,12 +6288,6 @@ impl RustGenerator {
         (structs, methods)
     }
 
-    /// Emit the body of a read-by-`row_index` over a chosen `fields` subset,
-    /// constructing `struct_ident`.  Shared by `read_at` (all model fields) and
-    /// projection reads (PK + selected) so there is ONE decode path — every
-    /// field decode is the same `field_read_stmt` branch (#113, PM constraint 1).
-    /// Only the columns of `fields` are touched, which is what lets a projection
-    /// skip the wasm lazy fault-in of unselected columns.
     fn generate_row_read_body(
         schema: &Schema,
         struct_ident: &proc_macro2::Ident,
@@ -9553,14 +6304,9 @@ impl RustGenerator {
             match Self::field_read_stmt(schema, field, &recv, &row, false, Some(field.name.as_str()) == key_name) {
                 Some((value_ident, stmt)) => {
                     read_statements.push(stmt);
-                    // C1: only push to field_values when a binding was emitted.
                     field_values.push(quote! { #field_name: #value_ident });
                 }
                 None => {
-                    // C1: Relation/component fields have no storage column.
-                    // Provide a type-appropriate default so the struct literal compiles.
-                    // (Projections never hit this branch — validation rejects
-                    // non-projectable fields — so it only serves the full record.)
                     let default_val = Self::default_for_unstored_field(&field.field_type);
                     field_values.push(quote! { #field_name: #default_val });
                 }
@@ -9568,16 +6314,12 @@ impl RustGenerator {
         }
 
         quote! {
-            // Read receives an already-resolved physical row index.
-            // Check if deleted
             if self.tombstones.is_deleted(row_index).unwrap_or(true) {
                 return None;
             }
 
-            // Read the selected fields
             #(#read_statements)*
 
-            // Construct the record
             Some(#struct_ident {
                 #(#field_values),*
             })
@@ -9590,8 +6332,6 @@ impl RustGenerator {
         Self::generate_row_read_body(schema, &model_name, &fields, Self::identity_field_name(model))
     }
 
-    /// Return the Rust type tokens used for raw byte storage read/write (C3).
-    /// For `OptionalStructType` and `Nullable` the stored type is `Option<Inner>`.
     fn stored_type_tokens(
         schema: &Schema,
         field_type: &forgedb_parser::FieldType,
@@ -9605,24 +6345,14 @@ impl RustGenerator {
         }
     }
 
-    /// Generate a sensible default value for fields that have no storage column
-    /// (virtual relations, components).  Returned tokens are placed directly in the
-    /// struct literal, so they must be valid expressions of the correct type.
-    ///
-    /// NOTE: `RequiredReference` and `OptionalReference` are FK scalars — they now
-    /// have storage columns and never reach this function.  Only `OneToMany` /
-    /// `ManyToMany` (virtual, no column) and `Component` (no column) are handled here.
     fn default_for_unstored_field(field_type: &forgedb_parser::FieldType) -> TokenStream {
         match field_type {
-            // Virtual relation fields (no storage column) map to ()
             forgedb_parser::FieldType::Relation(_) => quote! { () },
-            // Component fields map to String
             forgedb_parser::FieldType::Component(_) => quote! { Default::default() },
             _ => quote! { Default::default() },
         }
     }
 
-    /// Check if a field type is fixed-size
     fn is_fixed_size_type(schema: &Schema, field_type: &forgedb_parser::FieldType) -> bool {
         let field_type = &Self::resolved_type(schema, field_type);
         match field_type {
@@ -9634,19 +6364,8 @@ impl RustGenerator {
             | forgedb_parser::FieldType::Bool
             | forgedb_parser::FieldType::Uuid
             | forgedb_parser::FieldType::Timestamp(_)
-            // `decimal` is a fixed 16-byte column (rust_decimal::Decimal::serialize),
-            // stored exactly like Uuid.
             | forgedb_parser::FieldType::Decimal
-            // `enum` is a fixed 1-byte discriminant column (2 bytes for nullable);
-            // the enum-specific append/read branches (gated on `is_enum_type`) run
-            // BEFORE the generic fixed path everywhere, so this only makes column
-            // layout / iteration agree that an enum field HAS a column.
             | forgedb_parser::FieldType::Enum(_)
-            // #238: `string(N)` occupies one fixed-width slot of a `FixedColumn`.
-            // Note that the parser's `FieldType::is_fixed_size()` says the
-            // OPPOSITE — deliberately. That one asks whether the type may be
-            // embedded in an inline `struct`, where storage transmutes the Rust
-            // value's bytes, and the Rust value here is a heap `String`.
             | forgedb_parser::FieldType::StringN { .. }
             | forgedb_parser::FieldType::Bytes(_)
             | forgedb_parser::FieldType::FixedArray(_, _)
@@ -9657,47 +6376,27 @@ impl RustGenerator {
         }
     }
 
-    /// serde's built-in `[T; N]` impls stop here; past it a generated array field
-    /// needs one of the emitted helpers (#243).  utoipa's array impls stop at the
-    /// same place, which is why crossing it changes the `#[schema]` attribute too.
     const SERDE_ARRAY_CEILING: usize = 32;
 
-    /// Which emitted serde helper a field needs, if any (#243).
-    ///
-    /// Deliberately a *width* question, not a type question: `bytes(8)` and
-    /// `bytes(64)` are the same type and the same column, and they serialize to the
-    /// same JSON array — they differ only in which impl serde can find.
     fn big_array_serde_path(field_type: &forgedb_parser::FieldType) -> Option<&'static str> {
         use forgedb_parser::FieldType;
         match field_type {
             FieldType::Bytes(n) if *n > Self::SERDE_ARRAY_CEILING => Some("__forgedb_big_bytes"),
-            // A fixed array of oversized `bytes(N)`: the OUTER length is irrelevant,
-            // the element is what serde cannot describe.
             FieldType::FixedArray(inner, _) if matches!(**inner, FieldType::Bytes(n) if n > Self::SERDE_ARRAY_CEILING) => {
                 Some("__forgedb_big_bytes::array")
             }
-            // Any other fixed array, oversized in its own length.  Nested fixed
-            // arrays do not parse, so the element here always has its own serde.
             FieldType::FixedArray(_, m) if *m > Self::SERDE_ARRAY_CEILING => {
                 Some("__forgedb_big_array")
             }
             FieldType::Nullable(inner) => match Self::big_array_serde_path(inner)? {
                 "__forgedb_big_bytes" => Some("__forgedb_big_bytes::option"),
                 "__forgedb_big_array" => Some("__forgedb_big_array::option"),
-                // `[bytes(N); M]?` would need a fourth carrier; nothing generates it
-                // today (an optional fixed array is not a parseable field shape), so
-                // it is left unhandled rather than emitted unused and untested.
                 _ => None,
             },
             _ => None,
         }
     }
 
-    /// Whether any model or inline-struct field in the schema needs the emitted
-    /// oversized-array serde helpers (#243).  Inline structs are included because
-    /// they carry the same `#[derive(Serialize, Deserialize)]` and so break the same
-    /// way — `generate_struct` is a second field-emission site, not a variant of the
-    /// first.
     fn schema_needs_big_array_serde(schema: &Schema) -> bool {
         let model_fields = schema.models.iter().flat_map(|m| m.fields.iter());
         let struct_fields = schema.structs.iter().flat_map(|s| s.fields.iter());
@@ -9706,13 +6405,6 @@ impl RustGenerator {
             .any(|f| Self::big_array_serde_path(&f.field_type).is_some())
     }
 
-    /// Whether `__forgedb_f64_key` must be emitted (#242) — true when any model
-    /// indexes an `f64` in any position.
-    ///
-    /// Composite components are included, not just single-field indexes: a
-    /// composite key is built from each component's `index_key_expr`, so an f64
-    /// component reaches the same encoding. Missing them would emit a call to a
-    /// function that was never generated.
     fn schema_needs_f64_key(schema: &Schema) -> bool {
         schema.models.iter().any(|m| {
             let singles = Self::indexed_fields(m).into_iter();
@@ -9725,8 +6417,6 @@ impl RustGenerator {
         })
     }
 
-    /// `f64`, plain or nullable — the types whose index key routes through
-    /// `__forgedb_f64_key`.
     fn is_f64_type(field_type: &forgedb_parser::FieldType) -> bool {
         use forgedb_parser::FieldType;
         match field_type {
@@ -9736,11 +6426,6 @@ impl RustGenerator {
         }
     }
 
-    /// The `#[schema(...)]`/`#[serde(...)]` attribute pair an oversized array field
-    /// needs (#243), or `None` when serde's own impls already cover it.
-    ///
-    /// utoipa stops at 32 for the same reason serde does, so the schema type is
-    /// declared explicitly as the JSON array this serializes to.
     fn big_array_attrs(
         field_type: &forgedb_parser::FieldType,
     ) -> Option<(TokenStream, TokenStream)> {
@@ -9762,28 +6447,6 @@ impl RustGenerator {
         Some((schema_attr, quote! { #[serde(with = #path)] }))
     }
 
-    /// Is this field a **bare `string`** — the variable-storage one?
-    ///
-    /// This is the *storage/codec* predicate. It gates the
-    /// `append_string`/`read_string` bodies, the `BufferedVariableColumn` used to
-    /// scan the field, and (via `is_variable_column_type`) whether the field gets
-    /// a `VariableColumn` at all.
-    ///
-    /// It deliberately does **not** admit `string(N)` (#238), whose whole purpose
-    /// is to be stored in a `FixedColumn`. There are three predicates here, and
-    /// picking the wrong one is silent rather than loud, so the split is spelled
-    /// out:
-    ///
-    /// | predicate | asks | admits |
-    /// |---|---|---|
-    /// | `is_variable_string_type` | which codec / which column? | `string` |
-    /// | `is_inline_string_type` | is this the fixed-slot string? | `string(N)` |
-    /// | `is_string_semantic` | is the *value* a Rust `String`? | both |
-    ///
-    /// Before #238 the first and the third were one function, and its own doc
-    /// comment already recorded that it gated two unrelated things. Merging them
-    /// again would give `string(N)` a `VariableColumn` while every snapshot test
-    /// passed — which is exactly the storage this type exists to avoid.
     fn is_variable_string_type(field_type: &forgedb_parser::FieldType) -> bool {
         match field_type {
             forgedb_parser::FieldType::String => true,
@@ -9792,33 +6455,6 @@ impl RustGenerator {
         }
     }
 
-    /// The physical layout of one inline-string slot (#238) — `(slot, prefix,
-    /// payload)`, all in bytes.
-    ///
-    /// * `payload` is the widest the value can be: N bytes by default, `4N`
-    ///   under `@utf8` (res 4/5). N counts *characters*, so this is the only
-    ///   place the two units meet.
-    /// * `prefix` records how many payload bytes are actually used, so a read
-    ///   knows where the value ends. Its width is **derived from the payload**
-    ///   rather than fixed (res 6): one byte while the payload fits in a byte,
-    ///   two otherwise. A flat one-byte prefix cannot work under `@utf8` — 255
-    ///   characters at four bytes each is 1020 — and storing a *character* count
-    ///   instead does not rescue it, because slicing needs the byte end and
-    ///   recovering that from a character count means walking the UTF-8 on every
-    ///   row.
-    /// * `string(N!)` **without** `@utf8` has **no prefix at all**: every value
-    ///   is exactly N ASCII characters, therefore exactly N bytes, and there is
-    ///   nothing left to record. That makes the exact form the narrowest of the
-    ///   three shapes and byte-identical in construction to `bytes(N)` — and it
-    ///   is the form most likely to hold a key, which is where scan width costs
-    ///   most. (Under `@utf8`, exactly N *characters* is still a variable
-    ///   N..4N *bytes*, so the prefix stays.)
-    ///
-    /// The slot is **not** padded to an alignment boundary. #261 measured
-    /// unaligned strides throughout, so an aligned variant is unmeasured — and
-    /// padding would reintroduce exactly the over-reservation that experiment
-    /// identified as the thing that kills a fixed slot (at N=17 an 8-byte
-    /// alignment wastes 6 bytes on every row). Calibration is #264.
     fn inline_string_layout(chars: u8, exact: bool, utf8: bool) -> (usize, usize, usize) {
         let payload = chars as usize * if utf8 { 4 } else { 1 };
         let prefix = if exact && !utf8 {
@@ -9831,23 +6467,6 @@ impl RustGenerator {
         (payload + prefix, prefix, payload)
     }
 
-    /// Emit the body that packs one inline string into its slot (#238).
-    ///
-    /// `value_expr` must be a `&str`. Writes into a `[u8; slot]` named `__buf`
-    /// that the caller has already zeroed, at `base` (0, or 1 past a nullable
-    /// field's presence byte).
-    ///
-    /// **The unused tail stays zero.** Nothing requires it — the prefix bounds
-    /// the read, and the exact form has no tail — but it makes a column file
-    /// byte-reproducible for the same logical content, which is what lets a diff
-    /// of two data dirs mean something and what the compaction and backup
-    /// fixtures rely on.
-    ///
-    /// The `min(payload)` clamp is defensive rather than load-bearing: a value
-    /// wider than the column is rejected at validation with a 422. It is here
-    /// because this same body also runs during WAL replay, where the record comes
-    /// off disk rather than through the validator, and a panic there would turn a
-    /// corrupt byte into an unopenable database.
     fn inline_string_pack_body(
         chars: u8,
         exact: bool,
@@ -9873,11 +6492,6 @@ impl RustGenerator {
         }
     }
 
-    /// Emit the expression that recovers one inline string's used byte range from
-    /// its slot (#238) — `&raw_expr[start..start + n]`, as a `&[u8]`.
-    ///
-    /// For the exact form without `@utf8` there is no prefix and the whole slot
-    /// *is* the value, so this degenerates to a plain slice with no decode at all.
     fn inline_string_bytes_expr(
         chars: u8,
         exact: bool,
@@ -9899,16 +6513,6 @@ impl RustGenerator {
         }
     }
 
-    /// Does any model in the schema key on an inline string (#252)?
-    ///
-    /// Gates the `InlineStr` import, so a schema without a string key is
-    /// byte-identical to what it generated before #252 — the same zero-churn
-    /// discipline #266 held to, and the same reason #238 emits its prefix decoder
-    /// conditionally.
-    ///
-    /// One predicate covers all three key positions: a foreign key and a junction
-    /// endpoint both resolve *through* a model's identity, so neither can be an
-    /// inline string unless some model's identity already is.
     pub(crate) fn needs_inline_str(schema: &Schema) -> bool {
         schema.models.iter().any(|m| {
             matches!(
@@ -9918,7 +6522,6 @@ impl RustGenerator {
         })
     }
 
-    /// The `use forgedb_types::InlineStr;` line, or nothing.
     pub(crate) fn inline_str_import(schema: &Schema) -> TokenStream {
         if Self::needs_inline_str(schema) {
             quote! { use forgedb_types::InlineStr; }
@@ -9927,16 +6530,8 @@ impl RustGenerator {
         }
     }
 
-    /// Does any field in the schema need the inline-string prefix decoder (#238)?
-    ///
-    /// Emitted conditionally so a schema whose inline strings are all `string(N!)`
-    /// — the prefix-free shape — carries no prefix machinery at all.
     fn needs_inline_len_helper(schema: &forgedb_parser::Schema) -> bool {
         schema.models.iter().flat_map(|m| &m.fields).any(|f| {
-            // Resolved (#252): an FK to a string-keyed model is an inline-string
-            // column, and a non-exact target key gives it a length prefix to
-            // decode — so the helper has to be emitted for the FK's sake even
-            // when no `string(N)` is declared in that model at all.
             Self::inline_string_column_params(schema, &f.field_type)
                 .map(|(chars, exact)| {
                     Self::inline_string_layout(chars, exact, Self::is_utf8_field(f)).1 > 0
@@ -9945,67 +6540,23 @@ impl RustGenerator {
         })
     }
 
-    /// The `__forgedb_identity_char_ok` free function, emitted once per generated
-    /// file when some model keys on an inline string (#252 res 4).
-    ///
-    /// The rule is **RFC 3986 `pchar` minus `pct-encoded`** — every character that
-    /// is legal unencoded in a URL path segment, less `%`. Excluding `%` buys the
-    /// stronger property that the segment is **byte-identical to the key**, which
-    /// is what makes the rule checkable, explainable, and the URL for a row
-    /// obvious.
-    ///
-    /// It is chosen over the tighter *unreserved-only* set on purpose: `@` and `:`
-    /// are `pchar`, so `user@example.com` and `urn:isbn:0451450523` are admissible
-    /// natural keys — which is the ingestion scenario #252 exists for — and it is
-    /// the same rule #254's RFC 3339 timestamp key already satisfies (`:` is a
-    /// `pchar`), so the two identity types follow ONE path rule rather than two.
-    /// And it is chosen over "anything but `/` and `%`" because that admits
-    /// non-ASCII, which reopens the Unicode-normalization question res 3 and 4
-    /// close: `café` in NFC and NFD are two byte sequences for one text, and a
-    /// primary key compares byte-wise.
-    ///
-    /// **Generated, not substrate** (res 7). `InlineStr::try_from` enforces the
-    /// byte bound and nothing else — it is schema-agnostic and knows nothing about
-    /// identities or URLs. This rule applies *because the field is an identity*,
-    /// which is schema knowledge; putting it in the substrate would make
-    /// `InlineStr` a type that encodes an application-level policy.
     fn generate_identity_alphabet_helper() -> TokenStream {
         quote! {
-            /// Is `c` legal unencoded in a URL path segment (#252 res 4)?
-            ///
-            /// RFC 3986 `pchar` minus `pct-encoded`: `unreserved` / `sub-delims` /
-            /// `:` / `@`. Rejected: `/ ? # [ ] %`, space, and every control and
-            /// non-ASCII character.
             #[inline]
             fn __forgedb_identity_char_ok(__c: char) -> bool {
                 __c.is_ascii_alphanumeric()
                     || matches!(
                         __c,
-                        // unreserved
                         '-' | '.' | '_' | '~'
-                        // sub-delims
                         | '!' | '$' | '&' | '\'' | '(' | ')' | '*' | '+' | ',' | ';' | '='
-                        // the two pchar extras
                         | ':' | '@'
                     )
             }
         }
     }
 
-    /// The `__forgedb_inline_len` free function, emitted once per generated file
-    /// when some column actually carries a length prefix (#238).
     fn generate_inline_len_helper() -> TokenStream {
         quote! {
-            /// Read an inline string slot's length prefix (#238).
-            ///
-            /// The prefix records a BYTE count, not a character count: slicing
-            /// needs the byte end, and recovering that from a character count
-            /// would mean walking the UTF-8 on every row — reintroducing exactly
-            /// the per-row recovery cost that makes a fixed slot lose.
-            ///
-            /// Its width is derived from the slot (1 byte while the payload fits
-            /// in a byte, 2 above), so the common case — ASCII `string(N)` — pays
-            /// one byte and only `@utf8` above N = 63 pays two.
             #[inline]
             fn __forgedb_inline_len(__raw: &[u8], __prefix: usize) -> usize {
                 if __prefix == 1 {
@@ -10017,22 +6568,10 @@ impl RustGenerator {
         }
     }
 
-    /// Did this field opt into four bytes per character (#238 res 5)?
-    ///
-    /// `@utf8` stays a directive rather than part of the type: it does not change
-    /// what the column *is*, only how wide a character may be. That does mean the
-    /// slot width is a function of the declaration **and** the directive, which is
-    /// why the layout helpers take it as an explicit argument instead of reading
-    /// it off the `FieldType`.
     fn is_utf8_field(field: &forgedb_parser::Field) -> bool {
         field.has_constraint("utf8")
     }
 
-    /// Is this field an **inline `string(N)` / `string(N!)`** (#238)?
-    ///
-    /// The fixed-slot string: one `FixedColumn` slot per row, one byte per
-    /// character (four under `@utf8`), no `(offset, length)` indirection. See
-    /// [`Self::is_variable_string_type`] for why this is a separate predicate.
     fn is_inline_string_type(field_type: &forgedb_parser::FieldType) -> bool {
         match field_type {
             forgedb_parser::FieldType::StringN { .. } => true,
@@ -10041,7 +6580,6 @@ impl RustGenerator {
         }
     }
 
-    /// Peel to the inline-string parameters, through a `Nullable` wrapper (#238).
     fn inline_string_params(field_type: &forgedb_parser::FieldType) -> Option<(u8, bool)> {
         match field_type {
             forgedb_parser::FieldType::StringN { chars, exact } => Some((*chars, *exact)),
@@ -10050,18 +6588,6 @@ impl RustGenerator {
         }
     }
 
-    /// The **storage-layout** view of [`Self::inline_string_params`] (#252).
-    ///
-    /// Resolves an FK to its target's identity first (#266), so a column that
-    /// *stores* a string key is packed, read, sized and backfilled as an inline
-    /// string wherever the declared type is a relation. The unresolved form
-    /// stays the one the *value* predicates use: an FK's value is a key, not a
-    /// `String`, so it must not pick up `@length`/`@pattern`/the ASCII check.
-    ///
-    /// The width is always the target key's own, and `@utf8` is a validation
-    /// error on an identity (res 3), so an FK column is exactly N bytes wide —
-    /// the same layout the target's id column has, which is what lets a probe
-    /// key and a stored key compare byte for byte.
     fn inline_string_column_params(
         schema: &Schema,
         field_type: &forgedb_parser::FieldType,
@@ -10069,13 +6595,6 @@ impl RustGenerator {
         Self::inline_string_params(&Self::resolved_type(schema, field_type))
     }
 
-    /// Does this field's Rust type come out as `InlineStr<N>` (#252)?
-    ///
-    /// True in exactly the two key positions: the model's identity, and an FK
-    /// that resolves to a string-keyed identity. A `string(N)` *column* of the
-    /// same declared type is a `String` — the distinction `key_type_ident`
-    /// exists for. Drives the `#[schema(value_type = String)]` annotation,
-    /// since `InlineStr` implements no `ToSchema`.
     fn is_inline_key_field(
         schema: &Schema,
         model: &forgedb_parser::Model,
@@ -10086,23 +6605,10 @@ impl RustGenerator {
             && Self::is_inline_string_type(&Self::resolved_type(schema, &field.field_type))
     }
 
-    /// Does this field's *value* present as a Rust `String`?
-    ///
-    /// The semantic predicate: it gates the string validation directives
-    /// (`@length`/`@email`/`@url`/`@pattern`), the `&str` probe-parameter type,
-    /// and the borrowed `&'a str` scan view. All of those are properties of the
-    /// value, not of where the bytes live, so both spellings qualify (#238).
     fn is_string_semantic(field_type: &forgedb_parser::FieldType) -> bool {
         Self::is_variable_string_type(field_type) || Self::is_inline_string_type(field_type)
     }
 
-    /// Check if a field type is `json` (variable-length, typed `serde_json::Value`).
-    ///
-    /// `json` rides the exact same variable-column storage path as `String`
-    /// (a `VariableColumn`), but its encode/decode body serializes via
-    /// `serde_json::to_string`/`from_str` (JSON is always valid UTF-8, so the
-    /// serialized form is stored through the same `append_string`/`read_string`
-    /// as a plain string — no new storage machinery, no new dependency).
     fn is_json_type(field_type: &forgedb_parser::FieldType) -> bool {
         match field_type {
             forgedb_parser::FieldType::Json => true,
@@ -10111,15 +6617,6 @@ impl RustGenerator {
         }
     }
 
-    /// Check if a field type is (or wraps) `decimal` — an exact fixed-point value
-    /// typed `rust_decimal::Decimal`.
-    ///
-    /// `decimal` rides the FIXED 16-byte column path (like `Uuid`), encoded via
-    /// `Decimal::serialize() -> [u8; 16]` and decoded via `Decimal::deserialize`.
-    /// It needs its own append/read body (raw 16-byte column, but a
-    /// serialize/deserialize round-trip rather than uuid's `as_bytes`/`from_bytes`),
-    /// so this predicate special-cases it out of the generic fixed path — the same
-    /// way `is_uuid_like`/`is_timestamp` do.
     fn is_decimal_type(field_type: &forgedb_parser::FieldType) -> bool {
         match field_type {
             forgedb_parser::FieldType::Decimal => true,
@@ -10128,13 +6625,6 @@ impl RustGenerator {
         }
     }
 
-    /// Check if a field type is (or wraps) a user-declared enum (#enum).
-    ///
-    /// An enum is stored as a fixed 1-byte `u8` discriminant column (2 bytes for
-    /// nullable enum, `[present, disc]`), encoded via the generated `__to_u8`/
-    /// `__from_u8` codec.  Like `is_decimal_type` it special-cases enum out of the
-    /// generic fixed byte-conversion path (it needs an explicit variant match, not
-    /// `read_unaligned`), so this predicate gates that branch.
     fn is_enum_type(field_type: &forgedb_parser::FieldType) -> bool {
         match field_type {
             forgedb_parser::FieldType::Enum(_) => true,
@@ -10143,24 +6633,12 @@ impl RustGenerator {
         }
     }
 
-    /// The generated enum type ident an enum field maps to (for `__from_u8`), if any.
     fn enum_type_ident(field_type: &forgedb_parser::FieldType) -> Option<proc_macro2::Ident> {
         field_type
             .enum_name()
             .map(|n| format_ident!("{}", n))
     }
 
-    /// Whether a field occupies a variable-length column (`String` OR `json`).
-    /// This is the classification predicate for storage layout / column
-    /// iteration / projectability — everywhere the question is "does this field
-    /// get a `VariableColumn`?" (as opposed to the string-semantic checks that
-    /// stay on `is_string_semantic`).
-    ///
-    /// #238: this matches on the variants **directly** rather than delegating to a
-    /// string predicate. It used to be `is_string_type(ft) || is_json_type(ft)`,
-    /// and that delegation is a trap once a second string spelling exists —
-    /// widening the string predicate to admit `string(N)` would silently hand it a
-    /// `VariableColumn` here, through a call site that reads as unrelated.
     fn is_variable_column_type(field_type: &forgedb_parser::FieldType) -> bool {
         match field_type {
             forgedb_parser::FieldType::String | forgedb_parser::FieldType::Json => true,
@@ -10169,7 +6647,6 @@ impl RustGenerator {
         }
     }
 
-    /// Get the type name for storage paths
     fn type_name(schema: &Schema, field_type: &forgedb_parser::FieldType) -> &'static str {
         let field_type = &Self::resolved_type(schema, field_type);
         match field_type {
@@ -10181,13 +6658,8 @@ impl RustGenerator {
             forgedb_parser::FieldType::Bool => "bool",
             forgedb_parser::FieldType::Uuid => "uuid",
             forgedb_parser::FieldType::Timestamp(_) => "timestamp",
-            // decimal persists as a raw [u8; 16] (Decimal::serialize) — reuses the
-            // uuid column file-path label, same 16-byte fixed column on disk.
             forgedb_parser::FieldType::Decimal => "decimal",
-            // enum persists as a raw 1-byte discriminant (append_bytes/read_bytes).
             forgedb_parser::FieldType::Enum(_) => "enum",
-            // #238: its own label so a data dir reads honestly — the file holds
-            // text in fixed slots, not an opaque byte blob.
             forgedb_parser::FieldType::StringN { .. } => "inline_string",
             forgedb_parser::FieldType::Bytes(_) => "bytes",
             forgedb_parser::FieldType::FixedArray(_, _) => "bytes",
@@ -10198,48 +6670,24 @@ impl RustGenerator {
         }
     }
 
-    /// Get the append method name for a field type
     fn get_append_method(schema: &Schema, field_type: &forgedb_parser::FieldType) -> proc_macro2::Ident {
         format_ident!("append_{}", Self::type_name(schema, field_type))
     }
 
-    /// Get the read method name for a field type
     fn get_read_method(schema: &Schema, field_type: &forgedb_parser::FieldType) -> proc_macro2::Ident {
         format_ident!("read_{}", Self::type_name(schema, field_type))
     }
 
-    /// Generate reopen/rehydration logic for a model storage's `new()` (#65).
-    ///
-    /// Sets `row_count` from the tombstone-file length (the authoritative
-    /// row-count anchor — 1 byte/row, appended last per insert) and rebuilds
-    /// `id_to_row` by reading the id column for every committed row.  Operates on
-    /// a local `db` binding (the just-constructed storage).  Emitted for the id
-    /// field only — reconstructing the identity map is all reopen needs; the
-    /// remaining columns are read on demand by `get`.
     fn generate_rehydrate_logic(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         Self::generate_rehydrate_body(schema, model, &quote! { db })
     }
 
-    /// The shared reopen-rehydration body (#65), parameterized over the receiver
-    /// binding so it can rebuild the in-memory maps of either a just-constructed
-    /// storage (`db`, used by `new_at`) or `self` (used by the transaction
-    /// `__reindex_committed`, MVCC Tier 1).  Sets `<recv>.row_count` from the
-    /// tombstone anchor and rebuilds `id_to_row` + the secondary indexes from the
-    /// committed prefix via the SAME narrow per-field decode path everywhere.
     fn generate_rehydrate_body(
         schema: &Schema,
         model: &forgedb_parser::Model,
         recv: &TokenStream,
     ) -> TokenStream {
-        // Mirror `get`'s per-type read of the id field, but at loop index `i`, via
-        // the shared id-read helper.  The overwriting insert in ascending physical
-        // order yields last-occurrence-wins, which is exactly the superseding-version
-        // resolution the mutation surface (#66) needs on reopen: the newest version
-        // is the highest physical index for an id, so the reopened index resolves it.
         let i = format_ident!("i");
-        // #159: rebuild `id_versions` in the SAME ascending id-scan.  Every physical
-        // row is pushed in order, so each id's version vec ends up sorted ascending
-        // exactly as live maintenance built it (last element = newest version).
         let versions_push = Self::id_versions_push_stmt(model, recv, &quote! { id }, &quote! { i });
         let id_scan = match Self::generate_id_read_expr(schema, model, recv, &i) {
             Some(read_expr) => quote! {
@@ -10249,26 +6697,9 @@ impl RustGenerator {
                     #versions_push
                 }
             },
-            // No id/auto field: nothing to index (such a model cannot `insert`
-            // either — `insert` reads `record.id`).  Row count still recovers.
             None => quote! {},
         };
 
-        // Secondary-index rebuild (#90): fold into the SAME reopen scan that
-        // rebuilds `id_to_row`.  Runs AFTER `id_scan` has resolved each id to its
-        // newest physical row (last-write-wins), so the index keys only committed,
-        // live (non-tombstoned) values.
-        //
-        // Reads ONLY the indexed-field columns at each id's newest physical row —
-        // NOT the full record via `db.get()`.  `get()` would decode every column,
-        // which on the wasm lazy-source backend faults every column in at reopen
-        // (defeating partial hydrate); native pays the same over-read as file I/O.
-        // We resolve the row from `id_to_row` (already populated by `id_scan`),
-        // gate on the tombstone exactly as `read_at` does, then decode just the
-        // union of {single-index fields} ∪ {composite components} via the shared
-        // `field_read_stmt` decode path (same body `read_at` uses — no drift).
-        // Collect ids first to avoid holding an immutable borrow of `id_to_row`
-        // across the index mutation.
         let id_tok = quote! { __id };
         let index_rebuild = {
             let indexed = Self::indexed_fields(model);
@@ -10278,10 +6709,6 @@ impl RustGenerator {
             } else {
                 let id_type = Self::id_type_tokens(schema, model);
 
-                // The set of fields whose columns the rebuild must decode: every
-                // single-index field plus every composite component, de-duplicated
-                // by name (a field can be both).  Each becomes a `<field>_value`
-                // local via the shared per-field decode path.
                 let mut read_fields: Vec<&forgedb_parser::Field> = Vec::new();
                 for f in indexed.iter().copied() {
                     read_fields.push(f);
@@ -10301,11 +6728,6 @@ impl RustGenerator {
                     })
                     .collect();
 
-                // Single-field index adds (#90 + #100/#102 via `indexed_fields`),
-                // keyed off the just-decoded `<field>_value` locals.
-                // #157: build the key tokens inline from the decoded `_value`
-                // locals (reopen is a one-shot scan, not the hot write path, so no
-                // hoisting here — the block builders now take pre-built keys).
                 let mut adds: Vec<_> = indexed
                     .iter()
                     .map(|f| {
@@ -10316,15 +6738,12 @@ impl RustGenerator {
                         Self::index_add_block(recv, &ident, key, &id_tok)
                     })
                     .collect();
-                // #169 ordered index adds, keyed off the same decoded `<field>_value`
-                // locals (ordered fields ⊆ indexed fields, so already decoded).
                 adds.extend(Self::ordered_index_fields(model).iter().map(|f| {
                     let ident = Self::ordered_index_ident(f);
                     let val = format_ident!("{}_value", f.name);
                     let key = Self::ordered_key_expr(&f.field_type, quote! { #val });
                     Self::ordered_index_add_block(recv, &ident, key, &id_tok)
                 }));
-                // Composite index adds (#101), folded into the same scan.
                 adds.extend(composites.iter().map(|(ident, comps)| {
                     let parts: Vec<_> = comps
                         .iter()
@@ -10343,9 +6762,6 @@ impl RustGenerator {
                             Some(__r) => *__r,
                             None => continue,
                         };
-                        // Skip deleted rows — the same tombstone gate `read_at`
-                        // (and therefore `get`) applies, so the index keys only
-                        // live values.
                         if #recv.tombstones.is_deleted(__row).unwrap_or(true) {
                             continue;
                         }
@@ -10356,23 +6772,6 @@ impl RustGenerator {
             }
         };
 
-        // #187: fold each auto-integer field's maximum out of the SAME reopen
-        // traversal. A maximum is a running maximum, so for the *identity* this
-        // rides the `id_scan` above for free — that pass already decodes the
-        // identity column at every physical row.
-        //
-        // Two properties of that scan are load-bearing:
-        //
-        // 1. It is **ungated by tombstones**, so a deleted row still bounds the
-        //    counter. Without that, deleting the newest row and restarting would
-        //    hand its number to a different row — visible in the replication log,
-        //    in backups, and in any URL that still holds it. (The *index* rebuild
-        //    below is tombstone-gated by design; the max must not come from it.)
-        // 2. It walks every physical row, including superseded versions (#66).
-        //
-        // A **non-identity** auto is not free: the ungated pass decodes only the
-        // identity column, so its counter needs its own read per physical row.
-        // That cost is why the design does not encourage the shape.
         let autoseq_seed = {
             let identity = model.identity_field().map(|f| f.name.as_str());
             let folds: Vec<TokenStream> = Self::sequence_auto_fields(model)
@@ -10380,7 +6779,6 @@ impl RustGenerator {
                 .map(|f| {
                     let seq = Self::autoseq_field_ident(f);
                     if Some(f.name.as_str()) == identity {
-                        // Rides the id scan: `id_to_row`'s keys ARE this column.
                         let as_u64 = Self::autoseq_to_u64(f, quote! { __k });
                         quote! {
                             {
@@ -10393,9 +6791,6 @@ impl RustGenerator {
                             }
                         }
                     } else {
-                        // Its own column read per physical row — the cost the
-                        // identity case avoids. Ungated by tombstones for the same
-                        // reason: a deleted row's number must stay spent.
                         let col = format_ident!("{}_col", f.name);
                         let read_method = Self::get_read_method(schema, &f.field_type);
                         quote! {
@@ -10424,9 +6819,7 @@ impl RustGenerator {
         }
     }
 
-    /// Generate the main database struct
     fn generate_database(schema: &Schema) -> Result<TokenStream> {
-        // Generate field definitions for each model storage
         let db_fields: Vec<_> = schema
             .models
             .iter()
@@ -10437,8 +6830,6 @@ impl RustGenerator {
             })
             .collect();
 
-        // M2M junction storage: one persisted junction table per many-to-many
-        // pair, added as a Database field + initializer.
         let m2m = Self::valid_m2m(schema);
         let junction_fields: Vec<_> = m2m
             .iter()
@@ -10449,9 +6840,6 @@ impl RustGenerator {
             })
             .collect();
 
-        // `new()` builds each collection, then hands it a clone of the shared
-        // change feed (#62 Direction A) before assembling `Self`.  Every collection
-        // publishes into the same feed, so one WS subscriber sees all inserts/links.
         let attach_stmts: Vec<_> = schema
             .models
             .iter()
@@ -10472,10 +6860,6 @@ impl RustGenerator {
                 }
             }))
             .collect();
-        // Root-aware variant (#59): identical to `attach_stmts` but each
-        // collection opens under `root` (the process's tenant data dir) via
-        // `new_at(&root)` instead of the CWD-relative `new()`.  `Database::new()`
-        // and `Database::open_at(root)` share everything else.
         let attach_stmts_at: Vec<_> = schema
             .models
             .iter()
@@ -10505,16 +6889,6 @@ impl RustGenerator {
             .chain(m2m.iter().map(Self::junction_field_ident))
             .collect();
 
-        // Open-time format-version guard (#74 Phase 1).  For every collection that
-        // has already been written (its `manifest.json` exists), load exactly the
-        // opaque schema-serial integer (on-disk key `format_version`) and refuse the dir when it does
-        // not match this binary's codegen-baked `EXPECTED_SCHEMA_VERSION`.  This is
-        // the fail-fast that turns a stale data dir (written under an older schema,
-        // now opened by regenerated code) from a SILENT byte mis-decode into a
-        // clear panic pointing at the migration bin.  Red line DV-6: it reads one
-        // integer and refuses — it NEVER inspects column names/types to self-heal.
-        // A collection with no manifest yet (a fresh, never-written dir) is skipped
-        // — there is nothing stale to guard against.
         let version_guard_stmts: Vec<_> = schema
             .models
             .iter()
@@ -10543,10 +6917,6 @@ impl RustGenerator {
                                     EXPECTED_SCHEMA_VERSION,
                                 );
                             }
-                            // A DIFFERENT situation with a DIFFERENT remedy: the
-                            // schema did not change, ForgeDB did.  Sending the
-                            // user to the app's migration bin here would tell
-                            // them to regenerate a schema that is already correct.
                             if __m.engine_version != EXPECTED_ENGINE_VERSION {
                                 panic!(
                                     "ForgeDB: data dir at {} was written by engine \
@@ -10567,19 +6937,12 @@ impl RustGenerator {
             })
             .collect();
 
-        // Model-only field idents (#92 Phase 4): `Database::compact()` compacts
-        // model storages, not junctions — a junction is an append-only link table
-        // with no update/delete, so it accumulates no dead versions to reclaim.
         let model_field_idents: Vec<_> = schema
             .models
             .iter()
             .map(|model| format_ident!("{}", Self::to_snake_case(&model.name)))
             .collect();
 
-        // DatabaseSnapshot (#56, Direction A): one row-count watermark per model
-        // and per junction, captured together by `Database::snapshot()`.  Because
-        // storage is append-only, this set of watermarks defines a database-wide
-        // consistent read view — every `*_at` accessor clamps to it.
         let snapshot_fields: Vec<_> = schema
             .models
             .iter()
@@ -10605,12 +6968,6 @@ impl RustGenerator {
             }))
             .collect();
 
-        // DatabaseReader (#56, Direction B): a read-only bundle of every model's
-        // and junction's shared-fd reader handle.  A reader thread holds one of
-        // these plus a `DatabaseSnapshot` captured on the single writer, and reads
-        // lock-free — never blocking, and never blocked by, the writer's appends.
-        // The `DatabaseSnapshot` capture is routed through the writer (see
-        // `Database::snapshot()`), so it is cross-model atomic by construction.
         let reader_fields: Vec<_> = schema
             .models
             .iter()
@@ -10630,13 +6987,6 @@ impl RustGenerator {
             .map(|field| quote! { #field: self.#field.reader() })
             .collect();
 
-        // Replication apply dispatch (#110 Milestone C): map a frame's OPAQUE
-        // model tag to the matching collection's follower `apply`.  A closed,
-        // generated match — the follower reads no `.forge` at runtime; it only
-        // routes by the string tag the server stamped and lets generated code
-        // materialize the typed record.  Id-bearing models dispatch to their
-        // per-model `apply`; a junction tag decodes the opaque pair (one slot per
-        // endpoint key, #266) and re-links.  (Guard: this method must never `match` on a *decoded field*.)
         let apply_model_arms: Vec<_> = schema
             .models
             .iter()
@@ -10667,10 +7017,6 @@ impl RustGenerator {
                     Self::junction_frame_decode(schema, &rt, &quote! { &ev.bytes[#lw..#sw] });
                 quote! {
                     #base => {
-                        // Opaque pair: left ++ right, one slot per endpoint key
-                        // (#266), exactly as the junction broker recorded it.  The
-                        // follower re-links through the same generated `link`
-                        // (broker `None`, inert).
                         if ev.bytes.len() == #sw {
                             let __l = #l_dec;
                             let __r = #r_dec;
@@ -10681,16 +7027,8 @@ impl RustGenerator {
                 }
             })
             .collect();
-        // Junctions flush via `checkpoint` (they have no WAL to truncate — a #89
-        // boundary — so it is just an fsync of both id columns) in `commit`.
         let junction_field_idents: Vec<_> = m2m.iter().map(Self::junction_field_ident).collect();
 
-        // Journal-driven recovery arms (MVCC Tier 1, #83, M1b): map a committed-
-        // txn journal record's OPAQUE model tag to that collection's
-        // `__recover_to_committed`, truncating any aborted ahead-rows down to the
-        // journalled committed length.  Only id-bearing models are transactable
-        // and so appear in a journal record.  A closed generated match on the
-        // opaque tag — no `.forge` read at runtime.
         let journal_recover_arms: Vec<_> = schema
             .models
             .iter()
@@ -10704,20 +7042,12 @@ impl RustGenerator {
             })
             .collect();
 
-        // Generate-time runtime-behavior config (epic #126), read once for this
-        // `generate_database` emission.
         let cfg = Self::active_cfg();
 
-        // Durable replication-log retention (#137, Tier B): when replication is on
-        // AND a retention window is set, `maintain()` prunes the broker log to the
-        // last N offsets, bounding `_replication.log` growth. Emitted ONLY under
-        // both conditions, so the default (replication off, or retention 0) is
-        // byte-identical — no prune code, no unused const.
         let __replication_prune = if cfg.replication && cfg.replication_log_retention > 0 {
             let __retention_lit =
                 proc_macro2::Literal::u64_unsuffixed(cfg.replication_log_retention);
             quote! {
-                // #137: keep only the last #__retention_lit broker offsets.
                 if let Some(__broker) = &self.broker {
                     if let Ok(mut __b) = __broker.lock() {
                         let __wm = __b.watermark();
@@ -10729,28 +7059,13 @@ impl RustGenerator {
             quote! {}
         };
 
-        // Changefeed broadcast capacity (#135) + durable-broker in-memory buffer
-        // (#136). Default 1024 (byte-identical).
         let __changefeed_capacity = proc_macro2::Literal::usize_unsuffixed(cfg.changefeed_capacity);
-        // WAL fsync policy for the multi-model transaction journal (#132) — follows
-        // the same `[storage].fsync` knob as the per-model WALs. Default `Always`.
         let __journal_fsync = Self::wal_fsync_policy_tokens();
         let __broker_fsync = {
-            // The durable replication log's fsync policy (#136). Mirrors the WAL
-            // fsync variant name in the `changefeed::durable` module. Default
-            // `Always` (byte-identical).
             let variant = format_ident!("{}", cfg.fsync.wal_policy_variant());
             quote! { forgedb_changefeed::durable::FsyncPolicy::#variant }
         };
 
-        // Replication-broker attach gate (#130, Tier A — flagship). When OFF
-        // (the default, G6 sanctioned exception), emit `let broker = None` in
-        // place of `DurableBroker::open(...)`: no durable log is opened and no
-        // second `F_FULLFSYNC` barrier is paid per write (the mutation path's
-        // `if let Some(broker)` guard is then statically dead). When ON, open the
-        // durable, offset-addressed log so a resumable follower (#82/#110) can
-        // replay. The `broker` struct field is `Option<...>` either way, so
-        // downstream code (attach, `/replicate`) is unchanged.
         let __broker_open = if cfg.replication {
             quote! {
                 let broker = match forgedb_changefeed::durable::DurableBroker::open(
@@ -10764,10 +7079,6 @@ impl RustGenerator {
             }
         } else {
             quote! {
-                // Replication disabled at generate time (#130): no durable broker
-                // is attached, so no second fsync barrier per write. Turn on via
-                // `[runtime].replication = true` for apps that consume `/replicate`
-                // or run a browser read-replica follower.
                 let broker: Option<
                     std::sync::Arc<std::sync::Mutex<forgedb_changefeed::durable::DurableBroker>>,
                 > = None;
@@ -10775,65 +7086,20 @@ impl RustGenerator {
         };
 
         let tokens = quote! {
-            /// Main database struct
             pub struct Database {
                 #(#db_fields,)*
                 #(#junction_fields,)*
-                /// Shared change feed (#62 Direction A): every collection emits a
-                /// field-blind `(model, row_index)` signal here on insert/link.
-                /// The generated WS endpoint subscribes to it; standalone callers
-                /// can ignore it.
                 pub changefeed: forgedb_changefeed::ChangeFeed,
-                /// Durable replication broker (#82 Direction C): `Some` on the
-                /// per-tenant `open_at` path (durable log under the data root),
-                /// `None` on the lock-free `new()` convenience path.  Shared across
-                /// every collection behind an `Arc<Mutex<..>>` so one global offset
-                /// sequences all changes; the generated `/replicate` WS endpoint
-                /// streams from it to a resumable follower (#110).
                 pub broker: Option<std::sync::Arc<std::sync::Mutex<forgedb_changefeed::durable::DurableBroker>>>,
-                /// Single-writer guard (#89): `open_at` holds an exclusive advisory
-                /// lock on the data dir, so a second writer process refuses rather
-                /// than corrupting (v1 single-writer-per-process contract — this
-                /// only acquires-or-refuses; it is not a lease broker).  `None` on
-                /// the lock-free `new()` convenience path (standalone / tests).
                 _lock: Option<forgedb_storage::DirLock>,
-                /// Atomic multi-model commit journal (MVCC Tier 1, #83, M1b).  A
-                /// shared, CRC-framed, append-only log at the data-dir root holding
-                /// one opaque record per committed transaction: the touched
-                /// collections' post-commit row-counts `[(model_tag, post_len)]`.
-                /// Framed + fsynced by `forgedb-wal`'s published opaque `Raw` path
-                /// (no new substrate) — the single fsync that flips a transaction
-                /// from "aborted" to "committed" atomically across all its models.
-                /// `Some` on the `open_at` path (durable dir); `None` on the
-                /// lock-free `new()` convenience path, whose transactions are
-                /// in-process-atomic but not crash-atomic across models.
                 _txn_journal: Option<forgedb_wal::WalManager>,
-                /// Commit sequencer (MVCC Tier 2, #83): monotonic LSN source +
-                /// first-committer-wins conflict map.  In-memory, ephemeral;
-                /// rebuilds empty on restart (no in-flight txns survive a process
-                /// restart).  Shared behind `Arc<Mutex>` so prepare can be
-                /// concurrent and commit is serialized.  Seeded from the broker
-                /// watermark on `open_at` so the commit-LSN and broker offset form
-                /// one unified monotonic sequence.
                 seq: std::sync::Arc<std::sync::Mutex<forgedb_txn::CommitSequencer>>,
             }
 
-            /// A read-only, lock-free view of the whole database (#56 Direction B).
-            /// One per reader thread; each field shares the writer's column files
-            /// via independent descriptors.  Read through a `DatabaseSnapshot`
-            /// captured on the writer (`Database::snapshot()`) for a cross-model
-            /// consistent, torn-row-free view while the single writer keeps
-            /// appending.  Exposes only `&self` reads — it cannot mutate.
             pub struct DatabaseReader {
                 #(#reader_fields,)*
             }
 
-            /// A database-wide read snapshot (#56, Direction A): a row-count
-            /// watermark for every model and junction, captured atomically by
-            /// `Database::snapshot()`.  Pass a field to that collection's
-            /// `*_at` accessors for reads consistent as of the capture instant.
-            /// Rows appended after capture are invisible; concurrent writers
-            /// cannot make a reader observe a torn row.
             pub struct DatabaseSnapshot {
                 #(#snapshot_fields,)*
             }
@@ -10845,31 +7111,16 @@ impl RustGenerator {
                     Self {
                         #(#field_idents,)*
                         changefeed,
-                        // Standalone / test path: no durable replication broker.
                         broker: None,
                         _lock: None,
-                        // No durable dir → no crash-atomic multi-model commit
-                        // journal (transactions here are in-process-atomic only).
                         _txn_journal: None,
-                        // Sequencer seeded at 0 on the standalone path (no broker
-                        // watermark to seed from; commit LSNs start at Lsn(1)).
                         seq: std::sync::Arc::new(std::sync::Mutex::new(
                             forgedb_txn::CommitSequencer::new(0),
                         )),
                     }
                 }
 
-                /// Open the whole database rooted at `root` (#59): every model and
-                /// junction collection is opened under `root` via `new_at`, so a
-                /// single generated binary serves whichever data dir it is handed.
-                /// A per-tenant process passes that tenant's dir (e.g.
-                /// `<data>/<tenant>`), making tenant isolation the filesystem
-                /// boundary — no query logic, no `.forge` read at runtime.  `new()`
-                /// is exactly `open_at(".")`.
                 pub fn open_at(root: std::path::PathBuf) -> Self {
-                    // Single-writer guard (#89): acquire the data-dir lock BEFORE
-                    // opening any column/WAL file, so a second writer refuses up
-                    // front instead of racing.  Held for the life of the Database.
                     let _lock = Some(
                         forgedb_storage::DirLock::acquire(&root).expect(
                             "another writer already holds this data dir \
@@ -10879,44 +7130,13 @@ impl RustGenerator {
                     Self::__open_with_lock(root, _lock)
                 }
 
-                /// Lock-free-capable open core shared by the standalone path
-                /// (`open_at`, `_lock = Some`) and the Tier-3 coordinated path
-                /// (`connect`, `_lock = None`).  MVCC spec T3-5: a coordinated
-                /// client does NOT take the #89 `DirLock` — the coordinator holds
-                /// it on every client's behalf, and write mutual-exclusion among
-                /// coordinated clients is the coordinator's serialized turn-grant.
-                /// There is deliberately NO public lock-free open: `None` is
-                /// reachable only through `connect`, which first establishes a live
-                /// coordinator turn-channel, so a lock-free open never occurs
-                /// without a coordinator actually serializing writers (the PM
-                /// re-gate's binding constraint — no unserialized lock-free write).
                 fn __open_with_lock(
                     root: std::path::PathBuf,
                     _lock: Option<forgedb_storage::DirLock>,
                 ) -> Self {
-                    // Format-version guard (#74 Phase 1): refuse a data dir whose
-                    // stamped schema serial differs from this binary's baked
-                    // `EXPECTED_SCHEMA_VERSION`, BEFORE opening any column/WAL file.
-                    // Reads one opaque integer per existing manifest and fails fast
-                    // on mismatch — never reshapes (DV-6).  Skipped for a fresh dir.
                     #(#version_guard_stmts)*
                     let changefeed = forgedb_changefeed::ChangeFeed::new(#__changefeed_capacity);
-                    // Durable replication broker (#82 Direction C): one offset-addressed
-                    // log per tenant, under the data root, shared across all collections
-                    // so a single global offset sequences every change.  If it cannot be
-                    // opened the server still runs — replication is simply unavailable
-                    // (the `/replicate` endpoint reports it), never blocking writes.
-                    // Gated by `[runtime].replication` (#130, Tier A): when off (the
-                    // default) `broker` is `None` and no second fsync barrier is paid.
                     #__broker_open
-                    // MVCC Tier 2 (#83): seed the commit sequencer from the broker
-                    // watermark so the commit-LSN and the broker's global offset form
-                    // one unified monotonic sequence.  The broker watermark is the
-                    // highest offset recorded so far; seeding there means the first
-                    // Tier-2 commit LSN is broker_watermark + 1, guaranteeing the
-                    // two sequences never collide.  Falls back to 0 when there is no
-                    // broker (the `Err(_)` branch above), which is correct: the
-                    // standalone/test path has no broker to unify with.
                     let __seq_start = match &broker {
                         Some(b) => b.lock().map(|b| b.watermark()).unwrap_or(0),
                         None => 0,
@@ -10924,20 +7144,10 @@ impl RustGenerator {
                     let seq = std::sync::Arc::new(std::sync::Mutex::new(
                         forgedb_txn::CommitSequencer::new(__seq_start),
                     ));
-                    // Atomic multi-model commit journal (MVCC Tier 1, #83, M1b):
-                    // open the CRC-framed append-only log at the data-dir root
-                    // (reusing `forgedb-wal`'s published opaque `Raw` path — no new
-                    // substrate).  Read its LAST CRC-valid record BEFORE building
-                    // the collections: it is the authoritative durable
-                    // { model_tag -> committed_len } map.  (An absent/empty journal
-                    // ⇒ the collections' own #89 per-model recovery is authoritative
-                    // and this loop is a no-op — backward compatible with a data dir
-                    // written before transactions existed.)
                     let mut _txn_journal = forgedb_wal::WalManager::open(
                         root.join("_txn_journal.log"),
                         #__journal_fsync,
                     ).expect("Failed to open transaction journal");
-                    // The last valid record's decoded length vector (empty if none).
                     let __journal_committed: Vec<(String, u64)> = {
                         let __entries = _txn_journal
                             .replay(|_| -> std::io::Result<()> { Ok(()) })
@@ -10962,95 +7172,35 @@ impl RustGenerator {
                         _txn_journal: Some(_txn_journal),
                         seq,
                     };
-                    // Journal-driven recovery (M1b): a transaction that staged rows
-                    // but whose journal commit record never landed left ahead-rows
-                    // in some columns; truncate every touched collection back to its
-                    // journalled committed length so the txn is all-or-nothing.  A
-                    // committed txn's columns were fsynced BEFORE its journal record,
-                    // so a present record ⟺ all its columns are durable ⟹ this is a
-                    // no-op for it (its recovered length already matches).
                     for (__model, __len) in &__journal_committed {
                         let __len = *__len;
                         match __model.as_str() {
                             #(#journal_recover_arms)*
-                            // Unknown tag (a model removed since the record) → skip.
                             _ => {}
                         }
                     }
                     __db
                 }
 
-                /// Capture a consistent read snapshot across all collections.
-                /// Called on the single writer, so — because the writer is never
-                /// mid-mutation between calls — the per-collection watermarks are
-                /// captured atomically as of one commit boundary (#56 Direction B).
-                /// Hand the returned snapshot to `DatabaseReader` accessors for a
-                /// cross-model-consistent read view; rows appended after this call
-                /// are invisible and no reader can observe a torn row.
                 pub fn snapshot(&self) -> DatabaseSnapshot {
                     DatabaseSnapshot {
                         #(#snapshot_inits,)*
                     }
                 }
 
-                /// Force a WAL checkpoint across every collection (#89 step 2):
-                /// fsync all columns and truncate every model WAL now, bounding
-                /// the WALs and shortening the next reopen.  Models fsync-then-
-                /// truncate their WAL; junctions (no WAL — a #89 boundary) only
-                /// fsync their id columns.  Runs automatically every
-                /// `WAL_CHECKPOINT_INTERVAL` mutations per collection; this is the
-                /// explicit, force-now entry point.  Single-writer only.
                 pub fn checkpoint(&mut self) {
                     #(self.#field_idents.checkpoint();)*
                 }
 
-                /// Force compaction across every model (#92 Phase 4): reclaim the
-                /// dead (superseded/tombstoned) row versions the mutation surface
-                /// (#66) leaves behind, in-process under the single-writer lock.
-                /// Each model checkpoints, rewrites its files dropping dead rows,
-                /// then reopens to rebuild its in-memory maps.  Runs automatically
-                /// every `COMPACTION_DEAD_THRESHOLD` dead versions per model; this
-                /// is the explicit, force-now entry point (parity with the manual
-                /// `forgedb compact` CLI path).  Junctions are skipped — an
-                /// append-only link table accumulates no dead versions.  Single-
-                /// writer only.
-                ///
-                /// MVCC Tier 2 (#83, PM constraint 3): no row still visible as of
-                /// the oldest live snapshot may be GC'd.  With genuine concurrent
-                /// prepare (`SharedDatabase`/`Arc<RwLock<Database>>`), a
-                /// `ConcurrentTxHandle` registers a live snapshot on the sequencer
-                /// while another thread may take the write lock and call `compact()`,
-                /// so this guard is **load-bearing in Tier 2**: if any snapshot is
-                /// live, compaction is DEFERRED (skipped this pass) rather than
-                /// augmenting the keep-set — a conservative correctness guarantee
-                /// (never reclaims a pinned version) at the cost of compaction
-                /// liveness under sustained concurrent load.  `forgedb-compaction`
-                /// stays snapshot-unaware (opaque indices only).
                 pub fn compact(&mut self) {
-                    // MVCC Tier 2 (#83): if any snapshot is live in the sequencer,
-                    // defer compaction — a live prepare snapshot may still need the
-                    // versions a reclaim would drop.  Load-bearing under concurrent
-                    // prepare (SharedDatabase), where a snapshot can coexist with a
-                    // compaction call on another thread.
                     if let Ok(__seq) = self.seq.lock() {
                         if __seq.oldest_live_snapshot().as_u64() > 0 {
-                            // At least one snapshot is live — skip compaction this pass.
-                            // The per-model `in_transaction` flag separately defers
-                            // auto-compaction inside storage.
                             return;
                         }
                     }
                     #(self.#model_field_idents.compact();)*
                 }
 
-                /// Run maintenance deferred off the hot write turn (#162-A): for
-                /// every model, reclaim dead row versions IFF a compaction became
-                /// due (the soft dead-row threshold set `compaction_due` instead of
-                /// stalling the triggering write).  Call this at an operator /
-                /// coordinator idle point so the rewrite+remap cost lands here, not
-                /// on a user write.  Cheap when nothing is due (a per-model flag
-                /// check).  Snapshot-safety is the same as `compact()` — a live
-                /// prepare snapshot defers the whole pass.  Single-writer only.
                 pub fn maintain(&mut self) {
                     if let Ok(__seq) = self.seq.lock() {
                         if __seq.oldest_live_snapshot().as_u64() > 0 {
@@ -11061,32 +7211,12 @@ impl RustGenerator {
                     #__replication_prune
                 }
 
-                /// Open a read-only handle over the whole database (#56 Direction
-                /// B).  The returned `DatabaseReader` shares every collection's
-                /// files via independent descriptors, so it (and any clones handed
-                /// to reader threads) reads the committed prefix lock-free while
-                /// this writer keeps mutating.
                 pub fn reader(&self) -> DatabaseReader {
                     DatabaseReader {
                         #(#reader_inits,)*
                     }
                 }
 
-                /// Apply one replicated change frame on the browser read-replica
-                /// follower (#110 Milestone C).
-                ///
-                /// Dispatches on the frame's **opaque model tag** (a generated
-                /// closed set — the follower never reads a `.forge` schema at
-                /// runtime) to the matching generated collection, which decodes
-                /// the opaque row bytes and replays through the SAME generated
-                /// mutation surface the server used.  An unknown tag is ignored
-                /// (forward-compatible with a server that gained a model).  The
-                /// change feed / broker are `None` on a follower, so applying
-                /// neither re-emits nor re-journals — it is a pure local replay.
-                ///
-                /// Idempotent by absolute position for an in-order, from-zero
-                /// replay: the follower reproduces the server's exact physical
-                /// layout row-for-row.
                 pub fn apply_frame(
                     &mut self,
                     ev: &forgedb_changefeed::durable::PersistedEvent,
@@ -11094,56 +7224,15 @@ impl RustGenerator {
                     match ev.model.as_str() {
                         #(#apply_model_arms)*
                         #(#apply_junction_arms)*
-                        // Unknown model tag: ignore (a newer server model the
-                        // replica's generated code does not know).  Forward-compat.
                         _ => Ok(()),
                     }
                 }
 
-                /// Point-in-time recovery (#77): replay durable-broker frames in
-                /// `(base_offset .. target_offset]` through `apply_frame`, then
-                /// commit, leaving this database at exactly the state as of broker
-                /// offset `target_offset`.
-                ///
-                /// The recovery recipe: restore a full base backup (taken at broker
-                /// offset `base_offset`, recorded in the archive header) into this
-                /// data dir, place the retained `_replication.log` alongside it, then
-                /// `open_at` and call `recover_to(base_offset, target_offset)`. The
-                /// base's committed columns already contain every change through
-                /// `base_offset` (the generated mutation records to the broker only
-                /// *after* the column commit), so replay begins strictly *after* it —
-                /// exactly like #110's reload-resume skips frames `<= watermark`.
-                ///
-                /// Recovery reuses the SAME opaque-model-tag `apply_frame` the
-                /// browser follower (#110) uses — there is no second decode/apply
-                /// path, and the broker offset is the only ordering key (never a
-                /// decoded field). Reads the log via `DurableBroker::read_from` in
-                /// bounded batches so a long log does not materialize at once.
-                ///
-                /// Idempotent by id: even if a boundary frame `<= base_offset` were
-                /// re-applied (it is not, given the strict `>` filter), the
-                /// superseding-version append means `get`/`all` still resolve one
-                /// record per id — double-apply is read-safe.
-                ///
-                /// Returns the highest offset actually applied (`base_offset` if the
-                /// log holds nothing after it, capped at the log's watermark if
-                /// `target_offset` runs past the retained tail). Errors if there is
-                /// no broker (the standalone `new()` path has no `_replication.log`
-                /// to replay) or a frame fails to apply.
                 pub fn recover_to(
                     &mut self,
                     base_offset: u64,
                     target_offset: u64,
                 ) -> Result<u64, ApplyError> {
-                    // Read frames from the broker's durable log, but DETACH the
-                    // broker for the duration of replay so `apply_frame`'s
-                    // insert/update/delete do NOT re-record the frames we are
-                    // reading back into the same `_replication.log` (which would
-                    // duplicate the tail and corrupt the offset stream).  This is
-                    // exactly why the #110 follower runs with `broker: None`; here
-                    // we take it out, replay, then put the original handle back so
-                    // the recovered database stays usable (its log is unchanged,
-                    // still holding the pre-recovery frames).
                     let broker = self
                         .broker
                         .take()
@@ -11152,8 +7241,6 @@ impl RustGenerator {
                              opened via open_at with a _replication.log present"
                                 .to_string(),
                         ))?;
-                    // Detach the shared handle from every collection too, so their
-                    // generated mutations stay inert during replay.
                     #(self.#field_idents.attach_broker(None);)*
 
                     const BATCH: usize = 512;
@@ -11161,7 +7248,6 @@ impl RustGenerator {
                     let mut applied = base_offset;
                     let result: Result<u64, ApplyError> = (|| {
                         loop {
-                            // Read the next batch of frames strictly after `after`.
                             let frames = {
                                 let guard = broker.lock().unwrap();
                                 guard
@@ -11173,7 +7259,6 @@ impl RustGenerator {
                             }
                             for ev in &frames {
                                 if ev.offset > target_offset {
-                                    // Reached the recovery point — stop, don't apply.
                                     return Ok(applied);
                                 }
                                 self.apply_frame(ev)?;
@@ -11184,7 +7269,6 @@ impl RustGenerator {
                         Ok(applied)
                     })();
 
-                    // Re-attach the broker regardless of outcome, then flush.
                     #(self.#field_idents.attach_broker(Some(broker.clone()));)*
                     self.broker = Some(broker);
                     let applied = result?;
@@ -11192,14 +7276,6 @@ impl RustGenerator {
                     Ok(applied)
                 }
 
-                /// Commit every collection (#110 Milestone C additive commit):
-                /// flush all model columns + tombstones and fsync junction id
-                /// columns.  Native: an fsync durability boundary.  Wasm arena
-                /// backend: per-column `flush` is a no-op — durability instead
-                /// comes from the transport writing the arena blobs to
-                /// IndexedDB/OPFS in one transaction after this returns.  So on
-                /// the follower this is the "arenas are consistent, safe to
-                /// persist" barrier the transport's async commit waits on.
                 pub fn commit(&mut self) -> std::io::Result<()> {
                     #(
                         self.#model_field_idents.commit()?;
@@ -11215,16 +7291,6 @@ impl RustGenerator {
         Ok(tokens)
     }
 
-    /// Generate the `Database`-level validated write wrappers (#91 Phase 3):
-    /// `create_<model>` / `update_<model>`.  These add the one integrity check the
-    /// storage-scoped `insert`/`update` cannot make — **foreign-key existence** —
-    /// because it needs sibling-collection access (`self.<target>.get(fk)`), then
-    /// delegate to the storage method (which enforces field constraints + `&unique`).
-    /// Required FKs must resolve; optional FKs must resolve *when set*.  Since
-    /// #266 an FK carries its target's OWN key type, so **every** target is
-    /// checked — a `+u64`-keyed parent resolves its children exactly as a
-    /// uuid-keyed one does.  The generated REST boundary routes creates/updates through
-    /// these, so both the Rust API and REST get full integrity.
     fn generate_validated_writes(schema: &Schema) -> TokenStream {
         let mut methods = Vec::new();
         for model in &schema.models {
@@ -11279,30 +7345,15 @@ impl RustGenerator {
                 })
                 .collect();
 
-            let create_doc = format!(
-                "Create a {} with full integrity (#91): foreign keys must resolve, \
-                 then field constraints + `&unique` are enforced by `insert`.",
-                model.name
-            );
-            let update_doc = format!(
-                "Update a {} with full integrity (#91): foreign keys must resolve, \
-                 then field constraints + `&unique` are enforced by `update`. \
-                 `Ok(false)` if the id is absent.",
-                model.name
-            );
             let auto_synth =
                 Self::generate_auto_synthesis(model, &quote! { self.#storage_field });
             methods.push(quote! {
-                #[doc = #create_doc]
                 pub fn #create_fn(&mut self, mut record: #model_ident) -> Result<#id_type, ValidationError> {
-                    // #187: synthesize omitted `+` auto fields (uuid/timestamp) before
-                    // integrity checks so a create body may omit id/created_at.
                     #auto_synth
                     #(#fk_checks)*
                     self.#storage_field.insert(record)
                 }
 
-                #[doc = #update_doc]
                 pub fn #update_fn(&mut self, id: #id_type, record: #model_ident) -> Result<bool, ValidationError> {
                     #(#fk_checks)*
                     self.#storage_field.update(id, record)
@@ -11310,13 +7361,6 @@ impl RustGenerator {
             });
         }
 
-        // --- delete_<model> wrappers (delete semantics: referential integrity +
-        // cascade + set_null + M2M cascade-unlink).  Mirrors the create/update
-        // wrapper pattern (#91): the referential logic needs sibling-collection
-        // access `Storage` lacks, so it lives on `Database`.  The direct
-        // `db.<model>.delete` storage path SKIPS these checks (same caveat #91
-        // documents for `insert`) — REST + `Database::delete_<model>` get full
-        // integrity.
         let delete_methods = Self::generate_delete_wrappers(schema);
         for m in delete_methods {
             methods.push(m);
@@ -11325,17 +7369,9 @@ impl RustGenerator {
         if methods.is_empty() {
             return quote! {};
         }
-        // Cascade-depth bound (#150, epic #126): configurable at generate time via
-        // `[runtime].max_cascade_depth`; default 64 (byte-identical).
         let __max_cascade_depth =
             proc_macro2::Literal::u32_unsuffixed(Self::active_cfg().max_cascade_depth);
         quote! {
-            /// Maximum on-delete cascade recursion depth (delete semantics).  A
-            /// cascade delete recurses into referencing children (which may cascade
-            /// in turn); this bounds a pathological schema FK cycle so it fails
-            /// loudly with `ReferencedByChildren`-class refusal rather than
-            /// looping.  Configurable at generate time (#150) via
-            /// `[runtime].max_cascade_depth`.
             const MAX_CASCADE_DEPTH: u32 = #__max_cascade_depth;
 
             impl Database {
@@ -11344,29 +7380,10 @@ impl RustGenerator {
         }
     }
 
-    /// Generate the `delete_<model>` referential-integrity wrappers on `Database`
-    /// (delete semantics).  For each id-bearing parent model, emits (#266 — the
-    /// wrapper is no longer restricted to uuid-keyed parents):
-    ///   * a public `delete_<model>(id) -> Result<bool, ValidationError>` that
-    ///     evaluates every child FK's `@on_delete` policy before delegating to
-    ///     `<model>Storage::delete`, and unlinks the model's M2M junction rows;
-    ///   * an internal depth-bounded `delete_<model>_cascade(id, depth)` that the
-    ///     public method and any cascading parent call (cascade recurses through
-    ///     the child's OWN wrapper so ITS rules fire — multi-level chains work).
-    ///
-    /// Policies (default `restrict` when `@on_delete` is absent):
-    ///   * `restrict`  → refuse if any live child references the parent (409).
-    ///   * `cascade`   → recursively delete every referencing child.
-    ///   * `set_null`  → null each referencing (optional) child FK via update.
-    ///
-    /// All FK-graph walking is done here at compile time; the emitted code reads
-    /// no schema at runtime (identity red line held).
     fn generate_delete_wrappers(schema: &Schema) -> Vec<TokenStream> {
         let mut out = Vec::new();
 
         for parent in &schema.models {
-            // A wrapper is generated for every identity model (matching the
-            // create/update wrappers), so the REST DELETE route always has one.
             if !parent.has_identity() {
                 continue;
             }
@@ -11377,17 +7394,6 @@ impl RustGenerator {
             let parent_name_str = parent.name.as_str();
             let id_type = Self::id_type_tokens(schema, parent);
 
-            // #266: there is no longer a degenerate branch here.  A non-UUID key
-            // used to fall through to a bare delegate carrying the doc comment
-            // "no model references it via a foreign key" — asserted as fact in
-            // schemas where one plainly did, which is exactly what kept the hole
-            // invisible.  Every identity model now gets the real wrapper.
-
-            // Every child FK field that references THIS parent, with its policy.
-            // A child may have multiple FKs to the same parent (disambiguated by
-            // field), each with its own `@on_delete`.  Restrict CHECKS run before
-            // any cascade/set_null mutation, so a later `restrict` sibling refuses
-            // the whole delete without a partial cascade having already fired.
             let mut restrict_checks: Vec<TokenStream> = Vec::new();
             let mut mutations: Vec<TokenStream> = Vec::new();
             for child in &schema.models {
@@ -11409,9 +7415,6 @@ impl RustGenerator {
                     if target_name != &parent.name {
                         continue;
                     }
-                    // The reverse FK must be indexed to probe children in O(1).
-                    // FK fields are always indexed (#100), so this holds; guard
-                    // anyway so a non-indexed edge falls back to a scan.
                     let fk_field = format_ident!("{}", field.name);
                     let fk_probe = format_ident!("find_by_{}", field.name);
                     let child_field_str = field.name.as_str();
@@ -11456,8 +7459,6 @@ impl RustGenerator {
                             });
                         }
                         OnDeletePolicy::SetNull => {
-                            // Only reachable for OPTIONAL FKs (validated above),
-                            // so `#fk_field = None` type-checks.
                             mutations.push(quote! {
                                 {
                                     let __children = #find_children;
@@ -11473,9 +7474,6 @@ impl RustGenerator {
                 }
             }
 
-            // M2M cascade-unlink: any junction this parent participates in has its
-            // pairs referencing the deleted id retracted, so traversal no longer
-            // resolves the gone record.  Emitted for both sides of each M2M.
             let mut m2m_unlinks: Vec<TokenStream> = Vec::new();
             for m in Self::valid_m2m(schema) {
                 let junction_field = Self::junction_field_ident(&m);
@@ -11492,25 +7490,12 @@ impl RustGenerator {
                 }
             }
 
-            let doc = format!(
-                "Delete a {} with referential integrity (delete semantics): each child \
-                 FK's `@on_delete` policy (restrict/cascade/set_null) is applied, this \
-                 model's M2M junction rows are unlinked, then the row is tombstoned. \
-                 Returns `Ok(false)` if the id is absent, `Err(ReferencedByChildren)` \
-                 (409) if a `restrict` child blocks the delete.  The REST DELETE route \
-                 goes through this wrapper; the direct `db.{}.delete` storage path does \
-                 NOT (it skips these checks).",
-                parent.name, parent_snake
-            );
 
             out.push(quote! {
-                #[doc = #doc]
                 pub fn #public_fn(&mut self, id: #id_type) -> Result<bool, ValidationError> {
                     self.#cascade_fn(id, 0)
                 }
 
-                /// Internal depth-bounded cascade worker.  `depth` guards a
-                /// pathological FK cycle (bounded by `MAX_CASCADE_DEPTH`).
                 fn #cascade_fn(&mut self, id: #id_type, __depth: u32) -> Result<bool, ValidationError> {
                     if __depth > MAX_CASCADE_DEPTH {
                         return Err(ValidationError::ReferencedByChildren {
@@ -11518,17 +7503,11 @@ impl RustGenerator {
                             field: "on_delete cascade depth exceeded",
                         });
                     }
-                    // Nothing to delete → no-op (matches storage `delete` semantics),
-                    // and skip child work so a cascade cycle terminates.
                     if self.#parent_storage.get(id).is_none() {
                         return Ok(false);
                     }
-                    // Restrict checks run FIRST so a violation refuses before any
-                    // cascade/set_null side effect fires.
                     #(#restrict_checks)*
-                    // Then cascade-delete / set-null the referencing children.
                     #(#mutations)*
-                    // Retract M2M junction rows for this id (both sides).
                     #(#m2m_unlinks)*
                     Ok(self.#parent_storage.delete(id))
                 }
@@ -11538,20 +7517,7 @@ impl RustGenerator {
         out
     }
 
-    /// Generate the transaction surface (MVCC Tier 1, #83): the `TxHandle` struct,
-    /// its scoped per-model write (`create_/update_/delete_`) + read (`get_/all_`)
-    /// methods, `Database::transaction`, and the commit/rollback machinery.
-    ///
-    /// Identity: this is entirely GENERATED per schema (a method on the tailored
-    /// `Database`) — not a shipped generic `db.begin()` over an arbitrary schema.
-    /// `TxHandle` exposes exactly the per-model methods codegen already emits,
-    /// scoped to a transaction; no predicate-as-data, no runtime schema.  The only
-    /// substrate used is the already-published `forgedb-wal` `Raw` path (the commit
-    /// journal), `truncate_to_rows`, and the watermark — no new crate, no format
-    /// change.  Skipped entirely for a schema with no id-bearing (transactable)
-    /// model.
     fn generate_transaction_impl(schema: &Schema) -> TokenStream {
-        // Only id-bearing models are transactable (they can be inserted / mutated).
         let tx_models: Vec<&forgedb_parser::Model> = schema
             .models
             .iter()
@@ -11561,12 +7527,9 @@ impl RustGenerator {
             return quote! {};
         }
 
-        // Default optimistic-transaction retry count (#146, epic #126): baked
-        // from `[transaction].max_retries`; default 3 (byte-identical).
         let __txn_max_retries =
             proc_macro2::Literal::u32_unsuffixed(Self::active_cfg().txn_max_retries);
 
-        // #260 sequence-claim plumbing for `TxHandle` (empty pre-#260 schemas).
         let (seq_field, seq_init, seq_ws_self) = Self::sequence_claim_plumbing(
             schema,
             &quote! { self },
@@ -11574,8 +7537,6 @@ impl RustGenerator {
             true,
         );
 
-        // Rollback arms: truncate every touched collection's columns + WAL tail
-        // back to its recorded pre-txn mark, and clear its txn guard.
         let rollback_arms: Vec<_> = tx_models
             .iter()
             .map(|m| {
@@ -11584,14 +7545,11 @@ impl RustGenerator {
                 quote! {
                     #tag => {
                         let __mark = *__mark;
-                        // Erase staged rows: truncate every column + tombstone.
                         let _ = self.db.#field.__truncate_all_to(__mark);
                         self.db.#field.row_count = __mark;
-                        // Drop the staged WAL tail back to the recorded byte mark.
                         if let Some(__wm) = self.wal_marks.get(#tag) {
                             let _ = self.db.#field.wal.truncate_to(*__wm);
                         }
-                        // Leave the txn guard; run any deferred maintenance now.
                         self.db.#field.in_transaction = false;
                         self.db.#field.run_deferred_maintenance();
                     }
@@ -11599,10 +7557,6 @@ impl RustGenerator {
             })
             .collect();
 
-        // Commit reindex arms: after the watermark is (already) advanced by the
-        // staged appends, rebuild each touched collection's id_to_row + indexes
-        // from the now-visible committed prefix, clear the guard, run deferred
-        // maintenance.
         let commit_reindex_arms: Vec<_> = tx_models
             .iter()
             .map(|m| {
@@ -11618,9 +7572,6 @@ impl RustGenerator {
             })
             .collect();
 
-        // Commit fsync arms: make each touched collection's columns + WAL durable
-        // BEFORE the journal record (the ordering that makes the journal fsync the
-        // atomic commit point).
         let commit_fsync_arms: Vec<_> = tx_models
             .iter()
             .map(|m| {
@@ -11630,22 +7581,17 @@ impl RustGenerator {
                     #tag => {
                         let _ = self.db.#field.commit();
                         let _ = self.db.#field.wal.flush();
-                        // Record this collection's post-commit committed length for
-                        // the journal (the atomic multi-model commit marker).
                         __journal.push((#tag.to_string(), self.db.#field.row_count as u64));
                     }
                 }
             })
             .collect();
 
-        // Per-model scoped write + read methods on TxHandle.
         let mut tx_methods: Vec<TokenStream> = Vec::new();
         for model in &tx_models {
             tx_methods.push(Self::generate_txn_model_methods(model, schema));
         }
 
-        // The `mark_<model>` helpers: record the pre-txn physical row count + WAL
-        // byte offset the first time a collection is written, and set its txn guard.
         let mark_methods: Vec<_> = tx_models
             .iter()
             .map(|m| {
@@ -11653,8 +7599,6 @@ impl RustGenerator {
                 let field = format_ident!("{}", Self::to_snake_case(&m.name));
                 let mark_fn = format_ident!("__mark_{}", Self::to_snake_case(&m.name));
                 quote! {
-                    /// Record `#tag`'s pre-txn rollback marks on first touch and set
-                    /// its transaction guard (so auto-checkpoint/compaction defer).
                     fn #mark_fn(&mut self) {
                         if !self.marks.contains_key(#tag) {
                             let __rc = self.db.#field.row_count;
@@ -11669,48 +7613,14 @@ impl RustGenerator {
             .collect();
 
         quote! {
-            /// A scoped transaction handle (MVCC Tier 1, #83).  Exposes exactly the
-            /// per-model write surface codegen already emits (`create_/update_/
-            /// delete_`), scoped to the transaction, plus a read surface
-            /// (`get_/all_`) with **read-your-writes**: reads resolve against the
-            /// staged physical length (the watermark raised past the public one),
-            /// so the transaction sees its own uncommitted appends over the
-            /// committed prefix — the same `get_at` decode path, just a raised
-            /// watermark (no forked decoder).  Outside readers still clamp at the
-            /// public watermark, so staged rows are invisible until commit.
             pub struct TxHandle<'db> {
                 db: &'db mut Database,
-                /// Pre-txn physical row-count per touched collection (lazy, on first
-                /// write) — the rollback truncation target.
                 marks: std::collections::BTreeMap<&'static str, usize>,
-                /// Pre-txn per-model WAL byte offset per touched collection — the
-                /// rollback WAL-tail truncation target.
                 wal_marks: std::collections::BTreeMap<&'static str, u64>,
-                /// Buffered change-feed + durable-broker records, drained (offsets
-                /// consumed) only on commit — so a rolled-back txn consumes NO
-                /// broker offset and emits NO changefeed event (no offset gap).
                 pending_events: Vec<(&'static str, forgedb_changefeed::ChangeKind, Vec<u8>, usize, Vec<u8>)>,
-                /// Unique keys claimed by staged writes in this transaction (M1a fix).
-                ///
-                /// Each entry is `(model_name, field_name, encoded_key)`.  Checked
-                /// ALONGSIDE the committed index so that two `create_<model>` calls
-                /// with the SAME `&unique` value in one transaction both see the
-                /// conflict — the committed index only reflects rows visible before
-                /// the txn started.  Rollback discards the set automatically (it is
-                /// owned by `TxHandle` and never touches the real index maps, so no
-                /// undo is needed).
-                ///
-                /// The **model name is part of the key** (#257).  This set stands in
-                /// for the committed index, and that index is addressed per model
-                /// *and* per column (`db.<model>.<field_index>`); keying it by field
-                /// name alone put two unrelated models that merely share a field
-                /// name — `code`, `slug`, `sku` — into one uniqueness namespace, so
-                /// writing the same value to both in one transaction was rejected as
-                /// a duplicate.  The key must match what it is a pre-image of.
                 staged_unique_keys:
                     std::collections::BTreeSet<(&'static str, &'static str, String)>,
                 #seq_field
-                /// Set once `commit` runs; the `Drop` backstop rolls back otherwise.
                 committed: bool,
             }
 
@@ -11731,21 +7641,8 @@ impl RustGenerator {
 
                 #(#tx_methods)*
 
-                /// Commit the transaction (MVCC Tier 1, #83).  Ordering is
-                /// load-bearing (mirrors #96's checkpoint order): (1) fsync every
-                /// touched collection's columns + per-model WAL, (2) append + fsync
-                /// the atomic multi-model commit record to `_txn_journal.log` (THE
-                /// commit point — a present record ⟺ all its columns durable), (3)
-                /// advance visibility by rebuilding each touched collection's
-                /// id_to_row + indexes from the now-committed prefix, (4) drain the
-                /// buffered changefeed + broker events (offsets consumed HERE and
-                /// only here).  A crash before step 2 leaves no journal record → the
-                /// staged rows are truncated on reopen (all-or-nothing).
                 pub fn commit(mut self) -> Result<(), TxError> {
-                    // Step 1 + build the journal length vector.
                     let mut __journal: Vec<(String, u64)> = Vec::new();
-                    // Iterate marks in a stable order (BTreeMap) so the journal is
-                    // deterministic; only touched collections appear.
                     let __touched: Vec<&'static str> = self.marks.keys().copied().collect();
                     for __tag in &__touched {
                         match *__tag {
@@ -11753,8 +7650,6 @@ impl RustGenerator {
                             _ => {}
                         }
                     }
-                    // Step 2: the atomic commit point.  Encode the length vector as
-                    // opaque bytes and write it via the WAL `Raw` path (fsync-always).
                     if let Some(__jrnl) = self.db._txn_journal.as_mut() {
                         let __payload = serde_json::to_vec(&__journal)
                             .map_err(|e| TxError::Io(e.to_string()))?;
@@ -11763,23 +7658,14 @@ impl RustGenerator {
                             .map_err(|e| TxError::Io(e.to_string()))?;
                         __jrnl.flush().map_err(|e| TxError::Io(e.to_string()))?;
                     }
-                    // Step 3: advance visibility (rebuild maps) + close the guard +
-                    // run any deferred maintenance, per touched collection.
                     for __tag in &__touched {
                         match *__tag {
                             #(#commit_reindex_arms)*
                             _ => {}
                         }
                     }
-                    // Step 4: drain the buffered events to the shared broker +
-                    // change feed, consuming the contiguous offset run HERE (one
-                    // burst per commit).  A rolled-back txn never reaches this, so it
-                    // leaves no offset gap.
                     for (__model, __kind, _id_bytes, __row, __bytes) in std::mem::take(&mut self.pending_events) {
-                        // Best-effort in-process change feed (owned by `Database`).
                         self.db.changefeed.emit(__model, __row, __kind);
-                        // Durable replication broker (#82): consume the contiguous
-                        // offset run HERE — one burst per commit, no gap on abort.
                         if let Some(__broker) = &self.db.broker {
                             if let Ok(mut __b) = __broker.lock() {
                                 let _ = __b.record(__model, __row as u64, __kind, __bytes);
@@ -11790,15 +7676,9 @@ impl RustGenerator {
                     Ok(())
                 }
 
-                /// Roll back the transaction: truncate every touched collection's
-                /// staged rows + WAL tail back to its pre-txn mark, discard the
-                /// buffered events (no broker offset consumed, no changefeed emit),
-                /// and clear each txn guard.  No journal record is written, no
-                /// watermark advanced — nothing outside the transaction ever
-                /// observed the staged rows.
                 pub fn rollback(mut self) {
                     self.rollback_internal();
-                    self.committed = true; // prevent the Drop backstop double-running
+                    self.committed = true;
                 }
 
                 fn rollback_internal(&mut self) {
@@ -11814,31 +7694,14 @@ impl RustGenerator {
                     self.pending_events.clear();
                 }
 
-                /// Compute the write-set for the commit sequencer (MVCC Tier 2, #83).
-                ///
-                /// Returns all opaque keys touched by this transaction: one per staged
-                /// row (`model_tag_bytes ++ logical_id_bytes`) and one per claimed
-                /// unique key (`field_name_bytes ++ encoded_key_bytes`).  The
-                /// sequencer sees only opaque bytes — no model name, no field, no
-                /// schema — preserving the identity red line.
                 pub fn __write_set(&self, snapshot_lsn: forgedb_txn::Lsn) -> forgedb_txn::WriteSet {
                     let mut keys: Vec<forgedb_txn::OpaqueKey> = Vec::new();
-                    // Row-level opaque keys: model_tag_bytes ++ logical_id_bytes.
-                    // Using the logical entity id (not the physical row index) so two concurrent
-                    // transactions that both write the same logical entity conflict,
-                    // regardless of which physical rows they stage.
                     for (__model, _kind, __id_bytes, _row, _bytes) in &self.pending_events {
                         keys.push(
                             __forgedb_ws_key(&[b"r", __model.as_bytes(), __id_bytes])
                                 .into_boxed_slice(),
                         );
                     }
-                    // Unique-claim keys: (model, field, encoded value) — #257.  The
-                    // model is part of the identity because this mirrors the committed
-                    // index, which is per model AND per column.
-                    // Capturing unique-key claims prevents two concurrent txns from
-                    // committing the same unique value even when they staged different
-                    // physical rows (which have different row-level keys above).
                     for (__mtag, __fname, __ekey) in &self.staged_unique_keys {
                         keys.push(
                             __forgedb_ws_key(&[
@@ -11856,9 +7719,6 @@ impl RustGenerator {
             }
 
             impl<'db> Drop for TxHandle<'db> {
-                /// Panic-safety backstop: an un-committed handle (dropped via an
-                /// early `?`, a panic, or an explicit non-commit) rolls back, so a
-                /// half-staged transaction never becomes visible.
                 fn drop(&mut self) {
                     if !self.committed {
                         self.rollback_internal();
@@ -11866,30 +7726,9 @@ impl RustGenerator {
                 }
             }
 
-            /// Default retry count for `transaction_optimistic` (#83, Tier 2).
-            ///
-            /// Override per-call via `transaction_retrying(retries, f)`.  Baked at
-            /// generate time (#146, epic #126) from `[transaction].max_retries`;
-            /// default 3 (byte-identical).
             const DEFAULT_TXN_RETRIES: u32 = #__txn_max_retries;
 
             impl Database {
-                /// Run a transaction (MVCC Tier 1, #83).  The closure receives a
-                /// scoped `TxHandle` exposing the per-model `create_/update_/delete_`
-                /// writes + `get_/all_` reads; its writes are staged (physically
-                /// appended past the public watermark, durable in the per-model WAL,
-                /// but invisible outside) and made visible ATOMICALLY on `Ok`
-                /// (commit) or discarded on `Err`/panic (rollback-by-truncate).
-                /// Multi-model writes commit all-or-nothing across a crash via the
-                /// `_txn_journal.log` (M1b).
-                ///
-                /// ```ignore
-                /// let id = db.transaction(|tx| {
-                ///     let uid = tx.create_user(user)?;   // staged
-                ///     tx.create_post(post)?;             // atomic with the user
-                ///     Ok(uid)
-                /// })?;                                   // Ok → commit; Err → rollback
-                /// ```
                 pub fn transaction<T>(
                     &mut self,
                     f: impl FnOnce(&mut TxHandle) -> Result<T, TxError>,
@@ -11907,47 +7746,17 @@ impl RustGenerator {
                     }
                 }
 
-                /// Run an optimistic transaction with auto-retry (MVCC Tier 2, #83).
-                ///
-                /// The closure `f` is `Fn` (re-runnable): it may be invoked up to
-                /// `retries + 1` times.  Each attempt: (1) registers a snapshot LSN
-                /// via the `CommitSequencer`, (2) runs the prepare closure staging
-                /// writes into private buffers via `TxHandle`, (3) at the serialized
-                /// commit point calls `CommitSequencer::try_commit` — on
-                /// `Committed`, applies via the Tier-1 commit; on `Conflict`, drops
-                /// the buffers and retries (snapshot re-registered).
-                ///
-                /// **Isolation:** snapshot isolation, first-committer-wins.  The
-                /// disclosed anomaly is write-skew (two txns read overlapping key
-                /// sets, each writes a disjoint subset; both may commit in SI).
-                /// Serializable snapshot isolation (SSI, read-set tracking) is Tier 3.
-                ///
-                /// **"Concurrent writers"** = concurrent *prepare*, serialized
-                /// *commit*.  In Tier 2, `transaction_retrying` takes `&mut self`,
-                /// so prepare is also serialized (only one `&mut` holder at a time).
-                /// The sequencer and conflict-map are structurally ready for
-                /// concurrent prepare; `&mut Database` makes it a no-op here.
-                /// Genuine concurrent prepare lands in Tier 3
-                /// (`Arc<RwLock<Database>>`).
                 pub fn transaction_retrying<T>(
                     &mut self,
                     retries: u32,
                     f: impl Fn(&mut TxHandle) -> Result<T, TxError>,
                 ) -> Result<T, TxError> {
-                    // Clone the Arc<Mutex<CommitSequencer>> BEFORE the loop so we
-                    // can call the sequencer while `tx` (which holds &mut Database)
-                    // is live — cloning the Arc does not require borrowing `self`.
                     let __seq_arc = std::sync::Arc::clone(&self.seq);
                     for __attempt in 0..=retries {
-                        // Step 1: register the read snapshot (current committed LSN).
-                        // This can still use `self.seq` because `tx` is not yet alive.
                         let __snap_lsn = {
                             let mut __seq = self.seq.lock().unwrap();
                             __seq.register_snapshot()
                         };
-                        // TxHandle::begin takes &mut Database (self), so no further
-                        // `self.seq` borrows are possible while `tx` lives.  All
-                        // sequencer calls below use the cloned Arc.
                         let mut tx = TxHandle::begin(self);
                         let __out = f(&mut tx);
                         let __val = match __out {
@@ -11959,8 +7768,6 @@ impl RustGenerator {
                                 return Err(e);
                             }
                         };
-                        // Step 2: build the write-set from the staged transaction,
-                        // then hand it to the sequencer for first-committer-wins check.
                         let __ws = tx.__write_set(__snap_lsn);
                         let __outcome = {
                             let mut __seq = __seq_arc.lock().unwrap();
@@ -11968,29 +7775,22 @@ impl RustGenerator {
                         };
                         match __outcome {
                             forgedb_txn::CommitOutcome::Committed(_l) => {
-                                // Apply the staged writes via Tier-1 commit.
                                 tx.commit()?;
                                 let mut __seq = __seq_arc.lock().unwrap();
                                 __seq.release_snapshot(__snap_lsn);
-                                let _ = __attempt; // suppress unused variable warning
+                                let _ = __attempt;
                                 return Ok(__val);
                             }
                             forgedb_txn::CommitOutcome::Conflict { .. } => {
-                                // Drop the staged writes and retry.
                                 tx.rollback();
                                 let mut __seq = __seq_arc.lock().unwrap();
                                 __seq.release_snapshot(__snap_lsn);
-                                // Loop continues to next attempt.
                             }
                         }
                     }
                     Err(TxError::Conflict)
                 }
 
-                /// Run an optimistic transaction with the default retry count (#83).
-                ///
-                /// Uses `DEFAULT_TXN_RETRIES` (= 3 retries, 4 total attempts).  For
-                /// per-call control use `transaction_retrying(retries, f)`.
                 pub fn transaction_optimistic<T>(
                     &mut self,
                     f: impl Fn(&mut TxHandle) -> Result<T, TxError>,
@@ -12001,17 +7801,7 @@ impl RustGenerator {
         }
     }
 
-    /// Generate the Tier 2 concurrent-prepare surface (#83): `SharedDatabase` wrapping
-    /// `Arc<RwLock<Database>>`, and `ConcurrentTxHandle` which stages into private
-    /// in-memory buffers (touching NO shared state during prepare).  The commit
-    /// critical section takes the exclusive write lock briefly to apply the buffer
-    /// via the Tier-1 apply path and advance visibility.
-    ///
-    /// Identity red line: the conflict-detection path (sequencer) sees only opaque
-    /// keys; model-tag dispatch only appears in the apply path (after conflict
-    /// resolution passes) — the same pattern as `apply_frame` for the follower.
     fn generate_shared_database_impl(schema: &Schema) -> TokenStream {
-        // #260 sequence-claim plumbing for `ConcurrentTxHandle` (Tier 2).
         let (seq_field, seq_init, seq_ws_tx) = Self::sequence_claim_plumbing(
             schema,
             &quote! { __tx },
@@ -12027,7 +7817,6 @@ impl RustGenerator {
             return quote! {};
         }
 
-        // Per-model apply arms for __apply_and_commit_concurrent_buffer.
         let concurrent_apply_arms: Vec<_> = tx_models
             .iter()
             .map(|m| {
@@ -12045,7 +7834,6 @@ impl RustGenerator {
             })
             .collect();
 
-        // Per-model mark arms: record pre-txn row_count + wal byte offset, set in_transaction.
         let concurrent_mark_arms: Vec<_> = tx_models
             .iter()
             .map(|m| {
@@ -12065,7 +7853,6 @@ impl RustGenerator {
             })
             .collect();
 
-        // Per-model fsync arms.
         let concurrent_fsync_arms: Vec<_> = tx_models
             .iter()
             .map(|m| {
@@ -12081,7 +7868,6 @@ impl RustGenerator {
             })
             .collect();
 
-        // Per-model reindex arms.
         let concurrent_reindex_arms: Vec<_> = tx_models
             .iter()
             .map(|m| {
@@ -12097,7 +7883,6 @@ impl RustGenerator {
             })
             .collect();
 
-        // Per-model rollback arms for concurrent apply.
         let concurrent_rollback_arms: Vec<_> = tx_models
             .iter()
             .map(|m| {
@@ -12119,7 +7904,6 @@ impl RustGenerator {
             })
             .collect();
 
-        // Per-model concurrent methods on ConcurrentTxHandle.
         let mut concurrent_model_methods: Vec<TokenStream> = Vec::new();
         for model in &tx_models {
             let model_name = format_ident!("{}", model.name);
@@ -12135,21 +7919,12 @@ impl RustGenerator {
             let get_fn = format_ident!("get_{}", snake);
             let all_fn = format_ident!("all_{}", snake);
             let snap_field = format_ident!("{}", snake);
-            // The prepare closure runs with NO write lock (Tier 2), so allocation
-            // takes a brief READ lock, which is all it needs: the counter is an
-            // atomic, and `__alloc_*` is a lock-free compare-exchange loop.
             let auto_synth = Self::generate_auto_synthesis(
                 model,
                 &quote! { self.inner.read().unwrap().#snap_field },
             );
-            // #254: the concurrent staging path buffers row BYTES and commits via
-            // `__stage_append`, never through `Storage::insert` — so the gate has
-            // to be spliced here too, or a Tier-2 write would store an unfloored
-            // value the schema promised was quantized.
             let ts_gate = Self::generate_timestamp_write_gate(schema, model);
 
-            // Unique checks (insert) for ConcurrentTxHandle.
-            // #260: sequence claims for bare integer autos (empty otherwise).
             let seq_claim = Self::generate_sequence_claim_staging(model);
             let unique_checks_insert: Vec<_> = Self::indexed_fields(model)
                 .iter()
@@ -12180,7 +7955,6 @@ impl RustGenerator {
                 })
                 .collect();
 
-            // Unique checks (update) for ConcurrentTxHandle.
             let unique_checks_update: Vec<_> = Self::indexed_fields(model)
                 .iter()
                 .filter(|f| f.unique)
@@ -12216,7 +7990,6 @@ impl RustGenerator {
                 })
                 .collect();
 
-            // FK checks for ConcurrentTxHandle.
             let fk_checks: Vec<_> = model
                 .fields
                 .iter()
@@ -12259,15 +8032,11 @@ impl RustGenerator {
                 .collect();
 
             concurrent_model_methods.push(quote! {
-                /// Stage the creation of a #model_name in a concurrent transaction.
                 pub fn #create_fn(&mut self, mut record: #model_name) -> Result<#id_type, TxError> {
-                    // #187: synthesize omitted `+` auto fields (uuid/timestamp) first.
                     #auto_synth
                     #ts_gate
                     #validate_fn(&record)?;
                     #(#unique_checks_insert)*
-                    // #260: claim the allocated value so a peer's identical
-                    // allocation is a detected conflict, not a silent duplicate.
                     #seq_claim
                     #(#fk_checks)*
                     let id = record.#id_field;
@@ -12278,7 +8047,6 @@ impl RustGenerator {
                     Ok(id)
                 }
 
-                /// Stage an update of a #model_name in a concurrent transaction.
                 pub fn #update_fn(&mut self, id: #id_type, record: #model_name) -> Result<bool, TxError> {
                     if self.#get_fn(id).is_none() {
                         return Ok(false);
@@ -12294,7 +8062,6 @@ impl RustGenerator {
                     Ok(true)
                 }
 
-                /// Stage a delete of a #model_name in a concurrent transaction.
                 pub fn #delete_fn(&mut self, id: #id_type) -> bool {
                     let record = match self.#get_fn(id) {
                         Some(r) => r,
@@ -12307,7 +8074,6 @@ impl RustGenerator {
                     true
                 }
 
-                /// Read a #model_name within the concurrent transaction (read-your-writes).
                 pub fn #get_fn(&self, id: #id_type) -> Option<#model_name> {
                     let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
                     for (_, _kind, __ib, __bytes, __del) in self.buffer.iter().rev() {
@@ -12320,7 +8086,6 @@ impl RustGenerator {
                     __db.#field.get_at(&self.snap.#snap_field, id)
                 }
 
-                /// Read all live #model_name records visible to this concurrent transaction.
                 pub fn #all_fn(&self) -> Vec<#model_name> {
                     let __db = self.inner.read().unwrap();
                     let mut __rows = __db.#field.all_at(&self.snap.#snap_field);
@@ -12346,30 +8111,13 @@ impl RustGenerator {
         }
 
         quote! {
-            /// A cloneable, thread-safe handle for concurrent transaction preparation
-            /// (#83 Tier 2).
-            ///
-            /// Multiple threads may prepare transactions concurrently — each calls
-            /// `transaction_concurrent` which holds the inner `RwLock` in **read mode**
-            /// only during snapshot-capture, then releases it entirely during prepare.
-            /// The serialized commit section takes the **exclusive write lock** to apply
-            /// the buffer atomically.
-            ///
-            /// Create via `Database::shared()`.
             #[derive(Clone)]
             pub struct SharedDatabase {
                 inner: std::sync::Arc<std::sync::RwLock<Database>>,
-                /// Sequencer Arc cloned from Database.seq at construction.
                 seq: std::sync::Arc<std::sync::Mutex<forgedb_txn::CommitSequencer>>,
             }
 
             impl SharedDatabase {
-                /// Run a transaction with genuine concurrent prepare (#83 Tier 2).
-                ///
-                /// The closure receives a `ConcurrentTxHandle` that stages writes into
-                /// **private in-memory buffers** — NO shared state is modified during
-                /// prepare.  The commit critical section takes the exclusive write lock
-                /// briefly to apply the buffer and advance visibility.
                 pub fn transaction_concurrent<T>(
                     &self,
                     retries: u32,
@@ -12377,18 +8125,14 @@ impl RustGenerator {
                 ) -> Result<T, TxError> {
                     let __seq_arc = std::sync::Arc::clone(&self.seq);
                     for __attempt in 0..=retries {
-                        // Step 1: register read snapshot (sequencer only, no write lock).
                         let __snap_lsn = {
                             let mut __seq = __seq_arc.lock().unwrap();
                             __seq.register_snapshot()
                         };
-                        // Step 2: capture committed watermarks (brief read lock).
                         let __snap = {
                             let __db = self.inner.read().unwrap();
                             __db.snapshot()
                         };
-                        // Step 3: run the prepare closure with private-buffer staging.
-                        // NO lock held during prepare.
                         let mut __tx = ConcurrentTxHandle {
                             inner: std::sync::Arc::clone(&self.inner),
                             snap: __snap,
@@ -12406,8 +8150,6 @@ impl RustGenerator {
                                 return Err(e);
                             }
                         };
-                        // Step 4: build the opaque write-set (logical id keys + unique claims).
-                        // Identity red line: the sequencer sees only opaque bytes.
                         let mut __ws_keys: Vec<forgedb_txn::OpaqueKey> = Vec::new();
                         for (__model, _kind, __id_bytes, _bytes, _del) in &__tx.buffer {
                             __ws_keys.push(
@@ -12428,14 +8170,12 @@ impl RustGenerator {
                         }
                         #seq_ws_tx
                         let __ws = forgedb_txn::WriteSet { keys: __ws_keys, snapshot_lsn: __snap_lsn };
-                        // Step 5: serialized conflict check (sequencer mutex only, no RwLock).
                         let __outcome = {
                             let mut __seq = __seq_arc.lock().unwrap();
                             __seq.try_commit(&__ws)
                         };
                         match __outcome {
                             forgedb_txn::CommitOutcome::Committed(_l) => {
-                                // Step 6: apply the private buffer under exclusive write lock.
                                 {
                                     let mut __db = self.inner.write().unwrap();
                                     let __buf = __tx.buffer;
@@ -12450,7 +8190,6 @@ impl RustGenerator {
                             forgedb_txn::CommitOutcome::Conflict { .. } => {
                                 let mut __seq = __seq_arc.lock().unwrap();
                                 __seq.release_snapshot(__snap_lsn);
-                                // Loop continues to next attempt.
                             }
                         }
                     }
@@ -12458,22 +8197,13 @@ impl RustGenerator {
                 }
             }
 
-            /// Private-buffer transaction handle for concurrent preparation (#83 Tier 2).
-            ///
-            /// Unlike `TxHandle` (which stages into shared columns via `__stage_append`),
-            /// `ConcurrentTxHandle` stages into in-memory buffers that touch NO shared
-            /// state during prepare.
             pub struct ConcurrentTxHandle {
                 inner: std::sync::Arc<std::sync::RwLock<Database>>,
-                /// Snapshot watermarks for reads (captured at transaction start).
                 snap: DatabaseSnapshot,
-                /// Staged rows: (model_tag, kind, id_bytes, record_bytes, deleted).
                 buffer: Vec<(&'static str, forgedb_changefeed::ChangeKind, Vec<u8>, Vec<u8>, bool)>,
-                /// Claimed unique keys (field_name, encoded_key).
                 staged_unique_keys:
                     std::collections::BTreeSet<(&'static str, &'static str, String)>,
                 #seq_field
-                /// Pending events: (model_tag, kind, id_bytes, record_bytes).
                 pending_events: Vec<(&'static str, forgedb_changefeed::ChangeKind, Vec<u8>, Vec<u8>)>,
             }
 
@@ -12482,7 +8212,6 @@ impl RustGenerator {
             }
 
             impl Database {
-                /// Create a cloneable shared handle for concurrent transactions (#83 Tier 2).
                 pub fn shared(self) -> SharedDatabase {
                     let seq = std::sync::Arc::clone(&self.seq);
                     SharedDatabase {
@@ -12491,16 +8220,6 @@ impl RustGenerator {
                     }
                 }
 
-                /// Apply a concurrent-prepare private buffer under the exclusive write lock
-                /// (#83 Tier 2 apply path).
-                ///
-                /// The model-tag dispatch here is in the APPLY path (after conflict
-                /// resolution passed) — same pattern as `apply_frame` for the follower.
-                ///
-                /// Returns the physical `(model_tag_bytes, row_index)` for each row appended
-                /// so the Tier 3 caller can forward correct positions to the coordinator's
-                /// `_replication.log` (T3-3/T3-8 contract).  Tier 2 callers discard the
-                /// `Ok` value via `?;` — the call-site text is byte-identical (T3-5).
                 pub(crate) fn __apply_and_commit_concurrent_buffer(
                     &mut self,
                     buffer: Vec<(&'static str, forgedb_changefeed::ChangeKind, Vec<u8>, Vec<u8>, bool)>,
@@ -12511,7 +8230,6 @@ impl RustGenerator {
                     let mut __wal_marks: std::collections::BTreeMap<&'static str, u64> =
                         std::collections::BTreeMap::new();
 
-                    // Mark all touched models in_transaction and record pre-apply row counts.
                     for (__model_tag, _kind, _id_bytes, _bytes, _deleted) in &buffer {
                         match *__model_tag {
                             #(#concurrent_mark_arms)*
@@ -12519,7 +8237,6 @@ impl RustGenerator {
                         }
                     }
 
-                    // Apply all staged rows via __stage_append.
                     let mut __staged_events: Vec<(&'static str, forgedb_changefeed::ChangeKind, usize, Vec<u8>)> = Vec::new();
                     for (__model_tag, __kind, _id_bytes, __bytes, __deleted) in &buffer {
                         let __result: Result<(), TxError> = (|| {
@@ -12530,7 +8247,6 @@ impl RustGenerator {
                             Ok(())
                         })();
                         if let Err(e) = __result {
-                            // Rollback all touched models on partial apply failure.
                             let __touched: Vec<&'static str> = __marks.keys().copied().collect();
                             for __tag in &__touched {
                                 match *__tag {
@@ -12542,7 +8258,6 @@ impl RustGenerator {
                         }
                     }
 
-                    // Commit: fsync + journal + reindex + events.
                     let mut __journal: Vec<(String, u64)> = Vec::new();
                     let __touched: Vec<&'static str> = __marks.keys().copied().collect();
                     for __tag in &__touched {
@@ -12565,8 +8280,6 @@ impl RustGenerator {
                             _ => {}
                         }
                     }
-                    // Drain events to changefeed + durable broker; collect (tag, row) pairs
-                    // for the Tier 3 coordinator `Committed` payload (T3-3/T3-8).
                     let mut __row_index_pairs: Vec<(Vec<u8>, u64)> = Vec::with_capacity(__staged_events.len());
                     for (__model, __kind, __row, __bytes) in __staged_events {
                         __row_index_pairs.push((__model.as_bytes().to_vec(), __row as u64));
@@ -12584,12 +8297,6 @@ impl RustGenerator {
         }
     }
 
-    /// Generate one model's scoped write + read methods on `TxHandle` (MVCC
-    /// Tier 1, #83).  Each write records the collection's rollback mark on first
-    /// touch, runs the SAME #91 validators (field constraints, `&unique` against
-    /// the committed index, FK existence against txn-visible target rows), stages
-    /// the row via `__stage_append`, and buffers the changefeed/broker event.
-    /// Each read resolves against the raised (staged) watermark for read-your-writes.
     fn generate_txn_model_methods(
         model: &forgedb_parser::Model,
         schema: &Schema,
@@ -12608,18 +8315,8 @@ impl RustGenerator {
         let all_fn = format_ident!("all_{}", snake);
         let validate_fn = format_ident!("validate_{}", snake);
         let auto_synth = Self::generate_auto_synthesis(model, &quote! { self.db.#field });
-        // #254: same reasoning as the Tier-2 path — `__stage_append` bypasses
-        // `Storage::insert`, so the precision floor + RFC 3339 range gate is
-        // spliced into the staging methods directly.
         let ts_gate = Self::generate_timestamp_write_gate(schema, model);
 
-        // `&unique` checks: (1) against the committed index (same as the non-txn
-        // path) and (2) against the staged-unique buffer (`staged_unique_keys`) so
-        // two `create_<model>` calls with the SAME `&unique` value in ONE transaction
-        // both fail — the committed index only reflects pre-txn rows.
-        // On success, insert the key into `staged_unique_keys` so subsequent staged
-        // writes can see it.  Rollback discards the set (it never touches real maps).
-        // #260: sequence claims for bare integer autos (empty otherwise).
         let seq_claim = Self::generate_sequence_claim_staging(model);
         let unique_checks_insert: Vec<_> = Self::indexed_fields(model)
             .iter()
@@ -12635,15 +8332,12 @@ impl RustGenerator {
                 quote! {
                     {
                         let __uk: String = { #key };
-                        // Check committed index.
                         if self.db.#field.#ident.get(&__uk).is_some_and(|__ids| !__ids.is_empty()) {
                             return Err(TxError::Validation(ValidationError::Unique { model: #mtag, field: #fname }));
                         }
-                        // Check staged-key buffer (intra-txn duplicate guard, M1a fix).
                         if self.staged_unique_keys.contains(&(#mtag, #fname, __uk.clone())) {
                             return Err(TxError::Validation(ValidationError::Unique { model: #mtag, field: #fname }));
                         }
-                        // Claim the key for this transaction.
                         self.staged_unique_keys.insert((#mtag, #fname, __uk));
                     }
                 }
@@ -12663,24 +8357,11 @@ impl RustGenerator {
                 quote! {
                     {
                         let __uk: String = { #key };
-                        // Check committed index (exclude self-id).
                         if let Some(__ids) = self.db.#field.#ident.get(&__uk) {
                             if __ids.iter().any(|__i| *__i != id) {
                                 return Err(TxError::Validation(ValidationError::Unique { model: #mtag, field: #fname }));
                             }
                         }
-                        // Check staged-key buffer (intra-txn duplicate guard, M1a fix).
-                        // An update that keeps its own unique value is fine: the
-                        // staged_unique_keys set does NOT track the id owning each key,
-                        // so we can only block a staged update whose NEW value was
-                        // already claimed by a DIFFERENT staged write.  A prior
-                        // staged insert of the same id already put this key in the
-                        // buffer; an update by the same txn to a different value
-                        // should be blocked only if the new value was claimed by
-                        // someone else.  We use a conservative check: if the key is
-                        // in the staged buffer and the committed index does NOT
-                        // already hold it under this id, it was claimed by another
-                        // staged write.
                         let __committed_owns = self.db.#field.#ident
                             .get(&__uk)
                             .is_some_and(|__ids| __ids.contains(&id));
@@ -12689,17 +8370,12 @@ impl RustGenerator {
                         {
                             return Err(TxError::Validation(ValidationError::Unique { model: #mtag, field: #fname }));
                         }
-                        // Claim the key for this transaction.
                         self.staged_unique_keys.insert((#mtag, #fname, __uk));
                     }
                 }
             })
             .collect();
 
-        // FK-existence checks (txn-aware): each FK must resolve to a row VISIBLE to
-        // the transaction (committed OR staged in this txn), so a create-parent +
-        // create-child in one transaction is valid.  Reads through the scoped
-        // `get_<target>` so it sees the target's staged rows.
         let fk_checks: Vec<_> = model
             .fields
             .iter()
@@ -12741,63 +8417,25 @@ impl RustGenerator {
             })
             .collect();
 
-        let create_doc = format!(
-            "Stage the creation of a {} in this transaction (#83).  Validates field \
-             constraints + `&unique` (committed index) + FK existence (txn-visible \
-             targets), then stages the row; visible only after `commit`.",
-            model.name
-        );
-        let update_doc = format!(
-            "Stage an update of a {} in this transaction (#83).  `Ok(false)` if the \
-             id is not visible to the transaction.",
-            model.name
-        );
-        let delete_doc = format!(
-            "Stage a delete of a {} in this transaction (#83).  Appends a tombstoned \
-             version; `false` if the id is not visible to the transaction.",
-            model.name
-        );
-        let get_doc = format!(
-            "Read a {} within the transaction (#83) with read-your-writes: resolves \
-             the newest version over the committed prefix ∪ this txn's staged rows.",
-            model.name
-        );
-        let all_doc = format!(
-            "Read every live {} within the transaction (#83), including this txn's \
-             own staged rows (read-your-writes).",
-            model.name
-        );
 
         quote! {
-            #[doc = #create_doc]
             pub fn #create_fn(&mut self, mut record: #model_name) -> Result<#id_type, TxError> {
                 self.#mark_fn();
-                // #187: synthesize omitted `+` auto fields (uuid/timestamp) first.
                 #auto_synth
                 #ts_gate
-                // #91 field constraints.
                 #validate_fn(&record)?;
-                // #91 `&unique` (committed index; within-txn duplicate = honest limit).
                 #(#unique_checks_insert)*
-                // #260: claim the allocated value so a peer's identical allocation
-                // is a detected conflict, not a silent duplicate.
                 #seq_claim
-                // #91 FK existence, txn-visible.
                 #(#fk_checks)*
                 let id = record.#id_field;
                 let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
-                // Opaque row bytes for the buffered broker record (same encoding the
-                // WAL / #82 broker journal — never a decoded field).
                 let __bytes = serde_json::to_vec(&record).unwrap_or_default();
-                // Stage the row (WAL + columns + tombstone; NO index/feed/broker).
                 let __row = self.db.#field.__stage_append(record, false);
                 self.pending_events.push((#model_tag, forgedb_changefeed::ChangeKind::Inserted, __id_bytes, __row, __bytes));
                 Ok(id)
             }
 
-            #[doc = #update_doc]
             pub fn #update_fn(&mut self, id: #id_type, record: #model_name) -> Result<bool, TxError> {
-                // Existence within the txn (committed ∪ staged) via read-your-writes.
                 if self.#get_fn(id).is_none() {
                     return Ok(false);
                 }
@@ -12813,10 +8451,7 @@ impl RustGenerator {
                 Ok(true)
             }
 
-            #[doc = #delete_doc]
             pub fn #delete_fn(&mut self, id: #id_type) -> bool {
-                // Resolve the current (txn-visible) record to re-append under the
-                // tombstone and to supply the broker bytes.
                 let record = match self.#get_fn(id) {
                     Some(r) => r,
                     None => return false,
@@ -12829,16 +8464,11 @@ impl RustGenerator {
                 true
             }
 
-            #[doc = #get_doc]
             pub fn #get_fn(&self, id: #id_type) -> Option<#model_name> {
-                // Read-your-writes: `get_at` with the watermark raised to the current
-                // physical (staged) length resolves the newest version per id over
-                // the committed prefix ∪ this txn's staged rows — one decode path.
                 let __snap = forgedb_storage::Snapshot::new(self.db.#field.row_count);
                 self.db.#field.get_at(&__snap, id)
             }
 
-            #[doc = #all_doc]
             pub fn #all_fn(&self) -> Vec<#model_name> {
                 let __snap = forgedb_storage::Snapshot::new(self.db.#field.row_count);
                 self.db.#field.all_at(&__snap)
@@ -12846,24 +8476,12 @@ impl RustGenerator {
         }
     }
 
-    /// Generate the persisted junction storage struct for each M2M relation.
-    ///
-    /// Each junction stores two `Uuid` columns (`left` = model1 id, `right` =
-    /// model2 id) plus a per-pair `Tombstones` column (1 byte/row) for
-    /// `unlink` (delete semantics): `link` appends a pair (`false` tombstone),
-    /// `unlink` appends a NEW retracted pair (`true` tombstone) — append-only, the
-    /// same retraction primitive models use for `delete` (#66).  `pairs()` filters
-    /// out any pair that is retracted or superseded by a later retraction, so
-    /// traversal never resolves an unlinked edge.  Uses only the already-published
-    /// `Tombstones` type — no substrate change.
     fn generate_junction_structs(schema: &Schema) -> TokenStream {
         let mut structs = Vec::new();
 
         for m in Self::valid_m2m(schema) {
             let struct_ident = Self::junction_struct_ident(&m);
             let reader_ident = format_ident!("{}Reader", struct_ident);
-            // #266: each endpoint's column, index and frame slot is that
-            // endpoint's OWN identity type — a junction is no longer uuid-shaped.
             let (lt, rt) = Self::junction_key_pair(schema, &m);
             let lk = Self::key_type_ident(schema, &lt);
             let rk = Self::key_type_ident(schema, &rt);
@@ -12883,16 +8501,8 @@ impl RustGenerator {
             let sw = quote! { #sumv };
             let l_frame = Self::junction_frame_stmt(&lt, &quote! { __row_bytes }, &quote! { left });
             let r_frame = Self::junction_frame_stmt(&rt, &quote! { __row_bytes }, &quote! { right });
-            let reader_doc = format!(
-                "Read-only, lock-free reader handle for the {}<->{} junction (#56 Direction B)",
-                m.model1, m.model2
-            );
             let field_snake = Self::to_snake_case(&m.model1);
             let field_snake2 = Self::to_snake_case(&m.model2);
-            let struct_doc = format!(
-                "Junction table for the {}.{} <-> {}.{} many-to-many relation",
-                m.model1, m.field1, m.model2, m.field2
-            );
             let base = format!("{}_{}_link", field_snake, field_snake2);
             let left_path = format!("{}/fixed/left.bin", base);
             let right_path = format!("{}/fixed/right.bin", base);
@@ -12900,24 +8510,11 @@ impl RustGenerator {
             let manifest_path = format!("{}/manifest.json", base);
 
             structs.push(quote! {
-                #[doc = #struct_doc]
                 pub struct #struct_ident {
                     left_col: FixedColumn,
                     right_col: FixedColumn,
-                    /// Per-pair retraction (delete semantics): `true` = unlinked.
-                    /// Appended in lockstep with `left`/`right` (append-only).
                     tombstones: Tombstones,
                     row_count: usize,
-                    /// In-memory M2M traversal indexes (#154): the LIVE right-ids
-                    /// per left-id and vice-versa, so `post_tags`/`tag_posts` probe
-                    /// in O(matches) instead of scanning every link row into a
-                    /// latest-wins HashMap on every call.  Maintained in lockstep
-                    /// with `link`/`unlink` (link adds, unlink removes — so the
-                    /// stored set is always exactly the live set, latest-wins), and
-                    /// rebuilt from the committed rows on `new_at`.  Each per-key
-                    /// `Vec` preserves first-link order and never holds a duplicate
-                    /// (idempotent add).  Writer-only, like the FK `find_by_*`
-                    /// indexes (#100) — readers/snapshots still use the `_at` scans.
                     left_index: std::collections::HashMap<#lk, Vec<#rk>>,
                     right_index: std::collections::HashMap<#rk, Vec<#lk>>,
                     changefeed: Option<forgedb_changefeed::ChangeFeed>,
@@ -12925,18 +8522,10 @@ impl RustGenerator {
                 }
 
                 impl #struct_ident {
-                    /// Open the junction storage, rehydrating `row_count` from the
-                    /// persisted columns so M2M links survive a process restart
-                    /// (#65).  `right_col` is appended last in `link`, so its length
-                    /// is the count of fully-committed pairs; a torn link (left
-                    /// written, right not) is excluded and overwritten by the next.
                     pub fn new() -> Self {
                         Self::new_at(std::path::Path::new("."))
                     }
 
-                    /// Open the junction storage rooted at `root` (#59): both uuid
-                    /// columns and the manifest are joined under it, so a per-tenant
-                    /// process's M2M links live under that tenant's dir.
                     pub fn new_at(root: &std::path::Path) -> Self {
                         let left_col = FixedColumn::new(
                             root.join(#left_path),
@@ -12949,23 +8538,12 @@ impl RustGenerator {
                         let mut tombstones = Tombstones::new(
                             root.join(#tombstones_path),
                         ).expect("Failed to create junction tombstones");
-                        // `right_col` is appended last per `link`, so its length is
-                        // the count of fully-committed pairs.  Reconcile the
-                        // tombstone column to that count: back-fill `false` for any
-                        // pre-tombstone-format rows or a torn tail (tombstone not
-                        // written for the last link) so `is_deleted(i)` is defined
-                        // for every committed pair.
                         let row_count = right_col.len();
                         while tombstones.len() < row_count {
                             tombstones
                                 .append(false)
                                 .expect("Failed to back-fill junction tombstone");
                         }
-                        // Rebuild the in-memory traversal indexes (#154) from the
-                        // committed rows, applying latest-wins per pair so only LIVE
-                        // edges are indexed (an unlinked-then-not-relinked pair is
-                        // excluded).  Single pass over the prefix, mirroring
-                        // `pairs_prefix` but populating both directions.
                         let mut left_index: std::collections::HashMap<#lk, Vec<#rk>> =
                             std::collections::HashMap::new();
                         let mut right_index: std::collections::HashMap<#rk, Vec<#lk>> =
@@ -13003,9 +8581,6 @@ impl RustGenerator {
                         db
                     }
 
-                    /// Add a live edge to both traversal indexes (#154), idempotent
-                    /// per direction (a re-link of an already-live pair is a no-op in
-                    /// the index — `pairs()`/`get` already dedup by pair).
                     fn __index_add(&mut self, left: #lk, right: #rk) {
                         let rs = self.left_index.entry(left).or_default();
                         if !rs.contains(&right) {
@@ -13017,8 +8592,6 @@ impl RustGenerator {
                         }
                     }
 
-                    /// Remove an edge from both traversal indexes (#154); prunes an
-                    /// emptied bucket so the maps stay bounded by the live degree.
                     fn __index_remove(&mut self, left: #lk, right: #rk) {
                         if let Some(rs) = self.left_index.get_mut(&left) {
                             rs.retain(|r| *r != right);
@@ -13034,25 +8607,18 @@ impl RustGenerator {
                         }
                     }
 
-                    /// Live right-ids linked to `left` (#154): an O(degree) index
-                    /// probe, not an O(all-links) scan.  Order is first-link order.
                     pub fn rights_of(&self, left: #lk) -> Vec<#rk> {
                         self.left_index.get(&left).cloned().unwrap_or_default()
                     }
 
-                    /// Live left-ids linked to `right` (#154): the reverse probe.
                     pub fn lefts_of(&self, right: #rk) -> Vec<#lk> {
                         self.right_index.get(&right).cloned().unwrap_or_default()
                     }
 
-                    /// Attach a shared change feed (#62): `link` then emits a
-                    /// field-blind `(junction_name, row_index)` signal.
                     pub fn attach_changefeed(&mut self, feed: forgedb_changefeed::ChangeFeed) {
                         self.changefeed = Some(feed);
                     }
 
-                    /// Attach the shared durable replication broker (#82): `link`
-                    /// then durably records the pair (opaque bytes) at a global offset.
                     pub fn attach_broker(
                         &mut self,
                         broker: Option<std::sync::Arc<std::sync::Mutex<forgedb_changefeed::durable::DurableBroker>>>,
@@ -13060,12 +8626,6 @@ impl RustGenerator {
                         self.broker = broker;
                     }
 
-                    /// Write the junction's physical-layout manifest (#57): one
-                    /// fixed column per endpoint, each the width of that endpoint's
-                    /// own identity type (#266), and a row-count anchor on
-                    /// `right.bin` (appended last per link).  Layout only — carries
-                    /// no relation semantics.  Best-effort; reopen anchors on the
-                    /// file length regardless.
                     fn write_manifest(&self, root: &std::path::Path) {
                         let columns = vec![
                             forgedb_storage::ColumnMetadata {
@@ -13086,16 +8646,9 @@ impl RustGenerator {
                             },
                         ];
                         let __manifest_abs = root.join(#manifest_path);
-                        // Preserve the incremental-backup chain token (#76) across
-                        // reopen, same as the model path (junctions are not compacted
-                        // today, so this stays 0 — but the invariant is uniform).
                         let __compaction_epoch = forgedb_storage::Manifest::load_from(&__manifest_abs)
                             .map(|m| m.compaction_epoch)
                             .unwrap_or(0);
-                        // Preserve the on-disk format version across reopen (#74
-                        // Phase 1), same as the model path — a reopen must never
-                        // clobber a migration-bumped version.  Fresh dir → this
-                        // binary's `EXPECTED_SCHEMA_VERSION` baseline.
                         let __schema_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
                             .map(|m| m.schema_version)
                             .unwrap_or(EXPECTED_SCHEMA_VERSION);
@@ -13103,9 +8656,6 @@ impl RustGenerator {
                             row_count: self.row_count,
                             columns,
                             wal_enabled: false,
-                            // Observability only (#89 step 2): rows durable on disk at open
-                    // (== row_count — recovery already realigned the columns).  NOT
-                    // load-bearing for recovery, which reads the column lengths.
                     last_checkpoint: self.row_count as u64,
                             compaction_epoch: __compaction_epoch,
                             schema_version: __schema_version,
@@ -13114,34 +8664,22 @@ impl RustGenerator {
                                 relative_path: "fixed/right.bin".to_string(),
                                 bytes_per_row: #rw,
                             }),
-                            // A junction has no fields of its own — only the two
-                            // endpoint ids — so it can never carry a `+u32`/`+u64`
-                            // auto and its sequence map is always empty (#187).
                             auto_sequences: Default::default(),
                         };
                         let _ = manifest.save_to(&__manifest_abs);
                     }
 
-                    /// Record a link between a `left` (model1) id and a `right`
-                    /// (model2) id.
                     pub fn link(&mut self, left: #lk, right: #rk) {
                         let row_index = self.row_count;
                         #l_append.expect("Failed to append link");
                         #r_append.expect("Failed to append link");
-                        // A live link — tombstone `false`, appended in lockstep.
                         self.tombstones.append(false)
                             .expect("Failed to append junction tombstone");
                         self.row_count += 1;
-                        // Maintain the traversal indexes (#154) after the durable
-                        // append, so they only ever key committed edges.
                         self.__index_add(left, right);
-                        // Change-feed emit (#62): a link is an M2M junction append.
                         if let Some(feed) = &self.changefeed {
                             feed.emit(#base, row_index, forgedb_changefeed::ChangeKind::Linked);
                         }
-                        // Durable replication record (#82): the link pair as opaque
-                        // bytes (left ++ right, one slot per endpoint key) at a
-                        // global offset.
                         if let Some(__broker) = &self.broker {
                             let mut __row_bytes = Vec::with_capacity(#sw);
                             #l_frame
@@ -13157,16 +8695,7 @@ impl RustGenerator {
                         }
                     }
 
-                    /// Remove the link between `left` and `right` (delete
-                    /// semantics — the reverse of `link`).  Append-only retraction:
-                    /// a new row for the pair with tombstone `true`, so `pairs()`
-                    /// (latest-wins per pair) stops resolving it.  Returns `true` if
-                    /// a live link existed, `false` if the pair was not linked.
-                    /// Re-`link` after `unlink` restores the edge (a later live row
-                    /// supersedes the retraction).
                     pub fn unlink(&mut self, left: #lk, right: #rk) -> bool {
-                        // Is the pair currently live?  O(degree) index probe (#154)
-                        // instead of the old O(all-links) latest-wins scan.
                         let __live = self
                             .left_index
                             .get(&left)
@@ -13181,7 +8710,6 @@ impl RustGenerator {
                         self.tombstones.append(true)
                             .expect("Failed to append junction tombstone");
                         self.row_count += 1;
-                        // Retract the edge from the traversal indexes (#154).
                         self.__index_remove(left, right);
                         if let Some(feed) = &self.changefeed {
                             feed.emit(#base, row_index, forgedb_changefeed::ChangeKind::Deleted);
@@ -13202,36 +8730,21 @@ impl RustGenerator {
                         true
                     }
 
-                    /// Retract every live pair whose `left` id equals `id` (M2M
-                    /// cascade-unlink when the left model's row is deleted).
                     pub fn unlink_all_left(&mut self, id: #lk) {
-                        // O(degree) index probe (#154) instead of an O(all-links)
-                        // `pairs()` scan per cascade (a step toward #155).
                         let __targets = self.rights_of(id);
                         for r in __targets {
                             self.unlink(id, r);
                         }
                     }
 
-                    /// Retract every live pair whose `right` id equals `id` (M2M
-                    /// cascade-unlink when the right model's row is deleted).
                     pub fn unlink_all_right(&mut self, id: #rk) {
-                        // O(degree) index probe (#154) instead of an O(all-links)
-                        // `pairs()` scan per cascade (a step toward #155).
                         let __targets = self.lefts_of(id);
                         for l in __targets {
                             self.unlink(l, id);
                         }
                     }
 
-                    /// Make this junction's id columns durable (#89 step 2).  M2M
-                    /// junctions have no WAL (a #89 boundary — link appends are not
-                    /// yet crash-recovered), so there is nothing to truncate; this
-                    /// only fsyncs the columns so a `Database::checkpoint()`
-                    /// leaves link rows as durable as model rows.
                     pub fn checkpoint(&mut self) {
-                        // Coalesced durability (#153): push both id columns +
-                        // tombstones to the drive cache, then ONE device barrier.
                         self.left_col
                             .sync_to_drive()
                             .expect("Failed to sync junction left column on checkpoint");
@@ -13246,17 +8759,11 @@ impl RustGenerator {
                             .expect("Failed to issue junction checkpoint device barrier");
                     }
 
-                    /// Every LIVE (left, right) id pair (latest-wins per pair):
-                    /// a pair is live iff its most-recent row is not retracted, so
-                    /// `unlink`ed edges are excluded and a re-`link` restores it.
                     pub fn pairs(&self) -> Vec<(#lk, #rk)> {
                         self.pairs_prefix(self.row_count)
                     }
 
-                    /// Shared latest-wins resolution over the row prefix `0..end`.
                     fn pairs_prefix(&self, end: usize) -> Vec<(#lk, #rk)> {
-                        // Preserve first-link order while applying latest-wins on
-                        // the retraction flag.
                         let mut order: Vec<(#lk, #rk)> = Vec::new();
                         let mut state: std::collections::HashMap<(#lk, #rk), bool> =
                             std::collections::HashMap::new();
@@ -13275,26 +8782,18 @@ impl RustGenerator {
                             .collect()
                     }
 
-                    /// The number of committed link rows (the snapshot watermark).
                     pub fn row_count(&self) -> usize {
                         self.row_count
                     }
 
-                    /// Capture a read snapshot at the current link count (#56).
                     pub fn snapshot(&self) -> forgedb_storage::Snapshot {
                         forgedb_storage::Snapshot::new(self.row_count)
                     }
 
-                    /// Live link pairs committed as of `snap` (#56): latest-wins
-                    /// over the prefix `0..snap.watermark()`, excluding links
-                    /// appended after the snapshot AND pairs retracted within it.
                     pub fn pairs_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<(#lk, #rk)> {
                         self.pairs_prefix(snap.watermark())
                     }
 
-                    /// Open a read-only handle over this junction (#56 Direction B):
-                    /// shares both id columns + tombstones via independent fds for
-                    /// lock-free snapshot reads concurrent with the writer's `link`.
                     pub fn reader(&self) -> #reader_ident {
                         #reader_ident {
                             left_col: self.left_col.reader()
@@ -13307,7 +8806,6 @@ impl RustGenerator {
                     }
                 }
 
-                #[doc = #reader_doc]
                 pub struct #reader_ident {
                     left_col: forgedb_storage::FixedColumnReader,
                     right_col: forgedb_storage::FixedColumnReader,
@@ -13315,9 +8813,6 @@ impl RustGenerator {
                 }
 
                 impl #reader_ident {
-                    /// Live link pairs committed as of `snap` (#56 Direction B): the
-                    /// same latest-wins prefix resolution as the writer junction,
-                    /// reading through the shared-fd reader columns.
                     pub fn pairs_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<(#lk, #rk)> {
                         let end = snap.watermark();
                         let mut order: Vec<(#lk, #rk)> = Vec::new();
@@ -13344,19 +8839,12 @@ impl RustGenerator {
         quote! { #(#structs)* }
     }
 
-    /// Generate the relation-traversal `impl Database` block: forward FK getters,
-    /// reverse one-to-many collection getters, and M2M link/query helpers.
-    ///
-    /// All generated method names are pushed through a single `seen` set so a
-    /// pathological schema can never produce two methods with the same name
-    /// (which would fail to compile); a collision is skipped rather than emitted.
     fn generate_traversal_impl(schema: &Schema) -> TokenStream {
         use std::collections::{HashMap, HashSet};
 
         let mut methods = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
 
-        // --- A. Forward FK getters (`*Target` / `?Target`) --------------------
         for model in &schema.models {
             let model_snake = Self::to_snake_case(&model.name);
             for field in &model.fields {
@@ -13369,9 +8857,6 @@ impl RustGenerator {
                     ) => (t, true),
                     _ => continue,
                 };
-                // Only when the target model actually exists (a dangling FK is a
-                // validation error; codegen just skips it).  #266: its key type no
-                // longer matters — the getter takes whatever key the target has.
                 let Some(target) = schema.find_model(target_name) else {
                     continue;
                 };
@@ -13388,14 +8873,12 @@ impl RustGenerator {
 
                 if optional {
                     methods.push(quote! {
-                        #[doc = "Resolve the optional foreign key to its record."]
                         pub fn #method_ident(&self, record: &#model_ident) -> Option<#target_ident> {
                             record.#fk_field.and_then(|fk| self.#target_field.get(fk))
                         }
                     });
                 } else {
                     methods.push(quote! {
-                        #[doc = "Resolve the foreign key to its record."]
                         pub fn #method_ident(&self, record: &#model_ident) -> Option<#target_ident> {
                             self.#target_field.get(record.#fk_field)
                         }
@@ -13404,9 +8887,6 @@ impl RustGenerator {
             }
         }
 
-        // --- B. Reverse one-to-many collection getters ------------------------
-        // Group by (parent_model, parent_field) so that a parent whose child has
-        // multiple FKs back to it disambiguates by child field name.
         let pairs = schema.detect_relations();
         let mut group_counts: HashMap<(String, String), usize> = HashMap::new();
         for p in &pairs {
@@ -13418,7 +8898,6 @@ impl RustGenerator {
             let Some(parent) = schema.find_model(&p.parent_model) else {
                 continue;
             };
-            // #266: the reverse getter takes the PARENT's own key, whatever it is.
             let parent_id_type = Self::id_type_tokens(schema, parent);
 
             let ambiguous = group_counts
@@ -13442,25 +8921,12 @@ impl RustGenerator {
             let child_field = format_ident!("{}", Self::to_snake_case(&p.child_model));
             let fk_probe = format_ident!("find_by_{}", p.child_field);
 
-            // The FK column is now indexed (#100): probe the child's FK index in
-            // O(1) instead of scanning `all()` — but only when the child model has
-            // an identity (id/auto) field, since `indexed_fields` (and thus the
-            // probe) is empty otherwise; fall back to the scan in that case.
             let child_indexed = schema
                 .find_model(&p.child_model)
                 .is_some_and(|c| c.has_identity());
 
-            let doc = if child_indexed {
-                format!(
-                    "All {} whose {} references the given id (#100: O(1) FK-index probe, not a scan).",
-                    p.child_model, p.child_field
-                )
-            } else {
-                format!("All {} whose {} references the given id.", p.child_model, p.child_field)
-            };
 
             let body = if child_indexed {
-                // Required FK probe takes the key; optional FK probe takes `Option<key>`.
                 let arg = Self::fk_probe_arg(schema, &p.parent_model, p.is_required);
                 quote! { self.#child_field.#fk_probe(#arg) }
             } else {
@@ -13480,26 +8946,22 @@ impl RustGenerator {
             };
 
             methods.push(quote! {
-                #[doc = #doc]
                 pub fn #method_ident(&self, id: #parent_id_type) -> Vec<#child_ident> {
                     #body
                 }
             });
         }
 
-        // --- C. Many-to-many link + query helpers -----------------------------
         for m in Self::valid_m2m(schema) {
             let junction_field = Self::junction_field_ident(&m);
             let model1_ident = format_ident!("{}", m.model1);
             let model2_ident = format_ident!("{}", m.model2);
             let model1_storage = format_ident!("{}", Self::to_snake_case(&m.model1));
             let model2_storage = format_ident!("{}", Self::to_snake_case(&m.model2));
-            // #266: each side of the junction is keyed on its OWN identity type.
             let (lt, rt) = Self::junction_key_pair(schema, &m);
             let lk = Self::key_type_ident(schema, &lt);
             let rk = Self::key_type_ident(schema, &rt);
 
-            // link_<a>_<b>
             let link_name = format!(
                 "link_{}_{}",
                 Self::to_snake_case(&m.model1),
@@ -13507,21 +8969,13 @@ impl RustGenerator {
             );
             if seen.insert(link_name.clone()) {
                 let link_ident = format_ident!("{}", link_name);
-                let doc = format!(
-                    "Link a {} (left) and a {} (right) in the junction table.",
-                    m.model1, m.model2
-                );
-                // Fixed `left`/`right` param names — model-derived names would
-                // collide for a self-referential M2M (model1 == model2).
                 methods.push(quote! {
-                    #[doc = #doc]
                     pub fn #link_ident(&mut self, left: #lk, right: #rk) {
                         self.#junction_field.link(left, right);
                     }
                 });
             }
 
-            // unlink_<a>_<b> (delete semantics — reverse of link_<a>_<b>)
             let unlink_name = format!(
                 "unlink_{}_{}",
                 Self::to_snake_case(&m.model1),
@@ -13530,32 +8984,18 @@ impl RustGenerator {
             if seen.insert(unlink_name.clone()) {
                 let unlink_ident = format_ident!("{}", unlink_name);
                 let junction_field_u = Self::junction_field_ident(&m);
-                let doc = format!(
-                    "Remove the link between a {} (left) and a {} (right).  Returns \
-                     `true` if a live link existed.  Traversal (`{}_{}` / `{}_{}`) \
-                     stops resolving the pair afterwards.",
-                    m.model1, m.model2,
-                    Self::to_snake_case(&m.model1), m.field1,
-                    Self::to_snake_case(&m.model2), m.field2
-                );
                 methods.push(quote! {
-                    #[doc = #doc]
                     pub fn #unlink_ident(&mut self, left: #lk, right: #rk) -> bool {
                         self.#junction_field_u.unlink(left, right)
                     }
                 });
             }
 
-            // model1.field1 -> Vec<model2>
             let fwd_name = format!("{}_{}", Self::to_snake_case(&m.model1), m.field1);
             if seen.insert(fwd_name.clone()) {
                 let fwd_ident = format_ident!("{}", fwd_name);
-                let doc = format!("All linked {} for the given {} id.", m.model2, m.model1);
                 methods.push(quote! {
-                    #[doc = #doc]
                     pub fn #fwd_ident(&self, id: #lk) -> Vec<#model2_ident> {
-                        // O(degree) junction-index probe (#154), not an
-                        // O(all-links) `pairs()` scan.
                         self.#junction_field
                             .rights_of(id)
                             .into_iter()
@@ -13564,12 +9004,6 @@ impl RustGenerator {
                     }
                 });
 
-                // Snapshot-scoped variant of the same forward M2M query (#56,
-                // Direction A milestone).  Demonstrates cross-table snapshot
-                // consistency: the junction is clamped to *its* watermark
-                // (`pairs_at`) and each resolved target to *its* watermark
-                // (`get_at`), so links or target rows appended after the snapshot
-                // was captured are excluded on both sides of the join.
                 let fwd_at_name = format!(
                     "{}_{}_at",
                     Self::to_snake_case(&m.model1),
@@ -13578,12 +9012,7 @@ impl RustGenerator {
                 if seen.insert(fwd_at_name.clone()) {
                     let fwd_at_ident = format_ident!("{}", fwd_at_name);
                     let junction_field2 = junction_field.clone();
-                    let doc = format!(
-                        "All linked {} for the given {} id, consistent as of `snap`.",
-                        m.model2, m.model1
-                    );
                     methods.push(quote! {
-                        #[doc = #doc]
                         pub fn #fwd_at_ident(
                             &self,
                             snap: &DatabaseSnapshot,
@@ -13602,16 +9031,11 @@ impl RustGenerator {
                 }
             }
 
-            // model2.field2 -> Vec<model1>
             let rev_name = format!("{}_{}", Self::to_snake_case(&m.model2), m.field2);
             if seen.insert(rev_name.clone()) {
                 let rev_ident = format_ident!("{}", rev_name);
-                let doc = format!("All linked {} for the given {} id.", m.model1, m.model2);
                 methods.push(quote! {
-                    #[doc = #doc]
                     pub fn #rev_ident(&self, id: #rk) -> Vec<#model1_ident> {
-                        // O(degree) junction-index probe (#154), not an
-                        // O(all-links) `pairs()` scan.
                         self.#junction_field
                             .lefts_of(id)
                             .into_iter()
@@ -13633,14 +9057,6 @@ impl RustGenerator {
         }
     }
 
-    /// Generate the snapshot-scoped forward M2M traversal on `DatabaseReader`
-    /// (#56 Direction B).  Mirrors the `<model1>_<field1>_at` method emitted on
-    /// `Database`, but bound to the read-only reader bundle: `pairs_at` on the
-    /// junction reader + `get_at` on the target model reader, both clamped to the
-    /// same writer-captured `DatabaseSnapshot` for a cross-table-consistent join.
-    /// Only the snapshot-scoped `_at` variant is emitted — a `DatabaseReader`
-    /// never exposes the non-snapshot getters (they consult `get`/`pairs`, which
-    /// a read-only handle intentionally lacks).
     fn generate_reader_traversal_impl(schema: &Schema) -> TokenStream {
         let mut methods = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -13649,19 +9065,13 @@ impl RustGenerator {
             let junction_field = Self::junction_field_ident(&m);
             let model2_ident = format_ident!("{}", m.model2);
             let model2_storage = format_ident!("{}", Self::to_snake_case(&m.model2));
-            // #266: the left endpoint's own identity type.
             let (lt, _) = Self::junction_key_pair(schema, &m);
             let lk = Self::key_type_ident(schema, &lt);
 
             let fwd_at_name = format!("{}_{}_at", Self::to_snake_case(&m.model1), m.field1);
             if seen.insert(fwd_at_name.clone()) {
                 let fwd_at_ident = format_ident!("{}", fwd_at_name);
-                let doc = format!(
-                    "All linked {} for the given {} id, consistent as of `snap` (reader).",
-                    m.model2, m.model1
-                );
                 methods.push(quote! {
-                    #[doc = #doc]
                     pub fn #fwd_at_ident(
                         &self,
                         snap: &DatabaseSnapshot,
@@ -13691,19 +9101,10 @@ impl RustGenerator {
         }
     }
 
-    /// Generate `<Model>WithRelations` structs and their eager-load getters.
-    ///
-    /// For every model with at least one forward foreign key, emit a struct
-    /// bundling the base record with each resolved reference (`Option<Target>`,
-    /// since the referent may be missing), and a `<model>_with_relations(id)`
-    /// getter that populates them in one call.  Both the getter's `id` and each
-    /// resolved reference use the relevant model's OWN identity type (#266) —
-    /// the target no longer has to be uuid-keyed.
     fn generate_eager_load(schema: &Schema) -> TokenStream {
         let mut items = Vec::new();
 
         for model in &schema.models {
-            // Collect forward FKs, preserving field order (#266: any key type).
             let fks: Vec<(&forgedb_parser::Field, &str, bool)> = model
                 .fields
                 .iter()
@@ -13729,10 +9130,7 @@ impl RustGenerator {
             let struct_ident = format_ident!("{}WithRelations", model.name);
             let getter_ident = format_ident!("{}_with_relations", base_field);
             let id_type = Self::id_type_tokens(schema, model);
-            let struct_doc = format!("{} with its forward references resolved", model.name);
 
-            // Choose a non-colliding field name for each resolved reference:
-            // strip a trailing `_id`, falling back to the raw FK name on clash.
             let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
             used.insert(base_field.clone());
 
@@ -13752,8 +9150,6 @@ impl RustGenerator {
                 } else {
                     stripped
                 };
-                // If even the raw name collides, skip this reference rather than
-                // emit a duplicate struct field.
                 if !used.insert(resolved_name.clone()) {
                     continue;
                 }
@@ -13782,7 +9178,6 @@ impl RustGenerator {
 
             let to_schema_derive = Self::to_schema_derive();
             items.push(quote! {
-                #[doc = #struct_doc]
                 #[derive(Debug, Clone, Serialize, Deserialize #to_schema_derive)]
                 pub struct #struct_ident {
                     pub #base_ident: #model_ident,
@@ -13790,7 +9185,6 @@ impl RustGenerator {
                 }
 
                 impl Database {
-                    #[doc = "Load a record together with its forward references."]
                     pub fn #getter_ident(&self, id: #id_type) -> Option<#struct_ident> {
                         let #base_ident = self.#base_ident.get(id)?;
                         #(#resolvers)*
@@ -13803,54 +9197,21 @@ impl RustGenerator {
         quote! { #(#items)* }
     }
 
-    /// Map ForgeDB field type to Rust type identifier for use with quote!
-    ///
-    /// Note: for `OptionalStructType` and `Nullable`, this returns the *inner* type
-    /// token.  The `Option<>` wrapper is applied by callers that check `field.is_nullable()`.
-    /// The Rust type a `FieldType` takes in a **key position** (#252).
-    ///
-    /// Three positions are key positions, and they are the only three: a model's
-    /// identity field, a foreign key (whose value *is* the target's key), and a
-    /// junction endpoint column. In all three the generated code passes the value
-    /// **by value** — `get(id)`, `delete(id)`, the `id_to_row` / `id_versions`
-    /// maps, #266's junction traversal indexes, the live-query delta enum — which
-    /// is why a key must be `Copy` and a `String` cannot be one.
-    ///
-    /// The only type that renders differently here than in
-    /// [`map_field_type_ident`](Self::map_field_type_ident) is `string(N)`:
-    /// `InlineStr<N>` as a key, a plain `String` everywhere else (#238's
-    /// decision 5).
-    ///
-    /// **Why the split is not merely a preference.** `map_field_type_ident` takes
-    /// a `FieldType`, not a `Field`, so it cannot see `@utf8` — and a
-    /// *non-identity* `string(N) @utf8` column is N..4N bytes wide, so its
-    /// `InlineStr` parameter would have to be `4N`. A key is never `@utf8`
-    /// (res 3), so in a key position — and only in a key position — the byte
-    /// width is exactly N and a `FieldType` is enough to compute it.
     pub(crate) fn key_type_ident(
         schema: &Schema,
         field_type: &forgedb_parser::FieldType,
     ) -> TokenStream {
         match field_type {
             forgedb_parser::FieldType::StringN { chars, .. } => {
-                // Bytes, not characters — but under res 3 that mapping is the
-                // identity function, because a key is one byte per character.
                 let bytes = *chars as usize;
                 quote! { InlineStr<#bytes> }
             }
-            // `?Model` resolves to `Nullable(K)`; the `Option<>` wrapper is added
-            // by the caller's `is_nullable()`, exactly as elsewhere.
             forgedb_parser::FieldType::Nullable(inner) => Self::key_type_ident(schema, inner),
             other => Self::map_field_type_ident(schema, other),
         }
     }
 
     fn map_field_type_ident(schema: &Schema, field_type: &forgedb_parser::FieldType) -> TokenStream {
-        // #252: a foreign key's value IS the target's key, so a target keyed on
-        // an inline string gives the FK column the `Copy` key type rather than a
-        // `String`. Tested BEFORE `resolved_type` collapses the relation: after
-        // it, a resolved `StringN` is indistinguishable from an ordinary
-        // non-key `string(N)` column, which stays a `String`.
         if Self::fk_backing_type(schema, field_type).is_some() {
             return Self::key_type_ident(schema, &Self::resolved_type(schema, field_type));
         }
@@ -13862,9 +9223,6 @@ impl RustGenerator {
             forgedb_parser::FieldType::I64 => quote! { i64 },
             forgedb_parser::FieldType::F64 => quote! { f64 },
             forgedb_parser::FieldType::Bool => quote! { bool },
-            // #238: an inline `string(N)` presents as an ordinary `String` in
-            // the generated struct — a client cannot tell, and every wire
-            // generator agrees. Only the storage differs.
             forgedb_parser::FieldType::String
             | forgedb_parser::FieldType::StringN { .. } => quote! { String },
             forgedb_parser::FieldType::Json => quote! { serde_json::Value },
@@ -13884,7 +9242,6 @@ impl RustGenerator {
                 quote! { #ident }
             }
             forgedb_parser::FieldType::Nullable(inner) => {
-                // Return the inner type; is_nullable() causes the Option<> wrapper to be added
                 Self::map_field_type_ident(schema, inner)
             }
             forgedb_parser::FieldType::Bytes(size) => {
@@ -13894,16 +9251,11 @@ impl RustGenerator {
                 let inner_type = Self::map_field_type_ident(schema, inner);
                 quote! { [#inner_type; #count] }
             }
-            // #266: `resolved_type` has already turned a `*Model` / `?Model`
-            // into the target's identity type, so only the VIRTUAL relation
-            // kinds (`[Model]`, many-to-many) reach this arm — they have no
-            // column and no value.
             forgedb_parser::FieldType::Relation(_) => quote! { () },
-            _ => quote! { String }, // Default fallback
+            _ => quote! { String },
         }
     }
 
-    /// Convert PascalCase to snake_case
     pub(crate) fn to_snake_case(s: &str) -> String {
         let mut result = String::new();
         for (i, c) in s.chars().enumerate() {
@@ -13915,47 +9267,7 @@ impl RustGenerator {
         result
     }
 
-    /// Generate the Tier 3 coordinator client surface (#84, MVCC multi-process).
-    ///
-    /// Emits `CoordinatedDatabase` and `Database::connect` — additive to the
-    /// existing method bodies (the only non-additive edit is factoring `open_at`
-    /// into the lock-free-capable `__open_with_lock` core the coordinated open
-    /// reuses; the single-writer commit/transaction bodies stay byte-identical —
-    /// T3-5).
-    ///
-    /// ## What is generated
-    ///
-    /// ```rust,ignore
-    /// pub struct CoordinatedDatabase {
-    ///     shared: SharedDatabase,
-    ///     coordinator: std::sync::Arc<forgedb_coordinator::client::CoordinatorClient>,
-    /// }
-    ///
-    /// impl CoordinatedDatabase {
-    ///     pub fn transaction_coordinated<T>(
-    ///         &self,
-    ///         retries: u32,
-    ///         f: impl Fn(&mut ConcurrentTxHandle) -> Result<T, TxError>,
-    ///     ) -> Result<T, TxError> { ... }
-    /// }
-    ///
-    /// impl Database {
-    ///     pub fn connect(
-    ///         root: std::path::PathBuf,
-    ///         socket_path: std::path::PathBuf,
-    ///     ) -> Result<CoordinatedDatabase, TxError> { ... }
-    /// }
-    /// ```
-    ///
-    /// ## Identity red line
-    ///
-    /// `CoordinatedDatabase` sends only opaque byte keys to the coordinator and
-    /// calls the SAME `__apply_and_commit_concurrent_buffer` as `SharedDatabase`
-    /// for the data-plane write — no second apply path, no drift.  The
-    /// coordinator itself never receives a decoded field.
     fn generate_coordinated_client(schema: &Schema) -> TokenStream {
-        // #260 sequence-claim plumbing for the Tier-3 coordinated path.  The
-        // coordinator's write-set is a plain `Vec<Vec<u8>>`, not `OpaqueKey`.
         let (_, seq_init_coord, seq_ws_coord) = Self::sequence_claim_plumbing(
             schema,
             &quote! { __tx },
@@ -13963,14 +9275,11 @@ impl RustGenerator {
             false,
         );
         let seq_fastforward = Self::generate_sequence_fastforward(schema);
-        // Bind the conflict outcome ONLY when the fast-forward needs it — renaming
-        // the discard would otherwise diff every pre-#260 schema's output.
         let seq_outcome_binding = if Self::schema_has_bare_integer_auto(schema) {
             quote! { __outcome }
         } else {
             quote! { _ }
         };
-        // Only generate if there are transactable models.
         let tx_models: Vec<&forgedb_parser::Model> = schema
             .models
             .iter()
@@ -13980,29 +9289,10 @@ impl RustGenerator {
             return quote! {};
         }
 
-        // Per-model peer-refresh arms: re-derive EVERY column's row_count from the
-        // shared on-disk files, then rebuild id_to_row + secondary indexes.
-        // `__sync_columns_from_disk` syncs all data columns + the tombstone (via
-        // the additive `*::sync_from_disk` substrate) — NOT just the tombstone: a
-        // peer's row is only readable once every column's bound is refreshed, so a
-        // tombstone-only sync would leave `get`/`read_at` reading out of bounds.
-        // T3-8: reads shared columns via the existing storage fds; writes no column
-        // (no append/flush). The coordinator never calls this — it is generated
-        // data-plane code, satisfying T3-8.
         let peer_refresh_arms: Vec<_> = tx_models
             .iter()
             .map(|m| {
                 let field = format_ident!("{}", Self::to_snake_case(&m.name));
-                // #161-B: capture the pre-sync committed length, sync the columns to
-                // adopt the peer's advanced row count, then fold ONLY the new rows
-                // `[from..row_count)` into the maps — the incremental delta refresh,
-                // not a full clear-and-rescan of every row × index (`__reindex_delta`
-                // reuses the live update/delete maintenance, so the maps end up
-                // identical to `__reindex_committed`).  This process's maps are
-                // already correct for `[0..from)` (its own commits maintain them live
-                // and prior refreshes covered earlier peer rows); the coordinator
-                // serializes commits, so `[from..row_count)` are exactly the rows
-                // committed by peers since this process last synced.
                 quote! {
                     let __from = self.#field.row_count;
                     self.#field.__sync_columns_from_disk();
@@ -14012,58 +9302,15 @@ impl RustGenerator {
             .collect();
 
         quote! {
-            /// Tier 3 MVCC multi-process coordinator client (#84).
-            ///
-            /// Wraps a [`SharedDatabase`] (Tier 2 in-process concurrency) and
-            /// routes the serialized commit section through a running
-            /// `forgedb coordinate <root>` coordinator process over a Unix socket,
-            /// enabling multiple OS processes to share a single data directory
-            /// without corruption.
-            ///
-            /// Create via [`Database::connect`] (connects to the coordinator, then
-            /// opens the data dir lock-free — the coordinator holds the #89 lock).
-            ///
-            /// Native-only: `forgedb-coordinator` uses Unix sockets + advisory
-            /// file locks, so the whole Tier-3 coordinated surface is gated off
-            /// the `wasm32` build (the browser read-replica is a read-only
-            /// follower — it never coordinates multi-process writes).
             #[cfg(not(target_arch = "wasm32"))]
             pub struct CoordinatedDatabase {
                 shared: SharedDatabase,
                 coordinator: std::sync::Arc<forgedb_coordinator::client::CoordinatorClient>,
-                /// The coordinator LSN this writer has refreshed peer commits up to.
-                /// When `coordinator.last_known_lsn()` exceeds this, a peer refresh
-                /// is performed before the next prepare (peer read-currency, #84).
                 last_refreshed_lsn: std::sync::atomic::AtomicU64,
             }
 
             #[cfg(not(target_arch = "wasm32"))]
             impl CoordinatedDatabase {
-                /// Run a transaction through the Tier 3 commit coordinator.
-                ///
-                /// ## Commit flow
-                ///
-                /// 0. **Peer refresh** (if coordinator LSN advanced): sync tombstone
-                ///    counts from disk + rebuild id_to_row/indexes under write lock.
-                ///    This is how a writer sees commits made by other processes while
-                ///    it was prepare-ing — peer read-currency via #56-B shared column
-                ///    files, driven by the coordinator log offset as the signal.
-                ///    T3-8: the coordinator never writes a column; this refresh is
-                ///    generated data-plane code reading the shared files.
-                /// 1. Capture read snapshot (brief `RwLock` read, sequencer snapshot).
-                /// 2. Run prepare closure with `ConcurrentTxHandle` — no lock held.
-                /// 3. Build opaque write-set keys (same as Tier 2, identity red line).
-                /// 4. **`RequestTurn`** → coordinator: conflict-check + LSN assignment.
-                ///    - On `Grant`: proceed to data-plane write.
-                ///    - On `Nack` (conflict): release snapshot, retry from step 0.
-                ///    - On `Busy`: brief back-off then retry step 4.
-                /// 5. Data-plane write: `__apply_and_commit_concurrent_buffer` under
-                ///    the exclusive in-process `RwLock`.  Same path as Tier 2.
-                ///    Returns the physical `(model_tag_bytes, row_index)` pairs for
-                ///    each row appended (T3-3/T3-8: correct positions in the log).
-                /// 6. **`Committed`** → coordinator: hand opaque row bytes + REAL
-                ///    row indices for the durable replication log, receive `Ack { lsn }`.
-                /// 7. Release snapshot; return the prepared value.
                 pub fn transaction_coordinated<T>(
                     &self,
                     retries: u32,
@@ -14078,11 +9325,6 @@ impl RustGenerator {
                     let mut __last_lsn = __coord.last_known_lsn();
 
                     for __attempt in 0..=retries {
-                        // Step 0 – peer read-currency: if the coordinator has advanced
-                        // past our last-refreshed offset, a peer committed rows we have
-                        // not yet reflected in our in-memory id_to_row / indexes.
-                        // Refresh them now by re-reading the shared column files (T3-8:
-                        // generated data-plane code; coordinator has no column dep).
                         {
                             let __coord_lsn = __coord.last_known_lsn();
                             let __refreshed = self.last_refreshed_lsn.load(Ordering::Acquire);
@@ -14093,19 +9335,16 @@ impl RustGenerator {
                             }
                         }
 
-                        // Step 1 – register snapshot LSN (local; coordinator is the authority).
                         let __snap_lsn = {
                             let mut __seq = __seq_arc.lock().unwrap();
                             __seq.register_snapshot()
                         };
 
-                        // Step 2 – capture committed watermarks (brief read lock).
                         let __snap = {
                             let __db = __inner.read().unwrap();
                             __db.snapshot()
                         };
 
-                        // Step 3 – prepare closure with private-buffer staging (no lock held).
                         let mut __tx = ConcurrentTxHandle {
                             inner: std::sync::Arc::clone(&__inner),
                             snap: __snap,
@@ -14124,7 +9363,6 @@ impl RustGenerator {
                             }
                         };
 
-                        // Step 4 – build opaque write-set (identity red line: coordinator sees bytes only).
                         let mut __ws_keys: Vec<Vec<u8>> = Vec::new();
                         for (__model, _kind, __id_bytes, _bytes, _del) in &__tx.buffer {
                             __ws_keys.push(__forgedb_ws_key(&[
@@ -14143,7 +9381,6 @@ impl RustGenerator {
                         }
                         #seq_ws_coord
 
-                        // Step 5 – RequestTurn: coordinator conflict-check + LSN assignment.
                         let __turn = {
                             let mut __busy_retries = 0u32;
                             loop {
@@ -14164,13 +9401,6 @@ impl RustGenerator {
                                         std::thread::sleep(std::time::Duration::from_millis(20 * __busy_retries as u64));
                                     }
                                     Err(e) => {
-                                        // #274: a failed request leaves the reply in
-                                        // flight, so the connection is poisoned. Drop
-                                        // it here rather than letting the NEXT
-                                        // transaction read a stale `Grant` as its own
-                                        // and write columns for a turn it does not
-                                        // hold. Recovery policy lives here, beside the
-                                        // `Busy` budget above — not in the substrate.
                                         let _ = __coord.reconnect();
                                         let mut __seq = __seq_arc.lock().unwrap();
                                         __seq.release_snapshot(__snap_lsn);
@@ -14182,7 +9412,6 @@ impl RustGenerator {
 
                         match __turn {
                             Err(#seq_outcome_binding) => {
-                                // Conflict or busy exhaustion — retry.
                                 #seq_fastforward
                                 let mut __seq = __seq_arc.lock().unwrap();
                                 __seq.release_snapshot(__snap_lsn);
@@ -14190,7 +9419,6 @@ impl RustGenerator {
                                 continue;
                             }
                             Ok((__turn_id, _reserved_lsn)) => {
-                                // Save buffer metadata before moving buffer into apply.
                                 let __kinds_copy: Vec<u8> = __tx.buffer
                                     .iter()
                                     .map(|(_, k, _, _, _)| k.to_byte())
@@ -14200,10 +9428,6 @@ impl RustGenerator {
                                     .map(|(_, _, _, b, _)| b.clone())
                                     .collect();
 
-                                // Step 6 – data-plane write (same path as Tier 2).
-                                // __apply_and_commit_concurrent_buffer now returns
-                                // Vec<(model_tag_bytes, row_index)> — the real physical
-                                // positions for the coordinator's replication log (T3-3/T3-8).
                                 let __apply_result = {
                                     let mut __db = __inner.write().unwrap();
                                     __db.__apply_and_commit_concurrent_buffer(
@@ -14212,8 +9436,6 @@ impl RustGenerator {
                                     )
                                 };
 
-                                // Step 7 – Committed: hand opaque bytes + REAL row indices.
-                                // Build coordinator payload (opaque; coordinator never decodes).
                                 let (__model_tags, __row_indices) = match &__apply_result {
                                     Ok(__pairs) => {
                                         let tags: Vec<Vec<u8>> = __pairs.iter().map(|(t, _)| t.clone()).collect();
@@ -14221,9 +9443,6 @@ impl RustGenerator {
                                         (tags, rows)
                                     }
                                     Err(_) => {
-                                        // Apply failed — still send Committed with empty payload
-                                        // so the coordinator releases the turn (T3-5: data-plane
-                                        // error must not wedge the coordinator turn slot).
                                         (Vec::new(), Vec::new())
                                     }
                                 };
@@ -14237,15 +9456,7 @@ impl RustGenerator {
                                 match __ack {
                                     Ok(__lsn) => { __last_lsn = __lsn; }
                                     Err(e) => {
-                                        // Best-effort: the commit is already durable (columns
-                                        // + WAL fsynced before Committed); a missed ack only
-                                        // leaves `__last_lsn` briefly stale.  Dependency-free
-                                        // diagnostic so the generated crate needs no `log` dep.
                                         eprintln!("coordinator: Committed ack error: {e}");
-                                        // #274: the missing `Ack` may still be in flight, and
-                                        // the next request would read it in place of its own
-                                        // reply. Reconnect so this stays a stale-LSN nuisance
-                                        // instead of desynchronizing every later turn.
                                         let _ = __coord.reconnect();
                                     }
                                 }
@@ -14263,56 +9474,16 @@ impl RustGenerator {
 
             #[cfg(not(target_arch = "wasm32"))]
             impl Database {
-                /// Peer read-currency refresh for Tier 3 multi-process writers (#84).
-                ///
-                /// Re-reads the on-disk tombstone byte counts (the row-count anchor)
-                /// for each model, updates the in-memory `row_count`, then rebuilds
-                /// `id_to_row` + secondary indexes from the shared column files.
-                ///
-                /// Called under the exclusive write lock (`RwLock`) before each
-                /// `transaction_coordinated` prepare step whenever the coordinator's
-                /// committed LSN has advanced past `last_refreshed_lsn` — meaning a
-                /// peer process committed rows that this writer has not yet seen.
-                ///
-                /// T3-8 contract: this method reads shared column files via the
-                /// #56-B substrate (`sync_from_disk` / `__reindex_committed`); it
-                /// NEVER writes a column.  The coordinator has no `forgedb-storage*`
-                /// dependency and never calls this.
                 pub(crate) fn __peer_refresh(&mut self) {
                     #(#peer_refresh_arms)*
                 }
 
-                /// Open a data dir as a **coordinated Tier-3 client** of a running
-                /// `forgedb coordinate <root>` coordinator, returning a
-                /// [`CoordinatedDatabase`] that lets multiple OS processes share one
-                /// data directory safely (#84).
-                ///
-                /// ## Lock discipline (MVCC spec T3-5 / PM re-gate #84 — load-bearing)
-                ///
-                /// This connects to the coordinator **FIRST** and only then opens the
-                /// data dir **lock-free** (`_lock: None`): the coordinator holds the
-                /// #89 `DirLock` on `<root>/.forgedb.lock` on behalf of every client,
-                /// and write mutual-exclusion among coordinated clients is the
-                /// coordinator's serialized turn-grant — NOT the file lock.  If the
-                /// coordinator is unreachable, this returns
-                /// [`TxError::CoordinatorUnavailable`] and **no lock-free open
-                /// happens**, so there is never an unserialized lock-free writer
-                /// (the binding PM constraint).  Contrast `open_at`, which takes the
-                /// `DirLock` itself for the standalone single-writer path — the two
-                /// modes are mutually exclusive because both contend for the same
-                /// lock file.
                 pub fn connect(
                     root: std::path::PathBuf,
                     socket_path: std::path::PathBuf,
                 ) -> Result<CoordinatedDatabase, TxError> {
-                    // Establish the live coordinator turn-channel BEFORE any
-                    // lock-free open, so a socket-configured-but-coordinator-down
-                    // misconfiguration surfaces as CoordinatorUnavailable rather
-                    // than silently opening a second unserialized writer.
                     let coordinator = forgedb_coordinator::client::CoordinatorClient::connect(&socket_path)
                         .map_err(|e| TxError::CoordinatorUnavailable(e.to_string()))?;
-                    // Coordinator is live and holds the #89 DirLock for us → open
-                    // WITHOUT taking the lock ourselves (T3-5).
                     let shared = Self::__open_with_lock(root, None).shared();
                     Ok(CoordinatedDatabase {
                         shared,
@@ -14331,7 +9502,6 @@ mod tests {
     use forgedb_parser::ast::IndexType;
     use forgedb_parser::{Field, FieldType, Model, Schema};
 
-    /// A bare indexed field of `field_type`, for the predicate tests below.
     fn probe_field(field_type: FieldType) -> Field {
         Field {
             position: None,
@@ -14348,16 +9518,6 @@ mod tests {
         }
     }
 
-    /// Two lists describe ordered-index eligibility and must never disagree:
-    /// `ordered_key_type` here decides whether the `BTreeMap` is actually emitted,
-    /// while `FieldType::supports_range_queries` in `forgedb-parser` sets
-    /// `Field::index_type`, which `forgedb migrate` stringifies into user-facing
-    /// prose ("Add BTree index on 'Product.price'").
-    ///
-    /// They had drifted in BOTH directions (#242): `f64` was claimed and not
-    /// generated, `decimal` was generated and not claimed — so the migration plan
-    /// promised an index that did not exist and hid one that did. Editing the lists
-    /// fixed that instance; this is what stops the next one.
     #[test]
     fn ordered_key_type_agrees_with_parser_range_support() {
         let types = [
@@ -14386,14 +9546,6 @@ mod tests {
         }
     }
 
-    /// `is_numeric_type` gates whether a `@min`/`@max` arm runs at all;
-    /// `numeric_bound_operands` decides what that arm compares. If the first says
-    /// yes and the second says `None`, the directive silently emits no check — which
-    /// is exactly the `decimal` defect of #239, where a bound on the exact-money type
-    /// parsed, was carried, and enforced nothing.
-    ///
-    /// Adding a numeric type to one list and not the other reintroduces it, so they
-    /// are asserted equal rather than each being spot-checked.
     #[test]
     fn numeric_bound_operands_cover_every_numeric_type() {
         let types = [
@@ -14423,9 +9575,6 @@ mod tests {
         }
     }
 
-    /// A bound on a nullable numeric field must still compare in the inner type's
-    /// domain. `@min` on `decimal?` that fell through to the `_ => None` arm would
-    /// be the #239 silent no-op again, restricted to optional fields.
     #[test]
     fn nullable_numeric_fields_still_get_bound_operands() {
         for inner in [FieldType::U64, FieldType::F64, FieldType::Decimal] {
@@ -14441,10 +9590,6 @@ mod tests {
         }
     }
 
-    /// The three comparison domains are distinct on purpose (#239): `decimal` cannot
-    /// cast to `f64` at all, and a 64-bit integer bound rounds if it goes through
-    /// one. Pinning the emitted operands keeps a future "simplify" from collapsing
-    /// them back to a single lossy `as f64`.
     #[test]
     fn each_numeric_domain_compares_without_a_lossy_cast() {
         let rhs = |ty: FieldType| {
@@ -14457,14 +9602,9 @@ mod tests {
         assert_eq!(rhs(FieldType::U64), "(7i64asi128)");
         assert_eq!(rhs(FieldType::I64), "(7i64asi128)");
         assert_eq!(rhs(FieldType::F64), "(7i64asf64)");
-        // The `i64` suffix is load-bearing, not incidental: `Decimal::from` is
-        // generic, and a bare `7` would be an ambiguous-integer inference error.
         assert_eq!(rhs(FieldType::Decimal), "rust_decimal::Decimal::from(7i64)");
     }
 
-    /// Nullability is decided by `ordered_key_type` alone — `supports_range_queries`
-    /// is a `FieldType` predicate and never sees the field. A nullable
-    /// ordered-eligible type must still get no ordered index.
     #[test]
     fn nullable_fields_are_never_ordered_eligible() {
         for inner in [FieldType::U32, FieldType::F64, FieldType::Decimal] {
@@ -14476,9 +9616,6 @@ mod tests {
         }
     }
 
-    /// `f64` is the one type whose ordered key and range-bound parameter differ:
-    /// the map is keyed by the encoded `u64`, but a caller passes an `f64` (#242).
-    /// Every other type keeps them identical.
     #[test]
     fn f64_ordered_param_type_stays_f64_while_its_key_is_u64() {
         let f = probe_field(FieldType::F64);
@@ -14502,7 +9639,6 @@ mod tests {
 
     #[test]
     fn test_rust_generation_with_quote() {
-        // Create a simple schema
         let schema = Schema {
             models: vec![Model { position: None,
                 name: "User".to_string(),
@@ -14555,7 +9691,6 @@ mod tests {
         let result = RustGenerator::generate(&schema).unwrap();
         let code = result.code;
 
-        // Verify the generated code contains expected elements (formatted by prettyplease)
         assert!(code.contains("pub struct User"));
         assert!(code.contains("pub id: Uuid"));
         assert!(code.contains("pub email: String"));
@@ -14568,7 +9703,6 @@ mod tests {
         assert!(code.contains("pub fn insert"));
         assert!(code.contains("pub fn get"));
 
-        // Verify it compiles as valid Rust (basic syntax check)
         assert!(code.contains("use std::collections::HashMap"));
         assert!(code.contains("use forgedb_types::{Uuid, Timestamp, Value}"));
     }
@@ -14621,7 +9755,6 @@ mod tests {
         let result = RustGenerator::generate(&schema).unwrap();
         let code = result.code;
 
-        // Verify formatted output
         assert!(code.contains("pub struct User"));
         assert!(code.contains("pub struct Post"));
         assert!(code.contains("pub struct UserStorage"));
@@ -14630,9 +9763,6 @@ mod tests {
         assert!(code.contains("pub post: PostStorage"));
     }
 
-    // ---- #266: the FK backing-type resolver --------------------------------
-
-    /// A model whose identity is `id` of `ft`.
     fn keyed(name: &str, ft: FieldType) -> Model {
         Model {
             position: None,
@@ -14664,13 +9794,6 @@ mod tests {
         }
     }
 
-    /// **Scenario 8 (resolution 2).** `None => true` was backwards: a model with
-    /// no identity field reported as UUID-keyed, and a `true` default on a
-    /// predicate whose false branch REMOVES code is the wrong direction.
-    ///
-    /// #248 already makes an id-less model fatal, so this is defence in depth —
-    /// asserted directly on the resolver so the old default cannot come back in
-    /// another spelling.
     #[test]
     fn fk_backing_type_is_none_for_an_identity_less_target() {
         let ghost = Model {
@@ -14691,15 +9814,12 @@ mod tests {
             "an identity-less target resolves to nothing, never to Uuid by default"
         );
 
-        // ...and an unknown target likewise.
         let missing = FieldType::Relation(forgedb_parser::RelationType::RequiredReference(
             "Nope".to_string(),
         ));
         assert_eq!(RustGenerator::fk_backing_type(&schema, &missing), None);
     }
 
-    /// The resolution is transitive: an identity that is itself an FK resolves
-    /// through to the far end of the chain (resolution 1's second reproduction).
     #[test]
     fn fk_backing_type_resolves_through_a_chain() {
         let schema = schema_of(vec![
@@ -14719,8 +9839,6 @@ mod tests {
             Some(FieldType::Uuid)
         );
 
-        // An optional FK backs onto `Nullable(K)`, which is what makes every
-        // physical helper's existing `Nullable` arm the right one.
         let opt = FieldType::Relation(forgedb_parser::RelationType::OptionalReference(
             "Order".to_string(),
         ));
@@ -14730,13 +9848,6 @@ mod tests {
         );
     }
 
-    /// **Scenario 15, resolver half.** `Left { id: *Right }` / `Right { id: *Left }`
-    /// is legal to parse today. Once the FK arm resolves through the target, the
-    /// resolver is mutually recursive with `id_type_tokens` — so without a bound
-    /// it exhausts the stack rather than reporting anything.
-    ///
-    /// The bound is what keeps a *validation-skipping* caller degrading instead
-    /// of crashing; the diagnostic itself is `validate.rs`'s (scenario 15 proper).
     #[test]
     fn fk_backing_type_is_depth_bounded_against_an_identity_cycle() {
         let schema = schema_of(vec![
@@ -14762,14 +9873,9 @@ mod tests {
             "a cycle resolves to nothing — it must not recurse forever"
         );
 
-        // And generation returns rather than dying, so the CLI can report the
-        // validation error instead of the process disappearing.
         assert!(RustGenerator::generate(&schema).is_ok());
     }
 
-    /// **Scenario 16, resolver half.** A self-referential FK is NOT a cycle: it
-    /// resolves through the target's *identity*, which is a uuid. Nothing about
-    /// the bound may catch it.
     #[test]
     fn a_self_referential_fk_is_not_an_identity_cycle() {
         let mut category = keyed("Category", FieldType::Uuid);

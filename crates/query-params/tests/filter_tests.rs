@@ -14,20 +14,17 @@ fn test_from_params() {
     params.insert("name".to_string(), "John".to_string());
     params.insert("age".to_string(), "25".to_string());
     params.insert("active".to_string(), "true".to_string());
-    params.insert("sort".to_string(), "name".to_string()); // should be skipped
+    params.insert("sort".to_string(), "name".to_string());
 
     let filters = Filter::from_params(params);
-    assert_eq!(filters.len(), 3); // sort is skipped
+    assert_eq!(filters.len(), 3);
 
-    // Find name filter
     let name_filter = filters.iter().find(|f| f.field == "name").unwrap();
     assert_eq!(name_filter.value, FilterValue::String("John".to_string()));
 
-    // Find age filter
     let age_filter = filters.iter().find(|f| f.field == "age").unwrap();
     assert_eq!(age_filter.value, FilterValue::Number(25.0));
 
-    // Find active filter
     let active_filter = filters.iter().find(|f| f.field == "active").unwrap();
     assert_eq!(active_filter.value, FilterValue::Bool(true));
 }

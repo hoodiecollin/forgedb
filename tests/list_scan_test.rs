@@ -1,100 +1,5 @@
-//! List-path selection guard (#228): the **ids and `total`** the generated list
-//! endpoint returns, checked against an independently computed oracle, by running
-//! the real generated router over a churned corpus.
-//!
-//! # Why this test exists in this form
-//!
-//! #228 turned the narrow scan into a *scope*: the filter, the sort, the count and
-//! the pagination now all run inside `__with_scan`, on borrowed views over the
-//! buffered columns, and only `(total, Vec<Id>)` escapes. Nothing about the
-//! selection is supposed to change — but every step of it moved.
-//!
-//! A codegen snapshot cannot catch a regression here. It compares emitted
-//! *strings*; ordering, tie behaviour, and which rows survive a filter are
-//! properties of what the emitted code *does*. The companion
-//! `tests/api_wire_test.rs` freezes the response bytes for a two-row corpus, which
-//! pins the envelope but says nothing about selection over a realistic table.
-//!
-//! So this test computes the expected `(ids, total)` in the driver, from a plain
-//! `Vec` mirroring the rows it inserted, and compares. The oracle is a genuine
-//! second implementation — not a re-derivation from the same code — which is the
-//! only way a "these must be identical" claim means anything.
-//!
-//! # What the oracle deliberately replicates
-//!
-//! Three behaviours that are easy to break and easy to get subtly wrong:
-//!
-//! 1. **Pre-sort order is physical row order.** The scan walks `id_to_row`'s values
-//!    sorted ascending, and an update *appends* a new version (append-only storage,
-//!    #66), so an updated row moves to the tail. With no `?sort=` that order IS the
-//!    response order, and with a `?sort=` it decides ties.
-//! 2. **Descending is `sort_by(..)` then `reverse()`**, not a reversed comparator.
-//!    `sort_by` is stable, so reversing also reverses ties — a descending page is
-//!    not the ascending page read backwards field-by-field. The oracle does the same
-//!    two steps rather than sorting with a flipped comparator, because that is what
-//!    the generated code does and the difference is observable.
-//! 3. **A nullable sort key orders `None` first** (`Option`'s derived `Ord`), and
-//!    the borrowed view sorts `Option<&str>` where the owned one sorted
-//!    `Option<String>`. Same order, different type — pinned because #228 is exactly
-//!    the change that swapped them.
-//!
-//! # Coverage
-//!
-//! The corpus is churned before any query runs: rows are updated (dead versions
-//! inside the mapped span, live rows moved to the tail) and deleted (holes in the
-//! gathered selection, plus index entries removed). Cases cover the full scan, each
-//! index-pushdown arm, the pushdown-plus-residual-filter combination, the
-//! unparseable-value fallback that must never miss a match, and pagination past the
-//! end.
-//!
-//! # #288 — the hoisted unfiltered predicate
-//!
-//! #288 moved the "is there any filter at all?" question out of the per-row loop.
-//! It is provably a pure evaluation-order change, so the whole case table above is
-//! already equivalence coverage for it: several cases carry non-filter keys with no
-//! filter (the arm that now short-circuits) and the rest take the fall-through.
-//!
-//! Three properties are structurally beyond the oracle, and are checked separately:
-//!
-//! - **H2** — `Gauge` declares a field literally named `limit`, so `?limit=3` is a
-//!   real filter for that model. This is what forces the predicate to be positive
-//!   ("does any key name a filterable field?") rather than a reserved-key exclusion
-//!   list, which would short-circuit here and quietly return unfiltered rows.
-//! - **H4** — `/api/post` and `/api/post?limit=50` must be byte-identical. Compared
-//!   as bytes, not as `(ids, total)`, so an envelope divergence cannot slip through.
-//! - **H5** — `Link` has zero filterable fields, so its predicate takes no checks
-//!   and its parameter must be `_params`. That defect compiles and behaves
-//!   correctly; it is visible only as a *warning* in the user's crate, so the test
-//!   reads build diagnostics via `common::build_warnings`.
-//!
-//! # #281 — the unfiltered fast page
-//!
-//! #281 gave the unfiltered, unsorted request its own construction site
-//! (`__with_fast_page`), which builds the page from a bounded gather rather than
-//! from a full-table scan the caller then windows. Two sites means the answer can
-//! now diverge, and the WINDOW is where it would: the fast site slices before
-//! gathering, so an off-by-one in `__start`/`__end` there is invisible to any test
-//! that only ever reads the whole set.
-//!
-//! The unfiltered cases at the end of the table close that. They matter *here*
-//! specifically because this oracle is independent — it recomputes the physical
-//! order from its own append-only mirror. `tests/page_identity_test.rs` compares the
-//! two sites against each other over a far larger corpus, which is the stronger
-//! check of agreement but no check at all of whether they agree on the right answer.
-//!
-//! It compiles a generated crate, so it is `#[ignore]`d out of the fast hermetic
-//! default suite. Run it explicitly:
-//!
-//! ```bash
-//! make list-scan-test        # or:
-//! cargo test --test list_scan_test -- --ignored --nocapture
-//! ```
-
 mod common;
 
-/// `title` is unique-indexed, `views` and `status` are indexed (so all three drive
-/// the pushdown arm), `body` is not indexed (so it forces the full scan), and
-/// `summary` is a nullable string (the sort key with `None`s in it).
 const SCHEMA: &str = r#"
 enum Status { Draft, Published, Archived }
 
@@ -155,15 +60,9 @@ Link {
 #[ignore = "compiles a generated crate; run with --ignored (see `make list-scan-test`)"]
 fn list_selection_matches_an_independent_oracle() {
     let (out, proj) = common::generate_compile_run("scandriver", SCHEMA, DRIVER);
-    // Captured before `assert_driver_ok`, which removes the project directory.
     let warnings = common::build_warnings(&proj);
     common::assert_driver_ok(&out, &proj, "driver reported a list-selection mismatch");
 
-    // #288 H5. The `Link` model has no filterable fields, so its hoisted predicate
-    // takes no checks and its parameter must be named `_params`. Getting that wrong
-    // compiles and behaves correctly — it is observable ONLY as a warning in the
-    // user's crate, which is why this assertion reads build diagnostics rather than
-    // any value the driver produced.
     assert!(
         !warnings.contains("_is_unfiltered"),
         "#288: the generated unfiltered-predicate helper warns in the user's crate \

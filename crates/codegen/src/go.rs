@@ -1,99 +1,41 @@
-//! Golang binding generator — a class-2 transport target (RFC #203, sibling of
-//! the PyO3/NAPI/WASM bindings under the #122 taxonomy).
-//!
-//! Emits, per schema, an idiomatic Go package (`forgedb.go` + a `forgedb.h` C
-//! header) that calls the SAME generated native FFI C-ABI (`crates/codegen/src/
-//! ffi.rs`) over cgo. It adds **no new substrate dep**, which keeps it off the
-//! publish-gap critical path.
-//!
-//! # The C symbols this file names carry the app's prefix (#335 §2, decision 9)
-//!
-//! Every `forgedb_…` C symbol here became `<symbol_prefix><stem>`, from
-//! `forgedb::naming::symbol_prefix` — the ONE definition, threaded in by the
-//! caller and never re-derived. `ffi.rs` DEFINES those symbols and this file
-//! DECLARES (`forgedb.h`) and CALLS (`forgedb.go`) them, so the three move
-//! together or the Go binding fails to link.
-//!
-//! The one symbol emitted by *this* side rather than by `ffi.rs` is the cgo
-//! `//export`ed completion callback in `forgedb_async.go`; it is prefixed for
-//! the same reason, because `//export` makes it an external C symbol too.
-//!
-//! **Identity (class-2 transport glue).** Like the PyO3/NAPI wrappers, this file
-//! is *generated per schema*: schema-tailored Go structs + typed methods that
-//! reference the generated per-model C symbols **by name** (that IS the
-//! tailoring). It invents **no** generic query surface — rows and ids cross cgo
-//! as OPAQUE JSON bytes (the same opaque-bytes discipline as every other binding)
-//! and are decoded into the generated Go struct via `encoding/json` at a
-//! compile-time-known type. There is no runtime schema read, no `forgedb_query`,
-//! no `switch model` dispatch (the removed-`QueryBuilder` red line).
-//!
-//! **Surface (at NAPI-RS parity).** Per-model CRUD (`Insert`/`Get`/`Count`/
-//! `All`/`Update`/`Delete`), point-in-time `_at` reads over a `Snapshot`,
-//! relation traversal (forward FK, reverse 1:M, M2M link/unlink + query getters,
-//! incl. the M2M `_at` snapshot getter), **async CRUD** over the cgo completion
-//! bridge (`forgedb_async.go`), and **Arrow columnar export** (`forgedb_arrow.go`,
-//! zero-copy via `github.com/apache/arrow-go/v18`).
-//!
-//! Field-shape fidelity: scalars map to their Go equivalents; enums map to a
-//! generated Go enum type + consts and inline structs to generated nested Go
-//! structs; `json`, `char(N)`, fixed arrays, and virtual relation-collection
-//! fields map to `json.RawMessage` (a lossless JSON passthrough that round-trips
-//! whatever serde emits), so the Go struct matches the generated `database.rs`
-//! serde shape exactly.
-
 use crate::rust::RustGenerator;
 use crate::{GeneratedCode, Result};
 use forgedb_parser::{FieldType, RelationType, Schema};
 use std::collections::{HashMap, HashSet};
 
-/// Generates the Go cgo binding for a schema.
 pub struct GoGenerator;
 
-/// One id-bearing model exposed over the Go binding (CRUD + snapshot reads).
 pub(crate) struct GoModel {
-    /// PascalCase model name (also the Go struct name).
     pub(crate) name: String,
-    /// snake_case name — the `<prefix><snake>_<op>` C-symbol infix.
     pub(crate) snake: String,
-    /// Go type of the model's identity field (`string` for uuid PKs).
     pub(crate) id_go: String,
 }
 
-/// A relation-traversal C entry point mirrored one-for-one from the FFI
-/// generator (`generate_relation_ops`). `sym` is the C-symbol suffix (without
-/// the app's prefix); `method` is its PascalCase Go method name.
 pub(crate) enum GoRelOp {
-    /// Forward FK: resolve `*Target`/`?Target` by the source id → `*Target`.
     ForwardFk {
         sym: String,
         method: String,
         source_id_go: String,
         target: String,
     },
-    /// Reverse 1:M query getter: all records for a parent id → `[]Target`. The
-    /// id is typed as the PARENT's own identity type (#266).
     Vec {
         sym: String,
         method: String,
         id_go: String,
         target: String,
     },
-    /// Snapshot-scoped M2M query getter: all linked records for an id as of
-    /// a `*Snapshot` → `[]Target`.
     VecAt {
         sym: String,
         method: String,
         id_go: String,
         target: String,
     },
-    /// M2M link (each endpoint's own id type) → `error`.
     Link {
         sym: String,
         method: String,
         left_go: String,
         right_go: String,
     },
-    /// M2M unlink (each endpoint's own id type) → `(bool, error)`.
     Unlink {
         sym: String,
         method: String,
@@ -102,15 +44,12 @@ pub(crate) enum GoRelOp {
     },
 }
 
-/// One Arrow-exportable column: the `Export<Model><Field>Arrow` Go method and its
-/// `<snake>_<field>_export_arrow` C symbol suffix (below the app's prefix).
 pub(crate) struct ArrowCol {
     pub(crate) sym: String,
     pub(crate) method: String,
 }
 
 impl GoGenerator {
-    /// Generate the `forgedb.go` package for a schema.
     pub fn generate(
         schema: &Schema,
         symbol_prefix: &str,
@@ -125,26 +64,21 @@ impl GoGenerator {
         code.push_str(&subst(SPINE, symbol_prefix));
         code.push_str(&subst(ASYNC_SPINE, symbol_prefix));
 
-        // --- Generated enum + inline-struct types ---
         code.push_str(&Self::enum_types(schema));
         code.push_str(&Self::struct_types(schema));
 
-        // --- Per-model row structs ---
         for model in schema.models.iter() {
             code.push_str(&Self::model_struct(schema, model));
         }
 
-        // --- Per-model CRUD + snapshot reads ---
         for m in &models {
             code.push_str(&Self::crud_methods(m, symbol_prefix));
         }
 
-        // --- Per-model async CRUD (over the FFI completion bridge) ---
         for m in &models {
             code.push_str(&Self::async_methods(m, symbol_prefix));
         }
 
-        // --- Relation traversal ---
         for op in &rel_ops {
             code.push_str(&Self::relation_method(op, symbol_prefix));
         }
@@ -159,9 +93,6 @@ impl GoGenerator {
         })
     }
 
-    /// The Arrow-exportable columns (same filter as the FFI Arrow ops): each
-    /// id-bearing model's non-null fixed-width primitive / uuid / required-FK
-    /// columns.
     pub(crate) fn arrow_columns(schema: &Schema) -> Vec<ArrowCol> {
         let mut cols = Vec::new();
         for model in schema
@@ -186,30 +117,9 @@ impl GoGenerator {
         cols
     }
 
-    /// The package-`init()` fingerprint check.
-    ///
-    /// **The fingerprint compared here is the `ffi` package's, not this
-    /// directory's.** `<output>/go/` is not a cache package and is not hashed;
-    /// the archive this links IS the `ffi` package's artifact, so the `ffi`
-    /// package's value is the only one that can agree with what the archive
-    /// exports. A later reader will want to "fix" this into a per-directory
-    /// hash; that breaks the comparison.
-    ///
-    /// What this buys over the linker is narrower than "load-time verification"
-    /// suggests, and the narrow version is the honest one: a schema change that
-    /// removes an exported symbol ALREADY fails to link. This adds (a) a readable
-    /// message where the linker's names a mangled C symbol, and (b) the cases the
-    /// linker cannot see at all — a `[storage]`/`[runtime]` knob that changes
-    /// durability semantics without changing one symbol name.
     fn fingerprint_check(symbol_prefix: &str, fingerprint: &str) -> String {
         format!(
             r#"
-// forgedbFingerprint is the fingerprint of the generated source THIS file was
-// written from. The linked archive exposes the same value; `init` below refuses
-// to let the package load when they disagree.
-//
-// It is NOT a version: a ForgeDB upgrade that changes nothing about the emitted
-// source leaves it untouched.
 const forgedbFingerprint = "{fingerprint}"
 
 func init() {{
@@ -227,14 +137,6 @@ func init() {{
         )
     }
 
-    /// Generate the `forgedb_arrow.go` companion (only when the schema has
-    /// Arrow-exportable columns): per-column `Export<Model><Field>Arrow` methods
-    /// that import the FFI's Arrow C-Data-Interface export into an `arrow.Array`
-    /// via `arrow-go`'s `cdata`. Returns `None` (no file, no dep) when there are
-    /// no exportable columns.
-    ///
-    /// NOTE: this is the ONE place the Go binding pulls an external module
-    /// (`github.com/apache/arrow-go/v18`); the caller surfaces that to the user.
     pub fn generate_arrow(schema: &Schema, symbol_prefix: &str) -> Option<GeneratedCode> {
         let pfx = symbol_prefix;
         let cols = Self::arrow_columns(schema);
@@ -245,9 +147,6 @@ func init() {{
         for c in &cols {
             body.push_str(&format!(
                 r#"
-// {method} exports the live column as an Arrow array (zero-copy mmap alias when
-// the live rows are a dense prefix, a gathered copy otherwise). The caller owns
-// the result and MUST call Release() on it.
 func (db *DB) {method}() (arrow.Array, error) {{
 	var sch C.ArrowSchema
 	var arr C.ArrowArray
@@ -272,10 +171,6 @@ func (db *DB) {method}() (arrow.Array, error) {{
         })
     }
 
-    /// The `forgedb_async.go` companion file: the exported cgo completion
-    /// callback. It MUST be separate from `forgedb.go` because cgo forbids C
-    /// definitions in the preamble of any file that uses `//export`, and
-    /// `forgedb.go` carries the registration shim (a definition). Schema-invariant.
     pub fn generate_async_bridge(symbol_prefix: &str) -> GeneratedCode {
         GeneratedCode {
             description: "Go async completion bridge (//export callback)".to_string(),
@@ -283,10 +178,6 @@ func (db *DB) {method}() (arrow.Array, error) {{
         }
     }
 
-    /// A `go.mod` for the generated Go package. User-editable, so the CLI writes
-    /// it ONLY when absent (like every other binding scaffold). When the schema
-    /// has Arrow-exportable columns, the arrow-go require is included (run
-    /// `go mod tidy` to populate `go.sum`).
     pub fn go_mod_scaffold(module: &str, needs_arrow: bool) -> String {
         let mut m = format!("module {module}\n\ngo 1.21\n");
         if needs_arrow {
@@ -295,21 +186,14 @@ func (db *DB) {method}() (arrow.Array, error) {{
         m
     }
 
-    /// Whether the schema exposes any Arrow-exportable column (drives the
-    /// `forgedb_arrow.go` file + the arrow-go `go.mod` require).
     pub fn needs_arrow(schema: &Schema) -> bool {
         !Self::arrow_columns(schema).is_empty()
     }
 
-    /// A `README.md` documenting the build order and cgo caveats. Written only
-    /// when absent (a scaffold, like `go.mod`).
     pub fn readme_scaffold() -> &'static str {
         README_SCAFFOLD
     }
 
-    // --- Derivation (shared by `generate` and `generate_header`) --------------
-
-    /// The id-bearing models (same filter as the FFI per-model ops).
     pub(crate) fn crud_models(schema: &Schema) -> Vec<GoModel> {
         schema
             .models
@@ -323,18 +207,10 @@ func (db *DB) {method}() (arrow.Array, error) {{
             .collect()
     }
 
-    /// Mirror `FfiGenerator::generate_relation_ops` faithfully — the SAME public
-    /// schema helpers, the SAME family order and shared `seen` dedup — so every
-    /// symbol we emit corresponds to a symbol the FFI generator emits. (The
-    /// `test_go_calls_match_ffi_symbols` guard proves the correspondence.) The
-    /// M2M snapshot `_at` getter is intentionally not surfaced in this first cut,
-    /// but its name is still reserved in `seen` so later families collide
-    /// identically to the FFI derivation.
     pub(crate) fn relation_ops(schema: &Schema) -> Vec<GoRelOp> {
         let mut ops = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
 
-        // --- A. Forward FK getters (`*Target` / `?Target`) ---
         for model in &schema.models {
             let model_snake = RustGenerator::to_snake_case(&model.name);
             let model_has_id = model.has_identity();
@@ -364,7 +240,6 @@ func (db *DB) {method}() (arrow.Array, error) {{
             }
         }
 
-        // --- B. Reverse one-to-many collection getters ---
         let pairs = schema.detect_relations();
         let mut group_counts: HashMap<(String, String), usize> = HashMap::new();
         for p in &pairs {
@@ -404,11 +279,9 @@ func (db *DB) {method}() (arrow.Array, error) {{
             });
         }
 
-        // --- C. Many-to-many link / unlink + query getters ---
         for m in RustGenerator::valid_m2m(schema) {
             let snake1 = RustGenerator::to_snake_case(&m.model1);
             let snake2 = RustGenerator::to_snake_case(&m.model2);
-            // #266: each junction endpoint carries its OWN identity type.
             let id1 = schema
                 .find_model(&m.model1)
                 .map_or_else(|| "string".to_string(), |md| Self::go_id_type(schema, md));
@@ -444,9 +317,6 @@ func (db *DB) {method}() (arrow.Array, error) {{
                     id_go: id1.clone(),
                     target: m.model2.clone(),
                 });
-                // The snapshot-scoped forward getter (inserted into `seen` at the
-                // same point as the FFI derivation, so downstream families dedup
-                // identically).
                 let fwd_at_name = format!("{snake1}_{}_at", m.field1);
                 if seen.insert(fwd_at_name.clone()) {
                     ops.push(GoRelOp::VecAt {
@@ -472,17 +342,13 @@ func (db *DB) {method}() (arrow.Array, error) {{
         ops
     }
 
-    // --- Rendering ------------------------------------------------------------
-
     fn model_struct(schema: &Schema, model: &forgedb_parser::Model) -> String {
-        let mut s = format!("\n// {name} is a generated row of the `{name}` model.\ntype {name} struct {{\n", name = model.name);
+        let mut s = format!("\ntype {name} struct {{\n", name = model.name);
         for field in &model.fields {
             let go_ty = Self::go_field_type(schema, field);
             let tag = if field.auto_generate
                 && matches!(field.field_type, FieldType::Uuid | FieldType::Timestamp(_))
             {
-                // `+uuid` / `+timestamp` autos carry `#[serde(default)]`, so a
-                // create body may omit them (`create_*` synthesizes the value).
                 format!("`json:\"{},omitempty\"`", field.name)
             } else {
                 format!("`json:\"{}\"`", field.name)
@@ -502,7 +368,6 @@ func (db *DB) {method}() (arrow.Array, error) {{
         let GoModel { name, snake, id_go } = m;
         format!(
             r#"
-// Insert{name} inserts a {name} through the integrity gate, returning the new id.
 func (db *DB) Insert{name}(rec {name}) ({id_go}, error) {{
 	var zero {id_go}
 	body, err := json.Marshal(rec)
@@ -524,7 +389,6 @@ func (db *DB) Insert{name}(rec {name}) ({id_go}, error) {{
 	return id, nil
 }}
 
-// Get{name} fetches a {name} by id, or (nil, nil) if it does not exist.
 func (db *DB) Get{name}(id {id_go}) (*{name}, error) {{
 	idBytes, err := json.Marshal(id)
 	if err != nil {{
@@ -548,7 +412,6 @@ func (db *DB) Get{name}(id {id_go}) (*{name}, error) {{
 	return &rec, nil
 }}
 
-// Count{name} returns the live {name} row count.
 func (db *DB) Count{name}() (int64, error) {{
 	var e *C.ForgeError
 	n := int64(C.{pfx}{snake}_count(db.ptr, &e))
@@ -558,7 +421,6 @@ func (db *DB) Count{name}() (int64, error) {{
 	return n, nil
 }}
 
-// All{name} returns every live {name} row.
 func (db *DB) All{name}() ([]{name}, error) {{
 	var out *C.uint8_t
 	var outLen C.size_t
@@ -574,7 +436,6 @@ func (db *DB) All{name}() ([]{name}, error) {{
 	return recs, nil
 }}
 
-// Update{name} replaces a {name} by id (whole-record). Returns false if absent.
 func (db *DB) Update{name}(id {id_go}, rec {name}) (bool, error) {{
 	idBytes, err := json.Marshal(id)
 	if err != nil {{
@@ -596,7 +457,6 @@ func (db *DB) Update{name}(id {id_go}, rec {name}) (bool, error) {{
 	}}
 }}
 
-// Delete{name} deletes a {name} by id with referential integrity. Returns false if absent.
 func (db *DB) Delete{name}(id {id_go}) (bool, error) {{
 	idBytes, err := json.Marshal(id)
 	if err != nil {{
@@ -614,7 +474,6 @@ func (db *DB) Delete{name}(id {id_go}) (bool, error) {{
 	}}
 }}
 
-// Get{name}At fetches a {name} by id as of a snapshot, or (nil, nil) if absent then.
 func (db *DB) Get{name}At(snap *Snapshot, id {id_go}) (*{name}, error) {{
 	idBytes, err := json.Marshal(id)
 	if err != nil {{
@@ -638,7 +497,6 @@ func (db *DB) Get{name}At(snap *Snapshot, id {id_go}) (*{name}, error) {{
 	return &rec, nil
 }}
 
-// All{name}At returns every live {name} as of a snapshot.
 func (db *DB) All{name}At(snap *Snapshot) ([]{name}, error) {{
 	var out *C.uint8_t
 	var outLen C.size_t
@@ -661,7 +519,6 @@ func (db *DB) All{name}At(snap *Snapshot) ([]{name}, error) {{
         let GoModel { name, snake, id_go } = m;
         format!(
             r#"
-// Insert{name}Async inserts a {name} on the async worker, yielding the new id.
 func (db *DB) Insert{name}Async(rec {name}) <-chan Result[{id_go}] {{
 	body, err := json.Marshal(rec)
 	if err != nil {{
@@ -676,7 +533,6 @@ func (db *DB) Insert{name}Async(rec {name}) <-chan Result[{id_go}] {{
 	}})
 }}
 
-// Get{name}Async fetches a {name} by id on the async worker (Value nil if absent).
 func (db *DB) Get{name}Async(id {id_go}) <-chan Result[*{name}] {{
 	idBytes, err := json.Marshal(id)
 	if err != nil {{
@@ -696,7 +552,6 @@ func (db *DB) Get{name}Async(id {id_go}) <-chan Result[*{name}] {{
 	}})
 }}
 
-// Count{name}Async returns the live {name} row count on the async worker.
 func (db *DB) Count{name}Async() <-chan Result[int64] {{
 	return runAsync(func(t C.uint64_t) {{
 		C.{pfx}{snake}_count_async(db.ptr, t)
@@ -707,7 +562,6 @@ func (db *DB) Count{name}Async() <-chan Result[int64] {{
 	}})
 }}
 
-// All{name}Async returns every live {name} on the async worker.
 func (db *DB) All{name}Async() <-chan Result[[]{name}] {{
 	return runAsync(func(t C.uint64_t) {{
 		C.{pfx}{snake}_all_async(db.ptr, t)
@@ -718,7 +572,6 @@ func (db *DB) All{name}Async() <-chan Result[[]{name}] {{
 	}})
 }}
 
-// Update{name}Async replaces a {name} by id on the async worker (false if absent).
 func (db *DB) Update{name}Async(id {id_go}, rec {name}) <-chan Result[bool] {{
 	idBytes, err := json.Marshal(id)
 	if err != nil {{
@@ -737,7 +590,6 @@ func (db *DB) Update{name}Async(id {id_go}, rec {name}) <-chan Result[bool] {{
 	}})
 }}
 
-// Delete{name}Async deletes a {name} by id on the async worker (false if absent).
 func (db *DB) Delete{name}Async(id {id_go}) <-chan Result[bool] {{
 	idBytes, err := json.Marshal(id)
 	if err != nil {{
@@ -764,7 +616,6 @@ func (db *DB) Delete{name}Async(id {id_go}) <-chan Result[bool] {{
                 target,
             } => format!(
                 r#"
-// {method} resolves the foreign key by the source id, or (nil, nil) if the source is absent.
 func (db *DB) {method}(id {source_id_go}) (*{target}, error) {{
 	idBytes, err := json.Marshal(id)
 	if err != nil {{
@@ -796,7 +647,6 @@ func (db *DB) {method}(id {source_id_go}) (*{target}, error) {{
                 target,
             } => format!(
                 r#"
-// {method} returns the related {target} records for the given id.
 func (db *DB) {method}(id {id_go}) ([]{target}, error) {{
 	idBytes, err := json.Marshal(id)
 	if err != nil {{
@@ -824,7 +674,6 @@ func (db *DB) {method}(id {id_go}) ([]{target}, error) {{
                 target,
             } => format!(
                 r#"
-// {method} returns the linked {target} records for the given id as of a snapshot.
 func (db *DB) {method}(snap *Snapshot, id {id_go}) ([]{target}, error) {{
 	idBytes, err := json.Marshal(id)
 	if err != nil {{
@@ -852,7 +701,6 @@ func (db *DB) {method}(snap *Snapshot, id {id_go}) ([]{target}, error) {{
                 right_go,
             } => format!(
                 r#"
-// {method} links a left and right record in the junction.
 func (db *DB) {method}(left {left_go}, right {right_go}) error {{
 	lb, err := json.Marshal(left)
 	if err != nil {{
@@ -878,7 +726,6 @@ func (db *DB) {method}(left {left_go}, right {right_go}) error {{
                 right_go,
             } => format!(
                 r#"
-// {method} unlinks a left/right pair. Returns false if the link did not exist.
 func (db *DB) {method}(left {left_go}, right {right_go}) (bool, error) {{
 	lb, err := json.Marshal(left)
 	if err != nil {{
@@ -904,12 +751,7 @@ func (db *DB) {method}(left {left_go}, right {right_go}) (bool, error) {{
         }
     }
 
-    // --- Type mapping ---------------------------------------------------------
-
-    /// The Go type of a model's identity field (`string` for a uuid PK).
     fn go_id_type(schema: &Schema, model: &forgedb_parser::Model) -> String {
-        // #266: an identity that is itself a foreign key resolves through to the
-        // key it ultimately backs onto.
         let Some(ty) = RustGenerator::identity_type(schema, model) else {
             return "string".to_string();
         };
@@ -923,14 +765,9 @@ func (db *DB) {method}(left {left_go}, right {right_go}) (bool, error) {{
         .to_string()
     }
 
-    /// The Go type for a struct field — a pointer for a nullable value type, and
-    /// `json.RawMessage` for any JSON/`char(N)`/fixed-array/virtual-relation field
-    /// (a lossless passthrough that matches whatever serde emits).
     fn go_field_type(schema: &Schema, field: &forgedb_parser::Field) -> String {
         let (base, is_raw) = Self::go_scalar_type(schema, &field.field_type);
         if is_raw {
-            // `json.RawMessage` holds `null` natively, so it already covers the
-            // nullable case (virtual relation collection, char/array).
             "json.RawMessage".to_string()
         } else if field.is_nullable() {
             format!("*{base}")
@@ -939,10 +776,6 @@ func (db *DB) {method}(left {left_go}, right {right_go}) (bool, error) {{
         }
     }
 
-    /// Map a scalar field type to its Go type. The bool is `true` when the field
-    /// must be represented as `json.RawMessage` (JSON value, `char(N)`, fixed
-    /// array, or a virtual relation collection). Enums and inline structs map to
-    /// their generated Go named types.
     fn go_scalar_type(schema: &Schema, ft: &FieldType) -> (String, bool) {
         match ft {
             FieldType::U32 => ("uint32".to_string(), false),
@@ -951,37 +784,23 @@ func (db *DB) {method}(left {left_go}, right {right_go}) (bool, error) {{
             FieldType::I64 => ("int64".to_string(), false),
             FieldType::F64 => ("float64".to_string(), false),
             FieldType::Bool => ("bool".to_string(), false),
-            // #238: an inline `string(N)` is a string on the wire.
             FieldType::String | FieldType::StringN { .. } | FieldType::Uuid => {
                 ("string".to_string(), false)
             }
-            // Timestamp and decimal both serialize as strings.  A row crosses
-            // cgo as opaque JSON bytes and is decoded by `encoding/json`, so
-            // every Go field type here has to be whatever *serde* produces —
-            // and since #254 that is an RFC 3339 string, not a number.
             FieldType::Timestamp(_) => ("string".to_string(), false),
             FieldType::Decimal => ("string".to_string(), false),
-            // An enum serializes as its variant-name string → its generated
-            // `type <Name> string`; an inline struct → its generated Go struct.
             FieldType::Enum(name) => (name.clone(), false),
             FieldType::StructType(name) | FieldType::OptionalStructType(name) => {
                 (name.clone(), false)
             }
-            // #266: an FK is the target's identity value, so it is spelled with
-            // the target key's own Go type.
             FieldType::Relation(
                 RelationType::RequiredReference(_) | RelationType::OptionalReference(_),
             ) => Self::go_scalar_type(schema, &RustGenerator::resolved_type(schema, ft)),
-            // Nullable wraps a scalar; return the inner mapping (the `*` is added
-            // by `go_field_type` via `is_nullable`).
             FieldType::Nullable(inner) => Self::go_scalar_type(schema, inner),
-            // JSON passthrough for everything whose exact shape we don't type.
             _ => ("json.RawMessage".to_string(), true),
         }
     }
 
-    /// Emit a Go named type per declared enum (`type <Name> string` + a const per
-    /// variant), matching the serde variant-name string representation.
     fn enum_types(schema: &Schema) -> String {
         let mut s = String::new();
         for e in &schema.enums {
@@ -997,8 +816,6 @@ func (db *DB) {method}(left {left_go}, right {right_go}) (bool, error) {{
         s
     }
 
-    /// Emit a Go struct per declared inline struct (fixed-size fields only), so a
-    /// struct-typed model field is fully typed rather than `json.RawMessage`.
     fn struct_types(schema: &Schema) -> String {
         let mut s = String::new();
         for st in &schema.structs {
@@ -1020,25 +837,12 @@ func (db *DB) {method}(left {left_go}, right {right_go}) (bool, error) {{
     }
 }
 
-/// The token every C-symbol reference in the *static* Go/C templates below
-/// carries in place of the app's per-app C-symbol prefix (#335 §2, decision 9).
-///
-/// It is deliberately not a legal C or Go identifier fragment: a placeholder
-/// that survives substitution is a **syntax error in the emitted file**, not a
-/// silently-wrong symbol that links against the wrong app.
-/// `test_go_calls_match_ffi_symbols` asserts none survives.
 const SYM_PLACEHOLDER: &str = "%SYM%";
 
-/// Substitute the app's C-symbol prefix into a static template.
-///
-/// The prefix comes from `forgedb::naming::symbol_prefix` — the ONE definition —
-/// and is threaded in from the caller. `go.rs` never derives it, and neither
-/// does `ffi.rs`, which emits the symbols this file calls.
 pub(crate) fn subst(template: &str, symbol_prefix: &str) -> String {
     template.replace(SYM_PLACEHOLDER, symbol_prefix)
 }
 
-/// PascalCase a snake_case identifier (`user_posts` → `UserPosts`).
 fn to_pascal_case(s: &str) -> String {
     s.split('_')
         .filter(|p| !p.is_empty())
@@ -1052,41 +856,20 @@ fn to_pascal_case(s: &str) -> String {
         .collect()
 }
 
-/// The exported Go struct field name for a snake_case schema field.
 fn go_field_name(name: &str) -> String {
     to_pascal_case(name)
 }
 
-/// The generated-file banner + `package`/cgo/imports preamble.
 const FILE_HEADER: &str = r#"// Code generated by ForgeDB. DO NOT EDIT.
-//
-// The ForgeDB Go binding links the generated engine STATICALLY over cgo.
-// `forgedb build` compiles the app's FFI package and delivers its archive here
-// as `libforgedb.a`; `go build` copies the archive's contents into your binary,
-// so the binary depends on nothing inside ForgeDB's build cache — which is a
-// cache, and may be garbage-collected at any time.
-//
-// A dynamic library would NOT survive that: rustc stamps an ABSOLUTE install
-// name into a cdylib, so a Go binary that linked one records the cache path and
-// dies once the cache is cleared.
 package forgedb
 
 /*
-// `-lforgedb` resolves to libforgedb.a in this directory (${SRCDIR}), delivered
-// by `forgedb build`. The per-OS lines below supply what the Rust standard
-// library and the generated engine need at static link time; ONE flag set for
-// both platforms does not link.
 #cgo LDFLAGS: -L${SRCDIR} -lforgedb
 #cgo darwin LDFLAGS: -lc++ -framework CoreFoundation -framework Security
 #cgo linux LDFLAGS: -lm -ldl -lpthread
 #include <stdlib.h>
 #include "forgedb.h"
 
-// The exported Go async-completion callback is defined in forgedb_async.go.
-// This preamble only DECLARES it and wraps registration in a shim — the
-// exported symbol itself must live in a file that has no C definitions, per
-// cgo's //export rule. `forgedbGoRegister` is `static inline`, so it has
-// internal linkage and needs no prefix; everything it names does.
 extern void %SYM%GoCompletion(uint64_t token, int32_t status, uint8_t* payload, size_t payload_len);
 static inline void forgedbGoRegister(void) { %SYM%set_completion_callback(%SYM%GoCompletion); }
 */
@@ -1100,21 +883,11 @@ import (
 	"unsafe"
 )
 
-// The engine this package links is built by ForgeDB, not by `go generate`:
-//
-//	forgedb build     # compiles the app's packages and delivers libforgedb.a here
-//	go build ./...
-//
-// Re-run `forgedb build` after any schema change — the C ABI is tailored per
-// schema, and the archive is linked into your binary at `go build` time.
 
-// Keep the encoding/json import used even for a schema with no id-bearing models.
 var _ = json.RawMessage(nil)
 "#;
 
-/// The schema-invariant Go spine: error/handle types + lifecycle + snapshot.
 const SPINE: &str = r#"
-// Error is a ForgeDB engine error surfaced across the C ABI.
 type Error struct {
 	Code    int
 	Message string
@@ -1124,7 +897,6 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("forgedb error %d: %s", e.Code, e.Message)
 }
 
-// takeError converts a non-nil C ForgeError into a Go error, freeing it.
 func takeError(errp *C.ForgeError) error {
 	if errp == nil {
 		return &Error{Code: 0, Message: "unknown error"}
@@ -1135,8 +907,6 @@ func takeError(errp *C.ForgeError) error {
 	return &Error{Code: code, Message: msg}
 }
 
-// takeBuffer copies an engine-owned (ptr, len) buffer into Go memory and frees
-// it via the engine's free_buffer entry point. A nil pointer yields nil.
 func takeBuffer(ptr *C.uint8_t, length C.size_t) []byte {
 	if ptr == nil {
 		return nil
@@ -1146,8 +916,6 @@ func takeBuffer(ptr *C.uint8_t, length C.size_t) []byte {
 	return b
 }
 
-// bytesPtr views a Go byte slice as a *C.uint8_t for a synchronous C call (the
-// engine reads the bytes before returning, so the borrow never escapes).
 func bytesPtr(b []byte) *C.uint8_t {
 	if len(b) == 0 {
 		return nil
@@ -1155,17 +923,14 @@ func bytesPtr(b []byte) *C.uint8_t {
 	return (*C.uint8_t)(unsafe.Pointer(&b[0]))
 }
 
-// DB is an open ForgeDB database handle (single-writer per process).
 type DB struct {
 	ptr *C.Db
 }
 
-// Snapshot is a cross-model-consistent point-in-time read snapshot.
 type Snapshot struct {
 	ptr *C.Snapshot
 }
 
-// Open opens (or creates) a database rooted at the given directory.
 func Open(root string) (*DB, error) {
 	croot := C.CString(root)
 	defer C.free(unsafe.Pointer(croot))
@@ -1177,7 +942,6 @@ func Open(root string) (*DB, error) {
 	return &DB{ptr: p}, nil
 }
 
-// Close releases the database handle and its single-writer lock.
 func (db *DB) Close() {
 	if db.ptr != nil {
 		C.%SYM%close(db.ptr)
@@ -1185,7 +949,6 @@ func (db *DB) Close() {
 	}
 }
 
-// Commit flushes every column to durable storage (fsync).
 func (db *DB) Commit() error {
 	var e *C.ForgeError
 	if !bool(C.%SYM%commit(db.ptr, &e)) {
@@ -1194,7 +957,6 @@ func (db *DB) Commit() error {
 	return nil
 }
 
-// Checkpoint forces a WAL checkpoint (fsync columns, then truncate the WAL).
 func (db *DB) Checkpoint() error {
 	var e *C.ForgeError
 	if !bool(C.%SYM%checkpoint(db.ptr, &e)) {
@@ -1203,7 +965,6 @@ func (db *DB) Checkpoint() error {
 	return nil
 }
 
-// Compact explicitly reclaims dead row versions.
 func (db *DB) Compact() error {
 	var e *C.ForgeError
 	if !bool(C.%SYM%compact(db.ptr, &e)) {
@@ -1212,7 +973,6 @@ func (db *DB) Compact() error {
 	return nil
 }
 
-// Snapshot captures a cross-model-consistent read snapshot. Free it with Free.
 func (db *DB) Snapshot() (*Snapshot, error) {
 	var e *C.ForgeError
 	p := C.%SYM%snapshot(db.ptr, &e)
@@ -1222,7 +982,6 @@ func (db *DB) Snapshot() (*Snapshot, error) {
 	return &Snapshot{ptr: p}, nil
 }
 
-// Free releases a snapshot captured by Snapshot.
 func (s *Snapshot) Free() {
 	if s.ptr != nil {
 		C.%SYM%snapshot_free(s.ptr)
@@ -1230,13 +989,11 @@ func (s *Snapshot) Free() {
 	}
 }
 
-// Version returns the generated engine's version string.
 func Version() string {
 	return C.GoString(C.%SYM%version())
 }
 "#;
 
-/// The `README.md` scaffold: build order + cgo caveats for the Go binding.
 const README_SCAFFOLD: &str = r#"# ForgeDB Go binding
 
 Generated Go package binding a ForgeDB app database over cgo — schema-tailored
@@ -1287,13 +1044,7 @@ Run `go mod tidy` once to populate `go.sum` before building.
   the engine's worker thread is the handle's sole accessor.
 "#;
 
-/// The `forgedb_arrow.go` preamble: package + cgo + the arrow-go imports.
 const ARROW_FILE_HEADER: &str = r#"// Code generated by ForgeDB. DO NOT EDIT.
-//
-// Arrow columnar export for the Go binding. This file pulls the external module
-// github.com/apache/arrow-go/v18 — run `go mod tidy` before building. It imports
-// the FFI's Arrow C-Data-Interface export (zero-copy where possible) into an
-// arrow.Array.
 package forgedb
 
 /*
@@ -1311,14 +1062,7 @@ import (
 )
 "#;
 
-/// The static `forgedb_async.go`: the exported cgo completion callback. Its
-/// preamble contains ONLY declarations (per cgo's `//export` rule); the registry
-/// + registration shim live in `forgedb.go`.
 const ASYNC_BRIDGE_FILE: &str = r#"// Code generated by ForgeDB. DO NOT EDIT.
-//
-// The async completion bridge for the Go binding. This file is kept separate
-// from forgedb.go because cgo forbids C definitions in the preamble of a file
-// that uses //export.
 package forgedb
 
 /*
@@ -1330,17 +1074,6 @@ import "C"
 
 import "unsafe"
 
-// %SYM%GoCompletion is invoked by the engine's async worker thread when an
-// async op finishes. It copies the (engine-owned) payload, frees it, and hands
-// the result to the waiting goroutine via the token registry in forgedb.go.
-//
-// Its NAME carries the app's prefix like every other C symbol here: cgo's
-// //export makes it an external C symbol, so two ForgeDB Go packages linked
-// into one binary would otherwise collide on it exactly as they would on
-// `open` — and this one is emitted by Go, not by ffi.rs, so the ffi-side
-// prefix alone does not cover it.
-//
-//export %SYM%GoCompletion
 func %SYM%GoCompletion(token C.uint64_t, status C.int32_t, payload *C.uint8_t, payloadLen C.size_t) {
 	var b []byte
 	if payload != nil {
@@ -1351,18 +1084,12 @@ func %SYM%GoCompletion(token C.uint64_t, status C.int32_t, payload *C.uint8_t, p
 }
 "#;
 
-/// The schema-invariant async plumbing: the token→channel registry, the generic
-/// `runAsync` driver over the FFI completion bridge, and one-time callback
-/// registration. The exported completion callback itself lives in the separate
-/// `forgedb_async.go` (cgo forbids C definitions in an `//export` file).
 const ASYNC_SPINE: &str = r#"
-// Result carries the outcome of an async operation delivered on its channel.
 type Result[T any] struct {
 	Value T
 	Err   error
 }
 
-// asyncResult is the raw completion payload handed from the C callback thread.
 type asyncResult struct {
 	status  int
 	payload []byte
@@ -1374,30 +1101,16 @@ var (
 	asyncRegister    sync.Once
 )
 
-// deliverCompletion is called (via the exported callback) on the engine's async
-// worker thread with a finished op's token + result. It hands the payload to the
-// waiting goroutine. Defined here (not in the //export file) so the registry
-// stays in one place.
 func deliverCompletion(token uint64, status int, payload []byte) {
 	if ch, ok := asyncCompletions.LoadAndDelete(token); ok {
 		ch.(chan asyncResult) <- asyncResult{status: status, payload: payload}
 	}
 }
 
-// ensureAsyncRegistered installs the process-wide completion callback exactly
-// once, lazily on the first async op.
 func ensureAsyncRegistered() {
 	asyncRegister.Do(func() { C.forgedbGoRegister() })
 }
 
-// runAsync issues an async op: it reserves a token, enqueues the C call, and
-// returns a channel that yields the decoded result on completion. `call` runs
-// synchronously (the engine reads any arg bytes before returning), so caller
-// buffers never outlive the call.
-//
-// NOTE: async and sync ops must not be used concurrently on the SAME handle —
-// while async ops are outstanding the engine's worker is the handle's sole
-// accessor (the FFI async threading contract).
 func runAsync[T any](call func(token C.uint64_t), decode func([]byte) (T, error)) <-chan Result[T] {
 	ensureAsyncRegistered()
 	out := make(chan Result[T], 1)
@@ -1418,8 +1131,6 @@ func runAsync[T any](call func(token C.uint64_t), decode func([]byte) (T, error)
 	return out
 }
 
-// erroredResult yields a channel that immediately delivers an error (used when
-// argument marshaling fails before an async op is issued).
 func erroredResult[T any](err error) <-chan Result[T] {
 	out := make(chan Result[T], 1)
 	var zero T
@@ -1428,8 +1139,6 @@ func erroredResult[T any](err error) <-chan Result[T] {
 }
 "#;
 
-/// The `forgedb.h` fixed preamble: guard, includes, opaque handle typedefs, and
-/// the schema-invariant spine prototypes.
 pub(crate) const HEADER_PREAMBLE: &str = r#"/* Code generated by ForgeDB. DO NOT EDIT. */
 #ifndef FORGEDB_H
 #define FORGEDB_H
@@ -1442,7 +1151,6 @@ typedef struct Db Db;
 typedef struct ForgeError ForgeError;
 typedef struct Snapshot Snapshot;
 
-/* --- lifecycle + error spine (schema-invariant) --- */
 const char* %SYM%version(void);
 Db* %SYM%open(const char* root, uint32_t flags, ForgeError** err_out);
 void %SYM%close(Db* db);
@@ -1456,11 +1164,9 @@ void %SYM%free_buffer(uint8_t* ptr, size_t len);
 Snapshot* %SYM%snapshot(Db* db, ForgeError** err_out);
 void %SYM%snapshot_free(Snapshot* snap);
 
-/* --- async completion bridge (schema-invariant) --- */
 typedef void (*ForgeCompletion)(uint64_t token, int32_t status, uint8_t* payload, size_t payload_len);
 void %SYM%set_completion_callback(ForgeCompletion cb);
 
-/* --- Arrow C Data Interface (abi.h layout; matches arrow-go's cdata) --- */
 struct ArrowSchema {
   const char* format;
   const char* name;

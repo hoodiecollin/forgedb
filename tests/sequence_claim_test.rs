@@ -1,49 +1,7 @@
-//! Multi-process proof for #260: a **bare** integer auto — neither the model's
-//! identity nor `&unique` — is conflict-visible through its own write-set class.
-//!
-//! # Why this is a separate file from `auto_increment_coordinated_test`
-//!
-//! That file pins #187 decision 6: an integer auto that *is* the identity is safe
-//! because its row key (`b"r"`) already enters the write-set. This file pins the
-//! shape decision 6 **refused** — `seq: +u64` beside a `+uuid` identity — which is
-//! safe only because #260 adds a third class:
-//!
-//! ```text
-//! b"s" ++ model ++ field ++ value
-//! ```
-//!
-//! Same mechanism, different key. Keeping them apart means a regression in one
-//! cannot be masked by the other still passing.
-//!
-//! # The two scenarios, and why the second one exists
-//!
-//! **Phase 1 — distinctness.** Two processes allocate concurrently; every committed
-//! `seq` must be globally distinct. This is the correctness claim.
-//!
-//! **Phase 2 — convergence.** A claim key makes a collision *detected*, but detection
-//! alone does not make the retry *terminate*. `CoordinatorClient::last_known_lsn`
-//! advances only on a client's own `Ack`, so a `Nack` does not trip the peer-refresh
-//! gate, and a naive retry merely re-runs the closure — walking the counter forward
-//! one value per attempt. A writer 60 values behind would need 60 retries.
-//!
-//! So phase 2 gives the lagging writer a retry budget of **3** against a **60**-value
-//! gap. Brute force cannot pass it; only fast-forwarding off the `Nack`ed key can.
-//! The assertion is deliberately on the retry *budget* rather than on the committed
-//! value, because a generous budget converges either way and would prove nothing.
-//!
-//! Compiles a generated crate and spawns processes, so it is `#[ignore]`d out of the
-//! fast default suite:
-//!
-//! ```bash
-//! make auto-increment-test
-//! ```
-
 #![cfg(unix)]
 
 mod common;
 
-/// The shape #187 refused: an integer auto that is neither the identity nor unique.
-/// If this schema stops parsing, the #260 parser relaxation has regressed.
 const SCHEMA: &str = r#"
 Ticket {
   id: +uuid

@@ -1,54 +1,3 @@
-//! PyO3 language-binding generator (#51) — the ergonomic Python wrapper over the
-//! SAME generated `database.rs`, a sibling of the native FFI spine (`ffi.rs`) and
-//! the wasm replica (`wasm.rs`).
-//!
-//! It emits a per-schema `#[pyclass]` surface: one row class per identity model
-//! (native marshalling through the generated struct's own serde contract via
-//! `pythonize` — the same single source of truth the WAL / broker / FFI use, so
-//! there is no second per-field matrix to drift) plus a `ForgeDb` class whose
-//! methods mirror the generated `Database` CRUD **1:1**, calling the integrity
-//! wrappers (`create_<m>`/`update_<m>`/`delete_<m>`) and storage reads by name.
-//!
-//! **Typed field getters (Phase 5b follow-up).** Each `#[pyclass]` already has a
-//! `#[getter]` per stored field.  This release makes those getters return native
-//! Python-typed values rather than `Bound<'py, PyAny>` wherever a clean Rust↔Python
-//! type mapping exists:
-//!
-//! | `.forge` type            | Getter return type  | Notes                               |
-//! |--------------------------|---------------------|-------------------------------------|
-//! | `u32`                    | `u32`               | Python `int`                        |
-//! | `u64`                    | `u64`               | Python `int`                        |
-//! | `i32`                    | `i32`               | Python `int`                        |
-//! | `i64`                    | `i64`               | Python `int`                        |
-//! | `f64`                    | `f64`               | Python `float`                      |
-//! | `bool`                   | `bool`              | Python `bool`                       |
-//! | `string`                 | `String`            | Python `str`                        |
-//! | `uuid`                   | `String`            | Hyphenated UUID string              |
-//! | `timestamp`              | `String`            | RFC 3339 (#254), matching serde     |
-//! | `decimal`                | `String`            | Decimal string (serde-with-str)     |
-//! | `enum(X)`                | `String`            | Variant-name string (serde default) |
-//! | `*Target` (req. FK)      | the target's own    | Resolved through the key's arm (#266) |
-//! | `?Target` (opt. FK)      | `Option<…>`         | Same, wrapped                       |
-//! | Nullable(T)              | `Option<inner>`     | None when absent                    |
-//! | everything else          | `Bound<'py, PyAny>` | pythonize (no single-type mapping)  |
-//!
-//! The last row is a **wildcard, not a list** — `json`, `bytes(N)`, an inline
-//! struct, a fixed array and a **component ref** all reach it. That matters
-//! because the signature has to bind the `'py` the return type names, and the
-//! predicate deciding it used to be a hand-written enumeration of the types
-//! believed to land there. `FieldType::Component` was missing from it, so every
-//! schema with a component ref emitted nine hard errors. It is derived from the
-//! return type now (`returns_py_bound`), so it cannot drift from the wildcard.
-//!
-//! The `to_dict` / `__repr__` / `__init__` paths are unchanged (still use
-//! `pythonize`/`depythonize`), so existing callers that relied on the dict API
-//! remain unaffected.
-//!
-//! Identity: every schema-specific surface is generated per-model (constraint 2);
-//! there is **no** generic `query`/`filter`/`predicate` entry point and no
-//! `match model` dispatch (constraint 1). The row types and methods are named
-//! from the schema, which IS the tailoring.
-
 use crate::{GeneratedCode, Result};
 use forgedb_parser::Schema;
 use proc_macro2::TokenStream;
@@ -56,9 +5,6 @@ use quote::{format_ident, quote};
 
 use crate::rust::RustGenerator;
 
-/// The stub annotation for a schema field type. Deliberately coarse: a `.pyi`
-/// that over-promises is worse than one that says `Any`, because a type checker
-/// then rejects code the runtime accepts.
 fn py_stub_type(field_type: &forgedb_parser::FieldType) -> &'static str {
     use forgedb_parser::FieldType;
     match field_type {
@@ -79,41 +25,14 @@ fn py_stub_type(field_type: &forgedb_parser::FieldType) -> &'static str {
 pub struct PyO3Generator;
 
 impl PyO3Generator {
-    /// The stem of the delivered extension module, and therefore the name of the
-    /// `#[pymodule]` function — **one definition, read by both**.
-    ///
-    /// CPython resolves `PyInit_<stem>` from the delivered FILENAME, so a native
-    /// module and a Python module cannot both be called `forgedb` in one
-    /// directory. The extension takes the private name; the generated
-    /// `forgedb.py` beside it does the importing, so the user's `import forgedb`
-    /// is unchanged.
-    ///
-    /// This reverses nothing #335 decided. #335 refused to rename the
-    /// `#[pymodule]` *to the derived cargo package name*, which breaks the import
-    /// for no gain. Renaming it to introduce an executable shim is a different
-    /// act with a different payoff, and the delivered filename moves with it.
     pub const EXTENSION_STEM: &str = "_forgedb_native";
 
-    /// The suffix the delivered extension carries.
-    ///
-    /// `.abi3.so` on both supported hosts: the crate is built `abi3-py38`, and
-    /// `.abi3.so` is in `importlib.machinery.EXTENSION_SUFFIXES` on macOS as well
-    /// as on Linux. Cargo writes `lib<pkg>.dylib` / `lib<pkg>.so`, so the
-    /// delivered name is always a RENAME — CPython will not import a `.dylib`.
     pub const EXTENSION_SUFFIX: &str = ".abi3.so";
 
-    /// The delivered filename of the extension module.
-    ///
-    /// **Composed, never spelled out.** A literal `"_forgedb_native.abi3.so"`
-    /// beside [`Self::EXTENSION_STEM`] is a second spelling of the stem, and the
-    /// two coming apart is exactly the `PyInit_<stem>` mismatch this constant
-    /// exists to prevent — invisible to `cargo build`, to `cargo check` and to
-    /// every snapshot, surfacing only at `import`.
     pub fn extension_file() -> String {
         format!("{}{}", Self::EXTENSION_STEM, Self::EXTENSION_SUFFIX)
     }
 
-    /// Generate the PyO3 wrapper (`pyo3/src/lib.rs`) for a schema.
     pub fn generate(schema: &Schema) -> Result<GeneratedCode> {
         let row_classes = Self::generate_row_classes(schema);
         let db_methods = Self::generate_db_methods(schema);
@@ -125,24 +44,8 @@ impl PyO3Generator {
         let stem_ident = format_ident!("{}", Self::EXTENSION_STEM);
 
         let tokens = quote! {
-            //! Generated by ForgeDB — Python binding (PyO3, #51).
-            //! DO NOT EDIT - This file is auto-generated.
-            //!
-            //! Class-2 transport glue: the ergonomic Python surface over the
-            //! generated `Database`. One `#[pyclass]` per identity model + a
-            //! `ForgeDb` whose methods mirror the generated CRUD 1:1. The tailored
-            //! data logic lives in the generated `database.rs`; this file binds it.
-            //! It invents no query API (the identity red line).
             #![allow(warnings)]
 
-            // #335 §1: the one generated database for this app is the sibling
-            // `core` package, linked as an ordinary rlib. It used to be a
-            // `mod database;` compiled from a COPY of `database.rs` dropped
-            // beside this file — the copy is what let one `generate` run ship
-            // two databases with different durability semantics.
-            //
-            // The dependency is renamed to `forgedb_core` by the MANIFEST, so no
-            // generated byte in this file carries this app's package name.
             use forgedb_core as database;
 
             use pyo3::prelude::*;
@@ -153,14 +56,6 @@ impl PyO3Generator {
             use std::ptr;
 
             use database::Database;
-            // Names the primary-key type of UUID-keyed models (`id_type_tokens`
-            // emits a bare `Uuid`); integer-PK models use std types.
-            //
-            // Reached THROUGH `core`'s `pub use forgedb_types;` re-export rather
-            // than through a pin of this crate's own (#335 §1): this crate pins
-            // ZERO substrate, so its `Uuid` is the same type as the database's
-            // by construction, instead of only when one lockfile happens to
-            // resolve two independently-authored pin lists identically.
             use forgedb_core::forgedb_types::Uuid;
 
             pyo3::create_exception!(
@@ -170,15 +65,10 @@ impl PyO3Generator {
                 "Raised on any ForgeDB engine or validation error."
             );
 
-            /// Map any engine error (`ValidationError`, `io::Error`, …) to the
-            /// Python-visible `ForgeDbError`.
             fn to_py_err<E: std::fmt::Display>(e: E) -> PyErr {
                 ForgeDbError::new_err(e.to_string())
             }
 
-            /// Convert a caught panic payload into a `ForgeDbError` so an engine
-            /// panic (e.g. the single-writer `DirLock`) never unwinds into the
-            /// interpreter as a raw abort.
             fn panic_to_py_err(payload: Box<dyn std::any::Any + Send>) -> PyErr {
                 let msg = payload
                     .downcast_ref::<&str>()
@@ -192,8 +82,6 @@ impl PyO3Generator {
 
             #arrow_spine
 
-            /// A ForgeDB database handle — one single-writer process over a data
-            /// directory. Methods mirror the generated `Database` surface 1:1.
             #[pyclass]
             pub struct ForgeDb {
                 inner: Database,
@@ -201,8 +89,6 @@ impl PyO3Generator {
 
             #[pymethods]
             impl ForgeDb {
-                /// Open (or create) the database at `root`. Holds the single-writer
-                /// lock; a second writer raises `ForgeDbError` rather than aborting.
                 #[staticmethod]
                 fn open(root: String) -> PyResult<Self> {
                     let root = std::path::PathBuf::from(root);
@@ -212,7 +98,6 @@ impl PyO3Generator {
                     }
                 }
 
-                /// Flush every column to disk (fsync on native).
                 fn commit(&mut self) -> PyResult<()> {
                     match catch_unwind(AssertUnwindSafe(|| self.inner.commit())) {
                         Ok(r) => r.map_err(to_py_err),
@@ -220,7 +105,6 @@ impl PyO3Generator {
                     }
                 }
 
-                /// Force a WAL checkpoint (fsync columns, then truncate the WAL).
                 fn checkpoint(&mut self) -> PyResult<()> {
                     match catch_unwind(AssertUnwindSafe(|| self.inner.checkpoint())) {
                         Ok(()) => Ok(()),
@@ -228,8 +112,6 @@ impl PyO3Generator {
                     }
                 }
 
-                /// Reclaim dead (superseded/tombstoned) row versions in-process.
-                /// Explicit only — never reached from a read path (constraint 4).
                 fn compact(&mut self) -> PyResult<()> {
                     match catch_unwind(AssertUnwindSafe(|| self.inner.compact())) {
                         Ok(()) => Ok(()),
@@ -244,26 +126,8 @@ impl PyO3Generator {
                 #(#arrow_methods)*
             }
 
-            // #337: the source fingerprint of this package, written beside this
-            // file by `forgedb generate` and excluded from its own hash input by
-            // name. `forgedb.py` compares the value it was written with against
-            // this one at `import` time.
             mod fingerprint;
 
-            /// The generated Python module — registers the row classes, `ForgeDb`,
-            /// and `ForgeDbError`.
-            ///
-            /// **The function name IS `PyInit_<name>`, and CPython resolves that
-            /// symbol from the DELIVERED FILENAME.** So this name and the delivered
-            /// stem are one decision, made once, in
-            /// `PyO3Generator::EXTENSION_STEM` — get them out of step and the
-            /// failure is `dynamic module does not define module export function`
-            /// at import, invisible to `cargo build`, to `cargo check` and to every
-            /// snapshot.
-            ///
-            /// The user still writes `import forgedb`: the generated `forgedb.py`
-            /// beside this extension imports it, checks the fingerprint, and
-            /// re-exports.
             #[pymodule]
             fn #stem_ident(m: &Bound<'_, PyModule>) -> PyResult<()> {
                 m.add_class::<ForgeDb>()?;
@@ -288,8 +152,6 @@ impl PyO3Generator {
         })
     }
 
-    /// The identity models a binding surface is generated for — those with an
-    /// `id` field or an auto-generated PK (same filter as the FFI spine).
     fn identity_models(schema: &Schema) -> impl Iterator<Item = &forgedb_parser::Model> {
         schema
             .models
@@ -297,45 +159,16 @@ impl PyO3Generator {
             .filter(|m| m.has_identity())
     }
 
-    /// Does this getter's return type mention the `'py` lifetime?
-    ///
-    /// **Derived from the return type, never from a second list of field types**
-    /// (#335 step 5b). It used to be a hand-written `matches!` enumerating the
-    /// variants believed to reach [`Self::pyo3_getter`]'s pythonize fallback, and
-    /// that list has to agree with the fallback's `_` arm — which is a wildcard,
-    /// so it silently grows every time [`forgedb_parser::FieldType`] does.
-    ///
-    /// It had already drifted: `FieldType::Component` reaches the fallback, was
-    /// absent from the list, and every schema with a component ref therefore
-    /// emitted `fn field(&self) -> PyResult<Bound<'py, PyAny>>` — a getter with
-    /// an undeclared lifetime and no `py` in scope. Nine hard errors per field,
-    /// invisible to a snapshot diff and invisible to CI, whose schema has no
-    /// component ref. `Nullable(FixedArray(..))` was the same hole one variant
-    /// over.
-    ///
-    /// The invariant is not "these types pythonize"; it is "the signature must
-    /// bind whatever lifetime the return type names". Asking the return type is
-    /// that invariant, and it cannot drift from the wildcard.
     fn returns_py_bound(ret_ty: &TokenStream) -> bool {
         ret_ty.to_string().contains("'py")
     }
 
-    /// The PyO3 getter return type and body for a given `.forge` field type.
-    ///
-    /// Returns `(return_type_tokens, body_tokens)` where `body_tokens` is the
-    /// expression returned from `fn #fname(&self, py: Python<'py>) -> PyResult<...>`.
-    /// For types with a clean Rust↔Python mapping (primitives, string, uuid,
-    /// timestamp, decimal, enum, FK scalars, nullable variants) we return a concrete
-    /// type so PyO3 emits typed Python stubs.  For types without a natural single
-    /// Python type (`json`, `char(N)`, inline `struct`) we fall back to pythonize
-    /// and return `Bound<'py, PyAny>`.
-    fn pyo3_getter(schema: &Schema, 
+    fn pyo3_getter(schema: &Schema,
         field_type: &forgedb_parser::FieldType,
         field_name: &proc_macro2::Ident,
     ) -> (TokenStream, TokenStream) {
         use forgedb_parser::{FieldType, RelationType};
         match field_type {
-            // Primitives — returned as native Rust types; PyO3 converts to Python int/float/bool.
             FieldType::U32 => (
                 quote! { u32 },
                 quote! { Ok(self.inner.#field_name) },
@@ -361,33 +194,26 @@ impl PyO3Generator {
                 quote! { Ok(self.inner.#field_name) },
             ),
 
-            // String — clone; Python `str`. `string(N)` too (#238): it is a
-            // `String` in the generated record.
             FieldType::String | FieldType::StringN { .. } => (
                 quote! { String },
                 quote! { Ok(self.inner.#field_name.clone()) },
             ),
 
-            // uuid → hyphenated string (matches serde and the REST wire shape).
             FieldType::Uuid => (
                 quote! { String },
                 quote! { Ok(self.inner.#field_name.to_string()) },
             ),
 
-            // timestamp → its RFC 3339 rendering (#254), matching serde exactly
-            // as every other mapping in this table does.
             FieldType::Timestamp(_) => (
                 quote! { String },
                 quote! { Ok(self.inner.#field_name.to_string()) },
             ),
 
-            // decimal → string (serde-with-str produces a decimal string).
             FieldType::Decimal => (
                 quote! { String },
                 quote! { Ok(self.inner.#field_name.to_string()) },
             ),
 
-            // enum → variant-name string (serde default serialization).
             FieldType::Enum(_) => (
                 quote! { String },
                 quote! {
@@ -397,22 +223,15 @@ impl PyO3Generator {
                 },
             ),
 
-            // #266: an FK surfaces with the SAME Python type as the target's
-            // own `id` — resolved through the target key's own arm rather than
-            // hardcoded to the uuid form.
             FieldType::Relation(
                 RelationType::RequiredReference(_) | RelationType::OptionalReference(_),
             ) => Self::pyo3_getter(schema, &RustGenerator::resolved_type(schema, field_type), field_name),
 
-            // Nullable(inner) — recurse; the outer getter wraps in Option.
             FieldType::Nullable(inner) => {
                 let (inner_ret, inner_body) = Self::pyo3_nullable_getter(inner, field_name);
                 (inner_ret, inner_body)
             }
 
-            // Complex types: json, char(N), inline struct — fall back to pythonize.
-            // These have no single clean Python type; the Bound<'py, PyAny> from
-            // pythonize is the correct ergonomic choice.
             _ => (
                 quote! { Bound<'py, PyAny> },
                 quote! { pythonize::pythonize(py, &self.inner.#field_name).map_err(to_py_err) },
@@ -420,7 +239,6 @@ impl PyO3Generator {
         }
     }
 
-    /// Typed getter for a nullable field; `self.inner.#field_name` is `Option<T>`.
     fn pyo3_nullable_getter(
         inner: &forgedb_parser::FieldType,
         field_name: &proc_macro2::Ident,
@@ -477,7 +295,6 @@ impl PyO3Generator {
                         .transpose()
                 },
             ),
-            // Fallback for nullable complex types.
             _ => (
                 quote! { Bound<'py, PyAny> },
                 quote! { pythonize::pythonize(py, &self.inner.#field_name).map_err(to_py_err) },
@@ -485,14 +302,6 @@ impl PyO3Generator {
         }
     }
 
-    /// One `#[pyclass]` per identity model: a newtype over the generated struct
-    /// with a dict/mapping `__init__`, `to_dict`, `__repr__`, and per-field
-    /// typed getters. Virtual relation collections (`OneToMany`/`ManyToMany`)
-    /// carry no data and are excluded.
-    ///
-    /// Getter return types are concrete Python-typed values wherever a clean
-    /// mapping exists (see `pyo3_getter`); complex types fall back to pythonize
-    /// and return `Bound<'py, PyAny>`.
     fn generate_row_classes(schema: &Schema) -> Vec<TokenStream> {
         Self::identity_models(schema)
             .map(|model| {
@@ -500,19 +309,16 @@ impl PyO3Generator {
                 let py_ident = format_ident!("Py{}", model.name);
                 let name_str = model.name.as_str();
 
-                // Per-field typed getters. Virtual relation collections are skipped.
                 let getters: Vec<TokenStream> = model
                     .fields
                     .iter()
                     .filter(|f| !Self::is_virtual_relation(&f.field_type))
                     .map(|f| {
                         let fname = format_ident!("{}", f.name);
-                        let doc = format!("The `{}` field.", f.name);
                         let (ret_ty, body) = Self::pyo3_getter(schema, &f.field_type, &fname);
                         let needs_py_lifetime = Self::returns_py_bound(&ret_ty);
                         if needs_py_lifetime {
                             quote! {
-                                #[doc = #doc]
                                 #[getter]
                                 fn #fname<'py>(&self, py: Python<'py>) -> PyResult<#ret_ty> {
                                     #body
@@ -520,7 +326,6 @@ impl PyO3Generator {
                             }
                         } else {
                             quote! {
-                                #[doc = #doc]
                                 #[getter]
                                 fn #fname(&self) -> PyResult<#ret_ty> {
                                     #body
@@ -530,14 +335,8 @@ impl PyO3Generator {
                     })
                     .collect();
 
-                let new_doc = format!(
-                    "Construct a `{}` from a Python mapping (dict) matching the schema fields.",
-                    model.name
-                );
-                let dict_doc = format!("Return this `{}` as a native Python dict.", model.name);
 
                 quote! {
-                    #[doc = #new_doc]
                     #[pyclass(name = #name_str)]
                     #[derive(Clone)]
                     pub struct #py_ident {
@@ -553,7 +352,6 @@ impl PyO3Generator {
                             Ok(Self { inner })
                         }
 
-                        #[doc = #dict_doc]
                         fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
                             pythonize::pythonize(py, &self.inner).map_err(to_py_err)
                         }
@@ -575,8 +373,6 @@ impl PyO3Generator {
             .collect()
     }
 
-    /// The per-model CRUD methods on `ForgeDb`, mirroring the generated `Database`
-    /// integrity wrappers + storage reads 1:1.
     fn generate_db_methods(schema: &Schema) -> Vec<TokenStream> {
         Self::identity_models(schema)
             .map(|model| {
@@ -597,25 +393,8 @@ impl PyO3Generator {
                 let update_m = format_ident!("update_{}", snake);
                 let delete_m = format_ident!("delete_{}", snake);
 
-                let create_doc = format!(
-                    "Insert a `{}` (FK-checked + validated); returns the new id.",
-                    model.name
-                );
-                let get_doc =
-                    format!("Fetch a `{}` by id, or `None` if absent.", model.name);
-                let all_doc = format!("Every live `{}`.", model.name);
-                let count_doc = format!("Live `{}` row count.", model.name);
-                let update_doc = format!(
-                    "Update a `{}` by id; `True` if present, `False` if absent.",
-                    model.name
-                );
-                let delete_doc = format!(
-                    "Delete a `{}` by id (referential integrity enforced); `True`/`False`.",
-                    model.name
-                );
 
                 quote! {
-                    #[doc = #create_doc]
                     fn #create_m<'py>(
                         &mut self,
                         record: &Bound<'py, PyAny>,
@@ -630,7 +409,6 @@ impl PyO3Generator {
                         pythonize::pythonize(py, &id).map_err(to_py_err)
                     }
 
-                    #[doc = #get_doc]
                     fn #get_m(&self, id: &Bound<'_, PyAny>) -> PyResult<Option<#py_ident>> {
                         let id: #id_ty = pythonize::depythonize(id).map_err(to_py_err)?;
                         match catch_unwind(AssertUnwindSafe(|| self.inner.#storage.get(id))) {
@@ -639,7 +417,6 @@ impl PyO3Generator {
                         }
                     }
 
-                    #[doc = #all_doc]
                     fn #all_m(&self) -> PyResult<Vec<#py_ident>> {
                         match catch_unwind(AssertUnwindSafe(|| self.inner.#storage.all())) {
                             Ok(rows) => Ok(rows.into_iter().map(#py_ident::from_record).collect()),
@@ -647,7 +424,6 @@ impl PyO3Generator {
                         }
                     }
 
-                    #[doc = #count_doc]
                     fn #count_m(&self) -> PyResult<usize> {
                         match catch_unwind(AssertUnwindSafe(|| self.inner.#storage.row_count())) {
                             Ok(n) => Ok(n),
@@ -655,7 +431,6 @@ impl PyO3Generator {
                         }
                     }
 
-                    #[doc = #update_doc]
                     fn #update_m(
                         &mut self,
                         id: &Bound<'_, PyAny>,
@@ -670,7 +445,6 @@ impl PyO3Generator {
                         }
                     }
 
-                    #[doc = #delete_doc]
                     fn #delete_m(&mut self, id: &Bound<'_, PyAny>) -> PyResult<bool> {
                         let id: #id_ty = pythonize::depythonize(id).map_err(to_py_err)?;
                         match catch_unwind(AssertUnwindSafe(|| self.inner.#delete_fn(id))) {
@@ -683,45 +457,17 @@ impl PyO3Generator {
             .collect()
     }
 
-    /// Whether a model has a materialized identity (an `id` field or an
-    /// auto-generated PK) — hence a generated row class (`Py<Model>`) and an
-    /// id-addressable storage read. A traversal that would return / start from a
-    /// model without one is skipped (there is no row class to marshal into).
     fn is_identity_model(model: &forgedb_parser::Model) -> bool {
         model.has_identity()
     }
 
-    /// The relation-traversal methods on `ForgeDb`, mirroring the generated
-    /// `Database` traversal getters **one-for-one** — same names, derived from the
-    /// same schema in the same order, sharing a `seen` dedup set that tracks
-    /// `RustGenerator::generate_traversal_impl` exactly (so a method is never
-    /// emitted for a getter that was deduped away). Three families, all id-keyed
-    /// (a fixed generated edge walk, never a runtime predicate):
-    ///   * **Forward FK** `<model>_<field>(id) -> Option<Py<Target>>` — fetch the
-    ///     source by id, resolve the `*Target`/`?Target` FK (flattened: `None` if
-    ///     the source is absent OR the FK is unset);
-    ///   * **Reverse 1:M** `<parent>_<field>[_by_<child_field>](id) -> [Py<Child>]`
-    ///     — every child whose FK references the (UUID) parent id;
-    ///   * **M2M** `link_<a>_<b>(l, r)` / `unlink_<a>_<b>(l, r) -> bool` + the
-    ///     query getters `<a>_<field1>(id) -> [Py<B>]` / `<b>_<field2>(id) ->
-    ///     [Py<A>]`.
-    ///
-    /// Rows marshal through the generated Py row classes (`Py<Model>::from_record`);
-    /// a traversal to/from a **non-identity** model (no row class) is skipped — an
-    /// honest limit, not a drift (the `seen` slot is still consumed so ordering is
-    /// unchanged). The one snapshot-scoped M2M `_at` traversal is deferred (there
-    /// is no `Snapshot` class on the ergonomic wrapper yet). Identity: no generic
-    /// query surface — each getter is a fixed, generated edge walk by name.
     fn generate_relation_methods(schema: &Schema) -> Vec<TokenStream> {
         use forgedb_parser::{FieldType, RelationType};
         use std::collections::{HashMap, HashSet};
 
         let mut methods = Vec::new();
-        // ONE `seen` set spanning all three families, inserted in the SAME order as
-        // `generate_traversal_impl`, so first-occurrence-wins agrees exactly.
         let mut seen: HashSet<String> = HashSet::new();
 
-        // --- A. Forward FK getters (`*Target` / `?Target`) --------------------
         for model in &schema.models {
             let model_snake = RustGenerator::to_snake_case(&model.name);
             let model_has_id = Self::is_identity_model(model);
@@ -740,20 +486,12 @@ impl PyO3Generator {
                 if !seen.insert(method_name.clone()) {
                     continue;
                 }
-                // Needs the source id-addressable (to `get` it) and the target to
-                // have a row class (identity). Either missing → skip emission; the
-                // `seen` slot is already consumed, matching the impl's ordering.
                 if !model_has_id || !Self::is_identity_model(target) {
                     continue;
                 }
                 let method_ident = format_ident!("{}", method_name);
                 let py_target = format_ident!("Py{}", target.name);
-                let doc = format!(
-                    "Resolve the `{}` foreign key of a `{}` (by id) to its record, or `None`.",
-                    field.name, model.name
-                );
                 methods.push(quote! {
-                    #[doc = #doc]
                     fn #method_ident(&self, id: &Bound<'_, PyAny>) -> PyResult<Option<#py_target>> {
                         let id: #source_id_ty = pythonize::depythonize(id).map_err(to_py_err)?;
                         match catch_unwind(AssertUnwindSafe(|| {
@@ -767,7 +505,6 @@ impl PyO3Generator {
             }
         }
 
-        // --- B. Reverse one-to-many collection getters ------------------------
         let pairs = schema.detect_relations();
         let mut group_counts: HashMap<(String, String), usize> = HashMap::new();
         for p in &pairs {
@@ -795,7 +532,6 @@ impl PyO3Generator {
             if !seen.insert(method_name.clone()) {
                 continue;
             }
-            // The child needs a row class to marshal into (identity).
             let Some(child) = schema.find_model(&p.child_model) else {
                 continue;
             };
@@ -804,14 +540,8 @@ impl PyO3Generator {
             }
             let method_ident = format_ident!("{}", method_name);
             let py_child = format_ident!("Py{}", child.name);
-            // #266: the id arrives as the PARENT's own key type.
             let parent_id_ty = RustGenerator::id_type_tokens(schema, parent);
-            let doc = format!(
-                "All `{}` whose `{}` references the given `{}` id.",
-                p.child_model, p.child_field, p.parent_model
-            );
             methods.push(quote! {
-                #[doc = #doc]
                 fn #method_ident(&self, id: &Bound<'_, PyAny>) -> PyResult<Vec<#py_child>> {
                     let id: #parent_id_ty = pythonize::depythonize(id).map_err(to_py_err)?;
                     match catch_unwind(AssertUnwindSafe(|| self.inner.#method_ident(id))) {
@@ -822,22 +552,17 @@ impl PyO3Generator {
             });
         }
 
-        // --- C. Many-to-many link / unlink + query getters --------------------
         for m in RustGenerator::valid_m2m(schema) {
             let snake1 = RustGenerator::to_snake_case(&m.model1);
             let snake2 = RustGenerator::to_snake_case(&m.model2);
-            // #266: each junction endpoint decodes as its OWN identity type.
             let (lk, rk) = RustGenerator::junction_key_idents(schema, &m);
             let model1 = schema.find_model(&m.model1);
             let model2 = schema.find_model(&m.model2);
 
-            // link_<a>_<b> — no row class needed (UUID ids in, unit out).
             let link_name = format!("link_{snake1}_{snake2}");
             if seen.insert(link_name.clone()) {
                 let link_ident = format_ident!("{}", link_name);
-                let doc = format!("Link a `{}` (left) and a `{}` (right) in the junction.", m.model1, m.model2);
                 methods.push(quote! {
-                    #[doc = #doc]
                     fn #link_ident(&mut self, left: &Bound<'_, PyAny>, right: &Bound<'_, PyAny>) -> PyResult<()> {
                         let left: #lk = pythonize::depythonize(left).map_err(to_py_err)?;
                         let right: #rk = pythonize::depythonize(right).map_err(to_py_err)?;
@@ -849,13 +574,10 @@ impl PyO3Generator {
                 });
             }
 
-            // unlink_<a>_<b> — no row class needed (UUID ids in, bool out).
             let unlink_name = format!("unlink_{snake1}_{snake2}");
             if seen.insert(unlink_name.clone()) {
                 let unlink_ident = format_ident!("{}", unlink_name);
-                let doc = format!("Unlink a `{}` (left) / `{}` (right); `True` if a pair was removed.", m.model1, m.model2);
                 methods.push(quote! {
-                    #[doc = #doc]
                     fn #unlink_ident(&mut self, left: &Bound<'_, PyAny>, right: &Bound<'_, PyAny>) -> PyResult<bool> {
                         let left: #lk = pythonize::depythonize(left).map_err(to_py_err)?;
                         let right: #rk = pythonize::depythonize(right).map_err(to_py_err)?;
@@ -867,16 +589,13 @@ impl PyO3Generator {
                 });
             }
 
-            // model1.field1 -> Vec<model2>  (forward M2M query)
             let fwd_name = format!("{snake1}_{}", m.field1);
             if seen.insert(fwd_name.clone()) {
                 if let Some(model2) = model2 {
                     if Self::is_identity_model(model2) {
                         let fwd_ident = format_ident!("{}", fwd_name);
                         let py_b = format_ident!("Py{}", model2.name);
-                        let doc = format!("All linked `{}` for the given `{}` id.", m.model2, m.model1);
                         methods.push(quote! {
-                            #[doc = #doc]
                             fn #fwd_ident(&self, id: &Bound<'_, PyAny>) -> PyResult<Vec<#py_b>> {
                                 let id: #lk = pythonize::depythonize(id).map_err(to_py_err)?;
                                 match catch_unwind(AssertUnwindSafe(|| self.inner.#fwd_ident(id))) {
@@ -889,16 +608,13 @@ impl PyO3Generator {
                 }
             }
 
-            // model2.field2 -> Vec<model1>  (reverse M2M query)
             let rev_name = format!("{snake2}_{}", m.field2);
             if seen.insert(rev_name.clone()) {
                 if let Some(model1) = model1 {
                     if Self::is_identity_model(model1) {
                         let rev_ident = format_ident!("{}", rev_name);
                         let py_a = format_ident!("Py{}", model1.name);
-                        let doc = format!("All linked `{}` for the given `{}` id.", m.model1, m.model2);
                         methods.push(quote! {
-                            #[doc = #doc]
                             fn #rev_ident(&self, id: &Bound<'_, PyAny>) -> PyResult<Vec<#py_a>> {
                                 let id: #rk = pythonize::depythonize(id).map_err(to_py_err)?;
                                 match catch_unwind(AssertUnwindSafe(|| self.inner.#rev_ident(id))) {
@@ -915,26 +631,11 @@ impl PyO3Generator {
         methods
     }
 
-    /// The Arrow columnar-export spine — the zero-copy selling point (#51). A
-    /// schema-invariant `ArrowColumn` `#[pyclass]` that implements the Arrow
-    /// **PyCapsule interface** (`__arrow_c_array__`), so `pyarrow.array(col)`
-    /// imports a whole live column **zero-copy** (an `mmap` alias of the on-disk
-    /// column when the live rows are a dense prefix, a gathered copy otherwise —
-    /// transparent, via `core`'s re-exported `forgedb_storage::ColumnExport`).
-    /// Emitted only when the schema has at least one Arrow-exportable column
-    /// (else an empty stream, so no unused `#[pyclass]` is generated).
-    ///
-    /// Identity clean: `ArrowColumn` holds an opaque `ColumnExport` + a fixed Arrow
-    /// format string chosen by the schema at codegen time; it reads no field/type
-    /// at runtime and exposes no query surface. The C Data Interface structs mirror
-    /// the FFI Arrow spine verbatim; the capsule destructor honors the Arrow
-    /// release protocol (release-if-not-consumed, no-op after a consumer moved it).
     fn generate_arrow_spine(schema: &Schema) -> TokenStream {
         if !Self::has_arrow_columns(schema) {
             return quote! {};
         }
         quote! {
-            /// Arrow C Data Interface schema struct (`struct ArrowSchema`).
             #[repr(C)]
             pub struct ArrowSchema {
                 format: *const c_char,
@@ -947,11 +648,8 @@ impl PyO3Generator {
                 release: Option<unsafe extern "C" fn(*mut ArrowSchema)>,
                 private_data: *mut c_void,
             }
-            // The capsule may be finalized on any thread; the raw pointers are
-            // managed by the Arrow release protocol, not shared mutably.
             unsafe impl Send for ArrowSchema {}
 
-            /// Arrow C Data Interface array struct (`struct ArrowArray`).
             #[repr(C)]
             pub struct ArrowArray {
                 length: i64,
@@ -967,17 +665,11 @@ impl PyO3Generator {
             }
             unsafe impl Send for ArrowArray {}
 
-            /// Owns everything an exported `ArrowArray` points at: the column export
-            /// (`mmap` alias or gathered `Vec`, transparent) backing `buffers[1]`,
-            /// and the two-element buffer pointer array. Dropped by the Arrow
-            /// `release` — freeing the copy or `munmap`ing the alias.
             struct ArrowArrayOwner {
                 _export: forgedb_core::forgedb_storage::ColumnExport,
                 _buffers: Vec<*const c_void>,
             }
 
-            /// Arrow `release` for an exported array: reclaim + drop the owner box,
-            /// then null `release` (the Arrow released marker).
             unsafe extern "C" fn arrow_array_release(array: *mut ArrowArray) {
                 if array.is_null() { return; }
                 let a = &mut *array;
@@ -989,20 +681,12 @@ impl PyO3Generator {
                 a.release = None;
             }
 
-            /// Arrow `release` for the schema: `format` is a `'static` C-string and
-            /// `name`/`metadata` are null, so there is nothing to free — just null
-            /// `release`.
             unsafe extern "C" fn arrow_schema_release(schema: *mut ArrowSchema) {
                 if schema.is_null() { return; }
                 let s = &mut *schema;
                 s.release = None;
             }
 
-            /// Build the Arrow C Data Interface pair for a non-null fixed-width
-            /// primitive column: two buffers (null validity + the exported data),
-            /// `length` values, no children.  `format` is a `'static` Arrow format
-            /// C-string; `export`'s buffer backs `buffers[1]` and outlives the pair
-            /// inside the owner box.
             fn arrow_build_primitive(
                 format: *const c_char,
                 export: forgedb_core::forgedb_storage::ColumnExport,
@@ -1038,9 +722,6 @@ impl PyO3Generator {
                 (schema, array)
             }
 
-            /// Map a schema-chosen Arrow format string to its `'static`
-            /// nul-terminated C string (the exportable set is closed at codegen
-            /// time — `RustGenerator::arrow_export_format`).
             fn arrow_format_cstr(fmt: &str) -> *const c_char {
                 match fmt {
                     "i" => b"i\0".as_ptr() as *const c_char,
@@ -1049,15 +730,10 @@ impl PyO3Generator {
                     "L" => b"L\0".as_ptr() as *const c_char,
                     "g" => b"g\0".as_ptr() as *const c_char,
                     "w:16" => b"w:16\0".as_ptr() as *const c_char,
-                    // Unreachable: the format is one of the closed exportable set.
                     _ => b"l\0".as_ptr() as *const c_char,
                 }
             }
 
-            /// A single exported live column, importable **zero-copy** by pyarrow /
-            /// polars via the Arrow PyCapsule interface: `pyarrow.array(col)` (or
-            /// `pa.table({"c": col}).to_pandas()`). Single-shot — the underlying
-            /// export is moved into the capsules on the first `__arrow_c_array__`.
             #[pyclass]
             pub struct ArrowColumn {
                 export: Option<forgedb_core::forgedb_storage::ColumnExport>,
@@ -1067,18 +743,12 @@ impl PyO3Generator {
 
             #[pymethods]
             impl ArrowColumn {
-                /// The Arrow C Data Interface PyCapsule protocol — returns the
-                /// `(schema_capsule, array_capsule)` pair a consumer imports. The
-                /// exported bytes/alias transfer into the capsules (single-shot);
-                /// the capsule destructors honor the Arrow release protocol.
                 #[pyo3(signature = (requested_schema=None))]
                 fn __arrow_c_array__<'py>(
                     &mut self,
                     py: Python<'py>,
                     requested_schema: Option<Bound<'py, PyAny>>,
                 ) -> PyResult<(Bound<'py, PyCapsule>, Bound<'py, PyCapsule>)> {
-                    // We export exactly our fixed schema; a requested cast is not
-                    // supported (the caller can cast in pyarrow).
                     let _ = requested_schema;
                     let export = self.export.take().ok_or_else(|| {
                         ForgeDbError::new_err("Arrow column already exported (single-shot)")
@@ -1111,14 +781,6 @@ impl PyO3Generator {
         }
     }
 
-    /// The per-(model, exportable-column) Arrow export methods on `ForgeDb`:
-    /// `<m>_<col>_arrow() -> ArrowColumn`. Each computes the live physical row
-    /// indices in generated code (`export_live_indices`) and exports exactly those
-    /// rows of the one column (`export_col_<f>` → `ColumnExport`). The exportable
-    /// set + Arrow format come from `RustGenerator::arrow_export_format` (the SAME
-    /// source of truth the generated `export_col_<f>` and the FFI Arrow op use), so
-    /// the three can never drift. Identity: the set is fixed by the schema at
-    /// codegen time (never a runtime column list); the export takes opaque indices.
     fn generate_arrow_methods(schema: &Schema) -> Vec<TokenStream> {
         let mut methods = Vec::new();
         for model in Self::identity_models(schema) {
@@ -1130,13 +792,7 @@ impl PyO3Generator {
                 };
                 let method_ident = format_ident!("{}_{}_arrow", snake, field.name);
                 let export_method = format_ident!("export_col_{}", field.name);
-                let doc = format!(
-                    "Export the live `{}.{}` column as a zero-copy Arrow array (`{}`) — \
-                     `pyarrow.array(db.{}_{}_arrow())`.",
-                    model.name, field.name, fmt, snake, field.name
-                );
                 methods.push(quote! {
-                    #[doc = #doc]
                     fn #method_ident(&self) -> PyResult<ArrowColumn> {
                         let (export, length) = match catch_unwind(AssertUnwindSafe(|| {
                             let live = self.inner.#storage.export_live_indices();
@@ -1155,8 +811,6 @@ impl PyO3Generator {
         methods
     }
 
-    /// Register the `ArrowColumn` class in the module (only when the schema has an
-    /// Arrow-exportable column, matching `generate_arrow_spine`).
     fn generate_arrow_registration(schema: &Schema) -> TokenStream {
         if Self::has_arrow_columns(schema) {
             quote! { m.add_class::<ArrowColumn>()?; }
@@ -1165,7 +819,6 @@ impl PyO3Generator {
         }
     }
 
-    /// Whether any identity model has at least one Arrow-exportable column.
     fn has_arrow_columns(schema: &Schema) -> bool {
         Self::identity_models(schema).any(|m| {
             m.fields
@@ -1174,7 +827,6 @@ impl PyO3Generator {
         })
     }
 
-    /// `m.add_class::<Py<Model>>()?` for each row class.
     fn generate_registrations(schema: &Schema) -> Vec<TokenStream> {
         Self::identity_models(schema)
             .map(|model| {
@@ -1193,71 +845,20 @@ impl PyO3Generator {
         )
     }
 
-    /// The PyO3 **cache package**'s `Cargo.toml` (#335 §1).
-    ///
-    /// Not a scaffold any more: nothing in the cache is user-editable, so this is
-    /// rewritten in full on every generate. Carried forward unchanged, a CLI
-    /// upgrade that bumps a substrate pin would never reach an existing member.
-    ///
-    /// `abi3-py38` makes one artifact work across CPython >= 3.8;
-    /// `extension-module` omits linking libpython, which is what lets the cdylib
-    /// build standalone under plain cargo — and is also why the sibling
-    /// [`Self::build_rs_scaffold`] is not optional on macOS.
-    ///
-    /// # Zero substrate pins
-    ///
-    /// The only ForgeDB dependency is the app's own `core`, renamed to
-    /// `forgedb_core`. Every substrate type the emitted `lib.rs` names
-    /// (`forgedb_types::Uuid`, `forgedb_storage::ColumnExport`) is reached
-    /// through `core`'s re-exports, which is what makes those types UNIFY with
-    /// the database's rather than merely resolve to the same version because one
-    /// lockfile happened to agree. It also drops `forgedb-query-params`, which
-    /// this crate never used — every occurrence was in a doc comment.
-    ///
-    /// # No `[lib] name`
-    ///
-    /// It used to be pinned to `"forgedb"`, in *both* this generator and the
-    /// napi one. Two apps in one cache workspace then declare the same lib name:
-    /// cargo **warns and exits 0**, leaving one `libforgedb.dylib` on disk. Cargo
-    /// derives the lib name from the per-app package name instead, which makes
-    /// the silent collision unrepresentable.
-    ///
-    /// **This does not rename the Python module.** CPython resolves
-    /// `PyInit_<stem>` from the DELIVERED FILENAME, not from cargo's lib name, so
-    /// `#[pymodule] fn forgedb` stays exactly as it is, the artifact is delivered
-    /// as `forgedb.abi3.so`, and the user's `import forgedb` is unchanged.
-    /// Renaming the `#[pymodule]` to match the derived package name is the reflex
-    /// move here and it breaks the import.
-    ///
-    /// # No `[profile.*]`
-    ///
-    /// A `[profile.*]` table in a workspace member is silently ignored
-    /// (`warning: profiles for the non root package will be ignored`). The build
-    /// driver applies the profile floor on the cargo invocation instead.
     pub fn cargo_toml(crate_name: &str, core_package: &str) -> String {
         format!(
             r#"# Generated by ForgeDB. Do not edit — rewritten in full on every generate.
 #
-# NOTHING IN THE CACHE IS USER-EDITABLE. The scaffolds in your output directory
-# are written only when absent, because they are yours; this file is ForgeDB's.
 [package]
 name = "{crate_name}"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-# cdylib: the Python extension module, delivered as `forgedb.abi3.so`.
 #
-# `name` is deliberately unset — cargo derives it from the per-app package name.
-# CPython reads `PyInit_<stem>` off the delivered filename, so `import forgedb`
-# does not depend on it; hardcoding it made two apps in one workspace collide at
-# a cargo WARNING and exit 0.
 crate-type = ["cdylib"]
 
 [dependencies]
-# The one generated database for this app. Renamed so no generated source
-# carries this app's package name, and the SOLE route to the substrate: this crate pins
-# none of it, so `Uuid`/`ColumnExport` here ARE the database's types.
 forgedb_core = {{ package = "{core_package}", path = "../core" }}
 
 pyo3 = {{ version = "0.23", features = ["abi3-py38", "extension-module"] }}
@@ -1265,27 +866,11 @@ pythonize = "0.23"
 serde_json = "1"
 
 [build-dependencies]
-# Not optional: `extension-module` means the cdylib does not link libpython, and
-# on macOS the link then fails on undefined `_PyModule_Create2` unless the build
-# script passes `-undefined dynamic_lookup`. See `build_rs_scaffold`.
 pyo3-build-config = "0.23"
 "#
         )
     }
 
-    /// The generated `forgedb.py` — the consumer-facing half of the load-time
-    /// check, and the reason `import forgedb` still works after the extension
-    /// took a private name.
-    ///
-    /// A `.pyi` could not do this job: a stub is read by type checkers and is
-    /// never executed by CPython. This module IS executed, on the import path,
-    /// which is the only place a stale extension can be caught before it starts
-    /// serving methods that no longer match the schema.
-    ///
-    /// The re-export list is generated per-schema rather than being a
-    /// `from _forgedb_native import *`: a star import silently drops nothing but
-    /// also silently *adds* nothing when a class fails to register, and the whole
-    /// point here is that a disagreement between the two halves is loud.
     pub fn python_module(schema: &Schema, fingerprint: &str) -> Result<GeneratedCode> {
         let stem = Self::EXTENSION_STEM;
         let mut names: Vec<String> = vec!["ForgeDb".to_string(), "ForgeDbError".to_string()];
@@ -1302,7 +887,6 @@ you if it was built from different generated source than this file was written
 from.
 """
 
-# The fingerprint of the generated source THIS file was written from.
 __fingerprint__ = "{fingerprint}"
 
 try:
@@ -1351,10 +935,6 @@ if _built != __fingerprint__:
         })
     }
 
-    /// The type stub (`forgedb.pyi`) beside the module it describes.
-    ///
-    /// Declarations only — it is never executed, which is exactly why the check
-    /// above lives in `forgedb.py` and not here.
     pub fn type_stub(schema: &Schema) -> Result<GeneratedCode> {
         let mut code = String::from(
             "# Generated by ForgeDB (#337). DO NOT EDIT.\n             from typing import Any, Optional\n\n             __fingerprint__: str\n\n             class ForgeDbError(Exception): ...\n\n",
@@ -1397,34 +977,13 @@ if _built != __fingerprint__:
         })
     }
 
-    /// The PyO3 `build.rs` (schema-invariant).
-    ///
-    /// **This file did not exist before #335, and its absence is why
-    /// `cargo build` on the emitted pyo3 crate failed on macOS.**
-    /// `extension-module` deliberately omits linking libpython so the extension
-    /// resolves CPython's symbols from the interpreter that loads it; the macOS
-    /// linker rejects undefined symbols in a `cdylib` unless it is passed
-    /// `-undefined dynamic_lookup`, and `add_extension_module_link_args()` emits
-    /// exactly that (and nothing at all on other platforms).
-    ///
-    /// The failure was invisible in CI twice over: Linux `ld -shared` permits
-    /// undefined symbols, so it is a **runner-OS** discriminator rather than a
-    /// check-vs-build one, and the reclose ran `cargo check`, which never links
-    /// at all. Both halves were removed by #335 — the reclose builds, on a
-    /// `[ubuntu, macos]` matrix — which is why this must land with or before that
-    /// change rather than after it.
     pub fn build_rs_scaffold() -> &'static str {
         "// Generated by ForgeDB — PyO3 build script (schema-invariant).\n\
-         //\n\
-         // `extension-module` does not link libpython, so on macOS the cdylib\n\
-         // must be linked `-undefined dynamic_lookup` or the link fails on\n\
-         // undefined `_PyModule_Create2`. This is a no-op on other platforms.\n\
          fn main() {\n    \
          pyo3_build_config::add_extension_module_link_args();\n\
          }\n"
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1433,8 +992,6 @@ mod tests {
     const CORE_PKG: &str = "blog-3f2a1b4c5d6e7f80-core";
     const PYO3_PKG: &str = "blog-3f2a1b4c5d6e7f80-pyo3";
 
-    /// An Arrow-exportable column is present so the export path — the only site
-    /// that names `ColumnExport` — is actually emitted.
     const SRC: &str = r#"
 User {
   id: +uuid
@@ -1443,8 +1000,6 @@ User {
 }
 "#;
 
-    /// The same schema plus a **component ref**, the field class whose getter
-    /// `needs_py_lifetime` used to omit.
     const COMPONENT_SRC: &str = r#"
 User {
   id: +uuid
@@ -1460,7 +1015,6 @@ User {
         PyO3Generator::generate(&schema).unwrap().code
     }
 
-    /// Whitespace-insensitive: `prettyplease` decides the line breaks.
     fn flat(code: &str) -> String {
         code.chars().filter(|c| !c.is_whitespace()).collect()
     }
@@ -1482,9 +1036,6 @@ User {
         );
     }
 
-    /// The negative assertion is the load-bearing half: `forgedb_types::Uuid` is a
-    /// SUBSTRING of `forgedb_core::forgedb_types::Uuid`, so a positive test alone
-    /// passes while the bug is present.
     #[test]
     fn the_substrate_is_reached_through_core() {
         let flat = flat(&generate(SRC));
@@ -1506,20 +1057,6 @@ User {
         );
     }
 
-    /// **Scenario 23, the source half.** A component ref reaches `pyo3_getter`'s
-    /// pythonize fallback, whose return type is `Bound<'py, PyAny>` — so the
-    /// signature has to bind `'py` and take `py`. It did not: the hand-written
-    /// list of "types that pythonize" omitted `FieldType::Component`, and the
-    /// emitted getter named an undeclared lifetime and an undefined `py`.
-    ///
-    /// The generator still SUCCEEDS on the broken form (`syn` parses it; the
-    /// errors are name resolution), so nothing but the emitted text can catch it
-    /// short of a compile. The compile is `tests/pyo3_component_compile_test.rs`.
-    ///
-    /// The negative assertion is what makes this a guard rather than a
-    /// restatement: the broken signature differs from the correct one only by the
-    /// absence of two token groups, so `contains` on the correct form alone would
-    /// still pass if a second, broken getter were emitted beside it.
     #[test]
     fn a_component_ref_getter_binds_the_py_lifetime() {
         let flat = flat(&generate(COMPONENT_SRC));
@@ -1535,9 +1072,6 @@ User {
         );
     }
 
-    /// The fix is derived from the return type, so it cannot drift from
-    /// `pyo3_getter`'s wildcard arm. `Nullable(FixedArray(..))` was the same hole
-    /// one variant over and is closed by the same derivation.
     #[test]
     fn the_py_lifetime_is_derived_from_the_return_type() {
         assert!(PyO3Generator::returns_py_bound(&quote! { Bound<'py, PyAny> }));
@@ -1546,16 +1080,8 @@ User {
         assert!(!PyO3Generator::returns_py_bound(&quote! { u32 }));
     }
 
-    /// Every field class that pythonizes must agree with the signature, whatever
-    /// it is — asserted over the getter TEXT rather than over a list of types, so
-    /// a new `FieldType` variant that falls through to the wildcard is covered
-    /// without anyone remembering to extend this test.
     #[test]
     fn no_getter_names_the_py_lifetime_without_binding_it() {
-        // Flattened rather than line-based: `prettyplease` wraps a long
-        // signature across lines, and a line-based scan would then read a
-        // signature's first line as "names `'py`, binds nothing" and fail for
-        // the wrong reason.
         const RET: &str = "->PyResult<Bound<'py,PyAny>>";
         for src in [SRC, COMPONENT_SRC] {
             let code = generate(src);
@@ -1568,15 +1094,6 @@ User {
                     .rfind("fn")
                     .expect("a signature precedes every return type");
                 let sig = &flat[start..end];
-                // Two separate facts, and only the first is the defect this
-                // guards. **Binding** `'py` in the generic list is what was
-                // missing (`fn card(&self) -> PyResult<Bound<'py, PyAny>>` —
-                // nine hard errors). **Obtaining** a `Python<'py>` is a second
-                // requirement with more than one legal answer: a getter takes
-                // `py: Python<'py>`, while `create_user<'py>(&mut self, record:
-                // &Bound<'py, PyAny>)` — which predates #335 and compiles —
-                // derives it from an argument. Requiring the `py:` token alone
-                // fails that pre-existing, correct signature.
                 assert!(
                     sig.contains("<'py>"),
                     "this signature names `'py` without binding it: `{sig}`\n\n{code}"
@@ -1589,25 +1106,13 @@ User {
                 seen += 1;
                 from = end + RET.len();
             }
-            // A scan that found nothing proves nothing — `to_dict` alone
-            // guarantees at least one per row class.
             assert!(seen > 0, "no pythonize-returning signature was examined:\n{code}");
         }
     }
 
-    /// Gotcha 15: CPython resolves `PyInit_<stem>` from the DELIVERED FILENAME,
-    /// not from cargo's lib name, so deleting `[lib] name = "forgedb"` must NOT
-    /// drag the `#[pymodule]` name with it. Renaming it to match the derived
-    /// per-app package name is the reflex move here and it breaks `import
-    /// forgedb`.
-    ///
-    /// Anchored on the DEFINITION token following the attribute — the thing
-    /// CPython's symbol is derived from — not on a doc comment or a string.
     #[test]
     fn the_pymodule_name_equals_the_extension_stem() {
         let flat = flat(&generate(SRC));
-        // Assembled at runtime so this assertion's own source text cannot satisfy
-        // it, and so a rename of the constant cannot leave a stale literal here.
         let needle = format!("#[pymodule]fn{}(", PyO3Generator::EXTENSION_STEM);
         assert!(
             flat.contains(&needle),
@@ -1672,12 +1177,6 @@ User {
         assert!(doc.get("profile").is_none(), "{manifest}");
     }
 
-    /// **Scenario 23, the link half.** `extension-module` does not link
-    /// libpython, so the macOS linker rejects the cdylib's undefined CPython
-    /// symbols unless the build script passes `-undefined dynamic_lookup`. There
-    /// was no build script at all, which is why `cargo build` failed on macOS
-    /// while Linux (`ld -shared` permits undefined symbols) and `cargo check`
-    /// (never links) both stayed green.
     #[test]
     fn a_build_script_supplies_the_extension_module_link_args() {
         let build_rs = PyO3Generator::build_rs_scaffold();
@@ -1687,8 +1186,6 @@ User {
         );
         assert!(build_rs.contains("fn main()"), "{build_rs}");
 
-        // A build script cargo cannot resolve a dependency for is not a build
-        // script. The version must track pyo3's own.
         let manifest = PyO3Generator::cargo_toml(PYO3_PKG, CORE_PKG);
         let doc: toml::Value = toml::from_str(&manifest).unwrap();
         let build_config = doc["build-dependencies"]["pyo3-build-config"]

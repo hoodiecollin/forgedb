@@ -171,29 +171,22 @@ fn test_validation_error_display_without_position() {
     assert!(display.contains("Try this instead"));
 }
 
-// Edge case tests
-
 #[test]
 fn test_snake_case_edge_cases() {
-    // Single character
     assert!(is_snake_case("a"));
     assert!(is_snake_case("x"));
     assert!(!is_snake_case("A"));
 
-    // Leading underscore (private fields)
     assert!(is_snake_case("_private"));
     assert!(is_snake_case("__double"));
 
-    // Numbers
     assert!(is_snake_case("field123"));
     assert!(is_snake_case("abc_123_def"));
-    assert!(!is_snake_case("123field")); // Can't start with number
+    assert!(!is_snake_case("123field"));
 
-    // Multiple underscores
-    assert!(is_snake_case("a__b")); // Double underscore is technically valid
+    assert!(is_snake_case("a__b"));
     assert!(is_snake_case("___"));
 
-    // Mixed invalid cases
     assert!(!is_snake_case("camelCase"));
     assert!(!is_snake_case("SCREAMING_CASE"));
     assert!(!is_snake_case("kebab-case"));
@@ -202,19 +195,16 @@ fn test_snake_case_edge_cases() {
 
 #[test]
 fn test_pascal_case_edge_cases() {
-    // Single character
     assert!(is_pascal_case("A"));
     assert!(is_pascal_case("X"));
     assert!(!is_pascal_case("a"));
 
-    // Numbers
     assert!(is_pascal_case("Model123"));
     assert!(is_pascal_case("HTTP2Server"));
-    assert!(!is_pascal_case("123Model")); // Can't start with number
+    assert!(!is_pascal_case("123Model"));
 
-    // Invalid cases
     assert!(!is_pascal_case("snake_case"));
-    assert!(is_pascal_case("SCREAMING")); // All caps is technically valid (no underscores, starts with uppercase)
+    assert!(is_pascal_case("SCREAMING"));
     assert!(!is_pascal_case("kebab-case"));
     assert!(!is_pascal_case("dot.case"));
     assert!(!is_pascal_case("camelCase"));
@@ -222,67 +212,50 @@ fn test_pascal_case_edge_cases() {
 
 #[test]
 fn test_to_snake_case_edge_cases() {
-    // Already snake_case
     assert_eq!(to_snake_case("already_snake"), "already_snake");
 
-    // Single char
     assert_eq!(to_snake_case("A"), "a");
 
-    // Consecutive capitals (acronyms)
     assert_eq!(to_snake_case("XMLParser"), "xml_parser");
     assert_eq!(to_snake_case("HTMLElement"), "html_element");
-    assert_eq!(to_snake_case("HTTPAPI"), "httpapi"); // All caps -> lowercase
+    assert_eq!(to_snake_case("HTTPAPI"), "httpapi");
 
-    // Numbers
     assert_eq!(to_snake_case("User123"), "user123");
     assert_eq!(to_snake_case("HTML5Parser"), "html5_parser");
 
-    // camelCase
     assert_eq!(to_snake_case("camelCase"), "camel_case");
     assert_eq!(to_snake_case("camelCaseExample"), "camel_case_example");
 
-    // Edge: already has underscores (these get preserved, not converted)
-    // Note: This is expected behavior - we don't try to fix mixed conventions
-    assert_eq!(to_snake_case("User_Name"), "user_name"); // Underscore is preserved
+    assert_eq!(to_snake_case("User_Name"), "user_name");
 }
 
 #[test]
 fn test_to_pascal_case_edge_cases() {
-    // Already PascalCase
     assert_eq!(to_pascal_case("AlreadyPascal"), "AlreadyPascal");
 
-    // Single char
     assert_eq!(to_pascal_case("a"), "A");
 
-    // Multiple underscores
     assert_eq!(to_pascal_case("a__b"), "AB");
     assert_eq!(to_pascal_case("___test"), "Test");
 
-    // Leading underscore
     assert_eq!(to_pascal_case("_private"), "Private");
 
-    // Numbers
     assert_eq!(to_pascal_case("field_123"), "Field123");
 
-    // Empty sections
     assert_eq!(to_pascal_case("_"), "");
 }
 
 #[test]
 fn test_duplicate_fields_edge_cases() {
-    // Empty list
     let empty: Vec<(String, Option<Position>)> = vec![];
     assert!(check_duplicate_fields(&empty).is_ok());
 
-    // Single field
     let single = vec![("field".to_string(), None)];
     assert!(check_duplicate_fields(&single).is_ok());
 
-    // Case sensitivity - these should be treated as different
     let case_sensitive = vec![("email".to_string(), None), ("Email".to_string(), None)];
     assert!(check_duplicate_fields(&case_sensitive).is_ok());
 
-    // First duplicate should be reported (not second)
     let three_duplicates = vec![
         ("name".to_string(), None),
         ("name".to_string(), Some(Position::new(5, 1))),
@@ -291,44 +264,36 @@ fn test_duplicate_fields_edge_cases() {
     let result = check_duplicate_fields(&three_duplicates);
     assert!(result.is_err());
     let err = result.unwrap_err();
-    // Should report the second occurrence (first duplicate)
     assert_eq!(err.position, Some(Position::new(5, 1)));
 }
 
 #[test]
 fn test_duplicate_models_edge_cases() {
-    // Empty list
     let empty: Vec<(String, Option<Position>)> = vec![];
     assert!(check_duplicate_models(&empty).is_ok());
 
-    // Single model
     let single = vec![("User".to_string(), None)];
     assert!(check_duplicate_models(&single).is_ok());
 
-    // Case sensitivity
     let case_sensitive = vec![("User".to_string(), None), ("user".to_string(), None)];
     assert!(check_duplicate_models(&case_sensitive).is_ok());
 }
 
 #[test]
 fn test_validation_error_builder() {
-    // Error without position or suggestion
     let err1 = ValidationError::new("Simple error");
     assert_eq!(err1.message, "Simple error");
     assert_eq!(err1.position, None);
     assert_eq!(err1.suggestion, None);
 
-    // Error with only position
     let err2 = ValidationError::new("Error with position").with_position(Position::new(5, 10));
     assert_eq!(err2.position, Some(Position::new(5, 10)));
     assert_eq!(err2.suggestion, None);
 
-    // Error with only suggestion
     let err3 = ValidationError::new("Error with suggestion").with_suggestion("Fix it this way");
     assert_eq!(err3.position, None);
     assert!(err3.suggestion.is_some());
 
-    // Chain both
     let err4 = ValidationError::new("Full error")
         .with_position(Position::new(1, 1))
         .with_suggestion("Try this");
@@ -338,16 +303,13 @@ fn test_validation_error_builder() {
 
 #[test]
 fn test_validate_edge_case_names() {
-    // Single character field names
     assert!(validate_field_name("x", None).is_ok());
     assert!(validate_field_name("a", None).is_ok());
     assert!(validate_field_name("_", None).is_ok());
 
-    // Single character model names
     assert!(validate_model_name("X", None).is_ok());
     assert!(validate_model_name("A", None).is_ok());
 
-    // Very long names (should still work)
     let long_field = "very_long_field_name_with_many_underscores_that_is_still_valid";
     assert!(validate_field_name(long_field, None).is_ok());
 

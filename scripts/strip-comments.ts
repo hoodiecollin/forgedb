@@ -59,9 +59,11 @@ function scanRust(src: string): Cut[] {
   const cuts: Cut[] = [];
   const n = src.length;
   let i = 0;
+  let inRegression = false;
   while (i < n) {
     const c = src[i]!;
     const d = src[i + 1];
+    if (inRegression && !/\s/.test(c) && !(c === "/" && d === "/")) inRegression = false;
 
     if (c === '"') {
       i++;
@@ -107,7 +109,10 @@ function scanRust(src: string): Cut[] {
     if (c === "/" && d === "/") {
       const start = i;
       while (i < n && src[i] !== "\n") i++;
-      if (!REGRESSION.test(src.slice(start, i))) {
+      const text = src.slice(start, i);
+      if (REGRESSION.test(text)) {
+        inRegression = true;
+      } else if (!inRegression) {
         cuts.push({ start, end: i, inline: !lineStartsAt(src, start) });
       }
       continue;
@@ -139,9 +144,11 @@ function scanTs(src: string): Cut[] {
   const n = src.length;
   let i = 0;
   let prevSignificant = "";
+  let inRegression = false;
   while (i < n) {
     const c = src[i]!;
     const d = src[i + 1];
+    if (inRegression && !/\s/.test(c) && !(c === "/" && d === "/")) inRegression = false;
 
     if (c === '"' || c === "'" || c === "`") {
       const quote = c;
@@ -168,7 +175,9 @@ function scanTs(src: string): Cut[] {
     if (c === "/" && d === "/") {
       const start = i;
       while (i < n && src[i] !== "\n") i++;
-      if (!REGRESSION.test(src.slice(start, i))) {
+      if (REGRESSION.test(src.slice(start, i))) {
+        inRegression = true;
+      } else if (!inRegression) {
         cuts.push({ start, end: i, inline: !lineStartsAt(src, start) });
       }
       continue;
@@ -207,7 +216,9 @@ function scanHash(src: string): Cut[] {
   const cuts: Cut[] = [];
   const lines = src.split("\n");
   let off = 0;
+  let inRegression = false;
   for (const line of lines) {
+    if (inRegression && !/^\s*(#|$)/.test(line)) inRegression = false;
     let i = 0;
     let inStr: string | null = null;
     while (i < line.length) {
@@ -221,7 +232,9 @@ function scanHash(src: string): Cut[] {
       if (c === '"' || c === "'") { inStr = c; i++; continue; }
       if (c === "#") {
         const seg = line.slice(i);
-        if (!REGRESSION.test(seg)) {
+        if (REGRESSION.test(seg)) {
+          inRegression = true;
+        } else if (!inRegression) {
           cuts.push({ start: off + i, end: off + line.length, inline: !/^\s*$/.test(line.slice(0, i)) });
         }
         break;
@@ -342,6 +355,16 @@ function selfTest(): number {
       "// REGRESSION(#486): kept\nfn f() {}\n",
       "rust",
       "// REGRESSION(#486): kept\nfn f() {}\n",
+    ],
+    [
+      "// REGRESSION(#486): one\n// two\n// three\nfn f() {}\n",
+      "rust",
+      "// REGRESSION(#486): one\n// two\n// three\nfn f() {}\n",
+    ],
+    [
+      "// REGRESSION(#1): a\nfn f() {}\n// unrelated\nfn g() {}\n",
+      "rust",
+      "// REGRESSION(#1): a\nfn f() {}\nfn g() {}\n",
     ],
     ['const S = "// no";\n', "ts", 'const S = "// no";\n'],
     ["const R = /a\\/\\/b/;\n", "ts", "const R = /a\\/\\/b/;\n"],

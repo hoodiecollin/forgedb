@@ -1,15 +1,6 @@
-//! Intermediate example for forgedb-query-params
-//!
-//! This example demonstrates integrating query params
-//! with a web API for database queries.
-//!
-//! Query-string convention: `sort`, `order`, `limit`, and `offset` are
-//! reserved; every other `field=value` pair is treated as a filter.
-
 use forgedb_query_params::*;
 use serde::{Deserialize, Serialize};
 
-// Example data model
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct User {
     id: u64,
@@ -19,7 +10,6 @@ struct User {
     created_at: u64,
 }
 
-// Simulated database
 struct Database {
     users: Vec<User>,
 }
@@ -70,7 +60,6 @@ impl Database {
     fn query(&self, params: &QueryParams) -> (Vec<User>, usize) {
         let mut results = self.users.clone();
 
-        // Apply every filter (AND semantics).
         for filter in &params.filters {
             results.retain(|user| match filter.field.as_str() {
                 "status" => match &filter.value {
@@ -87,7 +76,6 @@ impl Database {
 
         let total = results.len();
 
-        // Apply sorting if present
         if let Some(sort) = &params.sort {
             match sort.field.as_str() {
                 "name" => {
@@ -106,7 +94,6 @@ impl Database {
             }
         }
 
-        // Apply pagination
         let paged = params.pagination.apply(&results).to_vec();
 
         (paged, total)
@@ -119,7 +106,6 @@ fn main() {
     let db = Database::new();
     println!("✓ Database initialized with {} users\n", db.users.len());
 
-    // Example 1: List all users with default pagination
     println!("--- Query 1: Default (all users, first page) ---");
     let query1 = "limit=10";
     let params1 = QueryParams::from_query_string(query1).unwrap();
@@ -132,7 +118,6 @@ fn main() {
     }
     println!();
 
-    // Example 2: Filter by status
     println!("--- Query 2: Filter by status=active ---");
     let query2 = "status=active&limit=10";
     let params2 = QueryParams::from_query_string(query2).unwrap();
@@ -145,7 +130,6 @@ fn main() {
     }
     println!();
 
-    // Example 3: Sort by name ascending
     println!("--- Query 3: Sort by name (ascending) ---");
     let query3 = "sort=name&order=asc&limit=10";
     let params3 = QueryParams::from_query_string(query3).unwrap();
@@ -158,7 +142,6 @@ fn main() {
     }
     println!();
 
-    // Example 4: Sort by created_at descending
     println!("--- Query 4: Sort by created_at (descending) ---");
     let query4 = "sort=created_at&order=desc&limit=3";
     let params4 = QueryParams::from_query_string(query4).unwrap();
@@ -171,7 +154,6 @@ fn main() {
     }
     println!();
 
-    // Example 5: Combined filter and sort with pagination
     println!("--- Query 5: Filter + Sort + Pagination ---");
     let query5 = "status=active&sort=name&order=asc&limit=2";
     let params5 = QueryParams::from_query_string(query5).unwrap();

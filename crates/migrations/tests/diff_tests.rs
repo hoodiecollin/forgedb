@@ -124,16 +124,6 @@ fn test_detect_type_change() {
     assert!(changes[0].is_breaking());
 }
 
-// ---------------------------------------------------------------------------
-// #438 — the differ can see an enum / struct definition change
-//
-// Every case below asserts the emitted `SchemaChange` **and** its
-// `is_breaking()` + `hop_body_class()`. Asserting only "a change was emitted"
-// would pass a fix that misclassifies every single case, which is the failure
-// this whole issue is about: the operator acts on the verdict, not on the count.
-// ---------------------------------------------------------------------------
-
-/// A field carrying no enum/struct dependency.
 fn plain_field(name: &str, ty: &str) -> SimpleField {
     SimpleField {
         name: name.to_string(),
@@ -147,8 +137,6 @@ fn plain_field(name: &str, ty: &str) -> SimpleField {
     }
 }
 
-/// A field whose type reaches `deps` (transitively — the caller states the
-/// closure, exactly as `to_simple_schema` computes it).
 fn dependent_field(name: &str, ty: &str, deps: &[&str]) -> SimpleField {
     SimpleField {
         depends_on: deps.iter().map(|d| d.to_string()).collect(),
@@ -178,7 +166,6 @@ fn struct_def(name: &str, fields: &[(&str, &str)]) -> SimpleStruct {
     }
 }
 
-/// `Post.status: Status` on both sides; only the enum's variant list moves.
 fn post_with_status(variants: &[&str]) -> SimpleSchema {
     SimpleSchema {
         models: vec![model(
@@ -193,7 +180,6 @@ fn post_with_status(variants: &[&str]) -> SimpleSchema {
     }
 }
 
-/// `Shape.origin: Point` on both sides; only the struct's layout moves.
 fn shape_with_point(fields: &[(&str, &str)]) -> SimpleSchema {
     SimpleSchema {
         models: vec![model(
@@ -218,8 +204,6 @@ fn only_change(old: &SimpleSchema, new: &SimpleSchema) -> SchemaChange {
     changes.pop().unwrap()
 }
 
-// --- enum: the five rows of #442's matrix --------------------------------
-
 #[test]
 fn enum_append_at_the_end_is_detected_and_benign() {
     let change = only_change(
@@ -240,9 +224,6 @@ fn enum_append_at_the_end_is_detected_and_benign() {
         ("Post", "status")
     );
     assert_eq!(enum_name, "Status");
-    // Every existing byte still decodes to its own variant. Recorded anyway, so
-    // the version moves and an older binary meeting the new byte is told to
-    // migrate instead of panicking on an unknown discriminant.
     assert!(
         !change.is_breaking(),
         "an append at the end is benign at rest"
@@ -257,7 +238,6 @@ fn enum_insert_in_the_middle_is_breaking() {
         &post_with_status(&["Draft", "Review", "Published", "Archived"]),
     );
     assert!(matches!(change, SchemaChange::ChangeEnumVariants { .. }));
-    // Every byte >= 1 now decodes as its predecessor.
     assert!(change.is_breaking());
     assert_eq!(change.hop_body_class(), HopBodyClass::Auto);
 }
@@ -269,9 +249,7 @@ fn enum_reorder_is_breaking_and_auto() {
         &post_with_status(&["Published", "Draft", "Archived"]),
     );
     assert!(matches!(change, SchemaChange::ChangeEnumVariants { .. }));
-    // The sharpest case: every byte stays in range, so nothing anywhere fails.
     assert!(change.is_breaking());
-    // The JSON name round-trip re-encodes it with no authoring needed.
     assert_eq!(change.hop_body_class(), HopBodyClass::Auto);
     assert!(
         change.description().contains("REORDER"),
@@ -288,8 +266,6 @@ fn enum_remove_is_breaking_and_authored() {
     );
     assert!(matches!(change, SchemaChange::ChangeEnumVariants { .. }));
     assert!(change.is_breaking());
-    // A row carrying the retired name cannot decode into `v_to`; the operator
-    // must map it.
     assert_eq!(change.hop_body_class(), HopBodyClass::Authored);
 }
 
@@ -300,14 +276,9 @@ fn enum_rename_in_place_is_breaking_and_authored() {
         &post_with_status(&["Draft", "Live", "Archived"]),
     );
     assert!(matches!(change, SchemaChange::ChangeEnumVariants { .. }));
-    // Benign at rest — the byte still decodes to the same slot — but the NAME is
-    // what crosses the transformer's JSON boundary, so the old name does not
-    // deserialize.
     assert!(change.is_breaking());
     assert_eq!(change.hop_body_class(), HopBodyClass::Authored);
 }
-
-// --- struct: there is no additive case -----------------------------------
 
 #[test]
 fn struct_field_reorder_is_breaking_and_auto() {
@@ -329,10 +300,7 @@ fn struct_field_reorder_is_breaking_and_auto() {
         ("Shape", "origin")
     );
     assert_eq!(struct_name, "Point");
-    // Offsets follow declaration order, so each field reads its neighbour's
-    // bytes — and two same-typed fields swap plausible values.
     assert!(change.is_breaking());
-    // JSON transport is by field name, so the round-trip repairs it.
     assert_eq!(change.hop_body_class(), HopBodyClass::Auto);
 }
 
@@ -343,8 +311,6 @@ fn struct_field_retype_is_breaking_and_authored() {
         &shape_with_point(&[("x", "U32"), ("y", "I32")]),
     );
     assert!(matches!(change, SchemaChange::ChangeStructLayout { .. }));
-    // Same width, so nothing re-frames and nothing panics — the bytes are just
-    // reinterpreted.
     assert!(change.is_breaking());
     assert_eq!(change.hop_body_class(), HopBodyClass::Authored);
 }
@@ -356,9 +322,6 @@ fn struct_field_add_is_breaking_and_authored() {
         &shape_with_point(&[("x", "I32"), ("y", "I32"), ("z", "I32")]),
     );
     assert!(matches!(change, SchemaChange::ChangeStructLayout { .. }));
-    // THE point of this case: for an ENUM this same shape is benign. A struct
-    // has no additive case at all, because every offset is a function of the
-    // whole declaration.
     assert!(
         change.is_breaking(),
         "a struct has no benign append — the row width changes"
@@ -373,21 +336,10 @@ fn struct_field_remove_is_breaking_and_authored() {
         &shape_with_point(&[("x", "I32"), ("y", "I32")]),
     );
     assert!(matches!(change, SchemaChange::ChangeStructLayout { .. }));
-    // The derived row count GROWS (`len / value_size`), so every read is
-    // in-bounds and garbage.
     assert!(change.is_breaking());
     assert_eq!(change.hop_body_class(), HopBodyClass::Authored);
 }
 
-// --- transitivity: the case a depth-one walk passes everything else on ----
-
-/// `Sticker.badges: [Badge; 4]`, `Badge` is a struct holding a `Color` enum.
-/// Change `Color`, and NOTHING in `Badge`'s own declaration text moves — nor in
-/// the model field's type string, which is `FixedArray(StructType("Badge"), 4)`.
-///
-/// This is the one case a walk that stops at depth one passes every other test
-/// above and still misses. It is here because `FieldType::Enum` is
-/// `is_fixed_size`, so an enum inside an inline struct is legal and idiomatic.
 fn sticker_with_color(colors: &[&str]) -> SimpleSchema {
     SimpleSchema {
         models: vec![model(
@@ -436,11 +388,6 @@ fn an_enum_nested_inside_a_struct_inside_an_array_still_projects_onto_the_model_
     assert!(change.is_breaking());
 }
 
-// --- the deliberate non-goals, pinned ------------------------------------
-
-/// An enum nothing stores emits nothing. Nothing is on disk, so there is
-/// nothing to migrate. This is a DECISION, not an oversight — pinned so it is
-/// not "fixed" later into a migration for data that does not exist.
 #[test]
 fn an_unreferenced_enum_emits_nothing() {
     let schema = |variants: &[&str]| SimpleSchema {
@@ -458,7 +405,6 @@ fn an_unreferenced_enum_emits_nothing() {
     );
 }
 
-/// The struct half of the same decision.
 #[test]
 fn an_unreferenced_struct_emits_nothing() {
     let schema = |fields: &[(&str, &str)]| SimpleSchema {
@@ -476,8 +422,6 @@ fn an_unreferenced_struct_emits_nothing() {
     );
 }
 
-/// A field that carries no column must not receive the change either — a
-/// `[Model]` collection is not stored, so it cannot be re-mapped.
 #[test]
 fn one_change_is_emitted_per_storing_field() {
     let schema = |variants: &[&str]| SimpleSchema {

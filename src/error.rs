@@ -22,12 +22,6 @@ pub enum CliError {
     #[error("Configuration error: {0}")]
     Config(String),
 
-    /// A config diagnostic that already names its own file and position.
-    ///
-    /// Rendered verbatim: strict parsing (#333) makes multi-line `toml` errors a
-    /// primary diagnostic rather than a rare one, and a `Configuration error:`
-    /// prefix above a message that begins `TOML parse error at line 1, column 2`
-    /// buries the part the user needs.
     #[error("{0}")]
     ConfigDiagnostic(String),
 

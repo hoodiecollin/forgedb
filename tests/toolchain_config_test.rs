@@ -1,15 +1,3 @@
-//! `[toolchain]` is strict, and it is checked EARLY (#374 direction C,
-//! gate 1 decision 3).
-//!
-//! # The name is a one-way door
-//!
-//! Config parsing is `#[serde(deny_unknown_fields)]`, so **every already-released
-//! `forgedb` rejects a config carrying a table it does not know**. A project
-//! that adopts `[toolchain]` therefore cannot be built by an older CLI, and
-//! renaming the table later would strand every config that had adopted the first
-//! name. The spelling ships once. `the_table_is_spelled_toolchain` is a
-//! deliberately dumb guard on exactly that.
-
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -41,7 +29,6 @@ fn project(config: &str) -> TempDir {
 
 const BASE: &str = "[project]\nid = \"toolchain-fixture\"\n\n[generate]\ntargets = [\"all\"]\n";
 
-/// The table parses, with every key and every sub-key.
 #[test]
 fn the_table_parses_with_every_documented_key() {
     let t = project(&format!(
@@ -61,12 +48,6 @@ fn the_table_parses_with_every_documented_key() {
     );
 }
 
-/// A misspelled key is REFUSED, not silently ignored.
-///
-/// This is why the table is three explicit fields and not a
-/// `HashMap<String, InterpreterConfig>`: a map accepts every key even under
-/// `deny_unknown_fields`, so `pythn = { ... }` would parse and be ignored — a
-/// configuration that reads as applied and is not.
 #[test]
 fn a_misspelled_interpreter_is_refused() {
     for bad in ["pythn = { path = \"/x\" }", "deno = { path = \"/x\" }"] {
@@ -83,8 +64,6 @@ fn a_misspelled_interpreter_is_refused() {
     }
 }
 
-/// A misspelled SUB-key is refused too. `min_ver` reads as a version floor and
-/// is not one.
 #[test]
 fn a_misspelled_sub_key_is_refused() {
     let t = project(&format!(
@@ -97,13 +76,6 @@ fn a_misspelled_sub_key_is_refused() {
     assert!(!out.status.success(), "{}", combined(&out));
 }
 
-/// The table is spelled `toolchain` — a one-way door, guarded on purpose.
-///
-/// `[runtime]` was taken (replication, change-feed capacity, cascade depth), so
-/// this needed its own name; and under `deny_unknown_fields` the name cannot be
-/// changed afterwards without breaking every config that adopted it. The guard
-/// reads the DECLARATION in `config.rs` with comments stripped, so the prose
-/// explaining the invariant cannot satisfy it.
 #[test]
 fn the_table_is_spelled_toolchain() {
     let src: String = include_str!("../src/config.rs")

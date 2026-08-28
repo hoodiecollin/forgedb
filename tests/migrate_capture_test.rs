@@ -1,15 +1,3 @@
-//! The interactive half of `migrate create` (#374 direction A), driven by a
-//! **scripted operator**.
-//!
-//! # Why this file exists at all
-//!
-//! Every other `migrate` test in this repo drives the `forgedb` binary as a
-//! subprocess with piped stdio. `prompt::askable` correctly refuses to ask in
-//! that session, so those tests can only ever walk the NON-interactive branch —
-//! the branch a real operator walks would otherwise be covered by nothing.
-//! `prompt::Scripted` is what makes it testable, and this is why the `Ask`
-//! trait exists rather than `resolve_answers` calling `read_line` directly.
-
 use forgedb::commands::migrate::answers::resolve_answers;
 use forgedb::commands::migrate::escape::language_for;
 use forgedb::ask::ScriptedPrompt as Scripted;
@@ -47,14 +35,11 @@ fn retype_views() -> SchemaChange {
     }
 }
 
-/// Scenario 5 — the answer is recorded as **data**, and the record's checksum
-/// covers it.
 #[test]
 fn scenario_5_a_constant_is_recorded_as_data() {
     let t = TempDir::new().unwrap();
     let dest = parse(DEST);
     let mut changes = vec![add_slug()];
-    // "1" = a constant value, then the value itself.
     let mut ask = Scripted::new(["1", "untitled"]);
 
     let scaffold = resolve_answers(
@@ -81,7 +66,6 @@ fn scenario_5_a_constant_is_recorded_as_data() {
          encoded differently"
     );
 
-    // And it survives into a record whose checksum covers it.
     let m = Migration::with_id("20260808000000".into(), "x".into(), changes, 1, 2);
     assert_eq!(m.record_version, 1);
     assert!(m.verify_checksum());
@@ -89,15 +73,11 @@ fn scenario_5_a_constant_is_recorded_as_data() {
     assert_eq!(hop_answer_status(t.path(), &m), Ok(()));
 }
 
-/// A copy is offered only when the model HAS a field of the same type, and the
-/// recorded answer names it.
 #[test]
 fn a_copy_answer_names_a_field_of_the_same_type() {
     let t = TempDir::new().unwrap();
     let dest = parse(DEST);
     let mut changes = vec![add_slug()];
-    // "2" = copy another field, then pick from the candidate list. `title` and
-    // `views` are both `string`, and `title` sorts first in declaration order.
     let mut ask = Scripted::new(["2", "1"]);
 
     resolve_answers(
@@ -120,15 +100,11 @@ fn a_copy_answer_names_a_field_of_the_same_type() {
     );
 }
 
-/// A model with no field of the matching type is not offered the copy option at
-/// all — an option that cannot work is an invitation to an answer the build
-/// would then refuse.
 #[test]
 fn the_copy_option_is_absent_when_nothing_could_be_copied() {
     let t = TempDir::new().unwrap();
     let dest = parse("Post {\n  id: +uuid\n  views: u32\n  slug: string\n}\n");
     let mut changes = vec![add_slug()];
-    // "2" would be the escape row here, not a copy. Answer "1" (constant).
     let mut ask = Scripted::new(["1", "x"]);
     resolve_answers(
         &mut changes,
@@ -147,7 +123,6 @@ fn the_copy_option_is_absent_when_nothing_could_be_copied() {
             json: "\"x\"".to_string()
         })
     );
-    // With a copy row present the menu would have three entries; here it has two.
     let mut ask = Scripted::new(["2"]);
     let mut changes = vec![add_slug()];
     resolve_answers(
@@ -168,16 +143,11 @@ fn the_copy_option_is_absent_when_nothing_could_be_copied() {
     );
 }
 
-/// The escape hatch writes ONE scaffold for the whole migration, hashes it into
-/// every escaping change's answer, and that hash is what `migrate build`
-/// compares against.
 #[test]
 fn the_escape_hatch_records_the_scaffolds_own_hash() {
     let t = TempDir::new().unwrap();
     let dest = parse(DEST);
     let mut changes = vec![add_slug(), retype_views()];
-    // Escape for both. `slug` offers constant / copy / escape (3 rows);
-    // `views` the same.
     let mut ask = Scripted::new(["3", "3"]);
 
     let scaffold = resolve_answers(
@@ -221,21 +191,13 @@ fn the_escape_hatch_records_the_scaffolds_own_hash() {
         "every escape in one migration shares ONE file"
     );
 
-    // Unedited: the build refuses.
     let m = Migration::with_id("20260808000000".into(), "x".into(), changes, 1, 2);
     assert!(hop_answer_status(t.path(), &m).is_err());
 
-    // Authored: the build proceeds.
     std::fs::write(&scaffold, "export function transform(m, r) { return r }\n").unwrap();
     assert_eq!(hop_answer_status(t.path(), &m), Ok(()));
 }
 
-/// The scaffold does **not** teach the `TODO` convention.
-///
-/// The old text said "fill in every TODO, then this migration is ready to
-/// build". That sentence taught a convention the build-time refusal must not
-/// use: a `TODO` grep is satisfied by deleting a comment and refuses a
-/// genuinely authored file that happens to contain the word.
 #[test]
 fn the_scaffold_does_not_teach_the_todo_convention() {
     let t = TempDir::new().unwrap();
@@ -271,9 +233,6 @@ fn the_scaffold_does_not_teach_the_todo_convention() {
     }
 }
 
-/// An existing authored file is never clobbered, and the hash returned is of
-/// what is ON DISK — so a re-run of `migrate create` cannot un-answer a
-/// migration by overwriting the author's work with a fresh scaffold.
 #[test]
 fn an_existing_authored_file_is_never_clobbered() {
     let t = TempDir::new().unwrap();
@@ -311,35 +270,22 @@ fn an_existing_authored_file_is_never_clobbered() {
     );
 }
 
-/// Scenario 22 — the escape language is **derived** from `[generate].targets`,
-/// and there is no config key that can disagree with it.
 #[test]
 fn scenario_22_the_escape_language_is_derived_never_declared() {
     let l = |targets: &[&str]| {
         language_for(&targets.iter().map(|s| s.to_string()).collect::<Vec<_>>())
     };
-    // The INTERNAL names `targets::resolve` produces.
     assert_eq!(l(&["typescript"]), EscapeLanguage::TypeScript, "node/bun sdk");
     assert_eq!(l(&["napi"]), EscapeLanguage::TypeScript, "node/bun runtime");
     assert_eq!(l(&["pyo3"]), EscapeLanguage::Python, "python runtime");
     assert_eq!(l(&["python-sdk"]), EscapeLanguage::Python);
     assert_eq!(l(&["rust"]), EscapeLanguage::Rust);
-    // Go is COMPILED, so "run the author's own runtime out of process" would
-    // mean invoking a toolchain and linking generated packages — materially
-    // more than the line-oriented host loop. It falls back to Rust.
     assert_eq!(l(&["go", "go-sdk"]), EscapeLanguage::Rust);
-    // Precedence is fixed rather than taken from the user's ordering, so a
-    // project declaring several (or `all`, a set with no order) resolves the
-    // same way every time.
     assert_eq!(l(&["pyo3", "typescript"]), EscapeLanguage::TypeScript);
     assert_eq!(l(&["typescript", "pyo3"]), EscapeLanguage::TypeScript);
     assert_eq!(l(&["rust", "pyo3"]), EscapeLanguage::Python);
     assert_eq!(l(&[]), EscapeLanguage::Rust, "no target implies no runtime");
 }
-
-// ---------------------------------------------------------------------------
-// Scenario 10 — a rename is proposed, never assumed
-// ---------------------------------------------------------------------------
 
 use forgedb::commands::migrate::answers::resolve_rename_proposals;
 use forgedb_migrations::{RenameProposal, SchemaDiffer, SimpleField, SimpleModel, SimpleSchema};
@@ -369,11 +315,6 @@ fn schema(fields: Vec<SimpleField>) -> SimpleSchema {
     }
 }
 
-/// The differ **proposes** and emits the drop+add; it decides nothing.
-///
-/// A guess that is right most of the time is the worst shape available here:
-/// a rename carries every stored value across, a drop+add empties the column,
-/// and the wrong half succeeds silently.
 #[test]
 fn scenario_10a_the_differ_proposes_and_still_emits_the_pair() {
     let old = schema(vec![field("id", SimpleType::Uuid), field("email", SimpleType::Str)]);
@@ -410,8 +351,6 @@ fn scenario_10a_the_differ_proposes_and_still_emits_the_pair() {
     );
 }
 
-/// Answering "no, these are unrelated" leaves the drop+add — and the add is
-/// itself unprovable, so it gets its own question.
 #[test]
 fn scenario_10b_declining_leaves_a_drop_and_an_add() {
     let old = schema(vec![field("id", SimpleType::Uuid), field("email", SimpleType::Str)]);
@@ -446,7 +385,6 @@ fn scenario_10b_declining_leaves_a_drop_and_an_add() {
     );
 }
 
-/// Answering "yes" replaces the pair with exactly one `RenameField`.
 #[test]
 fn scenario_10c_accepting_replaces_the_pair_with_one_rename() {
     let old = schema(vec![field("id", SimpleType::Uuid), field("email", SimpleType::Str)]);
@@ -470,12 +408,6 @@ fn scenario_10c_accepting_replaces_the_pair_with_one_rename() {
     );
 }
 
-/// Non-interactively the proposal is **declined**.
-///
-/// A drop+add is what the schema literally says; inferring otherwise with
-/// nobody to check is exactly the guess #374 removes. It is also the safe
-/// direction to be wrong in — a spurious drop+add is visible in the report and
-/// costs a re-run, while a spurious rename is silent.
 #[test]
 fn scenario_10d_a_proposal_with_nobody_to_ask_is_declined() {
     let old = schema(vec![field("id", SimpleType::Uuid), field("email", SimpleType::Str)]);
@@ -489,8 +421,6 @@ fn scenario_10d_a_proposal_with_nobody_to_ask_is_declined() {
     assert!(!d.changes.iter().any(|c| matches!(c, SchemaChange::RenameField { .. })));
 }
 
-/// A model rename is the same shape, and accepting it must clear BOTH the
-/// `RemoveModel` and the `AddModel`.
 #[test]
 fn a_model_rename_is_proposed_and_replaces_both_halves() {
     let one = |name: &str| SimpleSchema {
@@ -521,24 +451,8 @@ fn a_model_rename_is_proposed_and_replaces_both_halves() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Decision 5 — a required add with no answer emits NOTHING
-// ---------------------------------------------------------------------------
-
 use forgedb::commands::migrate::{Fill, lower_fill};
 
-/// `lower_fill` is the one place a field's value is decided, and its precedence
-/// is stated rather than emergent.
-///
-/// The last row is decision 5. A required add with no default and no answer
-/// contributes **no op**, so the key is ABSENT from the row and the destination
-/// decode fails with `missing field`, naming it. Returning a type-zero here is
-/// what made an unanswered hop write `""` and exit 0 — a successful exit is the
-/// defect's whole signature, which is why the end-to-end half of this
-/// (`tests/migrate_escape_test.rs` scenario 15) has to RUN the generated hop.
-///
-/// Mutation-verified: making the final arm `Some(Fill::Json("\"\"".into()))`
-/// turns this test red, and scenario 15 red with it.
 #[test]
 fn decision_5_a_required_add_with_no_answer_lowers_to_nothing() {
     let constant = Answer::Constant {
@@ -553,14 +467,12 @@ fn decision_5_a_required_add_with_no_answer_lowers_to_nothing() {
         scaffold_checksum: "fnv1a64:0".into(),
     };
 
-    // 1. The schema's `@default` wins, whatever else is present.
     assert_eq!(
         lower_fill(false, Some("\"pending\""), Some(&constant)),
         Some(Fill::Json("\"pending\"".into())),
         "a schema default is applied by BOTH routes; an answer is applied by the \
          transformer only, so the two are not interchangeable"
     );
-    // 2. Then the operator's answer.
     assert_eq!(
         lower_fill(false, None, Some(&constant)),
         Some(Fill::Json("\"x\"".into()))
@@ -569,13 +481,8 @@ fn decision_5_a_required_add_with_no_answer_lowers_to_nothing() {
         lower_fill(false, None, Some(&copy)),
         Some(Fill::Copy("title".into()))
     );
-    // 3. An escape's value comes from the author's transform, which runs AFTER
-    //    these structural ops — so there is nothing to emit here.
     assert_eq!(lower_fill(false, None, Some(&escape)), None);
-    // 4. `null` for a nullable add: the only value a nullable field can be given
-    //    without asking.
     assert_eq!(lower_fill(true, None, None), Some(Fill::Json("null".into())));
-    // 5. DECISION 5. Nothing.
     assert_eq!(
         lower_fill(false, None, None),
         None,
@@ -584,10 +491,6 @@ fn decision_5_a_required_add_with_no_answer_lowers_to_nothing() {
          an unanswered hop write \"\" and exit 0."
     );
 }
-
-// ---------------------------------------------------------------------------
-// Scenario 20, tier 1 — the emitted modules are real types
-// ---------------------------------------------------------------------------
 
 use forgedb::commands::migrate::escape::write_support_files;
 
@@ -599,10 +502,6 @@ const TYPED: &str = "enum Status { Draft, Published }\n\n\
                      state: Status\n  origin: Point\n  tags: [u32; 3]\n  \
                      author: *Author\n  editor: ?Author\n  raw: bytes(8)\n}\n";
 
-/// `migrate create` writes ForgeDB's own files beside the author's transform,
-/// and they are ALWAYS rewritten — so a CLI upgrade reaches them and any drift
-/// lands in the author's own `git diff` rather than as a type error in a file
-/// nobody edited.
 #[test]
 fn the_support_files_are_forgedbs_and_are_always_rewritten() {
     let t = TempDir::new().unwrap();
@@ -618,7 +517,6 @@ fn the_support_files_are_forgedbs_and_are_always_rewritten() {
         .collect();
     assert_eq!(names, vec!["host.ts", "v1.ts", "v2.ts"]);
 
-    // Rewritten, not preserved — unlike the author's transform.
     std::fs::write(&written[1], "// stale\n").unwrap();
     write_support_files(t.path(), "20260808000000", EscapeLanguage::TypeScript, &versions).unwrap();
     assert!(
@@ -626,7 +524,6 @@ fn the_support_files_are_forgedbs_and_are_always_rewritten() {
         "ForgeDB's own modules are regenerated every time"
     );
 
-    // A Rust escape is compiled INTO the hop, so there is nothing to emit here.
     assert!(
         write_support_files(t.path(), "20260808000001", EscapeLanguage::Rust, &versions)
             .unwrap()
@@ -634,15 +531,6 @@ fn the_support_files_are_forgedbs_and_are_always_rewritten() {
     );
 }
 
-/// The TypeScript module types every field on the transformer's wire — and its
-/// wire is the `serde` form of the generated `vN` Rust struct, not the REST
-/// SDK's.
-///
-/// Tier 1 and structural. The **Python** pair is compiled for real by
-/// `tests/migrate_escape_test.rs` scenario 20 (`python -m compileall`, stdlib).
-/// TypeScript has no equivalent that needs nothing installed — `tsc` is not on
-/// any runner and a test that installs it fails on a network blip — so what is
-/// asserted here is the mapping, one row at a time.
 #[test]
 fn the_typescript_module_types_every_wire_shape() {
     let schema = parse(TYPED);
@@ -653,20 +541,14 @@ fn the_typescript_module_types_every_wire_shape() {
         "export type Status = \"Draft\" | \"Published\";",
         "export interface Point {",
         "export interface Post {",
-        // #238: an inline `string(N)` is a string on the wire — the fixed slot
-        // is a storage fact JSON cannot observe.
         "  title: string;",
         "  views: number | null;",
-        // #254: an instant crosses JSON as an RFC 3339 string, never a number.
         "  at: string;",
-        // decimal serializes as a string so precision survives.
         "  price: string;",
         "  meta: unknown;",
         "  state: Status;",
         "  origin: Point;",
         "  tags: number[];",
-        // #266: an FK carries the TARGET's identity value, which is not always
-        // a uuid — here `Author.id` is one, so `string`.
         "  author: string;",
         "  editor: string | null;",
         "  raw: number[];",
@@ -684,7 +566,6 @@ fn the_typescript_module_types_every_wire_shape() {
     assert!(src.contains("DO NOT EDIT"), "it is ForgeDB's file:\n{src}");
 }
 
-/// The Python module maps the same wire to Python's names.
 #[test]
 fn the_python_module_types_every_wire_shape() {
     let schema = parse(TYPED);
@@ -713,12 +594,6 @@ fn the_python_module_types_every_wire_shape() {
     }
 }
 
-/// A pure collection relation is **not on the row's wire at all** — it is stored
-/// as junction pairs the transformer copies separately — so it must not appear
-/// in either module.
-///
-/// A field typed `never` / `Any` here would be a lie the author would then try
-/// to return.
 #[test]
 fn a_collection_relation_is_absent_from_both_modules() {
     let schema = parse(

@@ -35,13 +35,13 @@ fn test_http_validation_error_internal() {
 fn test_validate_required_fields() {
     let fields = vec![
         ("name", Some("John")),
-        ("email", Some("")), // Empty counts as missing
+        ("email", Some("")),
         ("age", None),
     ];
     let result = HttpValidator::validate_required_fields(&fields);
     assert!(result.is_err());
     let errors = result.unwrap_err();
-    assert_eq!(errors.len(), 2); // email and age
+    assert_eq!(errors.len(), 2);
 }
 
 #[test]

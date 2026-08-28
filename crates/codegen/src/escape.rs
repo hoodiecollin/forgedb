@@ -1,42 +1,5 @@
-//! Typed modules and the host loop for a non-Rust escape transform (#374
-//! direction C).
-//!
-//! When a transform genuinely needs code, it should be written **against the
-//! generated types, in the language the author already chose** — not handed a
-//! `serde_json::Value` and a `match` arm. This module emits the two files that
-//! make that possible:
-//!
-//! * `v{n}.{ts,py}` — one type per model, for the version snapshot the lineage
-//!   committed at `migrations/schemas/v{n}.forge`. **ForgeDB's**, always
-//!   rewritten, so a CLI upgrade reaches them and the drift shows up in the
-//!   author's own diff rather than as a type error.
-//! * `host.{ts,py}` — the newline-delimited-JSON loop the scaffold wraps. Also
-//!   ForgeDB's, and also always rewritten.
-//!
-//! The author's `transform.{ts,py}` beside them is **theirs** and is never
-//! rewritten once it exists.
-//!
-//! # Identity
-//!
-//! Nothing here is shipped. These are *generated files in the author's own
-//! migration directory*, derived from a committed schema snapshot at generation
-//! time — the same class as `types.ts` from the TypeScript SDK. The host loop is
-//! schema-agnostic because a line of JSON is schema-agnostic; it carries no
-//! model list, no field table and no descriptor, and the emitted Rust hop names
-//! each model as a **string literal at its own call site**.
-//!
-//! # Why the type mapping is here rather than borrowed from the SDK generators
-//!
-//! The wire is different. The REST SDKs describe the *API's* representation of
-//! a model; this describes what `serde_json::to_value` produces from the
-//! generated `vN` Rust struct, which is what the hop actually hands the child.
-//! They agree today for every scalar, and pinning them to one mapper would make
-//! a future divergence in either surface silently change the other. The match
-//! below is **exhaustive**, so a new `FieldType` has to be decided here.
-
 use forgedb_parser::{FieldType, RelationType, Schema};
 
-/// `(filename, source)` for one version's TypeScript types.
 pub fn typescript_types(schema: &Schema, version: u32) -> (String, String) {
     let mut s = String::new();
     s.push_str(&format!(
@@ -82,7 +45,6 @@ pub fn typescript_types(schema: &Schema, version: u32) -> (String, String) {
     (format!("v{version}.ts"), s)
 }
 
-/// `(filename, source)` for one version's Python types.
 pub fn python_types(schema: &Schema, version: u32) -> (String, String) {
     let mut s = String::new();
     s.push_str(&format!(
@@ -132,8 +94,6 @@ pub fn python_types(schema: &Schema, version: u32) -> (String, String) {
     (format!("v{version}.py"), s)
 }
 
-/// A pure collection relation carries no column, so it is not on the row's wire
-/// at all — it is stored as junction pairs the transformer copies separately.
 fn on_the_wire(ty: &FieldType) -> bool {
     !matches!(
         ty,
@@ -142,24 +102,14 @@ fn on_the_wire(ty: &FieldType) -> bool {
     )
 }
 
-/// The TypeScript type of one field on the transformer's wire.
-///
-/// Exhaustive on purpose: a new `FieldType` must be decided here rather than
-/// silently becoming `any`, which is what a catch-all would do — and `any` in a
-/// module whose whole purpose is to type the author's transform is a type that
-/// checks nothing.
 fn ts_type(schema: &Schema, ty: &FieldType) -> String {
     match ty {
         FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64 | FieldType::F64 => {
             "number".into()
         }
         FieldType::Bool => "boolean".into(),
-        // #238: an inline `string(N)` is a string on the wire — the fixed slot
-        // is a storage fact the JSON cannot observe.
         FieldType::String | FieldType::StringN { .. } | FieldType::Uuid => "string".into(),
-        // #254: an instant crosses JSON as an RFC 3339 string, never a number.
         FieldType::Timestamp(_) => "string".into(),
-        // decimal serializes as a string so precision survives the wire.
         FieldType::Decimal => "string".into(),
         FieldType::Json => "unknown".into(),
         FieldType::Enum(name) => name.clone(),
@@ -168,24 +118,14 @@ fn ts_type(schema: &Schema, ty: &FieldType) -> String {
         FieldType::Bytes(_) => "number[]".into(),
         FieldType::FixedArray(inner, _) => format!("{}[]", ts_type(schema, inner)),
         FieldType::Nullable(inner) => format!("{} | null", ts_type(schema, inner)),
-        // #266: an FK carries the TARGET's identity value on the wire, which is
-        // not always a uuid.
-        //
-        // Both kinds delegate WITHOUT adding a nullability suffix:
-        // `resolved_type` already wraps an optional reference in `Nullable`, so
-        // adding one here produced `string | null | null`. Optionality has one
-        // source, and for a relation it is the resolution.
         FieldType::Relation(
             RelationType::RequiredReference(_) | RelationType::OptionalReference(_),
         ) => ts_type(schema, &crate::rust::RustGenerator::resolved_type(schema, ty)),
-        // Filtered out by `on_the_wire` before they reach here; kept so this
-        // match is total rather than needing a catch-all.
         FieldType::Relation(RelationType::OneToMany(_) | RelationType::ManyToMany(_))
         | FieldType::Component(_) => "never".into(),
     }
 }
 
-/// The Python type of one field on the transformer's wire. See [`ts_type`].
 fn py_type(schema: &Schema, ty: &FieldType) -> String {
     match ty {
         FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64 => "int".into(),
@@ -201,8 +141,6 @@ fn py_type(schema: &Schema, ty: &FieldType) -> String {
         FieldType::Bytes(_) => "List[int]".into(),
         FieldType::FixedArray(inner, _) => format!("List[{}]", py_type(schema, inner)),
         FieldType::Nullable(inner) => format!("Optional[{}]", py_type(schema, inner)),
-        // See `ts_type`: `resolved_type` already wraps an optional reference in
-        // `Nullable`, so both kinds delegate without adding a second one.
         FieldType::Relation(
             RelationType::RequiredReference(_) | RelationType::OptionalReference(_),
         ) => py_type(schema, &crate::rust::RustGenerator::resolved_type(schema, ty)),
@@ -211,34 +149,15 @@ fn py_type(schema: &Schema, ty: &FieldType) -> String {
     }
 }
 
-/// `(filename, source)` for the TypeScript host loop.
 pub fn typescript_host() -> (String, String) {
     ("host.ts".to_string(), TS_HOST.to_string())
 }
 
-/// `(filename, source)` for the Python host loop.
 pub fn python_host() -> (String, String) {
     ("host.py".to_string(), PY_HOST.to_string())
 }
 
-/// The line-oriented host loop, in TypeScript.
-///
-/// Deliberately **synchronous** `readSync`/`writeSync` over the raw fds rather
-/// than `readline` + `process.stdout.write`. The protocol is a strict
-/// request/response over pipes: the parent writes one row and then BLOCKS on the
-/// reply, so a child that buffers its stdout deadlocks the migration with no
-/// output at all. `writeSync` is flushed by definition.
 const TS_HOST: &str = r#"// Generated by ForgeDB — DO NOT EDIT. Rewritten on every migrate create/build.
-//
-// The bridge between ForgeDB's transformer and your transform. ForgeDB spawns
-// this process once per migration hop and speaks one JSON object per line:
-//
-//   -> {"model":"Post","row":{...}}
-//   <- {...}
-//
-// Strictly in order, one reply per row. Synchronous reads and writes are not an
-// accident: the parent blocks on your reply, so a buffered stdout would deadlock
-// the migration with no output at all.
 import { readSync, writeSync } from "node:fs";
 
 export type Row = Record<string, unknown>;
@@ -272,7 +191,6 @@ export function runTransform(fn: (model: string, row: Row) => Row): void {
 }
 "#;
 
-/// The line-oriented host loop, in Python.
 const PY_HOST: &str = r#"# Generated by ForgeDB — DO NOT EDIT. Rewritten on every migrate create/build.
 #
 # The bridge between ForgeDB's transformer and your transform. ForgeDB spawns
@@ -291,7 +209,6 @@ import sys
 from typing import Any, Callable, Dict
 
 Row = Dict[str, Any]
-
 
 def run_transform(fn: Callable[[str, Row], Row]) -> None:
     while True:

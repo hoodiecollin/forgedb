@@ -1,55 +1,3 @@
-//! **#281 · S10** — the two `PageRef` construction sites must agree, byte for byte,
-//! over a grid of windows.
-//!
-//! #281 adds a second place that builds a `<Model>PageRef`: `__with_fast_page`, which
-//! skips the full-table scan for a request that names no filter and no sort. Its
-//! whole contract is that it is *indistinguishable* from what `__with_page` produces
-//! for the same window — same rows, same order, same `total`, same field order, same
-//! JSON key order. That is exactly what makes the change safe and exactly what makes
-//! it hard to test: a wire test cannot tell the two apart, which is the point.
-//!
-//! So this test compares them **against each other** rather than against a frozen
-//! literal:
-//!
-//! ```ignore
-//! to_string(__with_fast_page(o, l, ser)) == to_string(__with_page(None, |_| true, |_| {}, o, l, ser))
-//! ```
-//!
-//! for every `(offset, limit)` in the grid and every model in the schema. It is not
-//! redundant with `tests/api_wire_test.rs`: that pins the bytes against a **literal**,
-//! which catches a change moving *both* sites; this pins the sites against **each
-//! other**, which catches a change moving *one*. Neither catches the other's failure.
-//!
-//! Three things about the fixture are part of the spec rather than incidental:
-//!
-//! - **≥ 1,000 live rows per model.** At that size the `limit = 1000` column is a
-//!   genuine near-full page rather than a synonym for "the whole table", and every
-//!   `limit ≥ 50` cell stays distinct. On a small corpus the four largest limits all
-//!   collapse to the same page and two thirds of the grid stops discriminating. It
-//!   also supplies the predicted **zero-win regime** for free.
-//! - **A `string(6!)`-keyed model with an FK to it** (`Org` / `Widget.owner`). That
-//!   FK is the one field class whose `borrowed` flag genuinely flips: it is non-scan
-//!   (a relation is never filterable) *and* inline-string, so the read path moves
-//!   between the owned and borrowed arms of `field_read_stmt`. `__with_fast_page`
-//!   passes `borrowed = true` for every field; this is the field that proves it must.
-//! - **A junction with ZERO filterable fields** (`Link { id: *Doc, other: *Tag, meta:
-//!   json }`). Nothing else in the schema has an empty scan-filter set, and the
-//!   emitter must not assume one away.
-//!
-//! The corpus is **churned**: updates leave dead versions inside the mapped span and
-//! move the live row to the tail, deletes punch holes in the selection. Both make the
-//! live row set something other than the dense prefix `[0, n)`, which is the only
-//! condition under which slicing the selection could disagree with mapping through a
-//! recorded slot.
-//!
-//! It compiles and RUNS a generated crate, so it is `#[ignore]`d out of the fast
-//! hermetic default suite:
-//!
-//! ```bash
-//! make page-identity-test    # or:
-//! cargo test --test page_identity_test -- --ignored --nocapture
-//! ```
-
 mod common;
 
 const SCHEMA: &str = r#"
@@ -358,13 +306,6 @@ fn main() {
 #[ignore = "compiles and runs a generated crate; run with --ignored (see `make page-identity-test`)"]
 fn fast_page_and_page_build_identical_pages() {
     let (out, proj) = common::generate_compile_run("pageidentity", SCHEMA, DRIVER);
-    // Captured before `assert_driver_ok`, which removes the project directory.
-    //
-    // Targeted, never "no warnings at all": generated code carries pre-existing
-    // benign warnings in arms a given schema does not exercise. What must not appear
-    // is a diagnostic naming #281's own emissions — the per-model buffer holder or
-    // the method itself — which is how an unused binding or an unreachable arm in the
-    // new emitter would surface in the USER's crate rather than in this repo.
     let warnings = common::build_warnings(&proj);
     common::assert_driver_ok(&out, &proj, "the fast page and the page disagree");
     for needle in ["FastPageBufs", "__with_fast_page"] {

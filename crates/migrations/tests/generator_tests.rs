@@ -20,7 +20,6 @@ fn test_generate_and_load_migration() {
         },
     ];
 
-    // Generate migration
     let migration = MigrationGenerator::generate(
         migrations_dir,
         "Create User model".to_string(),
@@ -31,7 +30,6 @@ fn test_generate_and_load_migration() {
     assert_eq!(migration.changes.len(), 2);
     assert_eq!(migration.description, "Create User model");
 
-    // Load it back
     let migrations = MigrationGenerator::load_all_migrations(migrations_dir).unwrap();
     assert_eq!(migrations.len(), 1);
     assert_eq!(migrations[0].id, migration.id);

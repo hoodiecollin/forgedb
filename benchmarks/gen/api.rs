@@ -1,5 +1,3 @@
-//! Generated API server by ForgeDB
-//! DO NOT EDIT - This file is auto-generated
 #![allow(dead_code, unused_imports)]
 use super::*;
 use axum::{
@@ -350,22 +348,6 @@ fn user_apply_sort(
         rows.reverse();
     }
 }
-/// Is this request unfiltered — does NO query key name a filterable field
-/// of this model (#288)?
-///
-/// Hoisted out of the per-row loop by every caller, because it is a
-/// property of the query string and not of the row. `_scan_matches` can
-/// only short-circuit on `params.is_empty()`, and `?limit=50` defeats that
-/// while naming no filterable field at all — so an unfiltered request was
-/// running one `HashMap` lookup per filterable field per SCANNED ROW, all
-/// of them guaranteed to miss. Measured at ~50 ns/row, i.e. 502 µs of a
-/// 850 µs request over 10k rows.
-///
-/// The question is POSITIVE — "does any key name a field of this model?" —
-/// deliberately. A negative exclusion list (`limit`/`offset`/`sort`/
-/// `order`/`as_of`) would need maintaining, and would be wrong: a model may
-/// legally declare a field named `limit`, and for that model `?limit=3`
-/// genuinely is a filter.
 fn __user_is_unfiltered(params: &HashMap<String, String>) -> bool {
     if params.contains_key("id") {
         return false;
@@ -381,10 +363,6 @@ fn __user_is_unfiltered(params: &HashMap<String, String>) -> bool {
     }
     true
 }
-/// Narrow closed-set filter over the BORROWED scan view (#160/#224), so
-/// a row is accepted or rejected before its strings are ever copied out
-/// of the buffered column.  Same per-field checks as `_event_matches`,
-/// only the operand type is narrower.
 fn __user_scan_matches(
     record: &super::UserScanRef<'_>,
     params: &HashMap<String, String>,
@@ -430,10 +408,6 @@ fn __user_scan_matches(
     }
     true
 }
-/// Narrow list sort over the borrowed scan view (#160/#228) — same arms
-/// as `_apply_sort`.  Runs inside the scan scope, on views that borrow
-/// the buffered columns: `&str` and `Option<&str>` are `Ord`, so
-/// comparing them is comparing the buffer's bytes in place.
 fn __user_scan_sort(
     rows: &mut Vec<super::UserScanRef<'_>>,
     sort: &Option<forgedb_query_params::Sort>,
@@ -866,22 +840,6 @@ fn post_apply_sort(
         rows.reverse();
     }
 }
-/// Is this request unfiltered — does NO query key name a filterable field
-/// of this model (#288)?
-///
-/// Hoisted out of the per-row loop by every caller, because it is a
-/// property of the query string and not of the row. `_scan_matches` can
-/// only short-circuit on `params.is_empty()`, and `?limit=50` defeats that
-/// while naming no filterable field at all — so an unfiltered request was
-/// running one `HashMap` lookup per filterable field per SCANNED ROW, all
-/// of them guaranteed to miss. Measured at ~50 ns/row, i.e. 502 µs of a
-/// 850 µs request over 10k rows.
-///
-/// The question is POSITIVE — "does any key name a field of this model?" —
-/// deliberately. A negative exclusion list (`limit`/`offset`/`sort`/
-/// `order`/`as_of`) would need maintaining, and would be wrong: a model may
-/// legally declare a field named `limit`, and for that model `?limit=3`
-/// genuinely is a filter.
 fn __post_is_unfiltered(params: &HashMap<String, String>) -> bool {
     if params.contains_key("id") {
         return false;
@@ -900,10 +858,6 @@ fn __post_is_unfiltered(params: &HashMap<String, String>) -> bool {
     }
     true
 }
-/// Narrow closed-set filter over the BORROWED scan view (#160/#224), so
-/// a row is accepted or rejected before its strings are ever copied out
-/// of the buffered column.  Same per-field checks as `_event_matches`,
-/// only the operand type is narrower.
 fn __post_scan_matches(
     record: &super::PostScanRef<'_>,
     params: &HashMap<String, String>,
@@ -958,10 +912,6 @@ fn __post_scan_matches(
     }
     true
 }
-/// Narrow list sort over the borrowed scan view (#160/#228) — same arms
-/// as `_apply_sort`.  Runs inside the scan scope, on views that borrow
-/// the buffered columns: `&str` and `Option<&str>` are `Ord`, so
-/// comparing them is comparing the buffer's bytes in place.
 fn __post_scan_sort(
     rows: &mut Vec<super::PostScanRef<'_>>,
     sort: &Option<forgedb_query_params::Sort>,
@@ -1303,22 +1253,6 @@ fn tag_apply_sort(
         rows.reverse();
     }
 }
-/// Is this request unfiltered — does NO query key name a filterable field
-/// of this model (#288)?
-///
-/// Hoisted out of the per-row loop by every caller, because it is a
-/// property of the query string and not of the row. `_scan_matches` can
-/// only short-circuit on `params.is_empty()`, and `?limit=50` defeats that
-/// while naming no filterable field at all — so an unfiltered request was
-/// running one `HashMap` lookup per filterable field per SCANNED ROW, all
-/// of them guaranteed to miss. Measured at ~50 ns/row, i.e. 502 µs of a
-/// 850 µs request over 10k rows.
-///
-/// The question is POSITIVE — "does any key name a field of this model?" —
-/// deliberately. A negative exclusion list (`limit`/`offset`/`sort`/
-/// `order`/`as_of`) would need maintaining, and would be wrong: a model may
-/// legally declare a field named `limit`, and for that model `?limit=3`
-/// genuinely is a filter.
 fn __tag_is_unfiltered(params: &HashMap<String, String>) -> bool {
     if params.contains_key("id") {
         return false;
@@ -1328,10 +1262,6 @@ fn __tag_is_unfiltered(params: &HashMap<String, String>) -> bool {
     }
     true
 }
-/// Narrow closed-set filter over the BORROWED scan view (#160/#224), so
-/// a row is accepted or rejected before its strings are ever copied out
-/// of the buffered column.  Same per-field checks as `_event_matches`,
-/// only the operand type is narrower.
 fn __tag_scan_matches(
     record: &super::TagScanRef<'_>,
     params: &HashMap<String, String>,
@@ -1359,10 +1289,6 @@ fn __tag_scan_matches(
     }
     true
 }
-/// Narrow list sort over the borrowed scan view (#160/#228) — same arms
-/// as `_apply_sort`.  Runs inside the scan scope, on views that borrow
-/// the buffered columns: `&str` and `Option<&str>` are `Ord`, so
-/// comparing them is comparing the buffer's bytes in place.
 fn __tag_scan_sort(
     rows: &mut Vec<super::TagScanRef<'_>>,
     sort: &Option<forgedb_query_params::Sort>,
@@ -1832,22 +1758,6 @@ fn metric_apply_sort(
         rows.reverse();
     }
 }
-/// Is this request unfiltered — does NO query key name a filterable field
-/// of this model (#288)?
-///
-/// Hoisted out of the per-row loop by every caller, because it is a
-/// property of the query string and not of the row. `_scan_matches` can
-/// only short-circuit on `params.is_empty()`, and `?limit=50` defeats that
-/// while naming no filterable field at all — so an unfiltered request was
-/// running one `HashMap` lookup per filterable field per SCANNED ROW, all
-/// of them guaranteed to miss. Measured at ~50 ns/row, i.e. 502 µs of a
-/// 850 µs request over 10k rows.
-///
-/// The question is POSITIVE — "does any key name a field of this model?" —
-/// deliberately. A negative exclusion list (`limit`/`offset`/`sort`/
-/// `order`/`as_of`) would need maintaining, and would be wrong: a model may
-/// legally declare a field named `limit`, and for that model `?limit=3`
-/// genuinely is a filter.
 fn __metric_is_unfiltered(params: &HashMap<String, String>) -> bool {
     if params.contains_key("id") {
         return false;
@@ -1917,10 +1827,6 @@ fn __metric_is_unfiltered(params: &HashMap<String, String>) -> bool {
     }
     true
 }
-/// Narrow closed-set filter over the BORROWED scan view (#160/#224), so
-/// a row is accepted or rejected before its strings are ever copied out
-/// of the buffered column.  Same per-field checks as `_event_matches`,
-/// only the operand type is narrower.
 fn __metric_scan_matches(
     record: &super::MetricScanRef<'_>,
     params: &HashMap<String, String>,
@@ -2128,10 +2034,6 @@ fn __metric_scan_matches(
     }
     true
 }
-/// Narrow list sort over the borrowed scan view (#160/#228) — same arms
-/// as `_apply_sort`.  Runs inside the scan scope, on views that borrow
-/// the buffered columns: `&str` and `Option<&str>` are `Ord`, so
-/// comparing them is comparing the buffer's bytes in place.
 fn __metric_scan_sort(
     rows: &mut Vec<super::MetricScanRef<'_>>,
     sort: &Option<forgedb_query_params::Sort>,
@@ -2596,22 +2498,6 @@ fn doc_apply_sort(
         rows.reverse();
     }
 }
-/// Is this request unfiltered — does NO query key name a filterable field
-/// of this model (#288)?
-///
-/// Hoisted out of the per-row loop by every caller, because it is a
-/// property of the query string and not of the row. `_scan_matches` can
-/// only short-circuit on `params.is_empty()`, and `?limit=50` defeats that
-/// while naming no filterable field at all — so an unfiltered request was
-/// running one `HashMap` lookup per filterable field per SCANNED ROW, all
-/// of them guaranteed to miss. Measured at ~50 ns/row, i.e. 502 µs of a
-/// 850 µs request over 10k rows.
-///
-/// The question is POSITIVE — "does any key name a field of this model?" —
-/// deliberately. A negative exclusion list (`limit`/`offset`/`sort`/
-/// `order`/`as_of`) would need maintaining, and would be wrong: a model may
-/// legally declare a field named `limit`, and for that model `?limit=3`
-/// genuinely is a filter.
 fn __doc_is_unfiltered(params: &HashMap<String, String>) -> bool {
     if params.contains_key("id") {
         return false;
@@ -2636,10 +2522,6 @@ fn __doc_is_unfiltered(params: &HashMap<String, String>) -> bool {
     }
     true
 }
-/// Narrow closed-set filter over the BORROWED scan view (#160/#224), so
-/// a row is accepted or rejected before its strings are ever copied out
-/// of the buffered column.  Same per-field checks as `_event_matches`,
-/// only the operand type is narrower.
 fn __doc_scan_matches(
     record: &super::DocScanRef<'_>,
     params: &HashMap<String, String>,
@@ -2712,10 +2594,6 @@ fn __doc_scan_matches(
     }
     true
 }
-/// Narrow list sort over the borrowed scan view (#160/#228) — same arms
-/// as `_apply_sort`.  Runs inside the scan scope, on views that borrow
-/// the buffered columns: `&str` and `Option<&str>` are `Ord`, so
-/// comparing them is comparing the buffer's bytes in place.
 fn __doc_scan_sort(
     rows: &mut Vec<super::DocScanRef<'_>>,
     sort: &Option<forgedb_query_params::Sort>,
@@ -2737,7 +2615,6 @@ fn __doc_scan_sort(
         rows.reverse();
     }
 }
-///Per-model change-feed filter for `User` (#62): narrow by exact-match `?field=value` query params. Each declared scalar field is checked by name in generated code, parsing the param into the field's type and comparing typed values (#84 — `?n=3` matches a stored `3.0`); the substrate feed never inspects a field. An empty param set matches everything; unknown keys are ignored.
 fn user_event_matches(record: &super::User, params: &HashMap<String, String>) -> bool {
     if params.is_empty() {
         return true;
@@ -2780,7 +2657,6 @@ fn user_event_matches(record: &super::User, params: &HashMap<String, String>) ->
     }
     true
 }
-/// Typed per-field change detector for the live-query `Updated` diff (#84).
 fn user_record_changed(a: &super::User, b: &super::User) -> bool {
     if a.id != b.id {
         return true;
@@ -2796,7 +2672,6 @@ fn user_record_changed(a: &super::User, b: &super::User) -> bool {
     }
     false
 }
-///WebSocket subscription for `User` changes (#62 Direction A + #66). Upgrades the connection and streams a typed `UserInserted` / `UserUpdated` / `UserDeleted` JSON event per change, optionally narrowed by `?field=value`.
 async fn subscribe_user(
     Query(params): Query<HashMap<String, String>>,
     headers: axum::http::HeaderMap,
@@ -2856,7 +2731,6 @@ async fn handle_user_subscription(
         }
     }
 }
-///Per-model change-feed filter for `Post` (#62): narrow by exact-match `?field=value` query params. Each declared scalar field is checked by name in generated code, parsing the param into the field's type and comparing typed values (#84 — `?n=3` matches a stored `3.0`); the substrate feed never inspects a field. An empty param set matches everything; unknown keys are ignored.
 fn post_event_matches(record: &super::Post, params: &HashMap<String, String>) -> bool {
     if params.is_empty() {
         return true;
@@ -2908,7 +2782,6 @@ fn post_event_matches(record: &super::Post, params: &HashMap<String, String>) ->
     }
     true
 }
-/// Typed per-field change detector for the live-query `Updated` diff (#84).
 fn post_record_changed(a: &super::Post, b: &super::Post) -> bool {
     if a.id != b.id {
         return true;
@@ -2930,7 +2803,6 @@ fn post_record_changed(a: &super::Post, b: &super::Post) -> bool {
     }
     false
 }
-///WebSocket subscription for `Post` changes (#62 Direction A + #66). Upgrades the connection and streams a typed `PostInserted` / `PostUpdated` / `PostDeleted` JSON event per change, optionally narrowed by `?field=value`.
 async fn subscribe_post(
     Query(params): Query<HashMap<String, String>>,
     headers: axum::http::HeaderMap,
@@ -2990,7 +2862,6 @@ async fn handle_post_subscription(
         }
     }
 }
-///Per-model change-feed filter for `Tag` (#62): narrow by exact-match `?field=value` query params. Each declared scalar field is checked by name in generated code, parsing the param into the field's type and comparing typed values (#84 — `?n=3` matches a stored `3.0`); the substrate feed never inspects a field. An empty param set matches everything; unknown keys are ignored.
 fn tag_event_matches(record: &super::Tag, params: &HashMap<String, String>) -> bool {
     if params.is_empty() {
         return true;
@@ -3015,7 +2886,6 @@ fn tag_event_matches(record: &super::Tag, params: &HashMap<String, String>) -> b
     }
     true
 }
-/// Typed per-field change detector for the live-query `Updated` diff (#84).
 fn tag_record_changed(a: &super::Tag, b: &super::Tag) -> bool {
     if a.id != b.id {
         return true;
@@ -3025,7 +2895,6 @@ fn tag_record_changed(a: &super::Tag, b: &super::Tag) -> bool {
     }
     false
 }
-///WebSocket subscription for `Tag` changes (#62 Direction A + #66). Upgrades the connection and streams a typed `TagInserted` / `TagUpdated` / `TagDeleted` JSON event per change, optionally narrowed by `?field=value`.
 async fn subscribe_tag(
     Query(params): Query<HashMap<String, String>>,
     headers: axum::http::HeaderMap,
@@ -3081,7 +2950,6 @@ async fn handle_tag_subscription(
         }
     }
 }
-///Per-model change-feed filter for `Metric` (#62): narrow by exact-match `?field=value` query params. Each declared scalar field is checked by name in generated code, parsing the param into the field's type and comparing typed values (#84 — `?n=3` matches a stored `3.0`); the substrate feed never inspects a field. An empty param set matches everything; unknown keys are ignored.
 fn metric_event_matches(
     record: &super::Metric,
     params: &HashMap<String, String>,
@@ -3289,7 +3157,6 @@ fn metric_event_matches(
     }
     true
 }
-/// Typed per-field change detector for the live-query `Updated` diff (#84).
 fn metric_record_changed(a: &super::Metric, b: &super::Metric) -> bool {
     if a.id != b.id {
         return true;
@@ -3359,7 +3226,6 @@ fn metric_record_changed(a: &super::Metric, b: &super::Metric) -> bool {
     }
     false
 }
-///WebSocket subscription for `Metric` changes (#62 Direction A + #66). Upgrades the connection and streams a typed `MetricInserted` / `MetricUpdated` / `MetricDeleted` JSON event per change, optionally narrowed by `?field=value`.
 async fn subscribe_metric(
     Query(params): Query<HashMap<String, String>>,
     headers: axum::http::HeaderMap,
@@ -3427,7 +3293,6 @@ async fn handle_metric_subscription(
         }
     }
 }
-///Per-model change-feed filter for `Doc` (#62): narrow by exact-match `?field=value` query params. Each declared scalar field is checked by name in generated code, parsing the param into the field's type and comparing typed values (#84 — `?n=3` matches a stored `3.0`); the substrate feed never inspects a field. An empty param set matches everything; unknown keys are ignored.
 fn doc_event_matches(record: &super::Doc, params: &HashMap<String, String>) -> bool {
     if params.is_empty() {
         return true;
@@ -3497,7 +3362,6 @@ fn doc_event_matches(record: &super::Doc, params: &HashMap<String, String>) -> b
     }
     true
 }
-/// Typed per-field change detector for the live-query `Updated` diff (#84).
 fn doc_record_changed(a: &super::Doc, b: &super::Doc) -> bool {
     if a.id != b.id {
         return true;
@@ -3522,7 +3386,6 @@ fn doc_record_changed(a: &super::Doc, b: &super::Doc) -> bool {
     }
     false
 }
-///WebSocket subscription for `Doc` changes (#62 Direction A + #66). Upgrades the connection and streams a typed `DocInserted` / `DocUpdated` / `DocDeleted` JSON event per change, optionally narrowed by `?field=value`.
 async fn subscribe_doc(
     Query(params): Query<HashMap<String, String>>,
     headers: axum::http::HeaderMap,
@@ -3578,7 +3441,6 @@ async fn handle_doc_subscription(
         }
     }
 }
-///Live-query WebSocket subscription for `User` (#62 Direction B). Runs the generated closed-set query (narrow `__with_scan` + `__user_scan_matches`, materializing only matches — #160), streams an initial `UserLiveDelta::Init`, then pushes removal-aware `Added` / `Updated` / `Removed` deltas as the matching set changes.
 async fn subscribe_live_user(
     Query(params): Query<HashMap<String, String>>,
     headers: axum::http::HeaderMap,
@@ -3686,7 +3548,6 @@ async fn handle_user_live_query(
         }
     }
 }
-///Live-query WebSocket subscription for `Post` (#62 Direction B). Runs the generated closed-set query (narrow `__with_scan` + `__post_scan_matches`, materializing only matches — #160), streams an initial `PostLiveDelta::Init`, then pushes removal-aware `Added` / `Updated` / `Removed` deltas as the matching set changes.
 async fn subscribe_live_post(
     Query(params): Query<HashMap<String, String>>,
     headers: axum::http::HeaderMap,
@@ -3794,7 +3655,6 @@ async fn handle_post_live_query(
         }
     }
 }
-///Live-query WebSocket subscription for `Tag` (#62 Direction B). Runs the generated closed-set query (narrow `__with_scan` + `__tag_scan_matches`, materializing only matches — #160), streams an initial `TagLiveDelta::Init`, then pushes removal-aware `Added` / `Updated` / `Removed` deltas as the matching set changes.
 async fn subscribe_live_tag(
     Query(params): Query<HashMap<String, String>>,
     headers: axum::http::HeaderMap,
@@ -3902,7 +3762,6 @@ async fn handle_tag_live_query(
         }
     }
 }
-///Live-query WebSocket subscription for `Metric` (#62 Direction B). Runs the generated closed-set query (narrow `__with_scan` + `__metric_scan_matches`, materializing only matches — #160), streams an initial `MetricLiveDelta::Init`, then pushes removal-aware `Added` / `Updated` / `Removed` deltas as the matching set changes.
 async fn subscribe_live_metric(
     Query(params): Query<HashMap<String, String>>,
     headers: axum::http::HeaderMap,
@@ -4012,7 +3871,6 @@ async fn handle_metric_live_query(
         }
     }
 }
-///Live-query WebSocket subscription for `Doc` (#62 Direction B). Runs the generated closed-set query (narrow `__with_scan` + `__doc_scan_matches`, materializing only matches — #160), streams an initial `DocLiveDelta::Init`, then pushes removal-aware `Added` / `Updated` / `Removed` deltas as the matching set changes.
 async fn subscribe_live_doc(
     Query(params): Query<HashMap<String, String>>,
     headers: axum::http::HeaderMap,
@@ -4120,9 +3978,6 @@ async fn handle_doc_live_query(
         }
     }
 }
-/// Upgrade to a replication stream.  `?after=<offset>` resumes from the
-/// follower's last applied offset (default `0` = cold / from the start
-/// of the retained log).  Tenant-scoped by the router's auth guard.
 async fn __replicate(
     Query(params): Query<HashMap<String, String>>,
     headers: axum::http::HeaderMap,
@@ -4175,25 +4030,15 @@ async fn __handle_replicate(
         }
     }
 }
-/// Liveness probe (Phase 5): 200 as long as the process is up and
-/// the async runtime is scheduling.  Never touches the database, so it
-/// never blocks on a write lock — the correct signal for a k8s
-/// `livenessProbe` / load-balancer health check.
 async fn __health() -> (StatusCode, Json<serde_json::Value>) {
     (StatusCode::OK, Json(json!({ "status" : "ok" })))
 }
-/// Readiness probe (Phase 5): acquires a read lock on the database
-/// and returns 200 once obtained, proving the store opened and the
-/// lock is not wedged — the correct signal for a k8s `readinessProbe`.
 async fn __ready(
     State(db): State<Arc<RwLock<super::Database>>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let _guard = db.read().await;
     (StatusCode::OK, Json(json!({ "status" : "ready" })))
 }
-/// Minimal metrics (Phase 5): per-model live row counts + totals,
-/// as JSON.  Generated per-schema by naming each model's storage field;
-/// no schema is interpreted at runtime.
 async fn __metrics(
     State(db): State<Arc<RwLock<super::Database>>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -4210,18 +4055,6 @@ async fn __metrics(
     );
     (StatusCode::OK, Json(body))
 }
-/// Snapshot token (#85): the current per-model row-count **watermark**
-/// of every model, captured atomically under one read guard on the
-/// single writer — a coherent "as of now" instant.  The client freezes
-/// this map and passes a model's watermark back as `?as_of=<w>` to that
-/// model's list/get for a point-in-time read.  Read-side peer of
-/// `/metrics`: opaque `usize` watermarks, a fixed per-schema key set,
-/// no field/relation/value decoded — so it is wired unauthenticated
-/// alongside the other ops routes (a process serves one tenant).  These
-/// watermarks are valid only within a compaction epoch: an in-process
-/// `compact()` renumbers physical rows, after which an older token is
-/// no longer comparable (the client must discard pinned tokens on a
-/// detected reopen).
 async fn __snapshot(
     State(db): State<Arc<RwLock<super::Database>>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -4280,14 +4113,9 @@ async fn __snapshot(
     )
 )]
 pub struct ApiDoc;
-/// Get OpenAPI specification as JSON
 pub fn openapi_json() -> String {
     ApiDoc::openapi().to_json().unwrap()
 }
-/// The data-plane routes (CRUD + WS subscriptions) with the database
-/// state still unbound.  Factored out so the tenant-auth guard can wrap
-/// ONLY these routes, leaving the operational endpoints unauthenticated
-/// (Phase 5).
 fn __data_routes() -> Router<Arc<RwLock<super::Database>>> {
     Router::new()
         .route(concat!("/api/", "user"), get(list_user))
@@ -4332,9 +4160,6 @@ fn __data_routes() -> Router<Arc<RwLock<super::Database>>> {
         .route(concat!("/live-query/", "doc"), get(subscribe_live_doc))
         .route("/replicate", get(__replicate))
 }
-/// The operational routes (Phase 5): liveness / readiness / minimal
-/// metrics.  Never behind the tenant-auth guard so infra probes and
-/// metric scrapers reach them without a JWT.
 fn __ops_routes() -> Router<Arc<RwLock<super::Database>>> {
     Router::new()
         .route("/health", get(__health))
@@ -4342,39 +4167,13 @@ fn __ops_routes() -> Router<Arc<RwLock<super::Database>>> {
         .route("/metrics", get(__metrics))
         .route("/snapshot", get(__snapshot))
 }
-/// Create the API router with all endpoints (no auth).  A
-/// `tower_http::trace::TraceLayer` wraps every route so each request is
-/// logged as a structured `tracing` span (level via `RUST_LOG`) — the
-/// server-side half of Phase 5 observability; the scaffold
-/// `main.rs` installs the subscriber.
 pub fn create_router(db: Arc<RwLock<super::Database>>) -> Router {
     create_router_with_options(db, HttpOptions::default())
 }
-/// Process-start HTTP options (#140, epic #126 Tier C).
-///
-/// Deployment identity, never baked at generate time: the same generated
-/// binary is promoted to localhost, staging, and production with
-/// different allowed origins, so baking them would make one build
-/// undeployable to two environments.
 #[derive(Debug, Clone, Default)]
 pub struct HttpOptions {
-    /// Origins allowed to call this API cross-origin.
-    ///
-    /// `None` — the default — emits **no** `CorsLayer` and applies **no**
-    /// WebSocket origin check, which is byte-identical to the behavior
-    /// before #140. `None` is not the same as `Some(vec![])`: an empty
-    /// `CorsLayer` still answers preflight `OPTIONS` with 200, whereas
-    /// these routes answer 405.
     pub allowed_origins: Option<Vec<String>>,
 }
-/// Parse a comma-separated origin list, as read from
-/// `FORGEDB_CORS_ORIGINS`.
-///
-/// Empty or all-whitespace input is `Ok(None)` — "not configured", not an
-/// error. Entries are trimmed. Returns `Err` for an entry that is not a
-/// valid header value, and for `*` mixed with explicit origins: that
-/// combination has two defensible readings and picking one silently is a
-/// security-relevant coin flip.
 pub fn parse_origins(raw: &str) -> Result<Option<Vec<String>>, String> {
     let parts: Vec<String> = raw
         .split(',')
@@ -4400,23 +4199,9 @@ pub fn parse_origins(raw: &str) -> Result<Option<Vec<String>>, String> {
     }
     Ok(Some(parts))
 }
-/// The origin allow-list as the WebSocket handlers see it.
-///
-/// Always present in request extensions — `AllowedOrigins(None)` when
-/// unconfigured — so the handlers can take it unconditionally and the
-/// "unconfigured means accept" branch lives in exactly one place.
 #[derive(Debug, Clone)]
 pub struct AllowedOrigins(pub Option<Arc<Vec<String>>>);
 impl AllowedOrigins {
-    /// Whether a handshake carrying `origin` may proceed.
-    ///
-    /// Unconfigured accepts everything (today's behavior, preserved). An
-    /// absent `Origin` header is accepted even when configured: native
-    /// `/replicate` followers, CLI tools and tests send none, rejecting
-    /// them would break them, and it buys nothing — an attacker who
-    /// controls the client controls the header. Origin checking defends
-    /// the *browser* threat model, where the browser sets the header and
-    /// the page cannot forge it.
     pub fn permits(&self, origin: Option<&str>) -> bool {
         match (&self.0, origin) {
             (None, _) => true,
@@ -4425,21 +4210,9 @@ impl AllowedOrigins {
         }
     }
 }
-/// Read the `Origin` header, if the request carries a valid one.
 fn __origin_of(headers: &axum::http::HeaderMap) -> Option<&str> {
     headers.get(axum::http::header::ORIGIN).and_then(|v| v.to_str().ok())
 }
-/// Build the CORS layer for `origins`, or `None` when unconfigured.
-///
-/// Methods are exactly the set the generated router registers; there is no
-/// `PATCH` route. Headers are `content-type` (JSON bodies) and
-/// `authorization` (bearer tokens when auth is on).
-///
-/// **No `allow_credentials`.** ForgeDB auth is a bearer token in a header,
-/// not a cookie, so credentials mode is unnecessary — and because nothing
-/// is auto-attached by the browser, an explicit `*` does not create a CSRF
-/// vector here. It also avoids tower-http's wildcard-plus-credentials
-/// conflict. Anyone later adding cookie auth must revisit this.
 fn __cors_layer(
     origins: &Option<Arc<Vec<String>>>,
 ) -> Option<tower_http::cors::CorsLayer> {
@@ -4463,21 +4236,6 @@ fn __cors_layer(
         .collect();
     Some(layer.allow_origin(parsed))
 }
-/// Apply the origin-dependent layers to an otherwise-finished router.
-///
-/// The `Extension` is applied unconditionally so the WS handlers can take
-/// it without an optional extractor; the `CorsLayer` only when configured,
-/// because an empty one would change `OPTIONS` from 405 to 200 for every
-/// existing deployment.
-///
-/// Layer order is inverted from reading order — a layer applied later
-/// wraps outer — so this runs **after** the `TraceLayer`, putting CORS
-/// outermost. That is load-bearing: browsers send preflight `OPTIONS`
-/// without an `Authorization` header, so a CORS layer inside the tenant
-/// guard would have its preflight rejected 401 and the browser would
-/// report an opaque CORS failure. Outermost also means error responses
-/// (401/403/422) carry the CORS headers the browser needs in order to let
-/// the page read the status.
 fn __apply_origin_layers(
     router: Router<Arc<RwLock<super::Database>>>,
     opts: HttpOptions,
@@ -4490,13 +4248,6 @@ fn __apply_origin_layers(
         None => router,
     }
 }
-/// Create the API router with process-start [`HttpOptions`] (#140).
-///
-/// `create_router` is this with the defaults, kept as a separate function
-/// with its original signature because the scaffold writes `src/main.rs`
-/// **once** at `forgedb init` and never regenerates it — changing the
-/// arity of the existing constructors would break every existing project
-/// the next time it ran `forgedb generate`.
 pub fn create_router_with_options(
     db: Arc<RwLock<super::Database>>,
     opts: HttpOptions,
@@ -4506,35 +4257,12 @@ pub fn create_router_with_options(
         .layer(tower_http::trace::TraceLayer::new_for_http());
     __apply_origin_layers(router, opts).with_state(db)
 }
-/// Create the API router with the tenant-auth guard layered over the
-/// data routes (#59).  Each data request must carry a bearer JWT whose
-/// configured tenant claim equals this process's tenant — the
-/// `forgedb-auth` substrate verifies the signature (asymmetric,
-/// JWKS/static key, algorithm-pinned) and cross-checks the tenant,
-/// rejecting with 401 (auth failure) or 403 (wrong tenant) before any
-/// handler runs; on success the verified `forgedb_auth::Principal` is
-/// injected into request extensions.  `auth` is built from deployment
-/// config (`forgedb.toml` / env), never from the `.forge` schema — the
-/// guard is a signed-string cross-check, not a schema-reading policy
-/// engine.
-///
-/// The guard covers the WS `/subscribe`, `/live-query`, and
-/// `/replicate` routes (WS clients must send the token in the
-/// `Authorization` header — a documented limitation); it does NOT cover
-/// the operational
-/// `/health` / `/ready` / `/metrics` routes, which are merged in
-/// AFTER the guard so infra probes stay unauthenticated (Phase 5).
 pub fn create_router_with_auth(
     db: Arc<RwLock<super::Database>>,
     auth: Arc<forgedb_auth::Authenticator>,
 ) -> Router {
     create_router_with_auth_and_options(db, auth, HttpOptions::default())
 }
-/// The tenant-auth router with process-start [`HttpOptions`] (#140).
-///
-/// The CORS layer is applied **outside** the tenant guard — see
-/// `__apply_origin_layers` for why that placement is load-bearing rather
-/// than incidental.
 pub fn create_router_with_auth_and_options(
     db: Arc<RwLock<super::Database>>,
     auth: Arc<forgedb_auth::Authenticator>,

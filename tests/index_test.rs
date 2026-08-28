@@ -1,82 +1,10 @@
-//! The index contract, end to end: every indexable type must resolve the row it
-//! was stored under, through the **real** generated `find_by_*`.
-//!
-//! # What it asserts
-//!
-//! The fixture model carries every type `indexed_fields` admits, in both its plain
-//! and its nullable form, plus a required and an optional FK. Each one is stored and
-//! then looked up again. Three properties fall out:
-//!
-//!   1. **The record side and the probe side agree.** The index key is emitted
-//!      inline in two places — once when a row is written, once when one is probed —
-//!      and nothing outside generated code can call either. Storing a value and
-//!      finding it again is what proves the two agree.
-//!   2. **Distinct values do not collide.** The `excludes` checks below.
-//!   3. **The null bucket is its own bucket** (#102). `None`, the literal string
-//!      `"null"` and the empty string are three different things; an unlinked
-//!      optional FK keys as absent rather than as some uuid.
-//!
-//! # What it deliberately does NOT assert
-//!
-//! This file used to also compare each emitted key **byte for byte** against the
-//! pre-#230 `serde_json::Value` form it replaced, holding a frozen copy of the old
-//! implementation and a hand-written mirror of each emitted arm. That half is gone
-//! (#381), and should not be reinstated:
-//!
-//! * It proved a one-time rewrite was behaviour-preserving. The rewrite shipped.
-//! * These keys are in-memory and **rebuilt at open**, so nothing on disk depends on
-//!   their bytes. Byte-identity with a superseded form has no compatibility value.
-//! * The "frozen" side was not frozen. It ran the value through `serde::Serialize`,
-//!   so it re-derived the baseline from whatever serde did *that day* — and when
-//!   #254 changed `Timestamp`'s serde from a transparent integer to an RFC 3339
-//!   string, the reference silently moved and the comparison stopped meaning
-//!   anything. A live re-derivation cannot be a historical baseline.
-//! * Byte-identity was only ever a proxy for the three properties above, which this
-//!   file now asserts directly instead of by proxy.
-//!
-//! What the generator *emits* stays pinned at the string level by the per-type shape
-//! assertions in `crates/codegen/tests/codegen_snapshots.rs`. That is the right layer
-//! for it: those run in the fast suite and cannot drift from the generator, because
-//! they read its output rather than a copy of it.
-//!
-//! # Coverage that used to live here
-//!
-//! Two things the deleted half also touched are covered better elsewhere, and are
-//! not re-tested here:
-//!
-//! * `f64` keys — total order, the non-finites, `-0.0`/NaN folding, and the ranges
-//!   the ordered index depends on: `tests/f64_index_key_test.rs`, end to end over a
-//!   real generated database.
-//! * Oversized `bytes(N)` past serde's `[T; N]` ceiling of N = 32 (#243):
-//!   `tests/oversized_array_test.rs`, which covers unindexed fields too.
-//!
-//! `s_hash` / `o_hash` stay in the fixture regardless — they are `bytes(64)`, so
-//! their presence means this crate compiled with a field past that ceiling.
-//!
-//! # Running it
-//!
-//! It generates and compiles a crate, so it is `#[ignore]`d out of the fast hermetic
-//! default suite. That cost is the only reason; nothing here is unreliable.
-//!
-//! ```bash
-//! make index-test      # or:
-//! cargo test --test index_test -- --ignored --nocapture
-//! ```
-//!
-//! Note that `#[ignore]` is why a break here can go unnoticed for a long time, and
-//! `cargo test --no-run` will NOT catch one: the driver below is a string literal
-//! compiled by a subprocess at run time, so only *running* this test type-checks it
-//! (#381).
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Repo root — `CARGO_MANIFEST_DIR` is the crate this test compiles under.
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Path dep line for a workspace substrate crate.
 fn dep(name: &str, crate_dir: &str) -> String {
     let path = repo_root().join("crates").join(crate_dir);
     format!("{name} = {{ path = {:?} }}\n", path.to_string_lossy())
@@ -89,8 +17,6 @@ fn write(path: &Path, contents: &str) {
     std::fs::write(path, contents).unwrap();
 }
 
-/// Every indexable type, in both its plain and nullable form, plus a required and an
-/// optional FK — the full domain `indexed_fields` admits.
 const SCHEMA: &str = r#"enum Status { Draft, Published, Archived }
 
 Kitchen {
@@ -143,10 +69,6 @@ fn every_indexed_field_resolves_the_row_it_was_stored_under() {
     let gen_status = Command::new(forgedb)
         .args(["generate", "rust", "--output", "src", "--schema", "schema.forge"])
         .current_dir(&proj)
-        // #333: `generate` claims this project id in the ledger under the
-        // ForgeDB home. Without an override that is the developer's real
-        // `~/.forgedb`, so two fixtures sharing a project name collide across
-        // unrelated test runs — and the suite writes outside the tempdir.
         .env("FORGEDB_HOME", proj.join(".forgedb-home"))
         .status()
         .expect("run forgedb generate");
@@ -199,9 +121,6 @@ fn every_indexed_field_resolves_the_row_it_was_stored_under() {
     let _ = std::fs::remove_dir_all(&proj);
 }
 
-/// The driver: store rows, then resolve them back through the real generated
-/// `find_by_*`. Counts failures rather than panicking so one run reports every
-/// broken field, not just the first.
 const DRIVER: &str = r##"mod database;
 use database::*;
 use forgedb_types::{Timestamp, Uuid};

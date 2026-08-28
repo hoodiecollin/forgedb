@@ -1,65 +1,10 @@
-//! `f64` index keys must be a **total order** (#242).
-//!
-//! # The defect this pins
-//!
-//! An `f64` index key was derived through `serde_json::Number::from_f64`, which
-//! returns `None` for every non-finite value. That `None` fell through to the null
-//! tag `\u{0}` — the same bucket as an unset optional or an unlinked FK. So NaN,
-//! `+Inf` and `-Inf` were not merely lumped together, they were indistinguishable
-//! from *absent*. And the ordered index (#169) excluded `f64` outright, because
-//! `f64: !Ord` cannot key a `BTreeMap`, so `^f64` silently had no range method.
-//!
-//! Both are one problem — no total order over `f64` — so one encoding fixes both:
-//!
-//! ```text
-//! let bits = v.to_bits();
-//! let mask = ((bits as i64 >> 63) as u64) | 0x8000_0000_0000_0000;
-//! bits ^ mask
-//! ```
-//!
-//! For a non-negative float this flips only the sign bit, lifting positives into
-//! the upper half of `u64`. For a negative one the arithmetic shift yields all-ones,
-//! so every bit inverts — which both reverses the ordering within the negatives
-//! (correct: IEEE magnitude runs backwards there) and drops them into the lower
-//! half. The result orders `-Inf < negatives < ±0 < positives < +Inf < NaN` under
-//! plain `u64: Ord`, and being a bijection on bit patterns it gives each non-finite
-//! its own key for free.
-//!
-//! # Why "an index only narrows candidates" is not a defense
-//!
-//! It would be, if the generated probe re-checked the value. It does not: the live
-//! `find_by_*` resolves the bucket and calls `get(id)` with no post-filter, the
-//! snapshot `find_by_*_at` form recomputes the same colliding key, and `&unique`
-//! enforcement rejects on bucket occupancy alone. A collision here is a wrong
-//! answer, not a slow one — which is what the scenarios below assert.
-//!
-//! # Scope
-//!
-//! `f64?` still gets no *ordered* index: `ordered_key_type` returns `None` for any
-//! nullable field regardless of inner type, which is orthogonal to this and
-//! unchanged. What a nullable f64 gains here is the hash-side fix — `None` stops
-//! colliding with NaN.
-//!
-//! Neither index is persisted (both rebuild in memory at open), so nothing here is
-//! an on-disk format change.
-//!
-//! It compiles a generated crate, so it is `#[ignore]`d out of the fast hermetic
-//! default suite. Run it explicitly:
-//!
-//! ```bash
-//! make f64-index-key      # or:
-//! cargo test --test f64_index_key_test -- --ignored --nocapture
-//! ```
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Repo root — `CARGO_MANIFEST_DIR` is the crate this test compiles under.
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Path dep line for a workspace substrate crate.
 fn dep(name: &str, crate_dir: &str) -> String {
     let path = repo_root().join("crates").join(crate_dir);
     format!("{name} = {{ path = {:?} }}\n", path.to_string_lossy())
@@ -72,9 +17,6 @@ fn write(path: &Path, contents: &str) {
     std::fs::write(path, contents).unwrap();
 }
 
-/// Every shape an `f64` key reaches: hash-indexed, nullable hash-indexed, unique,
-/// and a composite component. `score` is the ordered-eligible one (non-nullable,
-/// so it also gets the `BTreeMap`).
 const SCHEMA: &str = r#"Sample {
   id: +uuid
   bucket: ^string
@@ -102,10 +44,6 @@ fn f64_index_keys_are_a_total_order() {
     let gen_status = Command::new(forgedb)
         .args(["generate", "rust", "--output", "src", "--schema", "schema.forge"])
         .current_dir(&proj)
-        // #333: `generate` claims this project id in the ledger under the
-        // ForgeDB home. Without an override that is the developer's real
-        // `~/.forgedb`, so two fixtures sharing a project name collide across
-        // unrelated test runs — and the suite writes outside the tempdir.
         .env("FORGEDB_HOME", proj.join(".forgedb-home"))
         .status()
         .expect("run forgedb generate");

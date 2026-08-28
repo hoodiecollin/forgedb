@@ -2,10 +2,6 @@ use crate::error::CliError;
 use forgedb_compaction::{CompactionConfig, MaintenanceApi};
 use std::path::PathBuf;
 
-/// Options for the DEPRECATED offline `compact` command (#105).  The fields are
-/// still parsed from the CLI (so the flags resolve rather than erroring) but are
-/// no longer acted on — the command mutates nothing and returns a deprecation
-/// error.  `#[allow(dead_code)]` because the offline execution was removed.
 #[allow(dead_code)]
 pub struct CompactOptions {
     pub data_dir: PathBuf,
@@ -14,14 +10,6 @@ pub struct CompactOptions {
     pub threshold: Option<f64>,
 }
 
-/// Deprecation message for the offline compaction path (#105).  The
-/// tombstone-based `compact_model` is misaligned with the generated
-/// superseding-version mutation surface (#66): superseded update-versions are
-/// orphaned but NOT tombstoned (so nothing is reclaimed), and a delete's
-/// tombstone is a NEW marker row — dropping it RESURRECTS the deleted record.
-/// Computing the correct live-row set offline needs schema-aware id-column logic
-/// the CLI does not carry, so this path is REMOVED: the supported path is the
-/// in-process, keep-set-based `Database::compact()` (#92).
 const DEPRECATED_COMPACT_MSG: &str = "\
 Offline `forgedb compact` / `vacuum` is REMOVED (issue #105).  Its tombstone-based \
 algorithm is unsafe on data written by the generated mutation surface \
@@ -37,8 +25,6 @@ pub struct StatsOptions {
     pub json: bool,
 }
 
-/// Options for the DEPRECATED offline `vacuum` command (#105).  See
-/// [`CompactOptions`] — parsed but not acted on.
 #[allow(dead_code)]
 pub struct VacuumOptions {
     pub data_dir: PathBuf,
@@ -49,23 +35,15 @@ pub struct AnalyzeOptions {
     pub json: bool,
 }
 
-/// Offline compaction is DEPRECATED and no longer executed (#105).
-///
-/// The tombstone-based offline algorithm is unsafe against the generated
-/// mutation surface (#66) — it reclaims nothing from updates and can resurrect
-/// deleted rows — so this command mutates nothing and returns an error (non-zero
-/// exit) pointing to the supported in-process `Database::compact()` path (#92).
 pub fn compact(_opts: CompactOptions) -> Result<(), CliError> {
     Err(CliError::Compaction(DEPRECATED_COMPACT_MSG.to_string()))
 }
 
-/// Show database statistics
 pub fn stats(opts: StatsOptions) -> Result<(), CliError> {
     let config = CompactionConfig::default();
     let api = MaintenanceApi::new(&opts.data_dir, config);
 
     if let Some(model) = opts.model {
-        // Show stats for specific model
         let stats = api.model_stats(&model).map_err(map_err)?;
 
         if opts.json {
@@ -75,7 +53,6 @@ pub fn stats(opts: StatsOptions) -> Result<(), CliError> {
             print_model_stats(&stats);
         }
     } else {
-        // Show database-wide stats
         let stats = api.stats().map_err(map_err)?;
 
         if opts.json {
@@ -89,13 +66,10 @@ pub fn stats(opts: StatsOptions) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Vacuum is DEPRECATED and no longer executed (#105) — an alias for the removed
-/// offline compaction path.  See [`compact`]; use in-process `Database::compact()`.
 pub fn vacuum(_opts: VacuumOptions) -> Result<(), CliError> {
     Err(CliError::Compaction(DEPRECATED_COMPACT_MSG.to_string()))
 }
 
-/// Analyze database (collect statistics)
 pub fn analyze(opts: AnalyzeOptions) -> Result<(), CliError> {
     let config = CompactionConfig::default();
     let api = MaintenanceApi::new(&opts.data_dir, config.clone());
@@ -108,7 +82,6 @@ pub fn analyze(opts: AnalyzeOptions) -> Result<(), CliError> {
     } else {
         print_database_stats(&stats);
 
-        // Show recommendations
         println!("\nRecommendations:");
         let models_needing_compact = stats.models_needing_compaction(&config);
         if models_needing_compact.is_empty() {
@@ -262,5 +235,3 @@ pub fn format_bytes(bytes: u64) -> String {
 fn map_err(e: String) -> CliError {
     CliError::Compaction(e)
 }
-
-

@@ -1,16 +1,3 @@
-//! Concurrency report (scenario 16): ForgeDB reader throughput under a live writer.
-//!
-//! #56-B (single writer + concurrent readers) claims reads are LOCK-FREE under a
-//! live single writer — a `DatabaseReader` captured from the writer reads its own
-//! consistent snapshot with no lock shared with the write path. This measures
-//! aggregate reader throughput at 1/2/4/8 reader threads, each WITH and WITHOUT a
-//! background writer hammering inserts, so the claim is falsifiable: if reads were
-//! serialized against the writer, the "with writer" column would collapse.
-//!
-//! Not a Criterion micro-timing (it measures sustained throughput under background
-//! load), so it lives as an example. Run:
-//!   cargo run --manifest-path benchmarks/Cargo.toml --example concurrency --release
-
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -26,8 +13,6 @@ const READ_POSTS: usize = 10_000;
 const DURATION: Duration = Duration::from_secs(2);
 const WRITE_BASE: u128 = 0xF000_0000_0000_0000_0000_0000_0000_0000;
 
-/// Aggregate reads/sec across `threads` reader threads for `DURATION`, and (if
-/// `with_writer`) writes/sec of one background writer running concurrently.
 fn run(threads: usize, with_writer: bool) -> (f64, f64) {
     let data = dataset(READ_USERS, READ_POSTS);
     let dir = tempfile::tempdir().unwrap();
@@ -57,9 +42,6 @@ fn run(threads: usize, with_writer: bool) -> (f64, f64) {
             .unwrap();
     }
 
-    // Capture a consistent reader + snapshot BEFORE moving the db to the writer.
-    // Both are owned ('static): reader handles are try_clone'd fds + Arc'd index
-    // maps, the snapshot is a plain row-count watermark.
     let snap = db.snapshot();
     let reader = Arc::new((db.reader(), snap));
 
@@ -67,8 +49,6 @@ fn run(threads: usize, with_writer: bool) -> (f64, f64) {
     let reads = Arc::new(AtomicU64::new(0));
     let writes = Arc::new(AtomicU64::new(0));
 
-    // Keep the db alive: move it into the writer thread, OR hold it here so its
-    // files (which the reader's cloned fds point at) stay open for read-only runs.
     let _hold;
     let writer = if with_writer {
         let stop = stop.clone();

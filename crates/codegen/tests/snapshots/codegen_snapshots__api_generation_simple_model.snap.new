@@ -1,0 +1,834 @@
+---
+source: crates/codegen/tests/codegen_snapshots.rs
+assertion_line: 201
+expression: result.code
+---
+#![allow(dead_code, unused_imports)]
+use super::*;
+use axum::{
+    extract::{Path, Query, State},
+    extract::ws::{Message, WebSocket, WebSocketUpgrade},
+    http::StatusCode, response::{IntoResponse, Json, Response},
+    routing::{delete, get, post, put},
+    Router,
+};
+use forgedb_types::{Timestamp, Uuid};
+use serde_json::json;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use utoipa::OpenApi;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
+const PAGE_DEFAULT_LIMIT: usize = 50;
+const PAGE_MAX_LIMIT: usize = 1000;
+#[derive(serde::Serialize)]
+struct __ListEnvelope<'a, T: serde::Serialize> {
+    data: &'a [T],
+    total: usize,
+    limit: usize,
+    offset: usize,
+}
+#[utoipa::path(
+    get,
+    path = "",
+    tag = "User",
+    params(
+        (
+            "limit" = Option<usize>,
+            Query,
+            description = "Max rows (clamped to [1, 1000]; default 50)"
+        ),
+        ("offset" = Option<usize>, Query, description = "Rows to skip (default 0)"),
+        ("sort" = Option<String>, Query, description = "Field to sort by"),
+        ("order" = Option<String>, Query, description = "asc | desc (default asc)"),
+        (
+            "as_of" = Option<usize>,
+            Query,
+            description = "Row-count watermark for a point-in-time read (#85); non-numeric → 400"
+        ),
+    ),
+    responses((status = 200, description = "List all User", body = Vec<User>))
+)]
+async fn list_user(
+    Query(params): Query<HashMap<String, String>>,
+    State(db): State<Arc<RwLock<super::Database>>>,
+) -> Response {
+    let mut qp = forgedb_query_params::QueryParams::from_map(params.clone());
+    qp.pagination.limit = params
+        .get("limit")
+        .and_then(|__s| __s.parse::<usize>().ok())
+        .unwrap_or(PAGE_DEFAULT_LIMIT)
+        .clamp(1, PAGE_MAX_LIMIT);
+    let __as_of: Option<usize> = match params.get("as_of") {
+        Some(__w) => {
+            match __w.parse::<usize>() {
+                Ok(__n) => Some(__n),
+                Err(_) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(
+                            json!(
+                                { "error" : "as_of must be a non-negative integer watermark"
+                                }
+                            ),
+                        ),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        None => None,
+    };
+    let db = db.read().await;
+    let (page, total) = match __as_of {
+        Some(__w) => {
+            let mut rows: Vec<super::User> = db
+                .user
+                .all_at(&forgedb_storage::Snapshot::new(__w))
+                .into_iter()
+                .filter(|r| user_event_matches(r, &params))
+                .collect();
+            user_apply_sort(&mut rows, &qp.sort);
+            let total = rows.len();
+            let page: Vec<super::User> = qp.pagination.apply(&rows).to_vec();
+            (page, total)
+        }
+        None => {
+            let __keep_all: bool = __user_is_unfiltered(&params);
+            if __keep_all && qp.sort.is_none() {
+                return db
+                    .user
+                    .__with_fast_page(
+                        qp.pagination.offset,
+                        qp.pagination.limit,
+                        |__total: usize, __page: &[super::UserPageRef<'_>]| {
+                            (
+                                StatusCode::OK,
+                                Json(__ListEnvelope {
+                                    data: __page,
+                                    total: __total,
+                                    limit: qp.pagination.limit,
+                                    offset: qp.pagination.offset,
+                                }),
+                            )
+                                .into_response()
+                        },
+                    );
+            }
+            let __sel: Option<Vec<usize>> = if let Some(__v) = params.get("email") {
+                db.user.__rows_by_email(__v)
+            } else {
+                None
+            };
+            return db
+                .user
+                .__with_page(
+                    __sel,
+                    |r| __keep_all || __user_scan_matches(r, &params),
+                    |__scan: &mut Vec<super::UserScanRef<'_>>| {
+                        __user_scan_sort(__scan, &qp.sort);
+                    },
+                    qp.pagination.offset,
+                    qp.pagination.limit,
+                    |__total: usize, __page: &[super::UserPageRef<'_>]| {
+                        (
+                            StatusCode::OK,
+                            Json(__ListEnvelope {
+                                data: __page,
+                                total: __total,
+                                limit: qp.pagination.limit,
+                                offset: qp.pagination.offset,
+                            }),
+                        )
+                            .into_response()
+                    },
+                );
+        }
+    };
+    (
+        StatusCode::OK,
+        Json(__ListEnvelope {
+            data: &page,
+            total,
+            limit: qp.pagination.limit,
+            offset: qp.pagination.offset,
+        }),
+    )
+        .into_response()
+}
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    tag = "User",
+    params(
+        ("id" = String, Path, description = "User"),
+        (
+            "as_of" = Option<usize>,
+            Query,
+            description = "Row-count watermark for a point-in-time read (#85); non-numeric → 400"
+        )
+    ),
+    responses(
+        (status = 200, description = "Get User by ID", body = User),
+        (status = 404, description = "Not found")
+    )
+)]
+async fn get_user(
+    Path(id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    State(db): State<Arc<RwLock<super::Database>>>,
+) -> Response {
+    let key = match id.parse::<Uuid>() {
+        Ok(key) => key,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error" : "invalid id" })))
+                .into_response();
+        }
+    };
+    let __as_of: Option<usize> = match params.get("as_of") {
+        Some(__w) => {
+            match __w.parse::<usize>() {
+                Ok(__n) => Some(__n),
+                Err(_) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(
+                            json!(
+                                { "error" : "as_of must be a non-negative integer watermark"
+                                }
+                            ),
+                        ),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        None => None,
+    };
+    let db = db.read().await;
+    let __found = match __as_of {
+        Some(__w) => db.user.get_at(&forgedb_storage::Snapshot::new(__w), key),
+        None => db.user.get(key),
+    };
+    match __found {
+        Some(record) => (StatusCode::OK, Json(record)).into_response(),
+        None => {
+            (StatusCode::NOT_FOUND, Json(json!({ "error" : "not found" })))
+                .into_response()
+        }
+    }
+}
+#[utoipa::path(
+    post,
+    path = "",
+    tag = "User",
+    request_body = User,
+    responses(
+        (status = 201, description = "Create new User", body = User),
+        (
+            status = 409,
+            description = "Integrity conflict (duplicate unique / dangling foreign key)"
+        ),
+        (status = 422, description = "Field constraint violation")
+    )
+)]
+async fn create_user(
+    State(db): State<Arc<RwLock<super::Database>>>,
+    Json(payload): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let record = match serde_json::from_value::<super::User>(payload) {
+        Ok(record) => record,
+        Err(_) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "error" : "invalid payload" })),
+            );
+        }
+    };
+    let mut db = db.write().await;
+    match db.create_user(record) {
+        Ok(id) => (StatusCode::CREATED, Json(json!({ "id" : id.to_string() }))),
+        Err(e) => {
+            let status = StatusCode::from_u16(e.status_code())
+                .unwrap_or(StatusCode::UNPROCESSABLE_ENTITY);
+            (status, Json(json!({ "error" : e.to_string() })))
+        }
+    }
+}
+#[utoipa::path(
+    put,
+    path = "/{id}",
+    tag = "User",
+    params(("id" = String, Path, description = "User")),
+    request_body = User,
+    responses(
+        (status = 200, description = "Replace User by ID", body = User),
+        (status = 404, description = "Not found"),
+        (
+            status = 409,
+            description = "Integrity conflict (duplicate unique / dangling foreign key)"
+        ),
+        (status = 422, description = "Field constraint violation")
+    )
+)]
+async fn update_user(
+    Path(id): Path<String>,
+    State(db): State<Arc<RwLock<super::Database>>>,
+    Json(payload): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let key = match id.parse::<Uuid>() {
+        Ok(key) => key,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error" : "invalid id" })));
+        }
+    };
+    let record = match serde_json::from_value::<super::User>(payload) {
+        Ok(record) => record,
+        Err(_) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "error" : "invalid payload" })),
+            );
+        }
+    };
+    let mut db = db.write().await;
+    match db.update_user(key, record) {
+        Ok(true) => (StatusCode::OK, Json(json!({ "id" : key.to_string() }))),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(json!({ "error" : "not found" }))),
+        Err(e) => {
+            let status = StatusCode::from_u16(e.status_code())
+                .unwrap_or(StatusCode::UNPROCESSABLE_ENTITY);
+            (status, Json(json!({ "error" : e.to_string() })))
+        }
+    }
+}
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    tag = "User",
+    params(("id" = String, Path, description = "User")),
+    responses(
+        (status = 204, description = "Delete User by ID"),
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Referenced by children (on_delete=restrict)")
+    )
+)]
+async fn delete_user(
+    Path(id): Path<String>,
+    State(db): State<Arc<RwLock<super::Database>>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let key = match id.parse::<Uuid>() {
+        Ok(key) => key,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error" : "invalid id" })));
+        }
+    };
+    let mut db = db.write().await;
+    match db.delete_user(key) {
+        Ok(true) => (StatusCode::NO_CONTENT, Json(json!({}))),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(json!({ "error" : "not found" }))),
+        Err(e) => {
+            let status = StatusCode::from_u16(e.status_code())
+                .unwrap_or(StatusCode::CONFLICT);
+            (status, Json(json!({ "error" : e.to_string() })))
+        }
+    }
+}
+fn user_apply_sort(
+    rows: &mut Vec<super::User>,
+    sort: &Option<forgedb_query_params::Sort>,
+) {
+    let Some(sort) = sort.as_ref() else {
+        return;
+    };
+    match sort.field.as_str() {
+        "id" => rows.sort_by(|a, b| a.id.cmp(&b.id)),
+        "email" => rows.sort_by(|a, b| a.email.cmp(&b.email)),
+        _ => return,
+    }
+    if sort.is_descending() {
+        rows.reverse();
+    }
+}
+fn __user_is_unfiltered(params: &HashMap<String, String>) -> bool {
+    if params.contains_key("id") {
+        return false;
+    }
+    if params.contains_key("email") {
+        return false;
+    }
+    true
+}
+fn __user_scan_matches(
+    record: &super::UserScanRef<'_>,
+    params: &HashMap<String, String>,
+) -> bool {
+    if params.is_empty() {
+        return true;
+    }
+    if let Some(want) = params.get("id") {
+        let __ok = match want.parse::<Uuid>().ok() {
+            Some(__w) => record.id == __w,
+            None => false,
+        };
+        if !__ok {
+            return false;
+        }
+    }
+    if let Some(want) = params.get("email") {
+        let __ok = match Some(want.clone()) {
+            Some(__w) => record.email == __w,
+            None => false,
+        };
+        if !__ok {
+            return false;
+        }
+    }
+    true
+}
+fn __user_scan_sort(
+    rows: &mut Vec<super::UserScanRef<'_>>,
+    sort: &Option<forgedb_query_params::Sort>,
+) {
+    let Some(sort) = sort.as_ref() else {
+        return;
+    };
+    match sort.field.as_str() {
+        "id" => rows.sort_by(|a, b| a.id.cmp(&b.id)),
+        "email" => rows.sort_by(|a, b| a.email.cmp(&b.email)),
+        _ => return,
+    }
+    if sort.is_descending() {
+        rows.reverse();
+    }
+}
+///Per-model change-feed filter for `User` (#62): narrow by exact-match `?field=value` query params. Each declared scalar field is checked by name in generated code, parsing the param into the field's type and comparing typed values (#84 — `?n=3` matches a stored `3.0`); the substrate feed never inspects a field. An empty param set matches everything; unknown keys are ignored.
+fn user_event_matches(record: &super::User, params: &HashMap<String, String>) -> bool {
+    if params.is_empty() {
+        return true;
+    }
+    if let Some(want) = params.get("id") {
+        let __ok = match want.parse::<Uuid>().ok() {
+            Some(__w) => record.id == __w,
+            None => false,
+        };
+        if !__ok {
+            return false;
+        }
+    }
+    if let Some(want) = params.get("email") {
+        let __ok = match Some(want.clone()) {
+            Some(__w) => record.email == __w,
+            None => false,
+        };
+        if !__ok {
+            return false;
+        }
+    }
+    true
+}
+fn user_record_changed(a: &super::User, b: &super::User) -> bool {
+    if a.id != b.id {
+        return true;
+    }
+    if a.email != b.email {
+        return true;
+    }
+    if a.age != b.age {
+        return true;
+    }
+    false
+}
+///WebSocket subscription for `User` changes (#62 Direction A + #66). Upgrades the connection and streams a typed `UserInserted` / `UserUpdated` / `UserDeleted` JSON event per change, optionally narrowed by `?field=value`.
+async fn subscribe_user(
+    Query(params): Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
+    axum::Extension(allowed): axum::Extension<AllowedOrigins>,
+    ws: WebSocketUpgrade,
+    State(db): State<Arc<RwLock<super::Database>>>,
+) -> Response {
+    if !allowed.permits(__origin_of(&headers)) {
+        return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+    }
+    ws.on_upgrade(move |socket| handle_user_subscription(socket, db, params))
+}
+async fn handle_user_subscription(
+    mut socket: WebSocket,
+    db: Arc<RwLock<super::Database>>,
+    params: HashMap<String, String>,
+) {
+    let mut rx = { db.read().await.changefeed.subscribe() };
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                if event.model != "User" {
+                    continue;
+                }
+                let record = { db.read().await.user.read_at(event.row_index) };
+                let Some(record) = record else {
+                    continue;
+                };
+                if !user_event_matches(&record, &params) {
+                    continue;
+                }
+                let text = match event.kind {
+                    forgedb_changefeed::ChangeKind::Inserted => {
+                        serde_json::to_string(
+                            &super::UserInserted {
+                                user: record,
+                            },
+                        )
+                    }
+                    forgedb_changefeed::ChangeKind::Updated => {
+                        serde_json::to_string(&super::UserUpdated { user: record })
+                    }
+                    forgedb_changefeed::ChangeKind::Deleted => {
+                        serde_json::to_string(&super::UserDeleted { user: record })
+                    }
+                    forgedb_changefeed::ChangeKind::Linked => continue,
+                };
+                let Ok(text) = text else {
+                    continue;
+                };
+                if socket.send(Message::Text(text.into())).await.is_err() {
+                    break;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+///Live-query WebSocket subscription for `User` (#62 Direction B). Runs the generated closed-set query (narrow `__with_scan` + `__user_scan_matches`, materializing only matches — #160), streams an initial `UserLiveDelta::Init`, then pushes removal-aware `Added` / `Updated` / `Removed` deltas as the matching set changes.
+async fn subscribe_live_user(
+    Query(params): Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
+    axum::Extension(allowed): axum::Extension<AllowedOrigins>,
+    ws: WebSocketUpgrade,
+    State(db): State<Arc<RwLock<super::Database>>>,
+) -> Response {
+    if !allowed.permits(__origin_of(&headers)) {
+        return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+    }
+    ws.on_upgrade(move |socket| handle_user_live_query(socket, db, params))
+}
+async fn handle_user_live_query(
+    mut socket: WebSocket,
+    db: Arc<RwLock<super::Database>>,
+    params: HashMap<String, String>,
+) {
+    let __keep_all: bool = __user_is_unfiltered(&params);
+    let mut rx = { db.read().await.changefeed.subscribe() };
+    let mut members: HashMap<Uuid, super::User> = HashMap::new();
+    {
+        let rows: Vec<super::User> = {
+            let g = db.read().await;
+            let __ids = g
+                .user
+                .__with_scan(
+                    None,
+                    |r| __keep_all || __user_scan_matches(r, &params),
+                    |__scan: &mut Vec<super::UserScanRef<'_>>| {
+                        __scan.iter().map(|r| r.id).collect::<Vec<_>>()
+                    },
+                );
+            __ids.into_iter().filter_map(|__id| g.user.get(__id)).collect()
+        };
+        for r in &rows {
+            members.insert(r.id, r.clone());
+        }
+        let init = super::UserLiveDelta::Init { rows };
+        if let Ok(text) = serde_json::to_string(&init) {
+            if socket.send(Message::Text(text.into())).await.is_err() {
+                return;
+            }
+        }
+    }
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                if event.model != "User" {
+                    continue;
+                }
+                let current: Vec<super::User> = {
+                    let g = db.read().await;
+                    let __ids = g
+                        .user
+                        .__with_scan(
+                            None,
+                            |r| __keep_all || __user_scan_matches(r, &params),
+                            |__scan: &mut Vec<super::UserScanRef<'_>>| {
+                                __scan.iter().map(|r| r.id).collect::<Vec<_>>()
+                            },
+                        );
+                    __ids.into_iter().filter_map(|__id| g.user.get(__id)).collect()
+                };
+                let mut next: HashMap<Uuid, super::User> = HashMap::new();
+                let mut deltas: Vec<super::UserLiveDelta> = Vec::new();
+                for r in current {
+                    let id = r.id;
+                    match members.get(&id) {
+                        None => {
+                            deltas
+                                .push(super::UserLiveDelta::Added {
+                                    row: r.clone(),
+                                })
+                        }
+                        Some(prev) if user_record_changed(prev, &r) => {
+                            deltas
+                                .push(super::UserLiveDelta::Updated {
+                                    row: r.clone(),
+                                })
+                        }
+                        _ => {}
+                    }
+                    next.insert(id, r);
+                }
+                for id in members.keys() {
+                    if !next.contains_key(id) {
+                        deltas
+                            .push(super::UserLiveDelta::Removed {
+                                id: *id,
+                            });
+                    }
+                }
+                members = next;
+                for d in deltas {
+                    let Ok(text) = serde_json::to_string(&d) else {
+                        continue;
+                    };
+                    if socket.send(Message::Text(text.into())).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+async fn __replicate(
+    Query(params): Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
+    axum::Extension(allowed): axum::Extension<AllowedOrigins>,
+    ws: WebSocketUpgrade,
+    State(db): State<Arc<RwLock<super::Database>>>,
+) -> Response {
+    if !allowed.permits(__origin_of(&headers)) {
+        return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+    }
+    ws.on_upgrade(move |socket| __handle_replicate(socket, db, params))
+}
+async fn __handle_replicate(
+    mut socket: WebSocket,
+    db: Arc<RwLock<super::Database>>,
+    params: HashMap<String, String>,
+) {
+    let after: u64 = params.get("after").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let broker = { db.read().await.broker.clone() };
+    let Some(broker) = broker else {
+        let _ = socket.send(Message::Close(None)).await;
+        return;
+    };
+    let catch = match broker.lock() {
+        Ok(b) => b.catch_up_from(after, usize::MAX),
+        Err(_) => return,
+    };
+    let Ok(mut catch) = catch else { return };
+    for ev in &catch.replayed {
+        if socket.send(Message::Binary(ev.to_wire().into())).await.is_err() {
+            return;
+        }
+    }
+    let boundary = catch.boundary;
+    loop {
+        match catch.receiver.recv().await {
+            Ok(ev) => {
+                if ev.offset <= boundary {
+                    continue;
+                }
+                if socket.send(Message::Binary(ev.to_wire().into())).await.is_err() {
+                    break;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                let _ = socket.send(Message::Close(None)).await;
+                break;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+async fn __health() -> (StatusCode, Json<serde_json::Value>) {
+    (StatusCode::OK, Json(json!({ "status" : "ok" })))
+}
+async fn __ready(
+    State(db): State<Arc<RwLock<super::Database>>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let _guard = db.read().await;
+    (StatusCode::OK, Json(json!({ "status" : "ready" })))
+}
+async fn __metrics(
+    State(db): State<Arc<RwLock<super::Database>>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let db = db.read().await;
+    let per_model = json!({ "User" : db.user.row_count(), });
+    let total_rows: usize = 0 + db.user.row_count();
+    let body = json!(
+        { "model_count" : 1usize, "total_rows" : total_rows, "rows_per_model" :
+        per_model, }
+    );
+    (StatusCode::OK, Json(body))
+}
+async fn __snapshot(
+    State(db): State<Arc<RwLock<super::Database>>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let db = db.read().await;
+    let watermarks = json!({ "User" : db.user.row_count(), });
+    (StatusCode::OK, Json(json!({ "watermarks" : watermarks })))
+}
+#[derive(OpenApi)]
+#[openapi(
+    paths(list_user, get_user, create_user, update_user, delete_user),
+    components(schemas(User)),
+    tags(
+        (name = stringify!(User), description = concat!(stringify!(User), " operations"))
+    )
+)]
+pub struct ApiDoc;
+pub fn openapi_json() -> String {
+    ApiDoc::openapi().to_json().unwrap()
+}
+fn __data_routes() -> Router<Arc<RwLock<super::Database>>> {
+    Router::new()
+        .route(concat!("/api/", "user"), get(list_user))
+        .route(concat!("/api/", "user"), post(create_user))
+        .route(
+            concat!("/api/", "user", "/{id}"),
+            get(get_user).put(update_user).delete(delete_user),
+        )
+        .route(concat!("/subscribe/", "user"), get(subscribe_user))
+        .route(concat!("/live-query/", "user"), get(subscribe_live_user))
+        .route("/replicate", get(__replicate))
+}
+fn __ops_routes() -> Router<Arc<RwLock<super::Database>>> {
+    Router::new()
+        .route("/health", get(__health))
+        .route("/ready", get(__ready))
+        .route("/metrics", get(__metrics))
+        .route("/snapshot", get(__snapshot))
+}
+pub fn create_router(db: Arc<RwLock<super::Database>>) -> Router {
+    create_router_with_options(db, HttpOptions::default())
+}
+#[derive(Debug, Clone, Default)]
+pub struct HttpOptions {
+    pub allowed_origins: Option<Vec<String>>,
+}
+pub fn parse_origins(raw: &str) -> Result<Option<Vec<String>>, String> {
+    let parts: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    let wildcards = parts.iter().filter(|p| p.as_str() == "*").count();
+    if wildcards > 0 && parts.len() > 1 {
+        return Err(
+            "`*` cannot be combined with explicit origins — use either a \
+                         single `*` or an explicit list"
+                .to_string(),
+        );
+    }
+    for p in &parts {
+        if axum::http::HeaderValue::from_str(p).is_err() {
+            return Err(format!("`{p}` is not a valid origin header value"));
+        }
+    }
+    Ok(Some(parts))
+}
+#[derive(Debug, Clone)]
+pub struct AllowedOrigins(pub Option<Arc<Vec<String>>>);
+impl AllowedOrigins {
+    pub fn permits(&self, origin: Option<&str>) -> bool {
+        match (&self.0, origin) {
+            (None, _) => true,
+            (Some(_), None) => true,
+            (Some(list), Some(o)) => list.iter().any(|a| a == "*" || a == o),
+        }
+    }
+}
+fn __origin_of(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers.get(axum::http::header::ORIGIN).and_then(|v| v.to_str().ok())
+}
+fn __cors_layer(
+    origins: &Option<Arc<Vec<String>>>,
+) -> Option<tower_http::cors::CorsLayer> {
+    let list = origins.as_ref()?;
+    let methods = [
+        axum::http::Method::GET,
+        axum::http::Method::POST,
+        axum::http::Method::PUT,
+        axum::http::Method::DELETE,
+    ];
+    let headers = [axum::http::header::CONTENT_TYPE, axum::http::header::AUTHORIZATION];
+    let layer = tower_http::cors::CorsLayer::new()
+        .allow_methods(methods)
+        .allow_headers(headers);
+    if list.iter().any(|o| o == "*") {
+        return Some(layer.allow_origin(tower_http::cors::Any));
+    }
+    let parsed: Vec<axum::http::HeaderValue> = list
+        .iter()
+        .filter_map(|o| axum::http::HeaderValue::from_str(o).ok())
+        .collect();
+    Some(layer.allow_origin(parsed))
+}
+fn __apply_origin_layers(
+    router: Router<Arc<RwLock<super::Database>>>,
+    opts: HttpOptions,
+) -> Router<Arc<RwLock<super::Database>>> {
+    let origins = opts.allowed_origins.map(Arc::new);
+    let cors = __cors_layer(&origins);
+    let router = router.layer(axum::Extension(AllowedOrigins(origins)));
+    match cors {
+        Some(layer) => router.layer(layer),
+        None => router,
+    }
+}
+pub fn create_router_with_options(
+    db: Arc<RwLock<super::Database>>,
+    opts: HttpOptions,
+) -> Router {
+    let router = __data_routes()
+        .merge(__ops_routes())
+        .layer(tower_http::trace::TraceLayer::new_for_http());
+    __apply_origin_layers(router, opts).with_state(db)
+}
+pub fn create_router_with_auth(
+    db: Arc<RwLock<super::Database>>,
+    auth: Arc<forgedb_auth::Authenticator>,
+) -> Router {
+    create_router_with_auth_and_options(db, auth, HttpOptions::default())
+}
+pub fn create_router_with_auth_and_options(
+    db: Arc<RwLock<super::Database>>,
+    auth: Arc<forgedb_auth::Authenticator>,
+    opts: HttpOptions,
+) -> Router {
+    let guarded = __data_routes()
+        .layer(
+            axum::middleware::from_fn_with_state(
+                auth,
+                forgedb_auth::axum_mw::require_tenant,
+            ),
+        );
+    let router = guarded
+        .merge(__ops_routes())
+        .layer(tower_http::trace::TraceLayer::new_for_http());
+    __apply_origin_layers(router, opts).with_state(db)
+}

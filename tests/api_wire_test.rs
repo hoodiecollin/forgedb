@@ -1,59 +1,5 @@
-//! REST wire-format guard: boots the **real generated router** in-process and
-//! asserts the exact response bytes of every read path.
-//!
-//! # Why this test exists in this form
-//!
-//! #229 replaced `json!({ "data": page, ... })` with a typed envelope serialized
-//! straight to bytes, and the two record reads (`get`, and the `?projection=`
-//! variants) with `Json(record)` instead of `Json(to_value(&record))`. That removes
-//! an intermediate `serde_json::Value` clone of every string in the response — but
-//! it also changes the response bytes, because `Value::Object` is a `BTreeMap`
-//! (serde_json without `preserve_order`), so going through it *sorted the keys
-//! alphabetically*. Serializing from the type emits declaration order instead.
-//!
-//! JSON object key order carries no meaning, no conforming client can depend on it,
-//! and the generated WebSocket paths have always emitted records in declaration
-//! order — so this made the surface consistent rather than breaking it. But it is
-//! still a change nobody should be able to make *accidentally*, and #226/#228 both
-//! rewrite how the list page is produced. Hence: freeze the bytes.
-//!
-//! The generator-side counterpart is `test_api_generation_list_envelope` in
-//! `crates/codegen/tests/codegen_snapshots.rs`, which pins what is emitted. This
-//! test pins what that emission puts on the socket. Both must move together.
-//!
-//! # What is pinned, precisely
-//!
-//! - Envelope key order: `data`, `total`, `limit`, `offset`.
-//! - Record key order: schema declaration order, `id` first.
-//! - That a `json` field is emitted as a sorted *object* — not a string, not
-//!   restructured. NOTE this does not prove a borrowed passthrough would be caught:
-//!   the fixture is built with `json!`, so its bytes are sorted before storage. See
-//!   the comment above `PAGE_SCHEMA` for why that is not fixable from here.
-//! - The error bodies, which deliberately stayed `json!` objects.
-//!
-//! # Two tests, two generated crates
-//!
-//! - `rest_read_paths_emit_the_frozen_wire_bytes` — #229's baseline over
-//!   `SCHEMA` (`Post`/`Author`): envelope order, record order, projections, the
-//!   error bodies, and the `?as_of=` arm.
-//! - `list_page_emits_the_frozen_wire_bytes` — #226's guard over `PAGE_SCHEMA`,
-//!   which carries the field classes and declaration orders that `SCHEMA` cannot
-//!   express. See the block comment above `PAGE_SCHEMA` for why it is a second
-//!   schema rather than more fields on `Post`.
-//!
-//! Each compiles its own generated crate, so this file is `#[ignore]`d out of the
-//! fast hermetic default suite. Run it explicitly:
-//!
-//! ```bash
-//! make api-wire-test         # or:
-//! cargo test --test api_wire_test -- --ignored --nocapture
-//! ```
-
 mod common;
 
-/// Every field class that reaches the wire: string (with escapes), optional,
-/// integer, float, enum, json, required FK, optional FK — plus a projection, so
-/// the projected read/list arms are covered too.
 const SCHEMA: &str = r#"
 enum Status { Draft, Published, Archived }
 
@@ -85,9 +31,6 @@ fn rest_read_paths_emit_the_frozen_wire_bytes() {
     common::assert_driver_ok(&out, &proj, "driver reported a wire-format mismatch");
 }
 
-/// The driver: seeds two rows with **fixed** UUIDs (the bytes have to be
-/// deterministic), then drives the generated router through `tower::oneshot` and
-/// compares each response against a frozen literal.
 const DRIVER: &str = r##"mod database;
 use database::*;
 
@@ -308,72 +251,6 @@ async fn main() {
 }
 "##;
 
-// ---------------------------------------------------------------------------
-// #226 — the list page's frozen bytes
-// ---------------------------------------------------------------------------
-//
-// #226 replaces the list handler's page materialization (`page_ids` →
-// `filter_map(get)` → `Vec<Model>` → serde) with a buffered gather serialized
-// through a generated `<Model>PageRef<'a>`. Its success contract is **byte
-// identity**, so this is a guard written *before* the change and expected GREEN
-// against today's handler — a RED scenario here is a bug in the scenario.
-//
-// It is a second test rather than more requests on `SCHEMA` above, because three
-// of the nine scenarios need shapes `Post`/`Author` cannot express, and rewriting
-// `SCHEMA` would rewrite #229's frozen baseline at the same time:
-//
-//   - **the wide model** (`Widget`): a nullable `string`, a `decimal`, an enum, a
-//     `timestamp`, a `bytes(N)`, a `[T; N]`, an inline `struct`, a required FK and
-//     a virtual `[Model]`. `WidgetScanRef` holds only
-//     `{id, label, price, tier, made_at, checksum, serial}` — `scores`, `dims`,
-//     `owner`, `parts` and `payload` are outside `scan_field_set`, and `serial` is
-//     declared *after* all of them. So building `PageRef` by appending the excluded
-//     fields to the scan set emits `…checksum,serial,scores,dims,owner,payload`
-//     where `Widget` emits `…checksum,scores,dims,owner,parts,payload,serial`:
-//     semantically equal, byte-different, invisible to any `Value`-comparing
-//     assertion (gotcha 1).
-//   - **the identity-late model** (`Note`): `id` is declared *second*. `NoteScanRef`
-//     is `{id, body, weight}` (identity-first) while `Note` is `{body, id, weight}`,
-//     so the wire must NOT be identity-first (gotcha 1, sharpest form).
-//
-//   Two coverage limits worth knowing before editing these scenarios. A
-//   `?sort=…&order=desc` request is NOT automatically a gotcha-3 (`__slot`) case:
-//   under a position-instead-of-slot mutation, `Churn`'s desc sort stayed GREEN
-//   because `seq = 1000 - i` makes descending order coincide with physical row
-//   order — only the ASCENDING sorts caught it. The discriminating shape needs
-//   sorted order != physical order != reverse-physical order. And gotcha 3 is
-//   detectable only on `Widget`: every field of `Note` and `Churn` is filterable,
-//   so their `PageRef` field set equals their `ScanRef`'s, their page-only gather
-//   reads no columns, and a slot mis-map is invisible for them.
-//   - **the churned model** (`Churn`): 3 live rows scattered across 503 physical
-//     ones, which puts the scan's `note` column below
-//     `SPARSE_OFFSETS_SPAN_FACTOR` density and sends `gather_buffered` down
-//     `gather_sparse` (`crates/storage-native/src/lib.rs:1448`). The driver asserts
-//     that density predicate — but note it MIRRORS the factor as a hardcoded 128, so
-//     it tracks the *corpus*, not the substrate: raising
-//     `SPARSE_OFFSETS_SPAN_FACTOR` would silently stop exercising the sparse arm
-//     while the assertion still passed. Also, both gather arms are byte-equivalent in
-//     both directions, so this is a correctness guard on the sparse *implementation*
-//     and a performance guard on the branch *decision* — it is not a byte guard on
-//     which arm ran.
-//
-// `Widget.payload` is WRITTEN as `json!({"z": 1, "a": {"y": 2, "b": 3}})` and must
-// come out sorted, because `get(id)` round-trips it through `serde_json::Value`
-// (a `BTreeMap` without `preserve_order`).
-//
-// **Read this before trusting the scenario: it does NOT guard gotcha 2's literal
-// fear, and it cannot.** `json!` builds a `Value` — i.e. a `BTreeMap` — so the
-// source order above is discarded *before* the value is ever stored. The bytes on
-// disk are therefore ALREADY SORTED, and a borrowed `&str`/`RawValue` passthrough
-// would emit those same sorted bytes and pass every check in this file. Storing
-// genuinely unsorted json bytes is not expressible through the typed create path,
-// which is why no scenario here does it.
-//
-// What the scenario DOES guard (verified RED by mutation): the grosser sibling
-// failures — json emitted as a *string*, or otherwise restructured. That is worth
-// keeping. The `!body.contains("\"payload\":{\"z\":1")` half is vacuous against a
-// read-side change and is retained only as a cheap regression tripwire in case the
-// write path ever starts preserving source order.
 const PAGE_SCHEMA: &str = r#"
 enum Tier { Free, Pro, Enterprise }
 
@@ -467,13 +344,6 @@ fn list_page_emits_the_frozen_wire_bytes() {
     common::assert_driver_ok(&out, &proj, "driver reported a list-page wire mismatch");
 }
 
-/// The driver. Seeds fixed UUIDs and fixed field values (the bytes have to be
-/// deterministic), churns one `Churn` row 500 times to scatter the live set, then
-/// drives the generated router through `tower::oneshot`.
-///
-/// Three assertions are NOT about response bytes and exist so a scenario cannot
-/// silently stop exercising what it names: the sparse-density predicate, and that
-/// the pushdown resolver returns `Some` for the two `?serial=` requests.
 const PAGE_DRIVER: &str = r##"mod database;
 use database::*;
 

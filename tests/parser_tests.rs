@@ -112,7 +112,6 @@ User {
     let schema = parser.parse().unwrap();
 
     let model = &schema.models[0];
-    // 3 fields: the two unique ones under test, plus the mandatory identity (#248).
     assert_eq!(model.fields.len(), 3);
     assert!(model.fields[0].unique);
     assert!(model.fields[1].unique);
@@ -230,10 +229,6 @@ User {
 
 #[test]
 fn test_parse_timestamp_with_auto_generate() {
-    // The `id` is load-bearing, not decoration: since #254 a `+timestamp` is
-    // identity-eligible only when it is named `id`, so a model whose ONLY field
-    // is an auto timestamp is now rejected — it would silently acquire a
-    // timestamp primary key.
     let input = r#"
 User {
   id: +uuid
@@ -294,7 +289,6 @@ User {
     assert!(error.contains("Auto-generate symbol '+' cannot be used"));
 }
 
-// Validation tests
 #[test]
 fn test_validation_field_name_snake_case() {
     let input = r#"
@@ -336,7 +330,6 @@ user_model {
 "#;
     let mut parser = Parser::new_with_validation(input, false).unwrap();
     let result = parser.parse();
-    // Should succeed when validation is disabled
     assert!(result.is_ok());
 }
 
@@ -375,7 +368,6 @@ Post {
     assert!(result.is_ok());
 }
 
-// Integration edge case tests
 #[test]
 fn test_validation_single_char_names() {
     let input = r#"
@@ -419,7 +411,6 @@ User123 {
 
 #[test]
 fn test_validation_mixed_errors_stops_at_first() {
-    // Should report the first error encountered (model name)
     let input = r#"
 bad_model {
   BadField: string
@@ -429,7 +420,6 @@ bad_model {
     let result = parser.parse();
     assert!(result.is_err());
     let error = result.unwrap_err();
-    // Should fail on model name first
     assert!(error.contains("PascalCase"));
     assert!(error.contains("bad_model"));
 }
@@ -465,7 +455,6 @@ User {
     assert!(error.contains("snake_case"));
 }
 
-// Sprint 3: Indexing tests
 #[test]
 fn test_parse_indexed_field() {
     let input = r#"
@@ -516,7 +505,6 @@ User {
     let schema = parser.parse().unwrap();
 
     let model = &schema.models[0];
-    // Both orderings should work
     assert!(model.fields[0].indexed);
     assert!(model.fields[0].unique);
     assert!(model.fields[1].indexed);
@@ -552,7 +540,6 @@ User {
     assert!(!model.fields[3].unique);
 }
 
-// Sprint 4: Relation tests
 #[test]
 fn test_parse_one_to_many_relation() {
     let input = r#"
@@ -662,7 +649,6 @@ Post {
     assert_eq!(post.name, "Post");
     assert_eq!(post.fields.len(), 3);
 
-    // Test relation detection
     let relations = schema.detect_relations();
     assert_eq!(relations.len(), 1);
     assert_eq!(relations[0].parent_model, "User");
@@ -703,7 +689,6 @@ User {
 "#;
     let mut parser = Parser::new(input).unwrap();
     let result = parser.parse();
-    // This should succeed - Post references User which exists
     assert!(result.is_ok());
 }
 
@@ -799,21 +784,16 @@ User {
 
     assert_eq!(schema.models[0].fields.len(), 5);
 
-    // id has no constraints
     assert_eq!(schema.models[0].fields[0].constraints.len(), 0);
 
-    // email has @email
     assert_eq!(schema.models[0].fields[1].constraints.len(), 1);
     assert_eq!(schema.models[0].fields[1].constraints[0].name, "email");
 
-    // website has @url
     assert_eq!(schema.models[0].fields[2].constraints.len(), 1);
     assert_eq!(schema.models[0].fields[2].constraints[0].name, "url");
 
-    // age has @min and @max
     assert_eq!(schema.models[0].fields[3].constraints.len(), 2);
 
-    // password has @min and @private
     assert_eq!(schema.models[0].fields[4].constraints.len(), 2);
 }
 
@@ -828,11 +808,8 @@ User {
     let mut parser = Parser::new(input).unwrap();
     let result = parser.parse();
 
-    // Should fail - empty params not allowed for parameterized directive
     assert!(result.is_err());
 }
-
-// Sprint 5: Composite Index Tests
 
 #[test]
 fn test_parse_composite_index() {
@@ -899,7 +876,6 @@ User {
 
 #[test]
 fn test_parse_constraint_with_pattern() {
-    // Test pattern constraint with identifier (not full regex yet)
     let input = r#"
 User {
   phone: string @pattern(phone_regex)
@@ -914,7 +890,6 @@ User {
     assert_eq!(field.constraints[0].name, "pattern");
     assert_eq!(field.constraints[0].params.len(), 1);
 
-    // Check pattern parameter (currently supports identifier, not full regex string)
     match &field.constraints[0].params[0] {
         ConstraintParam::String(s) => {
             assert_eq!(s, "phone_regex");
@@ -925,10 +900,6 @@ User {
 
 #[test]
 fn test_parse_constraint_negative_number() {
-    // #239 gap 4: `-` never entered the lexer's number path, so a signed field
-    // could carry only a non-negative bound and `@min(-273)` — the textbook
-    // lower bound — failed to lex. This test previously asserted that failure
-    // and documented it as a known limitation; it now pins the fix.
     let input = r#"
 Temperature {
   id: +uuid
@@ -944,8 +915,6 @@ Temperature {
 
 #[test]
 fn test_parse_bare_dash_is_still_an_error() {
-    // `-` starts a number only when a digit follows. A stray dash must keep
-    // failing loudly rather than being absorbed by the numeric path.
     let input = r#"
 Temperature {
   id: +uuid
@@ -958,9 +927,6 @@ Temperature {
 
 #[test]
 fn test_parse_fractional_bound_keeps_the_verbatim_lexeme() {
-    // #239: the literal is carried as source text, not parsed to f64. `0.10` must
-    // survive as written — re-rendering it from a float would print `0.1`, and on
-    // a `decimal` field the round trip would lose exactness entirely.
     let input = r#"
 Product {
   id: +uuid
@@ -993,8 +959,6 @@ Product {
 
 #[test]
 fn test_parse_exclusive_bound_operators() {
-    // #239: `@min(>0)` / `@max(<1)` on a continuous domain, where there is no
-    // inclusive spelling for "strictly greater than zero".
     let input = r#"
 Rate {
   id: +uuid
@@ -1030,9 +994,6 @@ Rate {
 
 #[test]
 fn test_reject_fractional_and_exclusive_bounds_on_integer_fields() {
-    // #239 decisions: on a discrete domain a fractional bound is always a
-    // confusion, and `>0` ≡ `>=1` adds a spelling without adding expressiveness.
-    // Both are errors, not warnings — a warning-only path lets the schema ship.
     for (src, want) in [
         ("age: u32 @min(0.5)", "cannot be fractional"),
         ("age: u32 @min(>0)", "redundant"),
@@ -1053,7 +1014,6 @@ fn test_reject_fractional_and_exclusive_bounds_on_integer_fields() {
 
 #[test]
 fn test_reject_mismatched_exclusive_operator() {
-    // `@min(<5)` is not "exclusive with the direction ignored" — it is a mistake.
     let input = r#"
 Rate {
   id: +uuid
@@ -1070,8 +1030,6 @@ Rate {
 
 #[test]
 fn test_reject_unrepresentable_decimal_bound() {
-    // Codegen builds the bound with `Decimal::from_i128_with_scale`, which PANICS
-    // out of range. Rejecting it here turns a generator crash into a diagnostic.
     let input = format!(
         "Product {{\n  id: +uuid\n  price: decimal @min(0.{})\n}}\n",
         "1".repeat(29)
@@ -1098,16 +1056,10 @@ User {
     let field = &schema.models[0].fields[0];
     assert_eq!(field.constraints.len(), 2);
 
-    // Verify both min and max are present
     assert!(field.constraints.iter().any(|c| c.name == "min"));
     assert!(field.constraints.iter().any(|c| c.name == "max"));
 }
 
-/// `index_type` must report BTree for exactly the types codegen gives an ordered
-/// index to (`RustGenerator::ordered_key_type`) — it is stringified into the
-/// migration plan a user reads, so a mismatch claims an index that was never
-/// generated. `decimal` is included (scale-invariant normalized key) and so is
-/// `f64`, which has no `Ord` but is keyed by its total-order encoding (#242).
 #[test]
 fn test_parse_btree_index_type_for_ordered_types() {
     let input = r#"
@@ -1123,15 +1075,12 @@ Product {
     let schema = parser.parse().unwrap();
 
     let model = &schema.models[0];
-    // Check that ordered types get BTree index type
-    assert_eq!(model.fields[1].index_type, IndexType::BTree); // stock: u32
-    assert_eq!(model.fields[2].index_type, IndexType::BTree); // created_at: timestamp
-    assert_eq!(model.fields[3].index_type, IndexType::BTree); // cost: decimal
-    assert_eq!(model.fields[4].index_type, IndexType::BTree); // score: f64
+    assert_eq!(model.fields[1].index_type, IndexType::BTree);
+    assert_eq!(model.fields[2].index_type, IndexType::BTree);
+    assert_eq!(model.fields[3].index_type, IndexType::BTree);
+    assert_eq!(model.fields[4].index_type, IndexType::BTree);
 }
 
-/// The counterpart: types with no total order report Hash — they are exact-match
-/// only, with no `find_by_*_range`.
 #[test]
 fn test_parse_hash_index_type_for_unordered_types() {
     let input = r#"
@@ -1146,14 +1095,11 @@ User {
     let schema = parser.parse().unwrap();
 
     let model = &schema.models[0];
-    // Check that unordered types get Hash index type
-    assert_eq!(model.fields[1].index_type, IndexType::Hash); // email: string
-    assert_eq!(model.fields[2].index_type, IndexType::Hash); // active: bool
-    assert_eq!(model.fields[3].index_type, IndexType::Hash); // avatar: uuid
+    assert_eq!(model.fields[1].index_type, IndexType::Hash);
+    assert_eq!(model.fields[2].index_type, IndexType::Hash);
+    assert_eq!(model.fields[3].index_type, IndexType::Hash);
 }
 
-/// A nullable ordered-eligible field is Hash, not BTree: `ordered_key_type`
-/// returns `None` for any nullable field, so no ordered index is generated.
 #[test]
 fn test_parse_hash_index_type_for_nullable_ordered_type() {
     let input = r#"
@@ -1183,13 +1129,11 @@ User {
     let email_field = &schema.models[0].fields[0];
     let age_field = &schema.models[0].fields[1];
 
-    // Test has_constraint
     assert!(email_field.has_constraint("email"));
     assert!(!email_field.has_constraint("url"));
     assert!(age_field.has_constraint("min"));
     assert!(age_field.has_constraint("max"));
 
-    // Test get_constraint
     assert!(email_field.get_constraint("email").is_some());
     assert!(email_field.get_constraint("url").is_none());
 
@@ -1220,7 +1164,6 @@ Post {
     assert_eq!(user_model.name, "User");
     assert_eq!(user_model.fields.len(), 5);
 
-    // Test TSX component
     let card_field = &user_model.fields[2];
     assert_eq!(card_field.name, "card");
     if let FieldType::Component(comp_ref) = &card_field.field_type {
@@ -1231,7 +1174,6 @@ Post {
         panic!("Expected Component field type");
     }
 
-    // Test JSX component with @relations(*)
     let profile_field = &user_model.fields[3];
     assert_eq!(profile_field.name, "profile");
     if let FieldType::Component(comp_ref) = &profile_field.field_type {
@@ -1242,7 +1184,6 @@ Post {
         panic!("Expected Component field type");
     }
 
-    // Test API component
     let verify_field = &user_model.fields[4];
     assert_eq!(verify_field.name, "verify");
     if let FieldType::Component(comp_ref) = &verify_field.field_type {

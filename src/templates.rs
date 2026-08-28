@@ -1,4 +1,3 @@
-/// Default blank schema template
 pub fn blank_schema() -> &'static str {
     r#"// ForgeDB Schema
 // Define your models below
@@ -11,7 +10,6 @@ User {
 "#
 }
 
-/// Blog template schema
 pub fn blog_schema() -> &'static str {
     r#"// Blog Schema
 
@@ -45,7 +43,6 @@ Tag {
 "#
 }
 
-/// E-commerce template schema
 pub fn ecommerce_schema() -> &'static str {
     r#"// E-commerce Schema
 
@@ -86,7 +83,6 @@ OrderItem {
 "#
 }
 
-/// Todo app template schema
 pub fn todo_schema() -> &'static str {
     r#"// Todo App Schema
 
@@ -111,18 +107,7 @@ Todo {
 "#
 }
 
-/// Default forgedb.toml configuration.
-///
-/// `isolated` is written **explicitly, always** (#333). The field's absent value
-/// is `true`, so writing it changes nothing today — it exists so that "these are
-/// separate projects" is a declaration rather than an absence. An absence is
-/// fragile: someone adds a config above this one for an unrelated reason and
-/// every app beneath it silently regroups into one build cache.
 pub fn default_config(project_id: &str, isolated: bool) -> String {
-    // `id` is written ONLY when this config is a project root. A nested,
-    // non-isolated config that declares one is a contradiction ForgeDB rejects
-    // (#333 §6) — it reads as authoritative and is not — so scaffolding one would
-    // make `init` emit a config that fails on the very next `generate`.
     let id = if isolated {
         format!(
             "# Generated once, here. COMMIT IT: this id keys the build cache, and a\n\
@@ -253,13 +238,6 @@ enabled = false
     )
 }
 
-/// Default .gitignore
-///
-/// **Generated TEXT is committed; only compiled output is ignored** (#335 §15).
-/// This file used to ignore `/generated/` wholesale, which contradicted the rule
-/// outright — and after #335 it is plainly wrong: ForgeDB compiles the generated
-/// Rust in its own cache under `$FORGEDB_HOME`, so nothing under `generated/` is
-/// a build artifact any more. It holds reviewable, diffable source.
 pub fn default_gitignore() -> &'static str {
     r#"# ForgeDB generated code is COMMITTED, not ignored.
 #
@@ -303,7 +281,6 @@ Thumbs.db
 "#
 }
 
-/// README template
 pub fn readme_template(project_name: &str) -> String {
     format!(
         r#"# {}

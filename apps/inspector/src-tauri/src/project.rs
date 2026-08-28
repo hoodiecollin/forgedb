@@ -1,14 +1,3 @@
-//! At-rest **Structure lens** (#12): parse a project's `.forge` schema and read
-//! its on-disk storage stats, then hand the frontend a faithful, schema-shaped
-//! DTO. Everything here is *tooling* — the parser produces the same AST the CLI
-//! uses, and [`forgedb_compaction::StatsCollector`] reads the data directory's
-//! physical layout (tombstones + column files as opaque bytes). No runtime schema
-//! engine, no schema-as-runtime-input: the identity red line stays intact.
-//!
-//! The DTO stays close to the AST — presentation choices (which editor control a
-//! field maps to, how `@min`/`@max` render) live in the frontend, per the design
-//! review. Rust reports facts; TypeScript renders them.
-
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -19,15 +8,12 @@ use forgedb_parser::{
 };
 use serde::Serialize;
 
-/// The whole loaded project, as the Structure lens consumes it.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectDto {
-    /// Display name — the schema file stem (e.g. `blog` for `blog.forge`).
     pub db_name: String,
     pub schema_path: String,
     pub data_dir: Option<String>,
-    /// True when a data dir was supplied and yielded per-model stats.
     pub has_stats: bool,
     pub models: Vec<ModelDto>,
     pub structs: Vec<StructDto>,
@@ -39,10 +25,8 @@ pub struct ModelDto {
     pub name: String,
     pub soft_delete: bool,
     pub composite_indexes: Vec<Vec<String>>,
-    /// Count of `^`-indexed scalar fields — the storage panel's index count.
     pub index_count: usize,
     pub fields: Vec<FieldDto>,
-    /// Physical storage stats — `None` when no data dir has this model yet.
     pub stats: Option<ModelStatsDto>,
 }
 
@@ -53,31 +37,21 @@ pub struct StructDto {
     pub fields: Vec<FieldDto>,
 }
 
-/// One field, reduced to the raw facts a control needs. `kind` is a normalized
-/// discriminant; the frontend maps it (plus the flags) to a `FieldControl` and a
-/// `typeLabel`.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FieldDto {
     pub name: String,
-    /// Normalized type discriminant: one of `u32 u64 i32 i64 f64 bool string uuid
-    /// timestamp bytes fixed_array struct required_ref optional_ref one_to_many
-    /// many_to_many component`.
     pub kind: String,
     pub auto: bool,
     pub unique: bool,
     pub indexed: bool,
     pub nullable: bool,
-    /// `bytes(N)` length.
     pub bytes_len: Option<usize>,
-    /// `[T; N]` fixed-array length.
     pub array_len: Option<usize>,
     pub fulltext: bool,
     pub computed: bool,
     pub materialized: bool,
-    /// Target model for a relation field.
     pub rel_target: Option<String>,
-    /// Referenced struct name for a struct field.
     pub struct_name: Option<String>,
     pub directives: Vec<DirectiveDto>,
 }
@@ -86,16 +60,9 @@ pub struct FieldDto {
 #[serde(rename_all = "camelCase")]
 pub struct DirectiveDto {
     pub name: String,
-    /// Directive args as strings (numbers stringified) — semantic-only markers.
     pub params: Vec<String>,
 }
 
-/// Physical storage stats for one model, mirrored from
-/// [`forgedb_compaction::types::ModelStats`]. These are *physical* counts over the
-/// append-only files: `active_rows` is non-tombstoned row versions (with the #66
-/// mutation surface, superseded versions inflate this until compaction) and
-/// `dead_*` is reclaimable space. Honest storage-health numbers, not logical
-/// distinct-record counts.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelStatsDto {
@@ -108,9 +75,6 @@ pub struct ModelStatsDto {
     pub dead_bytes: u64,
 }
 
-/// Parse the schema at `schema_path`; if `data_dir` is given and exists, also
-/// read per-model storage stats. Returns a JSON-ready DTO or a human-readable
-/// error string (surfaced verbatim in the frontend's open-project flow).
 pub fn load_project(schema_path: &str, data_dir: Option<&str>) -> Result<ProjectDto, String> {
     let path = Path::new(schema_path);
     let source = std::fs::read_to_string(path)
@@ -119,9 +83,6 @@ pub fn load_project(schema_path: &str, data_dir: Option<&str>) -> Result<Project
     let mut parser = Parser::new(&source).map_err(|e| format!("Parse error: {e}"))?;
     let schema = parser.parse().map_err(|e| format!("Parse error: {e}"))?;
 
-    // Display name from the schema file stem — but a *generic* stem carries no
-    // identity, so prefer the parent directory name (e.g. `blog-cms/schema.forge`
-    // reads as `blog-cms`, not `schema`).
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("schema");
     const GENERIC: [&str; 6] = ["schema", "db", "database", "model", "models", "main"];
     let db_name = if GENERIC.contains(&stem) {
@@ -135,15 +96,12 @@ pub fn load_project(schema_path: &str, data_dir: Option<&str>) -> Result<Project
         stem.to_string()
     };
 
-    // Stats are additive: absent/empty data dir ⇒ schema-only structure view.
     let stats = data_dir
         .map(Path::new)
         .filter(|d| d.exists())
         .and_then(|d| StatsCollector::new(d).collect_database_stats().ok());
     let has_stats = stats.is_some();
 
-    // (model, field) pairs that are true many-to-many (bidirectional [..]/[..]),
-    // so we can tell an M2M collection apart from a plain one-to-many.
     let m2m_fields: HashSet<(String, String)> = schema
         .detect_many_to_many_relations()
         .into_iter()
@@ -215,7 +173,6 @@ fn model_dto(
 fn struct_dto(s: &AstStruct) -> StructDto {
     StructDto {
         name: s.name.clone(),
-        // Struct fields are always fixed-size scalars; no relation context needed.
         fields: s
             .fields
             .iter()
@@ -225,8 +182,6 @@ fn struct_dto(s: &AstStruct) -> StructDto {
 }
 
 fn field_dto(f: &AstField, owner: &str, m2m_fields: &HashSet<(String, String)>) -> FieldDto {
-    // Peel a `Nullable(_)` wrapper so `kind` is the underlying type and the
-    // nullability is a flag (the frontend renders a null toggle from it).
     let (inner, nullable_wrap) = match &f.field_type {
         FieldType::Nullable(inner) => (inner.as_ref(), true),
         other => (other, false),
@@ -245,9 +200,6 @@ fn field_dto(f: &AstField, owner: &str, m2m_fields: &HashSet<(String, String)>) 
         FieldType::I64 => "i64",
         FieldType::F64 => "f64",
         FieldType::Bool => "bool",
-        // #238: an inline `string(N)` reports as a string — the inspector shows
-        // logical shape, and the fixed slot is a storage fact the manifest
-        // already carries as a `FixedBytes(width)` column.
         FieldType::String | FieldType::StringN { .. } => "string",
         FieldType::Json => "json",
         FieldType::Decimal => "decimal",
@@ -270,8 +222,6 @@ fn field_dto(f: &AstField, owner: &str, m2m_fields: &HashSet<(String, String)>) 
             nullable = true;
             "struct"
         }
-        // Enum reference (#enum): carry the enum name in `struct_name` (the
-        // named-type slot) — the DTO reports it as kind "enum".
         FieldType::Enum(name) => {
             struct_name = Some(name.clone());
             "enum"
@@ -295,7 +245,6 @@ fn field_dto(f: &AstField, owner: &str, m2m_fields: &HashSet<(String, String)>) 
             }
         }
         FieldType::Component(_) => "component",
-        // Nullable is already peeled above; a doubly-nested Nullable is invalid.
         FieldType::Nullable(_) => "string",
     };
 
@@ -317,14 +266,9 @@ fn field_dto(f: &AstField, owner: &str, m2m_fields: &HashSet<(String, String)>) 
     }
 }
 
-/// Render one directive argument for display, in the spelling it was written in —
-/// a named argument reads `min: 3`, not a bare `3` (#235), so the inspector shows
-/// the same thing the schema says.
 fn render_param(p: &ConstraintParam) -> String {
     match p {
         ConstraintParam::Number(n) => n.to_string(),
-        // The verbatim lexeme (#239), so `@min(0.10)` displays as written rather
-        // than re-rendered from a float as `0.1`.
         ConstraintParam::Fractional(s) => s.clone(),
         ConstraintParam::String(s) => s.clone(),
         ConstraintParam::Named { name, value } => format!("{name}: {}", render_param(value)),
@@ -410,7 +354,6 @@ mod tests {
 
     #[test]
     fn generic_stem_uses_parent_dir_for_db_name() {
-        // `<...>/blog-cms/schema.forge` should read as `blog-cms`, not `schema`.
         let base =
             std::env::temp_dir().join(format!("fdb-insp-name-{}", std::process::id()));
         let proj = base.join("blog-cms");
@@ -434,9 +377,6 @@ mod tests {
             "User {\n  id: +uuid\n  name: string\n}\n",
         );
 
-        // Fabricate the physical layout StatsCollector reads (schema-blind): a
-        // `User` model dir with 5 committed rows, 1 tombstoned. tombstones.bin is
-        // the row anchor (1 byte/row); a fixed uuid column is 16 bytes/row.
         let model = data.join("User");
         std::fs::create_dir_all(model.join("fixed")).unwrap();
         std::fs::write(model.join("tombstones.bin"), [0u8, 0, 1, 0, 0]).unwrap();
