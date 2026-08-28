@@ -8606,10 +8606,8 @@ fn test_rust_generation_page_ref_field_order() {
 
     assert!(
         f.contains(
-            "pub struct WidgetScanRef<'a> { /// #226: the scan buffer slot this view \
-             was decoded at — the only /// thing that survives the sort's reordering \
-             to say which physical /// row it came from. Internal; this view is not \
-             `Serialize`. pub __slot: usize, pub id: Uuid, pub label: Option<&'a str>, \
+            "pub struct WidgetScanRef<'a> { \
+             pub __slot: usize, pub id: Uuid, pub label: Option<&'a str>, \
              pub price: rust_decimal::Decimal, pub tier: Tier, pub made_at: Timestamp, \
              pub checksum: [u8; 4usize], pub serial: u32, }"
         ),

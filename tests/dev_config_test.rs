@@ -151,35 +151,3 @@ fn dev_does_not_overwrite_a_correct_database_with_defaults() {
          refuses the data dir the running app is using (#364)"
     );
 }
-
-#[test]
-fn the_bare_name_trap_is_still_there() {
-    let dir = TempDir::new().expect("tempdir");
-    let root = dir.path();
-    scaffold(root);
-
-    let out = forgedb_cmd(root)
-        .args(["generate", "rust", "--output", "gen-trap"])
-        .output()
-        .expect("run generate");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-
-    let generated: PathBuf = root.join("gen-trap");
-    let src = fs::read_to_string(generated.join("database.rs")).expect("database.rs");
-
-    assert_eq!(
-        baked_fsync(&generated).as_deref(),
-        Some(CONFIGURED_FSYNC),
-        "the configured policy is Never"
-    );
-    assert!(
-        src.contains("FsyncPolicy::Always"),
-        "the unqualified `FsyncPolicy::Always` no longer appears — a naive \
-         substring assertion would now be a real guard, so this test has \
-         outlived its purpose and should be deleted"
-    );
-    assert!(
-        !src.contains("forgedb_wal::FsyncPolicy::Always"),
-        "the QUALIFIED path must carry the configured policy only"
-    );
-}

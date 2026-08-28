@@ -42,6 +42,9 @@ interface Cut {
 
 const REGRESSION = /^\s*(?:\/\/|#)\s*REGRESSION\(#\d+\):/;
 
+const DIRECTIVE =
+  /^\s*(?:\/\/(?:export|go:[a-z]+|nolint|#\s*sourceMappingURL|\/\s*<reference|\s*@ts-|\s*eslint|\s*prettier-ignore|\s*biome-ignore|\s*deno-lint)|#\s*(?:!|cgo|include|define|ifndef|ifdef|endif|pragma))/;
+
 function isIdent(c: string | undefined): boolean {
   return c !== undefined && /[A-Za-z0-9_]/.test(c);
 }
@@ -112,7 +115,7 @@ function scanRust(src: string): Cut[] {
       const text = src.slice(start, i);
       if (REGRESSION.test(text)) {
         inRegression = true;
-      } else if (!inRegression) {
+      } else if (!inRegression && !DIRECTIVE.test(text)) {
         cuts.push({ start, end: i, inline: !lineStartsAt(src, start) });
       }
       continue;
@@ -175,9 +178,10 @@ function scanTs(src: string): Cut[] {
     if (c === "/" && d === "/") {
       const start = i;
       while (i < n && src[i] !== "\n") i++;
-      if (REGRESSION.test(src.slice(start, i))) {
+      const text = src.slice(start, i);
+      if (REGRESSION.test(text)) {
         inRegression = true;
-      } else if (!inRegression) {
+      } else if (!inRegression && !DIRECTIVE.test(text)) {
         cuts.push({ start, end: i, inline: !lineStartsAt(src, start) });
       }
       continue;
@@ -234,7 +238,7 @@ function scanHash(src: string): Cut[] {
         const seg = line.slice(i);
         if (REGRESSION.test(seg)) {
           inRegression = true;
-        } else if (!inRegression) {
+        } else if (!inRegression && !DIRECTIVE.test(seg)) {
           cuts.push({ start: off + i, end: off + line.length, inline: !/^\s*$/.test(line.slice(0, i)) });
         }
         break;
@@ -367,6 +371,11 @@ function selfTest(): number {
       "// REGRESSION(#1): a\nfn f() {}\nfn g() {}\n",
     ],
     ['const S = "// no";\n', "ts", 'const S = "// no";\n'],
+    ["//export Foo\nfunc Foo() {}\n", "rust", "//export Foo\nfunc Foo() {}\n"],
+    ["//go:build linux\nfn f() {}\n", "rust", "//go:build linux\nfn f() {}\n"],
+    ["// @ts-ignore\nconst a = 1;\n", "ts", "// @ts-ignore\nconst a = 1;\n"],
+    ["// eslint-disable-next-line\nconst a = 1;\n", "ts", "// eslint-disable-next-line\nconst a = 1;\n"],
+    ["#!/usr/bin/env bun\nx = 1\n", "hash", "#!/usr/bin/env bun\nx = 1\n"],
     ["const R = /a\\/\\/b/;\n", "ts", "const R = /a\\/\\/b/;\n"],
     ["const T = `x // y`;\n", "ts", "const T = `x // y`;\n"],
     ["/** doc */\nexport const a = 1;\n", "ts", "export const a = 1;\n"],

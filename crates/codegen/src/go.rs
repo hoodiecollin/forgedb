@@ -1074,6 +1074,7 @@ import "C"
 
 import "unsafe"
 
+//export %SYM%GoCompletion
 func %SYM%GoCompletion(token C.uint64_t, status C.int32_t, payload *C.uint8_t, payloadLen C.size_t) {
 	var b []byte
 	if payload != nil {

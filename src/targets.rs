@@ -27,7 +27,7 @@ pub const VOCABULARY: &[TargetName] = &[
     TargetName { config: "browser-replica", internal: "wasm", cli: "generate browser --replica" },
 ];
 
-const DEPRECATED: &[(&str, &str)] = &[
+pub const DEPRECATED: &[(&str, &str)] = &[
     ("typescript", "node-sdk"),
     ("wasm", "browser-replica"),
 ];
@@ -289,29 +289,6 @@ mod tests {
         assert!(declared.contains(&PackageKind::Server), "{declared:?}");
     }
 
-    #[test]
-    fn every_vocabulary_row_is_documented_where_users_read_it() {
-        let config_rs = include_str!("config.rs");
-        let doc: String = config_rs
-            .lines()
-            .filter(|l| l.trim_start().starts_with("///"))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        for row in VOCABULARY {
-            assert!(
-                doc.contains(&format!("`{}`", row.config)),
-                "`{}` is legal but undocumented in config.rs",
-                row.config
-            );
-        }
-        for (old, _) in DEPRECATED {
-            assert!(
-                doc.contains(&format!("`{old}`")),
-                "the deprecated spelling `{old}` is accepted but undocumented in config.rs"
-            );
-        }
-    }
 
     #[test]
     fn an_sdk_only_app_declares_nothing() {

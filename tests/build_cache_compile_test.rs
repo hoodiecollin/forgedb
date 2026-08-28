@@ -328,21 +328,6 @@ fn scenario_21_the_configured_fsync_policy_reaches_the_emitted_source() {
     );
 }
 
-#[test]
-fn scenario_21_the_bare_name_assertion_would_be_vacuous() {
-    let fx = Fixture::generate(FULL_TARGETS, &[("schema.forge", SCHEMA)]);
-    let core = read(&fx.container().join("core/src/lib.rs"));
-
-    assert!(
-        core.contains("FsyncPolicy::Always"),
-        "the bare name no longer appears, so scenario 21's warning is stale"
-    );
-    assert!(
-        !flat_contains(&core, "forgedb_wal::FsyncPolicy::Always"),
-        "every bare-name occurrence must be prose, never a path"
-    );
-}
-
 const RUST_ONLY: &str = r#"[project]
 id = "s335-rust-only"
 isolated = true
@@ -375,10 +360,6 @@ fn scenario_22_an_app_with_no_server_carries_no_utoipa() {
     assert!(
         !core.contains("utoipa::"),
         "the emission names utoipa with nothing pinning it"
-    );
-    assert!(
-        core.contains("ToSchema"),
-        "the bare name no longer appears in prose, so the anchoring note is stale"
     );
 }
 
