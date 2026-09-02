@@ -22,30 +22,16 @@ members = [
     "crates/source-guard",
 ]
 
-# The Tauri inspector is its OWN workspace (#411), not a member of this one.
-#
-# As a member it was built by every `--workspace` command — `cargo test`, `cargo build`,
-# the tier-1 CI gate, the nightly. On Linux its shell needs GTK/WebKit system libraries,
-# which is why `cargo test --workspace` had never actually been runnable on a bare Linux
-# host: it passes on macOS because the equivalent frameworks ship with the OS, so every
-# past run of "the baseline" was a macOS run (found by #390's first CI run).
-#
-# `exclude` is required even though the child declares its own `[workspace]` — without it
-# cargo still treats a path inside this directory as a candidate member.
 exclude = ["apps/inspector/src-tauri"]
 
 resolver = "2"
 
-# Shared package metadata. `edition` is uniform across the workspace and inherited
-# via `edition.workspace = true`. Versions are intentionally NOT centralized here:
-# public crates (types, storage, wal) are published to crates.io on independent
-# version lines, while internal crates track their own.
 [workspace.package]
 edition = "2024"
 
 [package]
 name = "forgedb"
-version = "0.4.1"
+version = "0.5.0"
 edition.workspace = true
 authors = ["Collin Kokotas"]
 license = "MIT OR Apache-2.0"
@@ -55,10 +41,6 @@ homepage = "https://github.com/hoodiecollin/forgedb"
 readme = "README.md"
 keywords = ["database", "codegen", "orm", "cli", "generator"]
 categories = ["database", "command-line-utilities", "development-tools"]
-# `cargo run -- <cmd>` must reach the CLI. Adding the `forgedb-lsp` bin (epic #173)
-# made a bare `cargo run` ambiguous — cargo's ambiguity check counts every declared
-# bin, including one gated behind a non-default `required-features` — which broke
-# every documented `cargo run --` invocation (README, docs/, and `make bench-regen`).
 default-run = "forgedb"
 
 [package.metadata.wix]
@@ -71,10 +53,6 @@ eula = false
 name = "forgedb"
 path = "src/main.rs"
 
-# The language server binary. Behind the non-default `lsp` feature so a lean
-# `cargo install forgedb` skips the async LSP stack; release archives build with
-# `--features lsp` to ship `forgedb-lsp` alongside `forgedb` in one dist app
-# (epic #173). `forgedb lsp` resolves the sibling and hands off to it.
 [[bin]]
 name = "forgedb-lsp"
 path = "src/bin/forgedb-lsp.rs"
@@ -82,19 +60,16 @@ required-features = ["lsp"]
 
 [features]
 default = []
-# Build the bundled `forgedb-lsp` language-server binary.
 lsp = ["dep:forgedb-lsp-server"]
 
 [dependencies]
 forgedb-parser = { path = "crates/parser", version = "0.4.0" }
-forgedb-codegen = { path = "crates/codegen", version = "0.4.0" }
-forgedb-watcher = { path = "crates/watcher", version = "0.2.2" }
-forgedb-migrations = { path = "crates/migrations", version = "0.3.0" }
+forgedb-codegen = { path = "crates/codegen", version = "0.5.0" }
+forgedb-watcher = { path = "crates/watcher", version = "0.3.0" }
+forgedb-migrations = { path = "crates/migrations", version = "0.4.0" }
 forgedb-compaction = { path = "crates/compaction", version = "0.1.0" }
 forgedb-backup = { path = "crates/backup", version = "0.3.0" }
 forgedb-coordinator = { path = "crates/coordinator", version = "0.2.2" }
-# Bundled only under the `lsp` feature (drives the `forgedb-lsp` binary). Also a
-# dev-dependency below so the CLI↔LSP parity test always links it, feature or not.
 forgedb-lsp-server = { path = "crates/lsp-server", version = "0.1.2", optional = true }
 clap = { version = "4.4", features = ["derive", "cargo"] }
 anyhow = "1.0"
@@ -103,64 +78,28 @@ colored = "3.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
-# Format-preserving config editing (#367). ForgeDB may record `[project].name`
-# into a `forgedb.toml` it did not author, and a round-trip through `toml` would
-# silently drop every comment and reorder every table in a file the user owns.
-#
-# Naming it directly on `toml`'s CURRENT 0.8.x line is what makes this cost ONE
-# crate (`toml_write`) instead of three: `toml` 0.8.2 pins `toml_edit` 0.20, so a
-# direct `0.22` there resolves BOTH and compiles two copies of `toml_edit` and of
-# `winnow`. The bump is inside the existing `"0.8"` requirement — a lockfile move,
-# not a manifest change.
 toml_edit = "0.22"
 ctrlc = "3.4"
 home = "0.5"
-# The two prompt widgets (#367), DEFAULT FEATURES OFF.
-#
-# Priced against the SHIPPED graph (`cargo tree -e normal -p forgedb`), never
-# `cargo metadata` — which counts dev-deps and would make this look free. +4 on
-# a host target (`dialoguer`, `console`, `unicode-width`, `shell-words`; `libc`
-# is already present) and **+5 on `x86_64-pc-windows-msvc`**, which adds
-# `encode_unicode`. cargo-dist ships Windows archives, so +5 is the number that
-# belongs in a release note. Default features are 9.
-#
-# The alternatives were measured too: `cliclack` +11, `inquire` +23, and a
-# hand-roll over `std::io::stdin()` +0. The hand-roll's zero is real; taking the
-# dependency is consistency with the accepted #340 §8 recommendation. TTY
-# detection needs nothing either way — `std::io::IsTerminal` is std.
 dialoguer = { version = "0.12", default-features = false }
 
 [dev-dependencies]
 forgedb-parser = { path = "crates/parser", version = "0.4.0" }
 forgedb-validation = { path = "crates/validation", version = "0.3.0" }
 forgedb-lsp-server = { path = "crates/lsp-server", version = "0.1.2" }
-forgedb-watcher = { path = "crates/watcher", version = "0.2.2" }
+forgedb-watcher = { path = "crates/watcher", version = "0.3.0" }
 forgedb-wal = { path = "crates/wal", version = "0.2.0" }
 forgedb-query-params = { path = "crates/query-params", version = "0.1.0" }
-forgedb-migrations = { path = "crates/migrations", version = "0.3.0" }
+forgedb-migrations = { path = "crates/migrations", version = "0.4.0" }
 forgedb-compaction = { path = "crates/compaction", version = "0.1.0" }
 insta = { version = "1.40", features = ["yaml"] }
 tempfile = "3.8"
-# Used by tests/cache_dir_test.rs to parse the emitted workspace root and to
-# assert FORGEDB_HOME actually diverts away from the real home directory.
 toml = "0.8"
 home = "0.5"
-# Structural guards over generated source (#282 BDD-9). `prettyplease` breaks lines by
-# length, so the same emitted call renders `return db .post .__with_page(` in one schema
-# and unbroken in another — a literal needle matches nothing and the guard passes
-# vacuously. Already in the lockfile transitively, so this adds no package to the resolve;
-# dev-only, so `cargo install forgedb` never builds it.
 regex = "1.12"
 
-# AST-based guards over Rust source (#388). PATH-ONLY, and it MUST STAY THAT WAY:
-# `forgedb-source-guard` is `publish = false`, so adding a `version` key here makes
-# `cargo publish -p forgedb` fail with "no matching package found" — cargo only strips a
-# dev-dependency from the published manifest when it has no version. Every other path dep
-# above carries a version because every other one is published; this is the deliberate
-# exception, not an oversight. Verified in both directions with `cargo package`.
 forgedb-source-guard = { path = "crates/source-guard" }
 
-# The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
 lto = "thin"

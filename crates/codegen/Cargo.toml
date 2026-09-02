@@ -1,6 +1,6 @@
 [package]
 name = "forgedb-codegen"
-version = "0.4.0"
+version = "0.5.0"
 edition.workspace = true
 license = "MIT OR Apache-2.0"
 description = "Code generators (Rust, TypeScript SDK, REST API, OpenAPI) for the ForgeDB schema compiler"
@@ -23,9 +23,6 @@ prettyplease = "0.2"
 
 [dev-dependencies]
 insta = "1.40"
-# Dev-only: the generated cargo manifests are asserted to be valid TOML. A
-# malformed manifest is the exact failure class #335 is about, and a string
-# snapshot cannot see it.
 toml = "0.8"
 # AST-based guards over generated Rust (#388). PATH-ONLY — no `version` key. See the
 # longer note in the root Cargo.toml: a version here breaks `cargo publish` for this

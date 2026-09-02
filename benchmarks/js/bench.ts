@@ -1,22 +1,7 @@
-//! JS/Bun benchmark suite: PGlite (PostgreSQL 16 compiled to WASM, run in-process,
-//! no server) vs `bun:sqlite` (SQLite via Bun's native binding) — the two in-process
-//! engines that live in JS rather than the native Rust Criterion harness. Reading
-//! PGlite (in-process WASM PG) against the native server-PostgreSQL numbers
-//! (`make bench-postgres`) separates the *engine* cost from the *client/server
-//! transport* cost — that contrast is the point of including PGlite.
-//!
-//! The corpus generator mirrors the Rust `benchmarks/src/lib.rs` seed logic
-//! (splitmix64 + id_for) so the data model matches the native suites; the read
-//! corpus is smaller (2 000 posts) because PGlite's per-query WASM-boundary cost
-//! makes a 1e4 row-at-a-time load slow — point/probe latency is O(1), so the
-//! smaller corpus is representative for those. Run: `bun run benchmarks/js/bench.ts`
-//! (or `make bench-pglite`).
-
 import { PGlite } from "@electric-sql/pglite";
 import { Database as Sqlite } from "bun:sqlite";
 import { run, bench, group, summary } from "mitata";
 
-// ---- Deterministic corpus (mirrors benchmarks/src/lib.rs) --------------------
 const BASE_TS = 1_700_000_000n;
 const N_TAGS = 500;
 const TAGS_PER_POST = 3;
@@ -32,7 +17,6 @@ function splitmix64(state: { s: bigint }): bigint {
   return (z ^ (z >> 31n)) & MASK64;
 }
 
-/** 16-byte big-endian id from (kind << 96) | index — matches Uuid::from_u128. */
 function idFor(kind: number, index: number): Uint8Array {
   let v = (BigInt(kind) << 96n) | BigInt(index);
   const b = new Uint8Array(16);
@@ -88,7 +72,6 @@ CREATE INDEX ptl_post_idx ON post_tag_link(post_id);
 
 const data = dataset(READ_USERS, READ_POSTS);
 
-// ---- PGlite setup (in-process WASM Postgres) --------------------------------
 async function setupPglite(): Promise<PGlite> {
   const db = new PGlite();
   await db.exec(DDL_PG);
@@ -105,7 +88,6 @@ async function setupPglite(): Promise<PGlite> {
   return db;
 }
 
-// ---- bun:sqlite setup (native SQLite) ---------------------------------------
 function setupSqlite(): Sqlite {
   const db = new Sqlite(":memory:");
   db.run(DDL_SQLITE);
@@ -126,16 +108,13 @@ function setupSqlite(): Sqlite {
 const pg = await setupPglite();
 const sq = setupSqlite();
 
-// Prepared PGlite statements (parse once, mirror the native pg suite).
 const PG_POINT = "SELECT id,title,views,published,author,created_at FROM post WHERE id = $1";
 const PG_EMAIL = 'SELECT id,name,email,created_at FROM "user" WHERE email = $1';
 const PG_AUTHOR = "SELECT id,title,views,published,author,created_at FROM post WHERE author = $1";
 const PG_TAGS = "SELECT tag.id, tag.name FROM tag JOIN post_tag_link l ON l.tag_id = tag.id WHERE l.post_id = $1";
-// Scenario 7: filtered scan + aggregate, and filtered scan + sort + top-N.
 const PG_AGG = "SELECT COUNT(*), COALESCE(SUM(views),0) FROM post WHERE published";
 const PG_TOPN = "SELECT id,title,views,published,author,created_at FROM post WHERE views >= $1 ORDER BY views DESC LIMIT 10";
 
-// Prepared bun:sqlite statements.
 const sqPoint = sq.query("SELECT id,title,views,published,author,created_at FROM post WHERE id = ?");
 const sqEmail = sq.query("SELECT id,name,email,created_at FROM user WHERE email = ?");
 const sqAuthor = sq.query("SELECT id,title,views,published,author,created_at FROM post WHERE author = ?");
@@ -145,7 +124,6 @@ const sqTopN = sq.query("SELECT id,title,views,published,author,created_at FROM 
 
 let i = 0;
 
-// Scenario 5: point lookup by PK.
 summary(() => {
   group("js/point_lookup", () => {
     bench("pglite", async () => { const id = idFor(2, i++ % READ_POSTS); await pg.query(PG_POINT, [id]); });
@@ -153,7 +131,6 @@ summary(() => {
   });
 });
 
-// Scenario 6: secondary-index probe (unique email).
 summary(() => {
   group("js/index_probe", () => {
     bench("pglite", async () => { await pg.query(PG_EMAIL, [`user${i++ % READ_USERS}@example.com`]); });
@@ -161,7 +138,6 @@ summary(() => {
   });
 });
 
-// Scenario 8/10: FK-index probe -> reverse one-to-many.
 summary(() => {
   group("js/reverse_fk", () => {
     bench("pglite", async () => { const id = idFor(1, i++ % READ_USERS); await pg.query(PG_AUTHOR, [id]); });
@@ -169,7 +145,6 @@ summary(() => {
   });
 });
 
-// Scenario 11: many-to-many traversal (indexed junction join).
 summary(() => {
   group("js/m2m", () => {
     bench("pglite", async () => { const id = idFor(2, i++ % READ_POSTS); await pg.query(PG_TAGS, [id]); });
@@ -177,7 +152,6 @@ summary(() => {
   });
 });
 
-// Scenario 7a: filtered scan + aggregate (COUNT + SUM(views) WHERE published).
 summary(() => {
   group("js/scan_aggregate", () => {
     bench("pglite", async () => { await pg.query(PG_AGG); });
@@ -185,7 +159,6 @@ summary(() => {
   });
 });
 
-// Scenario 7b: filtered scan + sort + top-10 by views.
 summary(() => {
   group("js/scan_sort_top10", () => {
     bench("pglite", async () => { await pg.query(PG_TOPN, [50_000]); });

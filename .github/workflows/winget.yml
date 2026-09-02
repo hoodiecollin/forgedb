@@ -1,24 +1,3 @@
-# winget distribution for the `forgedb` CLI — epic #181 / Windows extras.
-#
-# cargo-dist has NO winget publisher, so this is a standalone channel that runs
-# AFTER a GitHub Release is published (release.yml creates it) and opens a PR
-# against microsoft/winget-pkgs with an updated manifest pointing at the freshly
-# released `forgedb-x86_64-pc-windows-msvc.zip`.
-#
-# FIRST SUBMISSION IS MANUAL. winget-releaser only *updates* an existing package;
-# the initial `ForgeDB.ForgeDB` manifest must be submitted once by hand (e.g. with
-# `wingetcreate new`) and merged into winget-pkgs. After that, every release auto-
-# opens an update PR here.
-#
-# Go-live is user-gated: needs the `WINGET_TOKEN` secret — a PAT (classic `public_repo`
-# or a fine-grained token with PR access) on a fork of microsoft/winget-pkgs that the
-# bot pushes the manifest branch to.
-#
-# DORMANT until Windows support lands. v0.2.0 ships no Windows binary (the `forgedb`
-# binary is currently Unix-only — storage-native positional I/O + coordinator Unix
-# sockets), so there is no `-x86_64-pc-windows-msvc.zip` for this to submit. The
-# `release` trigger is removed so it can only be run manually once a Windows target
-# is reintroduced. See #209.
 name: winget
 
 on:
@@ -35,14 +14,12 @@ jobs:
   publish:
     name: submit winget manifest
     runs-on: windows-latest
-    # Skip prereleases; winget ships stable versions only.
     if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
     steps:
       - name: Submit to winget-pkgs
         uses: vedantmgoyal9/winget-releaser@v2
         with:
           identifier: ForgeDB.ForgeDB
-          # Pull the version + zip URL from the release tag (strip a leading `v`).
           version: ${{ github.event.release.tag_name || github.event.inputs.tag }}
           installers-regex: '-x86_64-pc-windows-msvc\.zip$'
           token: ${{ secrets.WINGET_TOKEN }}

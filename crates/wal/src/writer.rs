@@ -1,4 +1,3 @@
-//! WAL Writer with configurable fsync policies
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -7,7 +6,6 @@ use std::time::{Duration, Instant};
 use crate::FsyncPolicy;
 use crate::entry::WalEntry;
 
-/// WAL Writer
 pub struct WalWriter {
     file: File,
     fsync_policy: FsyncPolicy,
@@ -16,7 +14,6 @@ pub struct WalWriter {
 }
 
 impl WalWriter {
-    /// Create a new WAL writer
     pub fn new<P: AsRef<Path>>(path: P, fsync_policy: FsyncPolicy) -> io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
@@ -32,13 +29,11 @@ impl WalWriter {
         })
     }
 
-    /// Write an entry to the WAL
     pub fn write(&mut self, entry: &WalEntry) -> io::Result<()> {
         let bytes = entry.to_bytes();
         self.file.write_all(&bytes)?;
         self.bytes_since_fsync += bytes.len();
 
-        // Apply fsync policy
         match self.fsync_policy {
             FsyncPolicy::Always => {
                 self.file.sync_all()?;
@@ -53,20 +48,12 @@ impl WalWriter {
                 }
             }
             FsyncPolicy::Never => {
-                // No automatic fsync
             }
         }
 
         Ok(())
     }
 
-    /// Append an entry WITHOUT fsyncing, regardless of the fsync policy (#170
-    /// group commit).  Durability is deferred to an explicit [`flush`](Self::flush)
-    /// at the batch/transaction commit boundary — so a batch of N appends pays one
-    /// barrier instead of N.  Safe only for writes whose visibility is gated on a
-    /// later durable marker (e.g. MVCC-Tier-1 staged rows, which crash-recovery
-    /// drops unless the transaction journal committed): a crash before the flush
-    /// loses these appends, which is exactly correct for not-yet-committed data.
     pub fn write_buffered(&mut self, entry: &WalEntry) -> io::Result<()> {
         let bytes = entry.to_bytes();
         self.file.write_all(&bytes)?;
@@ -74,7 +61,6 @@ impl WalWriter {
         Ok(())
     }
 
-    /// Manually flush the WAL to disk
     pub fn flush(&mut self) -> io::Result<()> {
         self.file.sync_all()?;
         self.last_fsync = Instant::now();
@@ -82,7 +68,6 @@ impl WalWriter {
         Ok(())
     }
 
-    /// Truncate the WAL (clear all entries)
     pub fn truncate(&mut self) -> io::Result<()> {
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
@@ -92,10 +77,6 @@ impl WalWriter {
         Ok(())
     }
 
-    /// Truncate the WAL to `offset` bytes, dropping any tail past it (MVCC Tier 1
-    /// transaction rollback).  A no-op if `offset` is already at or past the
-    /// current length.  The file is opened in append mode, so no cursor reset is
-    /// needed — the next write still appends at the (new, shorter) end.
     pub fn truncate_to(&mut self, offset: u64) -> io::Result<()> {
         let current = self.file.metadata()?.len();
         if offset >= current {
@@ -108,17 +89,14 @@ impl WalWriter {
         Ok(())
     }
 
-    /// Get the current fsync policy
     pub fn fsync_policy(&self) -> FsyncPolicy {
         self.fsync_policy
     }
 
-    /// Get bytes written since last fsync
     pub fn bytes_since_fsync(&self) -> usize {
         self.bytes_since_fsync
     }
 
-    /// Get time since last fsync
     pub fn time_since_fsync(&self) -> Duration {
         self.last_fsync.elapsed()
     }

@@ -1,11 +1,6 @@
 import { highlight } from "@/lib/shiki";
 import { cn } from "@/lib/utils";
 
-/**
- * Server component: highlights a code string at build time and renders it with
- * the site's code-block chrome. Used on the marketing landing (docs pages get
- * highlighting through the MDX pipeline instead).
- */
 export async function CodeBlock({
   code,
   lang,

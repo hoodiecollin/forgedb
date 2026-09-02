@@ -1,13 +1,5 @@
 "use client";
 
-/**
- * The type-aware record-editor field. Maps every ForgeDB field type to the
- * right control and surfaces the schema's real semantics — and its real honest
- * limits (see docs/forgedb-inspector-design-review.md): nullable ≠ empty,
- * tri-state bool, u64 precision, whole-record replace, no M2M unlink, linear
- * reverse scans.
- */
-
 import { useAtom } from "jotai";
 import { ArrowRight, Copy } from "lucide-react";
 import {
@@ -28,14 +20,12 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
-
 const MOD_META: Record<Mod, { label: string; cls: string }> = {
   "+": { label: "auto-generated", cls: "text-ok border-ok/50" },
   "&": { label: "unique", cls: "text-warn border-warn/50" },
   "^": { label: "indexed", cls: "text-info border-info/50" },
   "?": { label: "nullable", cls: "text-muted-foreground border-border" },
 };
-
 const SCALAR_NULLABLE = new Set([
   "string",
   "text",
@@ -45,7 +35,6 @@ const SCALAR_NULLABLE = new Set([
   "bytes",
   "ts",
 ]);
-
 function ModBadge({ mod }: { mod: Mod }) {
   const m = MOD_META[mod];
   return (
@@ -60,7 +49,6 @@ function ModBadge({ mod }: { mod: Mod }) {
     </span>
   );
 }
-
 export function FieldControl({
   field,
   onFollowRelation,
@@ -72,11 +60,8 @@ export function FieldControl({
   const [bools, setBools] = useAtom(editBoolsAtom);
   const [structs, setStructs] = useAtom(editStructsAtom);
   const [values, setValues] = useAtom(editValuesAtom);
-
-  // Controlled scalar value: the edited override, else the seeded/base value.
   const val = (fallback?: string) => values[field.name] ?? fallback ?? "";
   const onVal = (v: string) => setValues({ ...values, [field.name]: v });
-
   const nullable = field.mods.includes("?");
   const autoGen = field.mods.includes("+");
   const c = field.control;
@@ -84,15 +69,13 @@ export function FieldControl({
   const isNull = nulls[field.name] === true;
   const boolVal = bools[field.name] ?? field.default ?? "null";
   const structOpen = structs[field.name] !== false;
-
   const toggleNull = () =>
     setNulls({ ...nulls, [field.name]: !isNull });
   const toggleStruct = () =>
     setStructs({ ...structs, [field.name]: !structOpen });
-
   return (
     <div>
-      {/* header: name · mod badges · type · null toggle */}
+      { }
       <div className="mb-1.5 flex items-center gap-2">
         <label className="font-mono text-[13px] font-semibold">
           {field.name}
@@ -123,15 +106,13 @@ export function FieldControl({
           </button>
         ) : null}
       </div>
-
-      {/* null state */}
+      { }
       {scalarNullable && isNull ? (
         <div className="rounded-lg border border-dashed border-border bg-muted/40 px-3 py-2 font-mono text-[12.5px] text-muted-foreground">
           ∅ NULL — value absent (distinct from empty)
         </div>
       ) : null}
-
-      {/* value states (hidden when nulled) */}
+      { }
       {!(scalarNullable && isNull) ? (
         <>
           {c === "uuid" ? (
@@ -145,7 +126,6 @@ export function FieldControl({
               </button>
             </div>
           ) : null}
-
           {c === "string" ? (
             <Input
               value={val(field.value)}
@@ -153,7 +133,6 @@ export function FieldControl({
               placeholder={field.placeholder}
             />
           ) : null}
-
           {c === "text" ? (
             <Textarea
               value={val(field.value)}
@@ -161,7 +140,6 @@ export function FieldControl({
               rows={3}
             />
           ) : null}
-
           {c === "int" ? (
             <Input
               type="number"
@@ -171,7 +149,6 @@ export function FieldControl({
               max={field.max}
             />
           ) : null}
-
           {c === "bigint" ? (
             <>
               <Input value={val(field.value)} onChange={(e) => onVal(e.target.value)} />
@@ -181,7 +158,6 @@ export function FieldControl({
               </div>
             </>
           ) : null}
-
           {c === "float" ? (
             <Input
               type="number"
@@ -190,7 +166,6 @@ export function FieldControl({
               onChange={(e) => onVal(e.target.value)}
             />
           ) : null}
-
           {c === "bytes" ? (
             <div className="relative">
               <Input
@@ -203,7 +178,6 @@ export function FieldControl({
               </span>
             </div>
           ) : null}
-
           {c === "ts" ? (
             <div>
               <div className="grid grid-cols-[1.1fr_1fr] gap-2">
@@ -233,8 +207,7 @@ export function FieldControl({
           ) : null}
         </>
       ) : null}
-
-      {/* bool tri-state (owns its own null handling) */}
+      { }
       {c === "bool" ? (
         <div className="flex w-fit gap-1 rounded-lg border border-border bg-muted p-1">
           {(
@@ -260,8 +233,7 @@ export function FieldControl({
           ))}
         </div>
       ) : null}
-
-      {/* fk picker */}
+      { }
       {c === "fk" ? (
         <div>
           <div className="flex items-center gap-2">
@@ -301,8 +273,7 @@ export function FieldControl({
           </div>
         </div>
       ) : null}
-
-      {/* struct */}
+      { }
       {c === "struct" ? (
         structOpen ? (
           <div className="flex flex-col gap-2.5 rounded-lg border border-border bg-muted/30 p-3">
@@ -336,8 +307,7 @@ export function FieldControl({
           </div>
         )
       ) : null}
-
-      {/* has-many */}
+      { }
       {c === "hasmany" ? (
         <div>
           <button
@@ -360,8 +330,7 @@ export function FieldControl({
           </div>
         </div>
       ) : null}
-
-      {/* m2m */}
+      { }
       {c === "m2m" ? (
         <div>
           <div className="flex flex-wrap items-center gap-1.5">

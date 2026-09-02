@@ -1,15 +1,5 @@
 "use client";
 
-/**
- * Live grid rows for the Studio screen (#13). When attached to a real project's
- * running API, fetches the model's rows (`GET /api/<model>?filters`) and then
- * keeps them current from a `/live-query` subscription — init replaces, added/
- * updated upsert by id, removed drops by id. Columns come from the parsed schema.
- *
- * Filters are the composed predicates, which bind to the generated closed set
- * (equality on scalar fields); nothing here parses a predicate language.
- */
-
 import { useEffect, useState } from "react";
 import { useAtomValue } from "jotai";
 import {
@@ -31,18 +21,14 @@ import {
   listRows,
 } from "./live";
 import type { GridColumn } from "./types";
-
 export interface LiveRowsState {
-  /** true when the live path is engaged (Tauri + real project + attached) */
   active: boolean;
   loading: boolean;
   error: string | null;
   cols: GridColumn[];
   rows: LiveRow[];
 }
-
 const ID = "id";
-
 function applyDelta(rows: LiveRow[], d: LiveDelta): LiveRow[] {
   switch (d.kind) {
     case "Init":
@@ -63,12 +49,9 @@ function applyDelta(rows: LiveRow[], d: LiveDelta): LiveRow[] {
       return rows;
   }
 }
-
-/** Strip the display quoting the composer stores values with (e.g. `"draft"`). */
 function unquote(v: string): string {
   return v.replace(/^"(.*)"$/, "$1");
 }
-
 export function useLiveRows(): LiveRowsState {
   const source = useAtomValue(projectSourceAtom);
   const connected = useAtomValue(connectedAtom);
@@ -77,12 +60,10 @@ export function useLiveRows(): LiveRowsState {
   const base = useAtomValue(apiBaseAtom);
   const schema = useAtomValue(schemaAtom);
   const snapshotToken = useAtomValue(snapshotTokenAtom);
-
   const active = isTauri() && source === "project" && connected;
   const [rows, setRows] = useState<LiveRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
   const cols = liveColumns(schema[model] ?? []);
   const filterKey = JSON.stringify(
     Object.fromEntries(
@@ -91,12 +72,7 @@ export function useLiveRows(): LiveRowsState {
         .map((p) => [p.field, unquote(p.val)]),
     ),
   );
-  // #85: point-in-time read. A pinned snapshot supplies this model's row-count
-  // watermark as `as_of`; `undefined` = live. Keyed by PascalCase model name to
-  // match the `/snapshot` token. When pinned, the live-query subscription is
-  // suspended below — a snapshot is a frozen view, not a live tail.
   const asOf = snapshotToken ? snapshotToken[model] : undefined;
-
   useEffect(() => {
     if (!active) {
       setRows([]);
@@ -108,7 +84,6 @@ export function useLiveRows(): LiveRowsState {
     let sub: Subscription | null = null;
     setLoading(true);
     setError(null);
-
     listRows(base, model, filters, asOf)
       .then((r) => {
         if (!cancelled) {
@@ -122,8 +97,6 @@ export function useLiveRows(): LiveRowsState {
           setLoading(false);
         }
       });
-
-    // Live tail only in the live lens; a pinned snapshot is a static view.
     if (asOf === undefined) {
       liveQuery(base, model, filters, (d) => {
         if (!cancelled) setRows((cur) => applyDelta(cur, d));
@@ -132,12 +105,10 @@ export function useLiveRows(): LiveRowsState {
         else sub = s;
       });
     }
-
     return () => {
       cancelled = true;
       sub?.close();
     };
   }, [active, base, model, filterKey, asOf]);
-
   return { active, loading, error, cols, rows };
 }

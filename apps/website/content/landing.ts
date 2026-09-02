@@ -1,20 +1,5 @@
 import { dd } from "@/lib/dd";
 
-/**
- * Landing-page copy, extracted from the layout so it can be edited (and, phase 2,
- * fine-tuned in-browser by the rewrite tool) independently of `app/page.tsx`.
- *
- * Prose values are **markdown/MDX** — inline `<code>`, `[links](/href)`, and the
- * custom `<Hl>` primary-highlight — rendered through `components/markdown.tsx`.
- * Code samples are plain source fed to `<CodeBlock>`. Structural tokens (icon
- * keys, hrefs, langs) stay as plain strings; icons resolve to components in the
- * page via the `ICONS` map keyed by `IconKey`.
- *
- * Every multi-line value is authored with `dd` (see `lib/dd.ts`) — no `+`
- * concatenation, no `.join("\n")`.
- */
-
-/** Icon keys the feature grid references; the page maps these to lucide icons. */
 export type IconKey =
   | "ShieldCheck"
   | "Columns3"
@@ -29,39 +14,26 @@ export type IconKey =
 export interface FeatureItem {
   icon: IconKey;
   href: string;
-  /** markdown */
   title: string;
-  /** markdown */
   body: string;
 }
-
 export interface StatItem {
-  /** markdown */
   value: string;
-  /** markdown */
   label: string;
 }
-
 export interface StepItem {
   n: string;
-  /** markdown */
   title: string;
-  /** markdown */
+
   body: string;
-  /** code sample (plain source, not markdown) */
   code: string;
   lang: string;
 }
-
 export interface ClientTab {
-  /** stable tab id (radix value) */
   id: string;
-  /** tab label (plain text) */
   label: string;
-  /** shiki language + CodeBlock filename */
   lang: string;
   filename: string;
-  /** code sample (plain source, not markdown) */
   code: string;
 }
 
@@ -114,7 +86,6 @@ export interface LandingCopy {
     secondary: string;
   };
 }
-
 export const landing = {
   hero: {
     badge: dd`Schema-first · compile-time · pre-1.0`,
@@ -131,7 +102,6 @@ export const landing = {
     install: dd`curl -fsSL https://get.forgedb.dev/install.sh | sh`,
     installMore: dd`More ways to install — Homebrew, npm, pip, Docker, Nix, cargo →`,
   },
-
   showcase: {
     heading: dd`Write the schema. Get the stack.`,
     body: dd`
@@ -148,7 +118,6 @@ export const landing = {
         created_at: +timestamp
         posts: [Post]
       }
-
       Post {
         id: +uuid
         title: string @length(1, 200)
@@ -157,12 +126,10 @@ export const landing = {
         published: bool
         author: *User
         created_at: +timestamp
-
         @projection(card: title, slug, views)
       }
     `,
   },
-
   clients: {
     heading: dd`Typed clients in the languages you already ship`,
     body: dd`
@@ -184,9 +151,7 @@ export const landing = {
         filename: "app.ts",
         code: dd`
           import { ForgeDBClient } from "./generated/types";
-
           const db = new ForgeDBClient("http://localhost:3000");
-
           // createPost() is typed to PostCreate; returns the new id
           const id = await db.createPost({
             title: "Hello, ForgeDB",
@@ -195,7 +160,6 @@ export const landing = {
             published: true,
             author: userId,
           });
-
           // listPost() → ListResult<Post> { data, total, limit, offset }
           const { data, total } = await db.listPost({
             filter: { published: true },
@@ -212,9 +176,7 @@ export const landing = {
         filename: "app.py",
         code: dd`
           from forgedb_client import ForgeDbClient, PostCreate, ListOptions
-
           db = ForgeDbClient("http://localhost:3000")
-
           # create_post() takes a typed PostCreate; returns the new id
           post_id = db.create_post(PostCreate(
               title="Hello, ForgeDB",
@@ -223,7 +185,6 @@ export const landing = {
               published=True,
               author=user_id,
           ))
-
           # list_post() → ListResult { data, total, limit, offset }
           page = db.list_post(ListOptions(
               filter={"published": "true"},
@@ -240,9 +201,7 @@ export const landing = {
         filename: "main.rs",
         code: dd`
           use forgedb_client::{ForgeDbClient, PostCreate, ListOptions, SortOrder};
-
           let db = ForgeDbClient::new("http://localhost:3000");
-
           // create_post() takes a typed &PostCreate; returns the new id
           let id = db.create_post(&PostCreate {
               title: "Hello, ForgeDB".into(),
@@ -251,7 +210,6 @@ export const landing = {
               published: true,
               author: user_id,
           }).await?;
-
           // list_post() → ListResult<Post> { data, total, limit, offset }
           let page = db.list_post(&ListOptions {
               filter: vec![("published".into(), "true".into())],
@@ -269,9 +227,7 @@ export const landing = {
         filename: "main.go",
         code: dd`
           import client "forgedb-client"
-
           db := client.NewClient("http://localhost:3000")
-
           // CreatePost takes a typed *PostCreate; returns the new id
           id, err := db.CreatePost(&client.PostCreate{
               Title:     "Hello, ForgeDB",
@@ -280,7 +236,6 @@ export const landing = {
               Published: true,
               Author:    userID,
           })
-
           // ListPost → *ListResult[Post] { Data, Total, Limit, Offset }
           limit := 10
           page, err := db.ListPost(&client.ListOptions{
@@ -293,7 +248,6 @@ export const landing = {
       },
     ],
   },
-
   invariant: {
     lead: dd`
       Your schema is a <Hl>compile-time input to generation</Hl> — never a runtime
@@ -306,7 +260,6 @@ export const landing = {
       knows nothing about it, and never will. [Read the concepts →](/docs/concepts/)
     `,
   },
-
   features: {
     heading: dd`A real database, batteries generated in`,
     body: dd`
@@ -403,7 +356,6 @@ export const landing = {
       },
     ],
   },
-
   stats: {
     heading: dd`Small, fast, and honest`,
     body: dd`
@@ -418,7 +370,6 @@ export const landing = {
       { value: dd`0 deps`, label: dd`on any runtime ORM — only schema-agnostic substrate` },
     ],
   },
-
   steps: {
     heading: dd`From schema to server`,
     body: dd`
@@ -463,7 +414,6 @@ export const landing = {
       },
     ],
   },
-
   cta: {
     heading: dd`Stop writing the same data layer`,
     body: dd`

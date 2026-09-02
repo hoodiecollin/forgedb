@@ -1,22 +1,4 @@
-# Website deploy — build in GitHub Actions, deploy PREBUILT to Vercel (epic #196 / #198).
-#
-# Vercel serves; it does NOT build. `vercel build` runs `next build` on THIS GH runner
-# (our minutes, not Vercel build minutes) and still compiles apps/website/vercel.json's
-# `/relay` PostHog reverse-proxy rewrites into the deployed output. `vercel deploy
-# --prebuilt` uploads that output without re-running the build on Vercel.
-#
 #   vercel pull   --environment=<preview|production>   # fetch project settings/env
-#   vercel build  [--prod]                             # next build here (GH runner)
-#   vercel deploy --prebuilt [--prod]                  # upload the prebuilt output
-#
-# push to main → production; pull_request → preview. The `prebuild` search-index +
-# dead-nav-link check runs automatically as the `next build` lifecycle hook (a broken
-# docs nav link fails the build). Path-filtered so CLI-only changes don't redeploy.
-#
-# Secrets (1Password → Private → "forgedb.dev deploy" → GH Actions via `make website-secrets`):
-#   VERCEL_TOKEN, VERCEL_ORG_ID, VERCEL_PROJECT_ID — link the CLI to the project.
-#   NEXT_PUBLIC_POSTHOG_KEY — publishable (phc_) key; injected at BUILD time so Next inlines
-#     it. The key lives in GH (not Vercel env) because the build runs here, not on Vercel (#192).
 name: Website
 
 on:
@@ -29,10 +11,6 @@ on:
     paths:
       - 'apps/website/**'
       - '.github/workflows/website.yml'
-  # Manual + release-refresh dispatch (see website-release.yml, which fires this
-  # on a `v*` tag so /changelog reflects a new release). Defaults to production —
-  # a manual dispatch almost always means "deploy the site now"; pass
-  # environment=preview for a throwaway preview build.
   workflow_dispatch:
     inputs:
       environment:
@@ -41,17 +19,15 @@ on:
         options: [production, preview]
         default: production
 
-# One deploy per ref; a newer push supersedes an in-flight one.
 concurrency:
   group: website-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: read
-  issues: read # the roadmap prebuild reads public issues/milestones via `gh`
-  pull-requests: write # to post the preview URL on PRs
+  issues: read
+  pull-requests: write
 
-# The Vercel CLI reads these to resolve the project without a committed .vercel/project.json.
 env:
   VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
   VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
@@ -68,12 +44,6 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
 
-      # Cache ONLY bun's download cache (deps), keyed on the lockfile. We deliberately do
-      # NOT cache apps/website/.next/cache: restoring Next's persistent webpack cache across
-      # commits served STALE compiled CSS (a globals.css edit shipped byte-identical CSS and
-      # the fix never reached prod). The static-export build is fast, so recompiling CSS
-      # fresh every run is the right trade — correctness over a marginal cache hit.
-      # (`website-` keys from the old bun+Next cache are abandoned; `-bun-` starts clean.)
       - name: Cache bun install
         uses: actions/cache@v4
         with:
@@ -82,13 +52,9 @@ jobs:
           restore-keys: |
             website-bun-${{ runner.os }}-
 
-      # Node/npm are preinstalled on the runner; install the Vercel CLI globally. `vercel
-      # build` still uses bun for the project itself (it detects apps/website/bun.lock).
       - name: Install Vercel CLI
         run: npm install -g vercel@latest
 
-      # PRs → preview; a workflow_dispatch honors its `environment` input
-      # (default production); a push to main → production.
       - name: Resolve deploy target
         id: target
         run: |
@@ -106,10 +72,6 @@ jobs:
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
 
-      # `next build` runs here — including the `prebuild` search-index + dead-nav-link
-      # check + roadmap snapshot. NEXT_PUBLIC_POSTHOG_KEY is inlined into the client
-      # bundle at this step; GH_TOKEN lets the roadmap prebuild read issues/milestones
-      # via `gh` (degrades to a caveat-only page if absent).
       - name: Build (on the GH runner)
         run: vercel build ${{ steps.target.outputs.flag }} --token="$VERCEL_TOKEN"
         env:
@@ -130,7 +92,6 @@ jobs:
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
 
-      # Surface the preview URL on the PR so it's one click to review.
       - name: Comment preview URL on PR
         if: ${{ github.event_name == 'pull_request' }}
         run: |

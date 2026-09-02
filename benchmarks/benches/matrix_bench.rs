@@ -1,26 +1,7 @@
-//! Config-matrix benchmark suite (epic #126): the SAME scenarios run against the
-//! SAME `bench.forge` generated under several `forgedb.toml` configs, so Criterion
-//! reports how each generate-time knob shifts performance. Each config is a
-//! distinct generated module (`forgedb_benchmarks::variants::*`); a scenario is a
-//! macro invoked once per relevant variant into a shared Criterion group, so the
-//! configs line up side by side in the report.
-//!
-//! Scenario → variants mapping (only the config axes a scenario is sensitive to):
-//!   write-path latency (insert/update/delete): default, fsync_never, replication_on
-//!   changefeed capacity:                       insert_one adds changefeed_small
-//!   compaction churn + maintain():             default, compaction_off, compaction_low
-//!   cold-start reopen:                         default, compaction_off
-//!
-//! Regenerate the variant modules with `make bench-regen-matrix` after any codegen
-//! change (each module compiling is itself a codegen guard).
-
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use forgedb_benchmarks::{dataset, ts_from_seconds};
 use uuid::Uuid;
 
-// A unique user record for a write-path iteration: id + email are made unique by
-// `i` so inserts never collide on the `&unique` email and the durable write path
-// (WAL fsync / broker) is what's timed. `$m` is a variant module path.
 macro_rules! mk_user {
     ($m:path, $row:expr, $i:expr) => {{
         use $m as _m;
@@ -34,7 +15,6 @@ macro_rules! mk_user {
     }};
 }
 
-// insert_one: fresh unique record per iteration into a shared on-disk db.
 macro_rules! bench_insert {
     ($group:expr, $m:path, $tag:literal, $pool:expr) => {{
         use $m as _m;
@@ -57,13 +37,11 @@ macro_rules! bench_insert {
     }};
 }
 
-// update_one: repeatedly supersede a small live set (one dead version per update).
 macro_rules! bench_update {
     ($group:expr, $m:path, $tag:literal, $pool:expr) => {{
         use $m as _m;
         let dir = tempfile::tempdir().unwrap();
         let mut db = _m::Database::open_at(dir.path().to_path_buf());
-        // Seed a small live set to update in place.
         let mut ids = Vec::new();
         for i in 0..64usize {
             let u = mk_user!($m, &$pool.users[i], i);
@@ -78,8 +56,8 @@ macro_rules! bench_update {
                     next.set(i + 1);
                     let id = ids[i % ids.len()];
                     let mut u = mk_user!($m, &$pool.users[i % $pool.users.len()], i);
-                    u.id = id; // update the existing id (supersede)
-                    u.email = format!("u{}@example.com", i % ids.len()); // stable per id
+                    u.id = id;
+                    u.email = format!("u{}@example.com", i % ids.len());
                     (id, u)
                 },
                 |(id, u)| {
@@ -91,13 +69,6 @@ macro_rules! bench_update {
     }};
 }
 
-// delete_reinsert: each iteration deletes a slot's record (tombstone append +
-// fsync) then re-inserts the SAME id + email (delete cleared the unique-index
-// entry, so the reinsert is valid) — the live set stays stable and every
-// iteration times one durable delete + one durable insert. A pair-cost proxy for
-// delete on the fsync-bound write path (pure delete cannot be isolated without an
-// untimed reinsert per iteration, which criterion's batched setup cannot stage
-// per-op against a shared &mut db).
 macro_rules! bench_delete {
     ($group:expr, $m:path, $tag:literal, $pool:expr) => {{
         use $m as _m;
@@ -112,7 +83,6 @@ macro_rules! bench_delete {
                 let i = next.get();
                 next.set(i + 1);
                 let slot = i % 64;
-                // Stable id + email for this slot (mk_user derives both from `slot`).
                 let u = mk_user!($m, &$pool.users[slot], slot);
                 let id = u.id;
                 db.user.delete(id);
@@ -122,9 +92,6 @@ macro_rules! bench_delete {
     }};
 }
 
-// churn: N updates to ONE id — crosses the compaction threshold on the low/default
-// configs (triggering the deferred flag / inline ceiling) and never on
-// compaction_off. Times the whole burst so compaction cost (if any) is included.
 macro_rules! bench_churn {
     ($group:expr, $m:path, $tag:literal, $pool:expr, $n:expr) => {{
         use $m as _m;
@@ -143,7 +110,7 @@ macro_rules! bench_churn {
                         u.name = format!("v{i}");
                         db.user.update(id, u).expect("update");
                     }
-                    db.maintain(); // #162-A: run any deferred compaction off the write turn
+                    db.maintain();
                     dir
                 },
                 BatchSize::PerIteration,
@@ -152,8 +119,6 @@ macro_rules! bench_churn {
     }};
 }
 
-// reopen: seed a dir with `n` users (outside timing), then time Database::open_at
-// (the rehydrate — id_to_row + secondary index rebuild) on that populated dir.
 macro_rules! bench_reopen {
     ($group:expr, $m:path, $tag:literal, $pool:expr, $n:expr) => {{
         use $m as _m;
@@ -209,9 +174,6 @@ fn bench_matrix_churn(c: &mut Criterion) {
     let pool = dataset(200_000, 0);
     let mut g = c.benchmark_group("matrix/churn_250_updates");
     g.sample_size(20);
-    // 250 updates crosses the low threshold (100) — inline ceiling / maintain
-    // reclaim — and the default (1000) sets compaction_due but maintain() runs it;
-    // compaction_off never reclaims (grows to 251 physical rows).
     bench_churn!(g, forgedb_benchmarks::v_default, "default", pool, 250usize);
     bench_churn!(g, forgedb_benchmarks::v_compaction_off, "compaction_off", pool, 250usize);
     bench_churn!(g, forgedb_benchmarks::v_compaction_low, "compaction_low", pool, 250usize);

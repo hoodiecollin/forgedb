@@ -6,12 +6,6 @@ use crate::ast::{
 use crate::lexer::{Lexer, Token, TokenWithPos};
 use forgedb_validation::{Position, ValidationError};
 
-/// The result of a resilient parse ([`Parser::parse_recover`]): a best-effort
-/// (possibly partial) [`Schema`] plus every diagnostic collected along the way —
-/// syntax errors recovered from during parsing *and* the semantic diagnostics
-/// from [`crate::validate::validate_schema`] — each positioned and sorted by
-/// source location. This is the shape the LSP consumes to report diagnostics and
-/// offer symbols on a buffer that does not fully parse.
 #[derive(Debug, Clone)]
 pub struct ParsedSchema {
     pub schema: Schema,
@@ -23,31 +17,9 @@ pub struct Parser {
     tokens_with_pos: Vec<TokenWithPos>,
     position: usize,
     use_validation: bool,
-    /// When set, the field/member loops record a diagnostic and skip to the next
-    /// boundary instead of aborting the parse (see [`Parser::parse_recover`]).
-    /// The fail-fast [`Parser::parse`]/[`Parser::parse_unvalidated`] paths leave
-    /// this `false`, so their behavior is unchanged.
     recovering: bool,
-    /// Syntax diagnostics accumulated during a recovering parse.
     recovery_diagnostics: Vec<ValidationError>,
-    /// Non-fatal diagnostics accumulated during **any** parse (#237).
-    ///
-    /// Deliberately separate from `recovery_diagnostics`, which only fills when
-    /// `recovering` is set. Warnings must reach the fail-fast
-    /// [`Parser::parse`]/[`Parser::parse_unvalidated`] paths too — `forgedb
-    /// generate` is the most-run command and therefore where a deprecation most
-    /// needs to be seen, and it must not be pushed onto `parse_recover` to get
-    /// one (that would change its error semantics from abort-on-first to
-    /// recover-and-continue).
-    ///
-    /// Read with [`Parser::warnings`] / [`Parser::take_warnings`].
     warnings: Vec<ValidationError>,
-    /// Test-only producer seam (#237). The channel ships with **no** emitters —
-    /// #233 and #235 are the first — so without this there is no way to drive a
-    /// warning through a real parse and the `warnings → ParsedSchema::diagnostics`
-    /// fold (the path the LSP uses) would land unguarded. Emitted immediately
-    /// after each parse entry point clears its buffers, exactly where a real
-    /// producer inside the parse would land.
     #[cfg(test)]
     seed_warning: Option<String>,
 }
@@ -77,7 +49,6 @@ impl Parser {
         })
     }
 
-    /// Emit the test-only seeded warning, if any (#237). No-op in release builds.
     #[inline]
     fn emit_seeded_warning(&mut self) {
         #[cfg(test)]
@@ -86,25 +57,14 @@ impl Parser {
         }
     }
 
-    /// The non-fatal diagnostics collected by the most recent parse (#237).
-    ///
-    /// Populated by every parse entry point, including the fail-fast ones, so a
-    /// caller that used [`Self::parse`] can still surface deprecations. Empty
-    /// until a producer emits one — this channel ships with no emitters.
     pub fn warnings(&self) -> &[ValidationError] {
         &self.warnings
     }
 
-    /// Take the accumulated warnings, leaving the parser's buffer empty (#237).
     pub fn take_warnings(&mut self) -> Vec<ValidationError> {
         std::mem::take(&mut self.warnings)
     }
 
-    /// Record a non-fatal diagnostic (#237).
-    ///
-    /// The producer-side entry point for schema-language deprecations. Never
-    /// aborts a parse and never contributes to an exit code; the diagnostic
-    /// travels alongside a successful result.
     #[allow(dead_code)]
     pub(crate) fn warn(
         &mut self,
@@ -126,14 +86,10 @@ impl Parser {
         }
     }
 
-    /// Position of the token at `idx` (used to anchor a recovered diagnostic at
-    /// the start of the member/declaration it came from, not wherever the cursor
-    /// happened to stop).
     fn position_at(&self, idx: usize) -> Option<Position> {
         self.tokens_with_pos.get(idx).map(|t| t.position)
     }
 
-    /// Build a positioned diagnostic from a parse-error message.
     fn diag(message: String, position: Option<Position>) -> ValidationError {
         let err = ValidationError::new(message);
         match position {
@@ -142,10 +98,6 @@ impl Parser {
         }
     }
 
-    /// Recover from a bad member (field or model directive) by skipping to the
-    /// next member boundary. A member is a single line — it never spans a newline
-    /// or contains braces — so the next `Newline`/`}`/EOF is a safe resync point.
-    /// The closing `}`/EOF is left unconsumed so the enclosing loop can see it.
     fn recover_to_member_boundary(&mut self) {
         while !matches!(
             self.current_token(),
@@ -156,9 +108,6 @@ impl Parser {
         self.skip_newlines();
     }
 
-    /// Is the next significant token at or after `idx` (skipping newlines) an
-    /// opening brace? Used to spot a bare model header (`Name {`) — the one
-    /// top-level construct with no leading keyword — during recovery.
     fn next_significant_is_lbrace(&self, idx: usize) -> bool {
         let mut i = idx;
         while matches!(self.tokens.get(i), Some(Token::Newline)) {
@@ -167,13 +116,6 @@ impl Parser {
         matches!(self.tokens.get(i), Some(Token::LBrace))
     }
 
-    /// Recover from a bad *declaration* by skipping the whole broken block. From
-    /// the declaration's start token, scan forward: if this declaration has an
-    /// opening `{`, consume through its balanced closing `}` (to EOF if
-    /// unterminated); otherwise — a header with no brace — stop at the next clear
-    /// declaration boundary (a `struct`/`enum` keyword, or a bare `Name {` model
-    /// header) so a following valid declaration is not swallowed. Always advances
-    /// past `start`, guaranteeing top-level progress.
     fn synchronize_from(&mut self, start: usize) {
         let n = self.tokens.len();
         let mut i = start;
@@ -181,7 +123,6 @@ impl Parser {
         while i < n {
             match &self.tokens[i] {
                 Token::LBrace => {
-                    // This declaration's block: balance from here through its match.
                     let mut depth = 0i32;
                     let mut j = i;
                     while j < n {
@@ -202,15 +143,13 @@ impl Parser {
                         }
                         j += 1;
                     }
-                    self.position = n; // unterminated — consume to the end
+                    self.position = n;
                     return;
                 }
                 Token::Eof => {
                     self.position = i;
                     return;
                 }
-                // A clear next-declaration boundary (past our own start token):
-                // stop here rather than scanning into it for a brace.
                 Token::KwStruct | Token::KwEnum if i > start => {
                     self.position = i;
                     return;
@@ -225,7 +164,6 @@ impl Parser {
         self.position = n;
     }
 
-    /// Record a recovered syntax diagnostic anchored at token `at`.
     fn recover_diag(&mut self, message: String, at: usize) {
         let pos = self.position_at(at);
         self.recovery_diagnostics.push(Self::diag(message, pos));
@@ -245,36 +183,17 @@ impl Parser {
         }
     }
 
-    /// The token after the cursor.
     fn peek_token(&self) -> &Token {
         self.tokens.get(self.position + 1).unwrap_or(&Token::Eof)
     }
 
-    /// Is the cursor sitting on the contextual `bytes` type keyword (#233)?
-    ///
-    /// `bytes` is deliberately **not** a reserved word. Adding one would be a
-    /// larger break than the rename it serves: `bytes` is an ordinary noun for a
-    /// size, and reserving it turns `bytes: i32?` — a real column in the
-    /// Chinook-derived `music-store` example — into a parse error on a *minor*
-    /// version bump. So it lexes as [`Token::Ident`] and only means the type in
-    /// type position followed by `(`, the same lookahead trick the `tsx://` /
-    /// `jsx://` / `api://` component protocols already use.
-    ///
-    /// (The other type keywords — `string`, `timestamp`, `decimal`, … — *are*
-    /// reserved and cannot be field names. That is pre-existing and tracked
-    /// separately; this rename does not add to the problem.)
     fn at_bytes_type(&self) -> bool {
         matches!(self.current_token(), Token::Ident(name) if name == "bytes")
             && matches!(self.peek_token(), Token::LParen)
     }
 
-    /// Consume `bytes ( N )` / `char ( N )` and return [`FieldType::Bytes`].
-    ///
-    /// The cursor must be on the type keyword. Emits the #233 deprecation warning
-    /// when the source spelling was `char`.
     fn parse_bytes_type(&mut self) -> Result<FieldType, String> {
         let deprecated = matches!(self.current_token(), Token::TypeCharDeprecated);
-        // Anchor the diagnostic at the keyword, not wherever the size parse ends.
         let keyword_position = self.get_current_position();
         let keyword = if deprecated { "char" } else { "bytes" };
         self.advance();
@@ -306,26 +225,12 @@ impl Parser {
         Ok(FieldType::Bytes(size))
     }
 
-    /// Is the cursor sitting on a **parameterized** `string`, i.e. `string (`?
-    ///
-    /// Unlike `bytes` (#233), `string` is a reserved word and already lexes as
-    /// [`Token::TypeString`], so this is not a contextual-keyword dance — there is
-    /// no field named `string` to protect and no corpus hazard. The lookahead is
-    /// only here to split `string` from `string(N)`: bare `string` must keep
-    /// meaning exactly what it meant (#238 res 10).
     fn at_parameterized_string(&self) -> bool {
         matches!(self.current_token(), Token::TypeString)
             && matches!(self.peek_token(), Token::LParen)
     }
 
-    /// Consume `string ( N )` / `string ( N ! )` and return
-    /// [`FieldType::StringN`] (#238). The cursor must be on `string`.
-    ///
-    /// Res 7's `1 ≤ N ≤ 255` is enforced *here*, at the one place the literal is
-    /// read, because the AST carries N as a `u8` — every later site is handed a
-    /// width that cannot violate the cap rather than one it has to re-check.
     fn parse_string_type(&mut self) -> Result<FieldType, String> {
-        // Anchor the diagnostic at the keyword, not wherever the width parse ends.
         let keyword_position = self.get_current_position();
         self.advance();
         self.expect(Token::LParen)?;
@@ -348,8 +253,6 @@ impl Parser {
             )
         })?;
         self.advance();
-        // The `!` lives inside the parens, bound to the width — the width and its
-        // exactness are one fact about the column, so they are written as one.
         let exact = if matches!(self.current_token(), Token::Bang) {
             self.advance();
             true
@@ -360,33 +263,12 @@ impl Parser {
         Ok(FieldType::StringN { chars, exact })
     }
 
-    /// Is the cursor sitting on a **parameterized** `timestamp`, i.e.
-    /// `timestamp (`?
-    ///
-    /// Same shape as [`Self::at_parameterized_string`] (#238) and for the same
-    /// reason: `timestamp` is a reserved word, so this is not a
-    /// contextual-keyword dance — the lookahead only splits `timestamp` from
-    /// `timestamp(<key>)` so the bare spelling keeps parsing where it always did.
     fn at_parameterized_timestamp(&self) -> bool {
         matches!(self.current_token(), Token::TypeTimestamp)
             && matches!(self.peek_token(), Token::LParen)
     }
 
-    /// Consume `timestamp ( s | ms | us )` and return [`FieldType::Timestamp`]
-    /// carrying the declared precision (#254). The cursor must be on
-    /// `timestamp`.
-    ///
-    /// The key arrives as a [`Token::Ident`] — none of `s`/`ms`/`us` is a
-    /// keyword, and none of them should become one. The closed set is validated
-    /// here, at the one place the lexeme is read, so no later site is ever handed
-    /// a precision the type system cannot express.
-    ///
-    /// This deliberately mirrors [`Self::parse_string_type`] rather than sharing
-    /// a helper with it: the two argument grammars have nothing in common (a
-    /// bounded integer versus a closed set of unit identifiers), so a shared
-    /// helper would be a parameter bag, not an abstraction.
     fn parse_timestamp_type(&mut self) -> Result<FieldType, String> {
-        // Anchor the diagnostic at the keyword, not wherever the key parse ends.
         let keyword_position = self.get_current_position();
         self.advance();
         self.expect(Token::LParen)?;
@@ -416,8 +298,6 @@ impl Parser {
     }
 
     fn read_component_path(&mut self) -> Result<String, String> {
-        // Read a path like: components/user/card
-        // This is a sequence of identifiers separated by slashes
         let mut path = String::new();
 
         loop {
@@ -426,13 +306,10 @@ impl Parser {
                     path.push_str(name);
                     self.advance();
 
-                    // Check if there's a slash for more path segments
                     if matches!(self.current_token(), Token::Slash) {
                         path.push('/');
                         self.advance();
-                        // Continue to read next segment
                     } else {
-                        // End of path
                         break;
                     }
                 }
@@ -466,11 +343,8 @@ impl Parser {
     }
 
     fn parse_constraint(&mut self) -> Result<Constraint, String> {
-        // Expect @
         self.expect(Token::At)?;
 
-        // Parse constraint name.  Anchor any diagnostic at the directive name, not
-        // wherever the parameter list happens to end (#235).
         let constraint_position = self.get_current_position();
         let name = match self.current_token() {
             Token::Ident(s) => s.clone(),
@@ -485,11 +359,9 @@ impl Parser {
 
         let mut constraint = Constraint::new(name);
 
-        // Check for parameters
         if matches!(self.current_token(), Token::LParen) {
             self.advance();
 
-            // Parse parameters
             loop {
                 match self.current_token() {
                     Token::Number(n) => {
@@ -501,9 +373,6 @@ impl Parser {
                             constraint.with_param(ConstraintParam::Fractional(s.clone()));
                         self.advance();
                     }
-                    // `>n` / `<n` — an exclusive bound (#239).  The operator is
-                    // structural here; whether this directive and this field type
-                    // may carry one is a semantic question, checked in `validate`.
                     Token::Gt | Token::Lt => {
                         let greater = matches!(self.current_token(), Token::Gt);
                         let op = if greater { '>' } else { '<' };
@@ -527,12 +396,6 @@ impl Parser {
                     Token::Ident(s) => {
                         let ident = s.clone();
                         self.advance();
-                        // `name: value` (#235).  The colon-in-directive grammar
-                        // already exists for `@projection(name: a, b)`, but that is
-                        // parsed by a bespoke routine; this generalizes it to the
-                        // shared parameter loop so any directive can take named args.
-                        // Whether a given directive *accepts* them is a per-directive
-                        // question, checked after the loop.
                         if matches!(self.current_token(), Token::Colon) {
                             self.advance();
                             let value = match self.current_token() {
@@ -561,7 +424,6 @@ impl Parser {
                         self.advance();
                     }
                     Token::Asterisk => {
-                        // Special case for @relations(*) syntax
                         constraint =
                             constraint.with_param(ConstraintParam::String("*".to_string()));
                         self.advance();
@@ -574,7 +436,6 @@ impl Parser {
                     }
                 }
 
-                // Check for comma (more params) or closing paren
                 match self.current_token() {
                     Token::Comma => {
                         self.advance();
@@ -601,24 +462,6 @@ impl Parser {
         Ok(constraint)
     }
 
-    /// Validate `@length`'s arguments and warn on the single-arg meaning change
-    /// (#235).
-    ///
-    /// This lives in the parser because it is where the argument *names* are known.
-    /// The codegen side filters parameters it does not recognize, so an unchecked
-    /// `@length(foo: 3)` would silently produce a field with no bound at all — a
-    /// constraint the schema declares and the database does not enforce. Rejecting
-    /// it here is the difference between a typo being caught and being ignored.
-    ///
-    /// The accepted surface:
-    ///
-    /// | spelling | meaning |
-    /// |---|---|
-    /// | `@length(min: n)` | at least n |
-    /// | `@length(max: n)` | at most n |
-    /// | `@length(min: a, max: b)` | between a and b |
-    /// | `@length(a, b)` | between a and b — unchanged |
-    /// | `@length(n)` | **exactly** n — changed from "at most n" |
     fn check_length_constraint(
         &mut self,
         constraint: &Constraint,
@@ -634,8 +477,6 @@ impl Parser {
             .collect();
 
         if named.is_empty() {
-            // Positional.  Only the single-arg form changed meaning; the pair is
-            // kept first-class and says nothing.
             if constraint.params.len() == 1
                 && matches!(constraint.params[0], ConstraintParam::Number(_))
             {
@@ -698,32 +539,22 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> Result<FieldType, String> {
-        // `bytes(N)` is contextual and arrives as an identifier, so it has to be
-        // claimed before the `Token::Ident` arm below reads it as a struct name.
         if self.at_bytes_type() {
             return self.parse_bytes_type();
         }
-        // `string(N)` needs no such rescue — `string` is reserved — but it does
-        // need claiming before the bare-`string` arm in `parse_primitive_type`.
         if self.at_parameterized_string() {
             return self.parse_string_type();
         }
-        // `timestamp(<key>)` — the same claim, for the same reason (#254).
         if self.at_parameterized_timestamp() {
             return self.parse_timestamp_type();
         }
 
-        // Check for relation types first
         match self.current_token() {
-            // Fixed array or One-to-many: [type; count] or [Post]
             Token::LBracket => {
                 self.advance();
 
-                // Check if this is a fixed array [type; count] or one-to-many [Model]
                 let first_token = self.current_token().clone();
 
-                // `[bytes(20); 5]` — claim the contextual keyword before the
-                // `Token::Ident` arm treats it as a struct name (#233).
                 if self.at_bytes_type() {
                     let inner_type = self.parse_bytes_type()?;
                     self.expect(Token::Semicolon)?;
@@ -745,10 +576,8 @@ impl Parser {
                     Token::Ident(name) => {
                         self.advance();
 
-                        // Check next token to distinguish [Model] vs [type; count]
                         match self.current_token() {
                             Token::Semicolon => {
-                                // This is [Ident; count] - but Ident should be a type or struct
                                 self.advance();
                                 let count = match self.current_token() {
                                     Token::Number(n) => *n as usize,
@@ -761,14 +590,12 @@ impl Parser {
                                 };
                                 self.advance();
                                 self.expect(Token::RBracket)?;
-                                // The Ident could be a struct type
                                 return Ok(FieldType::FixedArray(
                                     Box::new(FieldType::StructType(name)),
                                     count,
                                 ));
                             }
                             Token::RBracket => {
-                                // This is [Model] - one-to-many relation
                                 self.advance();
                                 return Ok(FieldType::Relation(RelationType::OneToMany(name)));
                             }
@@ -781,7 +608,6 @@ impl Parser {
                         }
                     }
                     _ => {
-                        // Parse base type for fixed array
                         let inner_type = self.parse_primitive_type()?;
                         self.expect(Token::Semicolon)?;
                         let count = match self.current_token() {
@@ -799,7 +625,6 @@ impl Parser {
                     }
                 }
             }
-            // Required reference: *User
             Token::Asterisk => {
                 self.advance();
                 let model_name = match self.current_token() {
@@ -816,11 +641,8 @@ impl Parser {
                     model_name,
                 )));
             }
-            // Optional reference or nullable primitive: ?User  or  ?i32
             Token::Question => {
                 self.advance();
-                // `?bytes(3)` — claim the contextual keyword before the
-                // `Token::Ident` arm reads it as an optional model ref (#233).
                 if self.at_bytes_type() {
                     let inner = self.parse_bytes_type()?;
                     return Ok(FieldType::Nullable(Box::new(inner)));
@@ -830,7 +652,6 @@ impl Parser {
                         self.advance();
                         return Ok(FieldType::Relation(RelationType::OptionalReference(name)));
                     }
-                    // Nullable primitive types: ?i32, ?string, ?bool, etc.
                     Token::TypeU32
                     | Token::TypeU64
                     | Token::TypeI32
@@ -854,27 +675,21 @@ impl Parser {
                     }
                 }
             }
-            // Struct types, component references, or primitive identifiers
             Token::Ident(name) => {
                 let type_name = name.clone();
                 self.advance();
 
-                // Check if this is a component protocol (tsx://, jsx://, api://)
                 if matches!(type_name.as_str(), "tsx" | "jsx" | "api")
                     && matches!(self.current_token(), Token::Colon)
                 {
-                    // Parse component reference: tsx://path
-                    self.advance(); // skip :
-                    self.skip_newlines(); // Skip any newlines after colon
+                    self.advance();
+                    self.skip_newlines();
 
-                    // Expect two slashes
                     self.expect(Token::Slash)?;
                     self.expect(Token::Slash)?;
 
-                    // Read the component path
                     let path = self.read_component_path()?;
 
-                    // Determine protocol
                     let protocol = match type_name.as_str() {
                         "tsx" => ComponentProtocol::Tsx,
                         "jsx" => ComponentProtocol::Jsx,
@@ -889,13 +704,11 @@ impl Parser {
                     }));
                 }
 
-                // This could be a struct type or struct? for optional
                 return Ok(FieldType::StructType(type_name));
             }
             _ => {}
         }
 
-        // Primitive types
         self.parse_primitive_type()
     }
 
@@ -907,8 +720,6 @@ impl Parser {
             Token::TypeI64 => FieldType::I64,
             Token::TypeF64 => FieldType::F64,
             Token::TypeBool => FieldType::Bool,
-            // `string(N)` is the parameterized form (#238); bare `string` falls
-            // through to the variable-storage type below, unchanged (res 10).
             Token::TypeString if matches!(self.peek_token(), Token::LParen) => {
                 return self.parse_string_type()
             }
@@ -921,7 +732,6 @@ impl Parser {
             }
             Token::TypeTimestamp => FieldType::Timestamp(TimestampPrecision::default()),
             Token::TypeCharDeprecated => return self.parse_bytes_type(),
-            // The contextual `bytes(N)` spelling arrives as an identifier (#233).
             Token::Ident(name) if name == "bytes" && matches!(self.peek_token(), Token::LParen) => {
                 return self.parse_bytes_type()
             }
@@ -932,10 +742,8 @@ impl Parser {
     }
 
     fn parse_directive(&mut self) -> Result<CompositeIndex, String> {
-        // Expect @
         self.expect(Token::At)?;
 
-        // Get directive name
         let directive_name = match self.current_token() {
             Token::Ident(s) => s.clone(),
             _ => {
@@ -954,13 +762,10 @@ impl Parser {
     }
 
     fn parse_index_directive(&mut self) -> Result<CompositeIndex, String> {
-        // Expect (
         self.expect(Token::LParen)?;
 
-        // Parse field list
         let mut fields = Vec::new();
         loop {
-            // Parse field name
             let field_name = match self.current_token() {
                 Token::Ident(s) => s.clone(),
                 _ => {
@@ -973,11 +778,9 @@ impl Parser {
             self.advance();
             fields.push(field_name);
 
-            // Check for comma or closing paren
             match self.current_token() {
                 Token::Comma => {
                     self.advance();
-                    // Continue loop to parse next field
                 }
                 Token::RParen => {
                     self.advance();
@@ -999,12 +802,9 @@ impl Parser {
         Ok(CompositeIndex { fields })
     }
 
-    /// Parse a `@projection(<name>: <field>, ...)` directive body (#113).  The
-    /// caller has already consumed `@projection`; the current token is `(`.
     fn parse_projection_directive(&mut self) -> Result<Projection, String> {
         self.expect(Token::LParen)?;
 
-        // Projection name.
         let name = match self.current_token() {
             Token::Ident(s) => s.clone(),
             _ => {
@@ -1016,10 +816,8 @@ impl Parser {
         };
         self.advance();
 
-        // Name/field-list separator.
         self.expect(Token::Colon)?;
 
-        // Field list (same shape as @index).
         let mut fields = Vec::new();
         loop {
             let field_name = match self.current_token() {
@@ -1064,7 +862,6 @@ impl Parser {
     fn parse_field(&mut self) -> Result<Field, String> {
         self.skip_newlines();
 
-        // Parse field name
         let field_pos = self.get_current_position();
         let name = match self.current_token() {
             Token::Ident(s) => s.clone(),
@@ -1077,15 +874,8 @@ impl Parser {
         };
         self.advance();
 
-        // Naming, duplicate, and reference checks are deferred to
-        // `crate::validate` (the single positioned authority), run after the
-        // whole schema is assembled. Only structural/syntactic errors are fatal
-        // during parsing.
-
-        // Expect colon
         self.expect(Token::Colon)?;
 
-        // Check for symbols (+, &, and ^)
         let mut auto_generate = false;
         let mut unique = false;
         let mut indexed = false;
@@ -1108,10 +898,8 @@ impl Parser {
             }
         }
 
-        // Parse type
         let mut field_type = self.parse_type()?;
 
-        // Check for postfix nullable marker (Type?)
         if matches!(self.current_token(), Token::Question) {
             match field_type {
                 FieldType::StructType(ref name) => {
@@ -1119,7 +907,6 @@ impl Parser {
                     self.advance();
                     field_type = FieldType::OptionalStructType(name);
                 }
-                // Nullable primitives with postfix `?`: e.g. `age: i32?`
                 FieldType::U32
                 | FieldType::U64
                 | FieldType::I32
@@ -1138,11 +925,10 @@ impl Parser {
                     self.advance();
                     field_type = FieldType::Nullable(Box::new(inner));
                 }
-                _ => {} // Don't consume `?` for relations or other types
+                _ => {}
             }
         }
 
-        // Validate auto-generate is compatible with type
         if auto_generate && !field_type.is_auto_generatable() {
             return Err(format!(
                 "Auto-generate symbol '+' cannot be used with type {:?}. Only u32, u64, uuid, and timestamp support auto-generation",
@@ -1150,28 +936,23 @@ impl Parser {
             ));
         }
 
-        // Parse constraints (@directives)
         let mut constraints = Vec::new();
         let mut is_computed = false;
         let mut fulltext_indexed = false;
         let mut is_materialized = false;
         while matches!(self.current_token(), Token::At) {
             let constraint = self.parse_constraint()?;
-            // Check if this is the @relations directive (Sprint 17 - for components)
             if constraint.name == "relations" {
                 if let FieldType::Component(ref mut comp_ref) = field_type {
-                    // Parse the @relations parameters
                     if constraint.params.is_empty() {
                         return Err("@relations directive requires parameters".to_string());
                     }
 
-                    // Check if it's @relations(*)
                     if constraint.params.len() == 1 {
                         if let ConstraintParam::String(s) = &constraint.params[0] {
                             if s == "*" {
                                 comp_ref.relations = RelationInclusion::All;
                             } else {
-                                // Single relation field
                                 comp_ref.relations = RelationInclusion::Specific(vec![s.clone()]);
                             }
                         } else {
@@ -1180,7 +961,6 @@ impl Parser {
                             );
                         }
                     } else {
-                        // Multiple specific relations
                         let mut fields = Vec::new();
                         for param in &constraint.params {
                             if let ConstraintParam::String(field_name) = param {
@@ -1191,7 +971,6 @@ impl Parser {
                         }
                         comp_ref.relations = RelationInclusion::Specific(fields);
                     }
-                    // Don't add @relations to constraints list since we've handled it
                     continue;
                 } else {
                     return Err(
@@ -1199,22 +978,18 @@ impl Parser {
                     );
                 }
             }
-            // Check if this is the @computed directive
             if constraint.name == "computed" {
                 is_computed = true;
             }
-            // Check if this is the @fulltext directive (Sprint 18)
             if constraint.name == "fulltext" {
                 fulltext_indexed = true;
             }
-            // Check if this is the @materialized directive (Sprint 19)
             if constraint.name == "materialized" {
                 is_materialized = true;
             }
             constraints.push(constraint);
         }
 
-        // Determine index type based on field type
         let index_type = field_type.default_index_type();
 
         Ok(Field {
@@ -1235,10 +1010,8 @@ impl Parser {
     fn parse_struct(&mut self) -> Result<Struct, String> {
         self.skip_newlines();
 
-        // Expect 'struct' keyword
         self.expect(Token::KwStruct)?;
 
-        // Parse struct name
         let struct_pos = self.get_current_position();
         let name = match self.current_token() {
             Token::Ident(s) => s.clone(),
@@ -1251,13 +1024,9 @@ impl Parser {
         };
         self.advance();
 
-        // Name/duplicate/reference validation is deferred to `crate::validate`.
-
-        // Expect opening brace
         self.skip_newlines();
         self.expect(Token::LBrace)?;
 
-        // Parse fields
         let mut fields = Vec::new();
         self.skip_newlines();
 
@@ -1279,7 +1048,6 @@ impl Parser {
             }
         }
 
-        // Expect closing brace.
         if let Err(e) = self.expect(Token::RBrace) {
             if self.recovering {
                 self.recover_diag(e, self.position);
@@ -1304,16 +1072,11 @@ impl Parser {
         })
     }
 
-    /// Parse a top-level `enum Name { V1, V2, ... }` (#enum).  A sibling of
-    /// `struct`/model; variants are a comma/newline-separated PascalCase list
-    /// (trailing comma optional, matching the struct/model brace style).
     fn parse_enum(&mut self) -> Result<EnumDef, String> {
         self.skip_newlines();
 
-        // Expect 'enum' keyword
         self.expect(Token::KwEnum)?;
 
-        // Parse enum name (PascalCase — validated like a model/struct name).
         let enum_pos = self.get_current_position();
         let name = match self.current_token() {
             Token::Ident(s) => s.clone(),
@@ -1326,14 +1089,10 @@ impl Parser {
         };
         self.advance();
 
-        // Name/variant/duplicate validation is deferred to `crate::validate`.
-
-        // Expect opening brace
         self.skip_newlines();
         self.expect(Token::LBrace)?;
         self.skip_newlines();
 
-        // Parse variant list.
         let mut variants = Vec::new();
         while !matches!(self.current_token(), Token::RBrace | Token::Eof) {
             let variant = match self.current_token() {
@@ -1348,10 +1107,8 @@ impl Parser {
             };
             self.advance();
 
-            // Variant PascalCase + uniqueness are checked by `crate::validate`.
             variants.push(variant);
 
-            // Separator: comma or newline; trailing comma optional.
             match self.current_token() {
                 Token::Comma => {
                     self.advance();
@@ -1379,7 +1136,6 @@ impl Parser {
     fn parse_model(&mut self) -> Result<Model, String> {
         self.skip_newlines();
 
-        // Parse model name
         let model_pos = self.get_current_position();
         let name = match self.current_token() {
             Token::Ident(s) => s.clone(),
@@ -1392,13 +1148,9 @@ impl Parser {
         };
         self.advance();
 
-        // Name/duplicate/reference validation is deferred to `crate::validate`.
-
-        // Expect opening brace
         self.skip_newlines();
         self.expect(Token::LBrace)?;
 
-        // Parse fields and directives
         let mut fields = Vec::new();
         let mut composite_indexes = Vec::new();
         let mut projections = Vec::new();
@@ -1415,9 +1167,6 @@ impl Parser {
             ) {
                 Ok(()) => {}
                 Err(e) if self.recovering => {
-                    // Record the bad member, skip to the next line, keep going —
-                    // one malformed field/directive should not blank out the rest
-                    // of the model for the LSP.
                     self.recover_diag(e, member_start);
                     self.recover_to_member_boundary();
                     if self.position == member_start {
@@ -1428,7 +1177,6 @@ impl Parser {
             }
         }
 
-        // Expect closing brace.
         if let Err(e) = self.expect(Token::RBrace) {
             if self.recovering {
                 self.recover_diag(e, self.position);
@@ -1440,17 +1188,12 @@ impl Parser {
         if fields.is_empty() {
             let e = format!("Model '{}' has no fields", name);
             if self.recovering {
-                // Keep the (empty) model so its symbol still exists for the LSP.
                 self.recovery_diagnostics
                     .push(Self::diag(e, model_pos));
             } else {
                 return Err(e);
             }
         }
-
-        // Duplicate field names, composite-index field references, and
-        // projection name/field checks are deferred to `crate::validate` (the
-        // single positioned authority), run once the whole schema is assembled.
 
         Ok(Model {
             name,
@@ -1462,11 +1205,6 @@ impl Parser {
         })
     }
 
-    /// Parse a single member of a model body — a field, or a model-level
-    /// directive (`@index(...)`, `@projection(...)`, `@soft_delete`) — appending
-    /// it to the relevant accumulator. Extracted from the `parse_model` loop so a
-    /// recovering parse can catch a member's error and skip to the next line
-    /// without duplicating the body logic.
     fn parse_model_member(
         &mut self,
         fields: &mut Vec<Field>,
@@ -1475,7 +1213,6 @@ impl Parser {
         soft_delete: &mut bool,
     ) -> Result<(), String> {
         if matches!(self.current_token(), Token::At) {
-            // Try to parse as a composite index first.
             let start_pos = self.position;
             match self.parse_directive() {
                 Ok(composite_index) => {
@@ -1483,9 +1220,8 @@ impl Parser {
                     self.skip_newlines();
                 }
                 Err(_) => {
-                    // Reset and try to parse as a model-level directive.
                     self.position = start_pos;
-                    self.advance(); // skip @
+                    self.advance();
                     let directive_name = match self.current_token() {
                         Token::Ident(s) => s.clone(),
                         _ => {
@@ -1521,23 +1257,6 @@ impl Parser {
         Ok(())
     }
 
-    /// Parse the input into a [`Schema`], running the full positioned semantic
-    /// validation ([`crate::validate::validate_schema`]) and failing fast on the
-    /// first **error** to preserve the historical `Result<Schema, String>`
-    /// contract. Naming diagnostics are gated by the parser's `use_validation`
-    /// flag (see [`Self::new_with_validation`]); structural/reference diagnostics
-    /// always run.
-    ///
-    /// Non-fatal diagnostics (#237) do **not** fail the parse. They are moved into
-    /// the warning buffer, so a caller on this fail-fast path still surfaces them
-    /// via [`Self::warnings`] / [`Self::take_warnings`] — which is exactly what
-    /// `forgedb generate` does.
-    ///
-    /// This partitioning is load-bearing (#258). `Severity` shipped with no
-    /// emitters, so until the first `validate_schema` warning existed nothing
-    /// exercised this path — and the old `errors.first()` would have turned that
-    /// warning into a hard parse failure, which is a removal rather than a
-    /// deprecation. Any new advisory must stay non-fatal here.
     pub fn parse(&mut self) -> Result<Schema, String> {
         let schema = self.parse_unvalidated()?;
 
@@ -1550,40 +1269,22 @@ impl Parser {
         if let Some(first) = errors.iter().find(|d| !d.is_warning()) {
             return Err(first.to_string());
         }
-        // No error: keep the advisories on the warning channel rather than
-        // dropping them. `parse_unvalidated` cleared the buffer for this run.
         self.warnings.extend(errors.into_iter().filter(|d| d.is_warning()));
 
         Ok(schema)
     }
 
-    /// Parse the input into a [`Schema`] performing only *structural* parsing:
-    /// tokens are assembled into the AST and enum field-type references are
-    /// resolved, but no schema-level semantic validation is run. Syntactic
-    /// errors (unexpected tokens, malformed directives, empty models/structs,
-    /// composite-index arity) are still fatal.
-    ///
-    /// The returned schema may therefore contain semantic defects (duplicate
-    /// names, dangling relations, bad casing). Callers that want those reported —
-    /// the CLI `forgedb validate` command and the LSP — run
-    /// [`crate::validate::validate_schema`] on the result to collect **all**
-    /// positioned diagnostics instead of only the first. (Error recovery for
-    /// mid-keystroke buffers is #173.)
     pub fn parse_unvalidated(&mut self) -> Result<Schema, String> {
-        // Warnings belong to one parse run, not to the parser's lifetime (#237).
         self.warnings.clear();
         self.emit_seeded_warning();
 
         let mut structs = Vec::new();
         let mut enums = Vec::new();
         let mut models = Vec::new();
-        // Names of declared enums, used only to resolve bare-identifier field
-        // types below (duplicate detection is deferred to `crate::validate`).
         let mut enum_names = std::collections::HashSet::new();
         self.skip_newlines();
 
         while !matches!(self.current_token(), Token::Eof) {
-            // Dispatch on the leading keyword: struct / enum / (bare) model.
             if matches!(self.current_token(), Token::KwStruct) {
                 structs.push(self.parse_struct()?);
             } else if matches!(self.current_token(), Token::KwEnum) {
@@ -1601,12 +1302,6 @@ impl Parser {
             return Err("Schema is empty".to_string());
         }
 
-        // Resolve bare-identifier field types (parsed as `StructType`/
-        // `OptionalStructType`) that name a declared enum into `FieldType::Enum`
-        // (#enum).  A bare PascalCase identifier is either an enum (resolved here)
-        // or a struct (left as `StructType`, validated by struct-reference checks).
-        // This runs AFTER all declarations are collected so an enum may be declared
-        // after the model that references it.
         for model in &mut models {
             for field in &mut model.fields {
                 Self::resolve_enum_field_type(&mut field.field_type, &enum_names);
@@ -1620,24 +1315,6 @@ impl Parser {
         })
     }
 
-    /// Resilient parse (#173): parse the input into a best-effort
-    /// [`ParsedSchema`] — a partial [`Schema`] plus **all** diagnostics — instead
-    /// of aborting on the first error. This is the entry point for the LSP, where
-    /// a buffer is usually mid-edit and blanking every diagnostic/symbol on a
-    /// single typo is unacceptable.
-    ///
-    /// Recovery is two-tier: a malformed field or model directive is recorded and
-    /// skipped to the next line (the rest of its model still parses); a malformed
-    /// *declaration* is recorded and skipped as a whole balanced block (the rest
-    /// of the file still parses). After the partial AST is assembled it is run
-    /// through [`crate::validate::validate_schema`], so the returned diagnostics
-    /// contain both recovered syntax errors and every semantic error, positioned
-    /// and sorted by source location.
-    ///
-    /// Unlike [`Self::parse`], this always succeeds — an empty or unparseable
-    /// buffer yields an empty schema and (possibly) diagnostics rather than an
-    /// error. (Lexer errors are still fatal at [`Self::new`]; the LSP surfaces
-    /// those as a single diagnostic.)
     pub fn parse_recover(&mut self) -> ParsedSchema {
         enum Decl {
             Struct(Struct),
@@ -1680,15 +1357,12 @@ impl Parser {
                 }
             }
 
-            // Guarantee forward progress even if a parse returned without
-            // consuming and recovery could not advance.
             if self.position == decl_start {
                 self.advance();
             }
             self.skip_newlines();
         }
 
-        // Resolve enum field-type references over whatever models we recovered.
         for model in &mut models {
             for field in &mut model.fields {
                 Self::resolve_enum_field_type(&mut field.field_type, &enum_names);
@@ -1703,13 +1377,7 @@ impl Parser {
 
         let mut diagnostics = std::mem::take(&mut self.recovery_diagnostics);
         diagnostics.extend(crate::validate::validate_schema(&schema));
-        // Fold in any non-fatal diagnostics (#237). `ParsedSchema::diagnostics` is
-        // the single channel this entry point reports through — the LSP and
-        // `forgedb validate` both read it — so warnings travel here rather than in
-        // the `warnings` buffer that the fail-fast paths expose. Consumers MUST
-        // partition by `severity` instead of testing the list for emptiness.
         diagnostics.extend(self.take_warnings());
-        // Present diagnostics in source order (unpositioned ones last).
         diagnostics.sort_by_key(|d| {
             d.position
                 .map(|p| (p.line, p.column))
@@ -1720,9 +1388,6 @@ impl Parser {
         ParsedSchema { schema, diagnostics }
     }
 
-    /// Rewrite `StructType(name)`/`OptionalStructType(name)` → `Enum(name)`/
-    /// `Nullable(Enum(name))` when `name` is a declared enum (#enum).  Everything
-    /// else is left untouched (a real struct reference, or a non-named type).
     fn resolve_enum_field_type(
         field_type: &mut FieldType,
         enum_names: &std::collections::HashSet<String>,
@@ -1757,15 +1422,8 @@ mod tests {
         &f.constraints
     }
 
-    /// 2a (epic #173): parsed AST nodes carry the source position of their name,
-    /// so the LSP and unified validation can map diagnostics to editor ranges.
-    /// Positions are 1-based line/column.
     #[test]
     fn parsed_nodes_carry_source_positions() {
-        // Line-numbered so the expected positions are unambiguous:
-        // 1: User {          2:   id: +uuid       3:   email: &string   4: }
-        // 6: struct Point {  7:   x: i32          8: }
-        // 10: enum Status {  11:   Active         12:   Inactive         13: }
         let src = "User {\n  id: +uuid\n  email: &string\n}\n\nstruct Point {\n  x: i32\n}\n\nenum Status {\n  Active\n  Inactive\n}\n";
         let schema = Parser::new(src).unwrap().parse().unwrap();
 
@@ -1855,7 +1513,6 @@ mod tests {
             meta.field_type,
             FieldType::Nullable(Box::new(FieldType::Json))
         );
-        // json is variable-length (rides the string column path), not fixed-size.
         assert!(!payload.field_type.is_fixed_size());
         assert!(!meta.field_type.is_fixed_size());
     }
@@ -1878,7 +1535,6 @@ mod tests {
             discount.field_type,
             FieldType::Nullable(Box::new(FieldType::Decimal))
         );
-        // decimal is a fixed 16-byte column (like Uuid), NOT variable-length.
         assert!(price.field_type.is_fixed_size());
         assert!(discount.field_type.is_fixed_size());
         assert_eq!(price.field_type.to_rust_type(), "rust_decimal::Decimal");
@@ -1921,7 +1577,6 @@ mod tests {
 
     #[test]
     fn bare_identifier_default_still_parses() {
-        // The prior workaround must keep working — no regression.
         let src = r#"
             Ticket {
                 id: +uuid
@@ -1959,21 +1614,6 @@ mod tests {
         );
     }
 
-    // ---- #235: named `@length` arguments -------------------------------------
-    //
-    // The accepted surface (decided on the issue 2026-08-03):
-    //
-    //   @length(min: 1)          min only  — inexpressible before this
-    //   @length(max: 20)         max only  — the new spelling for the old @length(20)
-    //   @length(min: 3, max: 5)  both
-    //   @length(3, 5)            min 3, max 5 — UNCHANGED, kept first-class
-    //   @length(3)               EXACT (min = max = 3) — a BREAKING meaning change
-    //
-    // The single-arg change is silent at every other layer — it still parses, still
-    // compiles, and only shows up as a 422 at write time — so the warning is the
-    // only signal a reader gets. That is why it is asserted here, not just the shape.
-
-    /// The named form reaches the AST as `Named`, in each combination.
     #[test]
     fn length_accepts_named_arguments() {
         for (src_args, expected) in [
@@ -2004,7 +1644,6 @@ mod tests {
                     },
                 ],
             ),
-            // Order is preserved but not required — `max:` first is equally valid.
             (
                 "max: 64, min: 3",
                 vec![
@@ -2036,8 +1675,6 @@ mod tests {
         }
     }
 
-    /// Two-arg positional is kept first-class, not deprecated: same AST as before,
-    /// and no warning.
     #[test]
     fn length_positional_pair_is_unchanged_and_silent() {
         let src = r#"
@@ -2060,9 +1697,6 @@ mod tests {
         );
     }
 
-    /// Single-arg `@length(N)` changed meaning from `max: N` to exact `N`. It still
-    /// parses, so the warning is the only thing that tells a reader their field's
-    /// validation just narrowed.
     #[test]
     fn length_single_arg_warns_that_it_now_means_exact() {
         let src = r#"
@@ -2084,9 +1718,6 @@ mod tests {
         assert_eq!(warnings.len(), 1, "exactly one warning: {warnings:?}");
         let w = &warnings[0];
         assert!(w.is_warning(), "a meaning change is not a parse error");
-        // Both replacement spellings must be named: one to keep the old behavior,
-        // one to adopt the new. A warning that only says "this changed" leaves the
-        // reader to guess which way to go.
         assert!(
             w.message.contains("max: 20"),
             "the warning must name the spelling that preserves the old meaning: {}",
@@ -2100,9 +1731,6 @@ mod tests {
         assert!(w.position.is_some(), "the diagnostic is anchored in the source");
     }
 
-    /// The named form is validated at parse time, where the argument names are
-    /// known. Each of these would otherwise be silently dropped by the codegen
-    /// filter and produce a field with no bound at all.
     #[test]
     fn length_rejects_malformed_named_arguments() {
         for (args, expected_fragment) in [
@@ -2126,9 +1754,6 @@ mod tests {
         }
     }
 
-    /// The colon grammar must also work on the recovering path the LSP uses — that
-    /// path re-enters the same parameter loop, so a form that parses in one and not
-    /// the other would show as a phantom editor diagnostic on valid source.
     #[test]
     fn length_named_arguments_survive_parse_recover() {
         let src = r#"
@@ -2150,9 +1775,6 @@ mod tests {
 
     #[test]
     fn parses_enum_and_enum_typed_fields() {
-        // A top-level enum declaration, a field referencing it by bare name (the
-        // field is resolved to `FieldType::Enum`), a nullable enum field, and an
-        // enum declared AFTER the model that uses it (forward reference).
         let src = r#"
             Order {
                 id: +uuid
@@ -2174,13 +1796,11 @@ mod tests {
             prev.field_type,
             FieldType::Nullable(Box::new(FieldType::Enum("Status".to_string())))
         );
-        // enum is a fixed 1-byte column (not variable-length).
         assert!(status.field_type.is_fixed_size());
     }
 
     #[test]
     fn enum_trailing_comma_optional() {
-        // Both trailing-comma and no-trailing-comma variant lists parse.
         let with = Parser::new("enum A { X, Y, }\nM { id: +uuid }")
             .unwrap()
             .parse()
@@ -2204,7 +1824,6 @@ mod tests {
 
     #[test]
     fn enum_rejects_lowercase_variant() {
-        // Variants must be PascalCase.
         let err = Parser::new("enum Status { active }\nM { id: +uuid }")
             .unwrap()
             .parse()
@@ -2223,8 +1842,6 @@ mod tests {
 
     #[test]
     fn field_referencing_undefined_named_type_errors() {
-        // A bare PascalCase identifier that is neither a declared enum nor struct
-        // is an unknown named type.
         let err = Parser::new("Order { id: +uuid\n status: Nope }")
             .unwrap()
             .parse()
@@ -2241,14 +1858,10 @@ mod tests {
         assert!(err.contains("Duplicate enum name 'S'"), "got: {err}");
     }
 
-    // ---- #173: resilient parse (`parse_recover`) --------------------------
-
     fn recover(input: &str) -> ParsedSchema {
         Parser::new(input).unwrap().parse_recover()
     }
 
-    /// A valid schema parses identically under recovery, with no diagnostics —
-    /// parity with the fatal path.
     #[test]
     fn recover_valid_schema_matches_parse() {
         let input = "User {\n  id: +uuid\n  email: string\n}\nPost {\n  id: +uuid\n}\n";
@@ -2257,8 +1870,6 @@ mod tests {
         assert_eq!(recovered.schema, Parser::new(input).unwrap().parse().unwrap());
     }
 
-    /// Empty / whitespace-only input is not an error under recovery (unlike the
-    /// fatal path, which rejects an empty schema).
     #[test]
     fn recover_empty_input_is_not_an_error() {
         let recovered = recover("\n  \n");
@@ -2266,8 +1877,6 @@ mod tests {
         assert!(recovered.schema.models.is_empty());
     }
 
-    /// Declaration-level recovery: a header with no opening brace is reported, and
-    /// the valid declarations on either side of it both survive.
     #[test]
     fn recover_skips_a_broken_declaration_and_keeps_the_rest() {
         let input = "\
@@ -2292,8 +1901,6 @@ Post {
         );
     }
 
-    /// Field-level recovery: one malformed field does not blank out its model —
-    /// the surrounding good fields still parse, and the model is still produced.
     #[test]
     fn recover_skips_a_broken_field_and_keeps_the_model() {
         let input = "User {\n  id: +uuid\n  @@@ : broken\n  email: string\n}\n";
@@ -2307,8 +1914,6 @@ Post {
         assert!(!recovered.diagnostics.is_empty(), "the bad field was reported");
     }
 
-    /// Recovered partial AST is still run through `validate_schema`, so semantic
-    /// diagnostics (here a dangling relation) are merged with syntax diagnostics.
     #[test]
     fn recover_merges_semantic_diagnostics() {
         let input = "User {\n  id: +uuid\n  pet: *Ghost\n}\n";
@@ -2323,10 +1928,8 @@ Post {
         );
     }
 
-    /// Diagnostics come back ordered by source position.
     #[test]
     fn recover_diagnostics_are_sorted_by_position() {
-        // Two dangling relations on different lines + a snake_case violation.
         let input = "User {\n  id: +uuid\n  BadName: string\n  a: *Nope\n}\n";
         let recovered = recover(input);
         let lines: Vec<usize> = recovered
@@ -2339,16 +1942,12 @@ Post {
         assert_eq!(lines, sorted, "diagnostics sorted by line: {lines:?}");
     }
 
-    /// A mid-keystroke buffer with an unterminated block terminates (no infinite
-    /// loop) and yields a diagnostic rather than hanging or panicking.
     #[test]
     fn recover_handles_unterminated_block() {
         let recovered = recover("User {\n  id: +uuid\n  email:");
         assert!(!recovered.diagnostics.is_empty(), "unterminated buffer is diagnosed");
     }
 
-    /// Multiple independent broken declarations each produce a diagnostic and the
-    /// good one between them survives.
     #[test]
     fn recover_reports_multiple_broken_declarations() {
         let input = "\
@@ -2371,18 +1970,8 @@ B
         );
     }
 
-    // ---- #237: the deprecation-warning channel -------------------------------
-    //
-    // The channel ships with **no producers** — #233 (`char(n)` → `bytes(n)`) and
-    // #235 (`@length(N)` becoming exact) are the first two. These tests drive
-    // `Parser::warn` directly so the plumbing is guarded before either lands,
-    // rather than being incidentally covered by whichever ships first.
-
     const VALID: &str = "User {\n  id: +uuid\n  email: string\n}\n";
 
-    /// The channel is invisible until something emits: a schema that parsed
-    /// cleanly before #237 still parses cleanly, with no warnings and no change in
-    /// its `Result`. This is the regression that keeps the field additive.
     #[test]
     fn warnings_are_empty_without_a_producer() {
         let mut p = Parser::new(VALID).unwrap();
@@ -2397,10 +1986,6 @@ B
         );
     }
 
-    /// A warning emitted during a **fail-fast** parse survives to the caller. This
-    /// is the case `forgedb generate` depends on: it must be able to report a
-    /// deprecation without switching to `parse_recover` and thereby changing its
-    /// error semantics.
     #[test]
     fn fail_fast_parse_carries_warnings() {
         let mut p = Parser::new(VALID).unwrap();
@@ -2418,8 +2003,6 @@ B
         assert!(p.warnings().is_empty(), "take_warnings drains the buffer");
     }
 
-    /// Warnings belong to one parse run. Re-parsing with the same `Parser` must not
-    /// replay a previous run's deprecations, which would double-report them.
     #[test]
     fn warnings_do_not_accumulate_across_parses() {
         let mut p = Parser::new(VALID).unwrap();
@@ -2432,9 +2015,6 @@ B
         assert!(p.warnings().is_empty(), "a fresh parse clears prior warnings");
     }
 
-    /// A warning raised *during* a recovering parse reaches `ParsedSchema` on its
-    /// own — this is the path the LSP and `forgedb validate` actually read, so the
-    /// fold has to work without the caller merging anything by hand.
     #[test]
     fn recover_folds_warnings_into_diagnostics() {
         let mut p = Parser::new(VALID).unwrap();
@@ -2449,12 +2029,8 @@ B
         );
     }
 
-    /// A warning and a genuine error coexist in one `ParsedSchema` and stay
-    /// separable by severity alone. This is what lets `validate` keep failing on
-    /// real errors while a deprecation exits 0.
     #[test]
     fn recover_keeps_warnings_and_errors_distinguishable() {
-        // `posts: [Post]` with no `Post` model is a fatal dangling-relation error.
         let mut p = Parser::new("User {\n  id: +uuid\n  posts: [Post]\n}\n").unwrap();
         p.seed_warning = Some("char(n) is deprecated".into());
         let parsed = p.parse_recover();
@@ -2472,9 +2048,6 @@ B
         );
     }
 
-    /// The same seam through the fail-fast path: a producer firing inside `parse`
-    /// leaves its warning where `forgedb generate` reads it, and the parse still
-    /// succeeds.
     #[test]
     fn fail_fast_parse_surfaces_a_producer_warning() {
         let mut p = Parser::new(VALID).unwrap();
@@ -2484,17 +2057,8 @@ B
         assert!(p.warnings()[0].is_warning());
     }
 
-    /// A warning produced by `validate_schema` (not by the parser's own buffer)
-    /// must also stay non-fatal on the fail-fast path (#258).
-    ///
-    /// `Severity` shipped with no emitters, so this path was never exercised: the
-    /// old `errors.first()` took the first diagnostic of ANY severity, which would
-    /// have turned the first semantic advisory into a hard parse failure — and
-    /// `forgedb generate` parses through here, so every affected schema would have
-    /// stopped generating. That is a removal, not a deprecation.
     #[test]
     fn fail_fast_parse_does_not_fail_on_a_validate_schema_warning() {
-        // `&` on the identity is redundant → advisory (#258).
         let mut p = Parser::new("Thing {\n  id: &+uuid\n  name: string\n}\n").unwrap();
         let schema = p.parse().expect("a redundant modifier is valid, not an error");
         assert_eq!(schema.models.len(), 1);
@@ -2505,24 +2069,14 @@ B
         assert!(warnings[0].message.contains("has no effect"));
     }
 
-    /// The partition keys on severity, not on position in the list: a real error
-    /// still fails even when an advisory was collected first.
     #[test]
     fn fail_fast_parse_still_fails_on_an_error_beside_a_warning() {
-        // `Thing` warns (redundant `&`); `Bad` is a hard error (no identity).
         let mut p =
             Parser::new("Thing {\n  id: &+uuid\n}\n\nBad {\n  name: string\n}\n").unwrap();
         let err = p.parse().expect_err("the missing identity is still fatal");
         assert!(err.contains("no identity field"), "reported the error, not the warning: {err}");
     }
 
-    // ---- #233: `char(n)` → `bytes(n)` ---------------------------------------
-    //
-    // The first real producer on the #237 channel. Both spellings must reach the
-    // *same* `FieldType::Bytes`, in every type position, with a warning on
-    // exactly the deprecated one.
-
-    /// Parse a single-model schema and return `(field_type, warnings)`.
     fn parse_field(src: &str, field: &str) -> (FieldType, Vec<ValidationError>) {
         let mut p = Parser::new(src).unwrap();
         let schema = p.parse().expect("schema parses");
@@ -2537,7 +2091,6 @@ B
         (ty, p.take_warnings())
     }
 
-    /// The canonical spelling parses clean — no diagnostic of any severity.
     #[test]
     fn bytes_parses_without_a_diagnostic() {
         let (ty, warnings) = parse_field("T {\n  id: +uuid\n  code: bytes(3)\n}\n", "code");
@@ -2545,11 +2098,8 @@ B
         assert!(warnings.is_empty(), "canonical spelling is silent: {warnings:?}");
     }
 
-    /// The deprecated spelling reaches the identical AST, and warns exactly once
-    /// — positioned at the `char` keyword, and naming the replacement.
     #[test]
     fn char_parses_to_bytes_and_warns_once() {
-        // 1: T {   2:   id: +uuid   3:   code: char(3)
         let (ty, warnings) = parse_field("T {\n  id: +uuid\n  code: char(3)\n}\n", "code");
         assert_eq!(ty, FieldType::Bytes(3), "same AST as `bytes(3)`");
         assert_eq!(warnings.len(), 1, "exactly one diagnostic: {warnings:?}");
@@ -2568,8 +2118,6 @@ B
         );
     }
 
-    /// The deprecation reaches *inside* the compound type positions, not just a
-    /// bare field type. Each is a separate parse path in `parse_type`.
     #[test]
     fn char_warns_in_every_type_position() {
         for (src_type, expected) in [
@@ -2588,8 +2136,6 @@ B
         }
     }
 
-    /// `^` / `&` are parsed before the type, so a deprecation inside a modified
-    /// field must not eat them.
     #[test]
     fn char_deprecation_preserves_modifiers() {
         let mut p = Parser::new("T {\n  id: +uuid\n  key: ^&char(5)\n}\n").unwrap();
@@ -2603,10 +2149,6 @@ B
         assert_eq!(p.warnings().len(), 1);
     }
 
-    /// `bytes` is **contextual**, not reserved: it stays usable as a field name.
-    /// The Chinook-derived `music-store` example has exactly this column, so
-    /// reserving the word would have turned a valid schema into a parse error on
-    /// a minor version bump.
     #[test]
     fn bytes_is_still_a_valid_field_name() {
         let (ty, warnings) = parse_field(
@@ -2627,25 +2169,12 @@ B
         );
     }
 
-    /// Bare `bytes` with no size is not the type — it falls through to the
-    /// struct-reference path, exactly as any other unknown bare identifier does.
-    /// This is what keeps the contextual keyword from swallowing real names.
     #[test]
     fn bare_bytes_without_a_size_is_not_the_type() {
         let mut p = Parser::new("T {\n  id: +uuid\n  f: bytes\n}\n").unwrap();
-        // Unresolvable as a struct, so validation rejects it — the point is that
-        // it was never parsed as `FieldType::Bytes`.
         assert!(p.parse().is_err(), "a sizeless `bytes` is not a type");
     }
 
-    // ---- #238: `string(N)` / `string(N!)` -----------------------------------
-    //
-    // A fixed-width inline string column. `N` counts CHARACTERS (res 3), capped
-    // at 255 (res 7) — which the AST makes a type-level fact by carrying a `u8`,
-    // so the range check happens exactly once, here. `!` is a brand-new token
-    // meaning *exactly N* (res 2); it never appeared in the language before.
-
-    /// The at-most-N spelling.
     #[test]
     fn string_n_parses_to_the_inexact_variant() {
         let (ty, warnings) = parse_field("T {\n  id: +uuid\n  slug: string(64)\n}\n", "slug");
@@ -2653,7 +2182,6 @@ B
         assert!(warnings.is_empty(), "no diagnostic for a well-formed width: {warnings:?}");
     }
 
-    /// The exactly-N spelling. `!` binds to the width, inside the parens.
     #[test]
     fn string_n_bang_parses_to_the_exact_variant() {
         let (ty, warnings) = parse_field("T {\n  id: +uuid\n  code: string(26!)\n}\n", "code");
@@ -2661,9 +2189,6 @@ B
         assert!(warnings.is_empty(), "no diagnostic: {warnings:?}");
     }
 
-    /// Res 7's bound is enforced at the point the `u8` is constructed, so no
-    /// downstream site can ever be handed an over-wide N. Zero is refused for the
-    /// same reason: a column that can hold nothing is never what was meant.
     #[test]
     fn string_n_width_is_bounded_at_the_parse() {
         for src in ["string(0)", "string(256)", "string(1000)", "string(0!)", "string(256!)"] {
@@ -2677,9 +2202,6 @@ B
         }
     }
 
-    /// A negative width never reaches the range check — the lexer reads `-1` as a
-    /// number, so the diagnostic still has to name the range rather than report a
-    /// type mismatch.
     #[test]
     fn string_n_rejects_a_negative_width() {
         let mut p = Parser::new("T {\n  id: +uuid\n  f: string(-1)\n}\n").unwrap();
@@ -2687,8 +2209,6 @@ B
         assert!(err.contains("between 1 and 255"), "got: {err}");
     }
 
-    /// Res 10's regression guard: bare `string` is untouched — still the
-    /// variable-storage type, in every position.
     #[test]
     fn bare_string_is_unchanged() {
         for (src_type, expected) in [
@@ -2703,8 +2223,6 @@ B
         }
     }
 
-    /// `string(N)` reaches every compound type position, each of which is a
-    /// separate arm of `parse_type`.
     #[test]
     fn string_n_parses_in_every_type_position() {
         for (src_type, expected) in [
@@ -2720,9 +2238,6 @@ B
         }
     }
 
-    /// `!` is a new token and it is claimed by exactly one grammar production. A
-    /// stray one is a positioned parse error, not a silently skipped character —
-    /// which is what it would be if the lexer had no arm for it at all.
     #[test]
     fn a_stray_bang_is_a_parse_error() {
         let mut p = Parser::new("T {\n  id: +uuid\n  f: !string\n}\n").unwrap();
@@ -2732,14 +2247,6 @@ B
         assert!(p.parse().is_err(), "`!` is not admitted by `bytes(N)`");
     }
 
-    // ---- #254: `timestamp(s|ms|us)` -----------------------------------------
-    //
-    // Precision is a property of the TYPE, not of the field, so it survives
-    // `?` and `[T; N]`. Storage stays microseconds whatever is declared; the key
-    // is the allocation quantum and the guarantee about stored values.
-
-    /// Scenario 10 — a bare `timestamp` is `timestamp(ms)`. The default lives on
-    /// `TimestampPrecision`, so no site has to remember the rule.
     #[test]
     fn a_bare_timestamp_is_millis() {
         let (ty, warnings) = parse_field("T {\n  id: +uuid\n  at: timestamp\n}\n", "at");
@@ -2747,7 +2254,6 @@ B
         assert!(warnings.is_empty(), "{warnings:?}");
     }
 
-    /// Scenario 11a — each declared key reaches the matching precision.
     #[test]
     fn each_precision_key_parses() {
         for (key, expected) in [
@@ -2762,9 +2268,6 @@ B
         }
     }
 
-    /// Scenario 11b — anything else is a positioned parse error that NAMES the
-    /// three keys. `ns` is the one someone will actually try, and it is bounded
-    /// out by the microsecond storage unit rather than merely unimplemented.
     #[test]
     fn an_unknown_precision_key_names_the_three_that_exist() {
         for bad in ["ns", "seconds", "millis", "S", "MS", "us2", "micro"] {
@@ -2776,8 +2279,6 @@ B
                 "timestamp({bad}) must name the three admissible keys, got: {err}"
             );
         }
-        // An empty or non-identifier argument is also refused, and refused with
-        // the same message — there is one thing that can go in those parens.
         for src_type in ["timestamp()", "timestamp(1)", "timestamp(us!)"] {
             let src = format!("T {{\n  id: +uuid\n  at: {src_type}\n}}\n");
             let mut p = Parser::new(&src).unwrap();
@@ -2785,8 +2286,6 @@ B
         }
     }
 
-    /// Precision survives every compound type position, which is the whole
-    /// reason it rides in the variant rather than on `Field`.
     #[test]
     fn precision_survives_every_type_position() {
         for (src_type, expected) in [

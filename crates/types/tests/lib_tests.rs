@@ -10,7 +10,6 @@ fn test_timestamp_creation() {
 fn test_timestamp_now() {
     let now = Timestamp::now();
     assert!(now.as_micros() > 0);
-    // Should be reasonably recent (after year 2020)
     assert!(now.as_micros() > 1577836800);
 }
 
@@ -40,8 +39,6 @@ fn test_timestamp_ordering() {
 fn test_timestamp_serialization() {
     let ts = Timestamp::from_micros(1234567890);
     let json = serde_json::to_string(&ts).unwrap();
-    // #254: the JSON form is the RFC 3339 string, not the bare number. The break
-    // is deliberately loud — a number would silently start meaning micros.
     assert_eq!(json, "\"1970-01-01T00:20:34.567890Z\"");
 
     let deserialized: Timestamp = serde_json::from_str(&json).unwrap();
@@ -151,25 +148,21 @@ fn test_value_from_timestamp() {
 
 #[test]
 fn test_value_serialization() {
-    // Test i32
     let val = Value::I32(42);
     let json = serde_json::to_string(&val).unwrap();
     let deserialized: Value = serde_json::from_str(&json).unwrap();
     assert_eq!(deserialized, val);
 
-    // Test string
     let val = Value::String("hello".to_string());
     let json = serde_json::to_string(&val).unwrap();
     let deserialized: Value = serde_json::from_str(&json).unwrap();
     assert_eq!(deserialized, val);
 
-    // Test bool
     let val = Value::Bool(true);
     let json = serde_json::to_string(&val).unwrap();
     let deserialized: Value = serde_json::from_str(&json).unwrap();
     assert_eq!(deserialized, val);
 
-    // Test uuid
     let uuid = Uuid::new_v4();
     let val = Value::Uuid(uuid);
     let json = serde_json::to_string(&val).unwrap();
@@ -190,8 +183,6 @@ fn test_value_equality() {
     assert_eq!(Value::Timestamp(ts), Value::Timestamp(ts));
 }
 
-// --- T3: Value::U32 and Value::U64 ---
-
 #[test]
 fn test_value_u32() {
     let val = Value::U32(42_u32);
@@ -202,8 +193,6 @@ fn test_value_u32() {
 
 #[test]
 fn test_value_u64() {
-    // Verify that u64::MAX (above i64::MAX) round-trips losslessly — this was
-    // the correctness gap that motivated adding the U64 variant.
     let val = Value::U64(u64::MAX);
     assert_eq!(val.type_name(), "u64");
     assert!(val.is_numeric());
@@ -232,7 +221,6 @@ fn test_value_u32_serialization_roundtrip() {
 
 #[test]
 fn test_value_u64_serialization_roundtrip() {
-    // Use a value above i64::MAX to confirm lossless serialization.
     let original = Value::U64(u64::MAX);
     let json = serde_json::to_string(&original).unwrap();
     let deserialized: Value = serde_json::from_str(&json).unwrap();
@@ -241,9 +229,7 @@ fn test_value_u64_serialization_roundtrip() {
 
 #[test]
 fn test_value_u32_u64_distinct_from_signed() {
-    // U32 and I32 are distinct variants even for the same bit pattern.
     assert_ne!(Value::U32(42), Value::I32(42));
-    // U64 and I64 are distinct variants.
     assert_ne!(Value::U64(42), Value::I64(42));
 }
 
@@ -258,7 +244,7 @@ fn test_timestamp_hash() {
 
     set.insert(ts1);
     set.insert(ts2);
-    set.insert(ts3); // Duplicate of ts1
+    set.insert(ts3);
 
-    assert_eq!(set.len(), 2); // Only ts1 and ts2
+    assert_eq!(set.len(), 2);
 }

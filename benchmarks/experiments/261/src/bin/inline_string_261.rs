@@ -1,60 +1,3 @@
-//! Experiment #261 — does an inline `string(N)` slot beat pointer indirection?
-//!
-//! Gates the **soft** `string(N)` form of #238. The hard `string(N!)` form is
-//! justified independently (#252) and is not on trial here.
-//!
-//! # The grid
-//!
-//! Three axes, because the answer plausibly depends on all three and a single
-//! curve would hide it:
-//!
-//! 1. **Inline capacity N** — `tiny` 4, `small` 16, `modest` 64, `large` 256,
-//!    `huge` 1024 chars. This is the author-declared slot width, so it is the
-//!    knob the design actually exposes.
-//! 2. **Overflow value length**, relative to N — `just_over` (1–2×), `larger`
-//!    (3–5×), `very_large` (24–40×), `massive` (192–320×). What spills is not a
-//!    fixed size: a column that overflows by a few characters and one that
-//!    overflows into blobs stress completely different parts of the trade.
-//! 3. **Mix** — 5/10/20/33/50/66/80/90/99/100 % of rows inline.
-//!
-//! # What is compared
-//!
-//! One string column, scanned end to end, reading every value.
-//!
-//! | Variant | Layout | Per-row read |
-//! |---|---|---|
-//! | `p_real` | today's `VariableColumn` | `gather_buffered` + `read_str` — the real code path |
-//! | `p_hand` | data file + offsets file | hand-rolled mmap + slice — an *idealized* pointer baseline |
-//! | `i1` | fixed `N+4` slot + overflow column | length prefix, branch on sentinel |
-//! | `i4` | fixed `4N+4` slot + overflow column | same, with the worst-case-UTF-8 slot width #238 declares |
-//! | `h1` / `h4` | fixed slot, no overflow | no branch — the hard form's read (p=100 only) |
-//!
-//! `p_hand` is the primary baseline on purpose. It skips the `Vec<(u64,u64)>`
-//! that `gather_buffered` materializes, so it is *faster* than what ships — which
-//! makes it the conservative comparison. A mechanism that only wins against
-//! `p_real` would be beating an implementation artifact, not the design.
-//!
-//! `i1` vs `i4` isolates read amplification from the mechanism: `4N` is what a
-//! slot declared in *characters* must reserve, `N` is what all-ASCII data
-//! actually occupies. If the two diverge, the chars-vs-bytes choice in #238 is
-//! load-bearing rather than cosmetic.
-//!
-//! # Method (epic #167's, reused)
-//!
-//! Paired A/B — every variant sees the same values, on the same machine, inside
-//! the same process. An in-run control (a `u64` fixed-column scan, which no
-//! variant changes) is timed in every round to catch drift. Step vs slope is
-//! separated by a row-count sweep. Warm page cache throughout; each variant gets
-//! an untimed warm-up pass before its timed reps, and the median of `REPS` is
-//! reported.
-//!
-//! Row count is **derived per config** from a fixed value-byte target, so a
-//! `massive` panel does not try to materialize hundreds of gigabytes. Every
-//! reported number is per-row or per-byte, so panels stay comparable.
-//!
-//! Every variant's checksum is compared against `p_real`'s. A mismatch aborts —
-//! a timing comparison between variants that read different bytes is worthless.
-
 use std::fs::{self, File, OpenOptions};
 use std::hint::black_box;
 use std::io::Write;
@@ -64,31 +7,17 @@ use std::time::Instant;
 use forgedb_storage::{FixedColumn, VariableColumn};
 use memmap2::Mmap;
 
-/// Timed repetitions per variant per config; the median is reported.
 const REPS: usize = 7;
 
-/// Marks a slot whose value did not fit inline and lives in the overflow column.
-/// `u32::MAX` cannot collide with a real length: a slot only ever holds a value
-/// of at most `slot_bytes - 4`.
 const OVERFLOW: u32 = u32::MAX;
 
-/// Approximate total *value* bytes per config. Row count is derived from this so
-/// the `massive` panels stay finite; timings are reported per row and per byte.
 const TARGET_VALUE_BYTES: u64 = 128 << 20;
 
-/// Row-count bounds around that target: enough rows for the per-row cost to be
-/// resolvable, few enough that a huge-value config still fits on disk.
 const MIN_ROWS: usize = 2_000;
 const MAX_ROWS: usize = 200_000;
 
-/// Hard ceiling on a single value, so `huge` × `massive` cannot run away.
 const MAX_VALUE_BYTES: usize = 1 << 20;
 
-// ---------------------------------------------------------------------------
-// Axes
-// ---------------------------------------------------------------------------
-
-/// An inline capacity, in characters — the author-declared `N` in `string(N)`.
 struct Capacity {
     label: &'static str,
     n: usize,
@@ -102,8 +31,6 @@ const CAPACITIES: &[Capacity] = &[
     Capacity { label: "huge", n: 1024 },
 ];
 
-/// How far past the inline capacity an overflowing value goes, as a multiple of
-/// N. Overflow length is uniform in `[lo·N, hi·N]`, capped at [`MAX_VALUE_BYTES`].
 struct Overflow {
     label: &'static str,
     lo: usize,
@@ -119,11 +46,6 @@ const OVERFLOWS: &[Overflow] = &[
 
 const MIXES: &[u32] = &[5, 10, 20, 33, 50, 66, 80, 90, 99, 100];
 
-// ---------------------------------------------------------------------------
-// Data
-// ---------------------------------------------------------------------------
-
-/// xorshift64*, so a run is reproducible from its seed without a `rand` dep.
 struct Rng(u64);
 
 impl Rng {
@@ -141,8 +63,6 @@ impl Rng {
     }
 }
 
-/// Mean value length for a config, used to derive the row count before any data
-/// is generated.
 fn mean_len(n: usize, ovf: &Overflow, pct_inline: u32) -> f64 {
     let short = (1.0 + n as f64) / 2.0;
     let long =
@@ -156,13 +76,6 @@ fn rows_for(n: usize, ovf: &Overflow, pct_inline: u32) -> usize {
     est.clamp(MIN_ROWS, MAX_ROWS)
 }
 
-/// `rows` ASCII values, `pct_inline` percent of which fit within `n` chars.
-///
-/// The inline/overflow decision is made per row from the same stream that picks
-/// lengths, so the two classes are **interleaved randomly** rather than
-/// clustered. That is deliberate: a clustered column would let the branch
-/// predictor learn the pattern and would understate the branch's cost at exactly
-/// the mixes where it is worst.
 fn generate(rows: usize, n: usize, ovf: &Overflow, pct_inline: u32, seed: u64) -> Vec<String> {
     let mut rng = Rng(seed);
     let alphabet = b"abcdefghijklmnopqrstuvwxyz0123456789";
@@ -185,10 +98,6 @@ fn generate(rows: usize, n: usize, ovf: &Overflow, pct_inline: u32, seed: u64) -
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Layouts
-// ---------------------------------------------------------------------------
-
 fn build_pointer(dir: &Path, values: &[String]) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
     let mut col = VariableColumn::new(dir.join("v.data"), dir.join("v.offsets"))?;
@@ -198,26 +107,14 @@ fn build_pointer(dir: &Path, values: &[String]) -> std::io::Result<()> {
     col.flush()
 }
 
-/// A fixed slot column plus an overflow variable column.
-///
-/// Slot layout: `[u32 length | payload…]`, where a length of [`OVERFLOW`] means
-/// the payload's first 8 bytes are instead a `u64` row index into the overflow
-/// column. This is #238 resolution 5's shape — the length is *stored*, never
-/// recovered by scanning (which is why the issue's measurement 3 is moot).
 struct Inline {
     slot_bytes: usize,
-    /// True when no value overflowed, so the no-branch (hard-form) reader is valid.
     all_inline: bool,
 }
 
 fn build_inline(dir: &Path, values: &[String], n: usize, mult: usize) -> std::io::Result<Inline> {
     fs::create_dir_all(dir)?;
     let cap = n * mult;
-    // A slot must be wide enough for whichever is larger: the inline payload, or
-    // the overflow pointer that replaces it. So a *soft* declaration has a floor
-    // the author does not control — `string(4)` cannot occupy 8 bytes, because a
-    // spilled row still needs 4 (sentinel) + 8 (overflow index) = 12. The hard
-    // form has no such floor: it never spills, so it never reserves the pointer.
     let slot_bytes = 4 + cap.max(8);
 
     let mut fixed = File::create(dir.join("i.fixed"))?;
@@ -246,9 +143,6 @@ fn build_inline(dir: &Path, values: &[String], n: usize, mult: usize) -> std::io
     Ok(Inline { slot_bytes, all_inline })
 }
 
-/// The in-run control: a `u64` column no variant under test touches. Its timing
-/// must hold steady across rounds; if it drifts, the round's comparisons are not
-/// trustworthy, and the drift is reported rather than averaged away.
 fn build_control(dir: &Path, rows: usize) -> std::io::Result<PathBuf> {
     fs::create_dir_all(dir)?;
     let path = dir.join("control.col");
@@ -260,13 +154,7 @@ fn build_control(dir: &Path, rows: usize) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
-// ---------------------------------------------------------------------------
-// Readers — each returns a checksum so the variants can be proven equivalent
-// ---------------------------------------------------------------------------
-
 fn consume(acc: u64, s: &str) -> u64 {
-    // Touches the length AND a byte of the payload, so neither the slice nor the
-    // page fault behind it can be optimized away.
     acc.wrapping_mul(31)
         .wrapping_add(s.len() as u64)
         .wrapping_add(u64::from(s.as_bytes()[0]))
@@ -274,13 +162,9 @@ fn consume(acc: u64, s: &str) -> u64 {
 
 fn map(path: &Path) -> std::io::Result<Mmap> {
     let f = OpenOptions::new().read(true).open(path)?;
-    // SAFETY: the bench owns these files for the duration of the run and nothing
-    // writes to them while a mapping is live — the same append-only,
-    // single-writer discipline `ColumnExport::Mapped` documents.
     unsafe { Mmap::map(&f) }
 }
 
-/// Today's shipping path: `gather_buffered` + zero-copy `read_str` (#224/#228).
 fn scan_p_real(col: &VariableColumn, indices: &[usize]) -> std::io::Result<u64> {
     let buf = col.gather_buffered(indices)?;
     let mut acc = 0u64;
@@ -290,9 +174,6 @@ fn scan_p_real(col: &VariableColumn, indices: &[usize]) -> std::io::Result<u64> 
     Ok(acc)
 }
 
-/// An idealized pointer baseline: both files mapped, offsets read in place, no
-/// per-scan `Vec<(u64, u64)>`. Strictly cheaper than `p_real`, and therefore the
-/// bar the inline design actually has to clear.
 fn scan_p_hand(dir: &Path, rows: usize) -> std::io::Result<u64> {
     let data = map(&dir.join("v.data"))?;
     let offs = map(&dir.join("v.offsets"))?;
@@ -307,7 +188,6 @@ fn scan_p_hand(dir: &Path, rows: usize) -> std::io::Result<u64> {
     Ok(acc)
 }
 
-/// The soft `string(N)` read: length prefix, branch on the overflow sentinel.
 fn scan_inline(dir: &Path, rows: usize, slot_bytes: usize) -> std::io::Result<u64> {
     let fixed = map(&dir.join("i.fixed"))?;
     let odata = map(&dir.join("o.data"))?;
@@ -331,8 +211,6 @@ fn scan_inline(dir: &Path, rows: usize, slot_bytes: usize) -> std::io::Result<u6
     Ok(acc)
 }
 
-/// The hard `string(N!)` read — identical to [`scan_inline`] minus the branch and
-/// minus the overflow mappings. Valid only when nothing overflowed.
 fn scan_hard(dir: &Path, rows: usize, slot_bytes: usize) -> std::io::Result<u64> {
     let fixed = map(&dir.join("i.fixed"))?;
     let fixed = fixed.as_ref();
@@ -355,12 +233,6 @@ fn scan_control(path: &Path, rows: usize) -> std::io::Result<u64> {
     Ok(acc)
 }
 
-// ---------------------------------------------------------------------------
-// Timing
-// ---------------------------------------------------------------------------
-
-/// One untimed warm-up pass, then [`REPS`] timed passes; returns the median
-/// nanoseconds and the checksum every pass agreed on.
 fn measure(mut f: impl FnMut() -> std::io::Result<u64>) -> std::io::Result<(f64, u64)> {
     let expect = f()?;
     let mut times = Vec::with_capacity(REPS);
@@ -416,7 +288,6 @@ fn main() -> std::io::Result<()> {
                 let i1 = build_inline(&case.join("i1"), &values, cap.n, 1)?;
                 let i4 = build_inline(&case.join("i4"), &values, cap.n, 4)?;
 
-                // Control first, every round: drift shows up as a moving baseline.
                 let (c_ns, _) = measure(|| scan_control(&control, control_rows))?;
                 control_samples.push(c_ns / control_rows as f64);
 
@@ -456,8 +327,6 @@ fn main() -> std::io::Result<()> {
                 push("i1", i1_ns, bytes_i1);
                 push("i4", i4_ns, bytes_i4);
 
-                // The no-branch reader only exists when nothing overflowed — this
-                // is measurement 2, the branch's own cost, data held identical.
                 if i1.all_inline && i4.all_inline {
                     let (h1_ns, ck) =
                         measure(|| scan_hard(&case.join("i1"), rows, i1.slot_bytes))?;
@@ -483,9 +352,6 @@ fn main() -> std::io::Result<()> {
         }
     }
 
-    // -- step vs slope -------------------------------------------------------
-    // A fixed per-scan cost (mapping, setup) and a per-row cost are separated by
-    // how each moves with row count: a step amortizes away, a slope does not.
     eprintln!("# step vs slope — N=16, overflow=larger, p=50");
     let mut scale: Vec<serde_json::Value> = Vec::new();
     let ovf = &OVERFLOWS[1];

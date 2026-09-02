@@ -1,11 +1,5 @@
 "use client";
 
-/**
- * Top bar: brand + database switcher, the workflow nav (Explore: Atlas/Studio ·
- * Query: Console/Dashboards), a snapshot "as of" affordance, and the
- * attach/detach connection toggle that gates every Live surface.
- */
-
 import { useAtom, useAtomValue, useSetAtom } from "jotai";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
@@ -40,14 +34,12 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
-
 const NAV: { screen: Screen; label: string; icon: typeof Network }[] = [
   { screen: "atlas", label: "Atlas", icon: Network },
   { screen: "studio", label: "Studio", icon: Table2 },
   { screen: "console", label: "Console", icon: TerminalSquare },
   { screen: "dashboards", label: "Dashboards", icon: LayoutDashboard },
 ];
-
 export function TopBar() {
   const [screen, setScreen] = useAtom(screenAtom);
   const [connected, setConnected] = useAtom(connectedAtom);
@@ -58,18 +50,12 @@ export function TopBar() {
   const [snapshotToken, setSnapshotToken] = useAtom(snapshotTokenAtom);
   const pinned = useAtomValue(pinnedSnapshotsAtom);
   const desktop = isTauri();
-
-  // Label for the active "as of" lens: live, a matching pinned name, or a
-  // generic frozen marker (a token captured elsewhere, e.g. the Console).
   const activePinName =
     snapshotToken &&
     pinned.find(
       (p) => JSON.stringify(p.token) === JSON.stringify(snapshotToken),
     )?.name;
   const asOfLabel = !snapshotToken ? "now" : (activePinName ?? "snapshot");
-
-  // Editable API base (#71): a local draft committed on blur/Enter, validated to
-  // an http(s) URL; an invalid draft reverts to the persisted value.
   const [draft, setDraft] = useState(apiBase);
   useEffect(() => setDraft(apiBase), [apiBase]);
   const commitApiBase = () => {
@@ -81,18 +67,15 @@ export function TopBar() {
       toast.error("API base must be an http(s) URL");
     }
   };
-
-  // Surface an open-project failure (parse/read error) as a toast.
   useEffect(() => {
     if (projectError) {
       toast.error(projectError);
       setProjectError(null);
     }
   }, [projectError, setProjectError]);
-
   return (
     <header className="flex h-13 flex-none items-center gap-3.5 border-b border-border bg-card/60 px-3.5">
-      {/* brand + db switcher */}
+      { }
       <div className="flex items-center gap-2.5">
         <div className="flex size-6.5 items-center justify-center rounded-[7px] bg-primary text-primary-foreground">
           <Database className="size-[15px]" />
@@ -118,8 +101,7 @@ export function TopBar() {
           )}
         </button>
       </div>
-
-      {/* workflow nav */}
+      { }
       <nav className="mx-auto flex items-center gap-0.5 rounded-[10px] border border-border bg-muted p-0.5">
         <span className="px-1.5 text-[10px] uppercase tracking-wider text-muted-foreground">
           Explore
@@ -135,8 +117,7 @@ export function TopBar() {
           <NavButton key={n.screen} {...n} active={screen === n.screen} onClick={() => setScreen(n.screen)} />
         ))}
       </nav>
-
-      {/* right: api base + snapshot + connection */}
+      { }
       <div className="flex items-center gap-2.5">
         <div
           title="Base URL of the running generated API (persisted)"
@@ -241,7 +222,6 @@ export function TopBar() {
     </header>
   );
 }
-
 function NavButton({
   label,
   icon: Icon,

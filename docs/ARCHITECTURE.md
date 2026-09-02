@@ -101,71 +101,64 @@ implementation is wrong:
   an older CLI does not know reads as applied and is not, and a misspelled `[projekt]`
   merges two projects through the mechanism meant to protect them.
 
-Identity resolves at the project root in order: explicit `[project].name`, then exactly one
-ecosystem manifest name beside it, then a hash of the root's **absolute** path. That last
-one is deliberately asymmetric with the member hash below, which is over a
+Identity resolves at the project root in two branches, and **both are collision-free by
+construction**:
+
+1. `[project].id`, generated once by `forgedb init` and committed with the config
+2. otherwise, a hash of the root's **absolute** path
+
+That second one is deliberately asymmetric with the member hash below, which is over a
 *project-relative* path: a member must resolve identically on another machine, while a
 fallback project id only has to be unique on this one.
 
-#### Recording a decision it cannot make alone (`src/ask.rs`, `forgedb project`)
+#### Why the id is minted rather than derived (`forgedb project show`)
 
-Two of those decisions have no single answer: two ecosystem manifests naming the root, and
-an id another root already claims. Both were a hard error naming a file to edit by hand.
+It used to be derived — `[project].name`, else a single ecosystem manifest's package name,
+else the path hash. Two of those three could produce the same id for two unrelated
+projects, and the id keys `~/.forgedb/projects/<id>/`: one build cache, one `Cargo.lock`,
+one `target/`. So an entire apparatus grew around the possibility. A claim ledger to detect
+it. An ambiguity branch for two manifests naming one root. Two collision diagnostics, one
+for an unrelated project holding the name and one for the project's own ghost after a move.
+A `forgedb project claim --take-over` remedy for the second, a `release` inverse for
+symmetry, a `forgedb project name` to record a chosen answer, an `init --project-name` for
+the CI case that could not answer a prompt, and a consent boundary so a diagnostic could
+offer to perform the write.
 
-**A flag could express either answer. What a flag cannot do is make one stick.** The id
-keys `~/.forgedb/projects/<id>/`, so an answer living in one `argv` is a *different
-project* on the next invocation that omits it — silently getting its own cache, its own
-`Cargo.lock` and its own `target/`. And the invocations that omit it are the ones ForgeDB
-itself scaffolds: the `Dockerfile`, `docker-compose.yml`, the reclose workflows. So what is
-owed is a **persisting act**, and a prompt is one front end to it.
+**Every one of those was a consequence of derivation, not of the ledger.** Minting the id
+at `init` deleted all of them at once: there is nothing to disambiguate, because a package
+name is no longer an identity source; nothing to contest, because a generated id is not a
+name two projects can independently arrive at; and nothing to record, because the answer
+exists before the first `generate` rather than being negotiated at it.
 
-Four layers, and the ordering is the design — each is useful and testable without the one
-above it:
+What remains:
 
-1. **The write** — `config::{create_project_config, set_project_name}`, both through one
-   temp-file → re-parse → rename path, so a config that would no longer parse is never
-   applied and a half-written `forgedb.toml` never exists in the user's repository.
-2. **The command** — `forgedb project {name, claim --take-over, release, show}`. The
-   contract, not a side effect of a prompt: it can be named inside the non-interactive
-   error, run in CI, reviewed as a diff, and tested with no pty.
-3. **The boundary** — `Askability`, a pure predicate over four booleans (stdin is a
-   terminal, stderr is a terminal, not `--quiet`, not `forbid()`-ed). The four exist for
-   four different reasons and must not be collapsed: `--print-artifact` deadlocks a
-   `$(…)` capture on a prompt *reading* stdin, not on one writing stderr. `ask::forbid()`
-   latches the contexts that are wrong to ask from however the process was started —
-   `build`'s machine-readable modes and `dev`'s watch loop.
-4. **The widget** — `TerminalAsk`, reached only through `ask::asker()` and only past the
-   boundary, rendering on **stderr** so a question never enters a captured stdout.
+- **`forgedb project show`** — reports the facts and decides nothing. It must work in
+  precisely the cases resolution does not, so it reports rather than resolves. It is also
+  the only non-mutating window onto the ledger, and it names the cache directory the id
+  keys — previously findable only by knowing the layout.
+- **The ledger, as a pure detector.** A minted id still collides one way: a project
+  directory is copied and the copy inherits the original's `[project].id`. That is worth an
+  error, and it gets one — naming the holding root, the config file and the key to change,
+  and suggesting a freshly minted value. There is no remedy *command*, because the remedy
+  is a one-key edit in a file the user owns.
+- **The boundary** — `Askability`, a pure predicate over four booleans (stdin is a
+  terminal, stderr is a terminal, not `--quiet`, not `forbid()`-ed). The four exist for
+  four different reasons and must not be collapsed: `--print-artifact` deadlocks a
+  `$(…)` capture on a prompt *reading* stdin, not on one writing stderr. `ask::forbid()`
+  latches the contexts that are wrong to ask from however the process was started —
+  `build`'s machine-readable modes and `dev`'s watch loop. It outlived the identity
+  questions because `migrate create` still asks about values only an operator knows.
 
-`Asker` sits between 3 and 4, and that seam is load-bearing rather than tidy: the test
-harness drives `forgedb` as a subprocess with piped stdio, so it can never execute a branch
-that needs a terminal. With the decision and the act on this side of the trait, the whole
-resolution runs in a test with a scripted answer and no pty.
+Two rules that survive the change:
 
-Three rules the layers exist to keep:
-
-- **"Cannot ask" and "declined" are the same path.** `Asker::ask` returns `Ok(None)` for
-  both, and the result is the *unchanged* diagnostic and exit status. A prompt only ever
-  fills an answer that is otherwise absent. There is no timeout-and-default and no blanket
-  `--yes`: a prompt that answers itself is the silent-guess failure with extra steps.
-- **Create is not edit.** ForgeDB creates a `forgedb.toml` where none exists — nothing to
-  damage, nothing to clobber — and edits one it did not author only with explicit
-  in-session confirmation, format-preserving, never replacing an existing name without
-  `--force`. This is the same rule #338 states from the other side: ForgeDB *prints* the
-  dep line for a consumer's `Cargo.toml` rather than writing it. `forgedb.toml` is
-  ForgeDB's own format; a consumer's `Cargo.toml` is not.
-- **The ledger stays a detector.** A take-over rewrites *who holds an id*, which is
-  detection state and belongs there. A chosen *name* is a resolution and goes in the
-  project's own config, or wiping `~/.forgedb` would resurrect a resolved collision as a
-  silent merge.
-
-The claim ledger is **append-only** — nothing removes a `.claim` — so a project that is
-moved or renamed collides with its own ghost. That case gets its own diagnostic and its own
-remedy (`forgedb project claim --take-over`), deliberately *not* mentioning
-`[project].name`: telling that user to rename a project that has no conflict is the failure
-this exists to remove. A holder that still exists is a real collision and is never
-displaced without `--force`, because an absent path can also mean an unmounted volume.
-Detect and offer; never reap.
+- **"Cannot ask" and "declined" are the same path.** The result is the *unchanged*
+  diagnostic and exit status; a prompt only ever fills an answer that is otherwise absent.
+  There is no timeout-and-default and no blanket `--yes`: a prompt that answers itself is
+  the silent-guess failure with extra steps.
+- **The ledger stays a detector, and identity stays in the project.** The ledger records
+  *who currently holds an id*, which is machine-local state a GC may empty at any time. The
+  id itself is a committed fact in the project's own `forgedb.toml`, or wiping
+  `~/.forgedb` would change what a project *is*.
 
 ### Where it builds (`src/cache.rs`)
 

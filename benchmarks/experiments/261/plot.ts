@@ -1,17 +1,5 @@
 #!/usr/bin/env bun
-/**
- * Renders experiment #261's grid to SVG.
- *
- * Two figures:
- *   - `grid.svg`    — ns/row vs % inline, one panel per (capacity x overflow class)
- *   - `summary.svg` — crossover table, storage amplification, and step-vs-slope
- *
- * Deliberately dependency-free: the SVG is emitted as text so the plot has no
- * build step and can be regenerated from `results/raw.json` alone.
- */
-
 import { readFileSync, writeFileSync } from "node:fs";
-
 type Rec = {
   capacity: string;
   n_chars: number;
@@ -24,7 +12,6 @@ type Rec = {
   ns_per_row: number;
   bytes_on_disk: number;
 };
-
 type Raw = {
   mixes: number[];
   capacities: { label: string; n: number }[];
@@ -35,18 +22,14 @@ type Raw = {
 };
 
 const raw: Raw = JSON.parse(readFileSync("results/raw.json", "utf8"));
-
-/** Variants drawn as lines, in legend order. */
 const SERIES = [
   { key: "p_hand", label: "pointer (idealized)", color: "#1f77b4", dash: "" },
   { key: "p_real", label: "pointer (shipping)", color: "#7fb8db", dash: "4 3" },
   { key: "i1", key2: "h1", label: "inline N+4", color: "#2ca02c", dash: "" },
   { key: "i4", key2: "h4", label: "inline 4N+4", color: "#d62728", dash: "" },
 ] as const;
-
 const esc = (s: string) =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-
 function fmtNs(v: number): string {
   if (v >= 10000) return `${(v / 1000).toFixed(0)}µs`;
   if (v >= 1000) return `${(v / 1000).toFixed(1)}µs`;
@@ -54,7 +37,6 @@ function fmtNs(v: number): string {
   if (v >= 10) return v.toFixed(1);
   return v.toFixed(2);
 }
-
 function fmtBytes(v: number): string {
   const u = ["B", "KB", "MB", "GB"];
   let i = 0;
@@ -64,11 +46,6 @@ function fmtBytes(v: number): string {
   }
   return `${v.toFixed(v < 10 ? 1 : 0)}${u[i]}`;
 }
-
-// ---------------------------------------------------------------------------
-// Figure 1 — the grid
-// ---------------------------------------------------------------------------
-
 const PANEL_W = 300;
 const PANEL_H = 200;
 const PAD_L = 62;
@@ -78,11 +55,9 @@ const PAD_B = 40;
 const COL_GAP = 26;
 const ROW_GAP = 34;
 const HEAD_H = 108;
-
 const caps = raw.capacities;
 const ovfs = raw.overflows;
 const mixes = raw.mixes;
-
 const gridW =
   60 + ovfs.length * (PAD_L + PANEL_W + PAD_R) + (ovfs.length - 1) * COL_GAP;
 const gridH =
@@ -97,23 +72,18 @@ function pick(cap: string, ovf: string, variant: string): Map<number, Rec> {
   }
   return m;
 }
-
 const out: string[] = [];
 out.push(
   `<svg xmlns="http://www.w3.org/2000/svg" width="${gridW}" height="${gridH}" viewBox="0 0 ${gridW} ${gridH}" font-family="ui-sans-serif, -apple-system, Helvetica, Arial, sans-serif">`,
 );
 out.push(`<rect width="${gridW}" height="${gridH}" fill="#ffffff"/>`);
-
 out.push(
   `<text x="30" y="34" font-size="21" font-weight="700" fill="#111">Experiment #261 — inline <tspan font-family="ui-monospace, monospace">string(N)</tspan> slot vs pointer indirection</text>`,
 );
 out.push(
   `<text x="30" y="58" font-size="13" fill="#555">Full column scan, every value read. Lower is better. Rows = declared inline capacity N; columns = how far an overflowing value exceeds N.</text>`,
 );
-// The min/max control ratio is dominated by four `huge`x`massive` rounds, where
-// mapping ~500MB evicts the control column's own pages — pressure from the config
-// under test, not a moving machine. Every variant in a round faces it equally, so
-// the paired comparison holds; the robust statistic is what belongs on the figure.
+
 const ctl = (raw.control as any).samples as number[];
 const ctlSorted = [...ctl].sort((a, b) => a - b);
 const ctlMed = ctlSorted[Math.floor(ctlSorted.length / 2)];
@@ -121,8 +91,6 @@ const ctlSteady = ctl.filter((v) => v < ctlMed * 1.15).length;
 out.push(
   `<text x="30" y="76" font-size="13" fill="#555">Per-panel y-axis (ranges differ by orders of magnitude). Warm page cache, median of ${(raw as any).reps ?? 7} reps. In-run control steady in ${ctlSteady}/${ctl.length} rounds (within 15% of ${ctlMed.toFixed(2)} ns/row); the ${ctl.length - ctlSteady} excursions are all huge×massive panels, where the config under test evicts the control's pages.</text>`,
 );
-
-// legend
 let lx = 30;
 for (const s of SERIES) {
   out.push(
@@ -139,35 +107,28 @@ out.push(
 out.push(
   `<text x="${lx + 16}" y="98" font-size="12" fill="#333">hard form (no branch), 100% inline only</text>`,
 );
-
 for (let ri = 0; ri < caps.length; ri++) {
   for (let ci = 0; ci < ovfs.length; ci++) {
     const cap = caps[ri];
     const ovf = ovfs[ci];
     const ox = 60 + ci * (PAD_L + PANEL_W + PAD_R + COL_GAP) + PAD_L;
     const oy = HEAD_H + ri * (PAD_T + PANEL_H + PAD_B + ROW_GAP) + PAD_T;
-
     const series = SERIES.map((s) => ({
       s,
       data: pick(cap.label, ovf.label, s.key),
       hard: (s as any).key2 ? pick(cap.label, ovf.label, (s as any).key2) : new Map(),
     }));
-
     let vmax = 0;
     for (const { data, hard } of series) {
       for (const r of data.values()) vmax = Math.max(vmax, r.ns_per_row);
       for (const r of hard.values()) vmax = Math.max(vmax, r.ns_per_row);
     }
     vmax = vmax * 1.12 || 1;
-
     const x = (pct: number) => ox + (mixes.indexOf(pct) / (mixes.length - 1)) * PANEL_W;
     const y = (v: number) => oy + PANEL_H - (v / vmax) * PANEL_H;
-
     out.push(
       `<rect x="${ox}" y="${oy}" width="${PANEL_W}" height="${PANEL_H}" fill="#fafafa" stroke="#e3e3e3"/>`,
     );
-
-    // y gridlines
     for (let g = 1; g <= 4; g++) {
       const v = (vmax / 4) * g;
       out.push(
@@ -180,8 +141,6 @@ for (let ri = 0; ri < caps.length; ri++) {
     out.push(
       `<text x="${ox - 46}" y="${oy + PANEL_H / 2}" font-size="10" fill="#888" text-anchor="middle" transform="rotate(-90 ${ox - 46} ${oy + PANEL_H / 2})">ns / row</text>`,
     );
-
-    // x ticks
     for (const m of mixes) {
       const showLabel = [5, 20, 50, 80, 100].includes(m);
       out.push(
@@ -196,12 +155,9 @@ for (let ri = 0; ri < caps.length; ri++) {
     out.push(
       `<text x="${ox + PANEL_W / 2}" y="${oy + PANEL_H + 32}" font-size="10.5" fill="#777" text-anchor="middle">% of rows fitting inline</text>`,
     );
-
-    // panel title
     out.push(
       `<text x="${ox}" y="${oy - 16}" font-size="13" font-weight="650" fill="#222">N=${cap.n} <tspan font-weight="400" fill="#666">(${esc(cap.label)})</tspan> · overflow ${esc(ovf.label)} <tspan font-weight="400" fill="#888">${ovf.lo}–${ovf.hi}×N</tspan></text>`,
     );
-
     for (const { s, data, hard } of series) {
       const pts = mixes.filter((m) => data.has(m)).map((m) => `${x(m)},${y(data.get(m)!.ns_per_row)}`);
       if (pts.length > 1) {
@@ -222,27 +178,9 @@ for (let ri = 0; ri < caps.length; ri++) {
     }
   }
 }
-
 out.push("</svg>");
 writeFileSync("results/grid.svg", out.join("\n"));
-
-// ---------------------------------------------------------------------------
-// Figure 2 — crossover + amplification + step vs slope
-// ---------------------------------------------------------------------------
-
-/**
- * Margin below which a difference is not a result. Run-to-run spread on the
- * median of 7 reps sits under this, so calling a 0.1% edge a "crossover" would be
- * reporting noise as a finding — which is precisely the failure the in-run
- * control exists to make visible.
- */
 const TIE_PCT = 2;
-
-/**
- * Lowest mix at which `variant` reads meaningfully faster than the idealized
- * pointer baseline. `"tie"` when it gets within the noise band but never clears
- * it; `null` when it loses at every mix by more than the band.
- */
 function crossover(cap: string, ovf: string, variant: string): number | "tie" | null {
   const v = pick(cap, ovf, variant);
   const p = pick(cap, ovf, "p_hand");
@@ -257,21 +195,17 @@ function crossover(cap: string, ovf: string, variant: string): number | "tie" | 
   }
   return tied ? "tie" : null;
 }
-
-/** i4 bytes on disk divided by pointer bytes on disk, at the given mix. */
 function amp(cap: string, ovf: string, variant: string, m: number): number | null {
   const a = pick(cap, ovf, variant).get(m);
   const b = pick(cap, ovf, "p_hand").get(m);
   if (!a || !b || b.bytes_on_disk === 0) return null;
   return a.bytes_on_disk / b.bytes_on_disk;
 }
-
 const CW = 128;
 const CH = 40;
 const tblW = 190 + ovfs.length * CW;
 const sumW = Math.max(1180, 60 + tblW * 2 + 60);
 const sumH = 190 + caps.length * CH + 330;
-
 const s2: string[] = [];
 s2.push(
   `<svg xmlns="http://www.w3.org/2000/svg" width="${sumW}" height="${sumH}" viewBox="0 0 ${sumW} ${sumH}" font-family="ui-sans-serif, -apple-system, Helvetica, Arial, sans-serif">`,
@@ -318,7 +252,6 @@ function drawTable(
     }
   }
 }
-
 const y0 = 120;
 const crossCell = (cap: string, ovf: string, variant: string) => {
   const c = crossover(cap, ovf, variant);
@@ -327,33 +260,26 @@ const crossCell = (cap: string, ovf: string, variant: string) => {
   const fill = c >= 99 ? "#fbeee0" : c >= 80 ? "#fdf3d8" : "#dff0d8";
   return { text: `${c}%`, fill, fg: c > 90 ? "#7a5b13" : "#245b2b" };
 };
-
 drawTable(30, y0, "Crossover — inline 4N+4 (as #238 declares it)", `lowest % of rows inline at which it beats the pointer baseline by >${TIE_PCT}%; “never” = loses at every mix`, (cap, ovf) =>
   crossCell(cap, ovf, "i4"),
 );
-
 drawTable(30 + tblW + 60, y0, "Storage — inline 4N+4 bytes on disk ÷ pointer", "at a 50% mix; >1 means the inline layout stores more", (cap, ovf) => {
   const a = amp(cap, ovf, "i4", 50);
   if (a === null) return { text: "—", fill: "#eee" };
   const fill = a > 4 ? "#f6d5d3" : a > 2 ? "#fbeee0" : a > 1.2 ? "#fdf3d8" : "#dff0d8";
   return { text: `${a.toFixed(a < 10 ? 2 : 0)}×`, fill };
 });
-
-// second row of tables: the N+4 (bytes-declared) variant, to separate mechanism
-// from read amplification
 const y1 = y0 + 38 + caps.length * CH + 76;
 drawTable(30, y1, "Crossover — inline N+4 (if N counted bytes, not chars)", "the same mechanism without the 4× worst-case-UTF-8 slot reservation", (cap, ovf) =>
   crossCell(cap, ovf, "i1"),
 );
 
-// step vs slope
 const sx = 30 + tblW + 60;
 const sy = y1;
 const SW = 420;
 const SH = 200;
 s2.push(`<text x="${sx}" y="${sy - 26}" font-size="14" font-weight="650" fill="#222">Step vs slope — N=16, overflow 3–5×N, 50% inline</text>`);
 s2.push(`<text x="${sx}" y="${sy - 8}" font-size="11.5" fill="#777">flat with row count ⇒ the cost is a per-row slope, not a per-scan step that amortizes</text>`);
-
 const scaleRows = [...new Set(raw.scale.map((r) => r.rows))].sort((a, b) => a - b);
 const scaleMax = Math.max(...raw.scale.map((r) => r.ns_per_row)) * 1.12;
 const sxp = (r: number) => sx + (scaleRows.indexOf(r) / (scaleRows.length - 1)) * SW;
@@ -385,14 +311,8 @@ for (const s of SERIES) {
   s2.push(`<text x="${lx2 + 28}" y="${sy + 30 + SH + 54}" font-size="11" fill="#333">${esc(s.label)}</text>`);
   lx2 += 36 + s.label.length * 6.2;
 }
-
 s2.push("</svg>");
 writeFileSync("results/summary.svg", s2.join("\n"));
-
-// ---------------------------------------------------------------------------
-// Console digest — what the verdict gets written from
-// ---------------------------------------------------------------------------
-
 console.log(`control drift: ${raw.control.drift_pct.toFixed(2)}%`);
 console.log("\ncrossover (lowest % inline where the inline layout wins vs p_hand)");
 console.log(
@@ -420,7 +340,6 @@ for (const c of caps) {
     );
   }
 }
-
 console.log("\nstorage amplification at 50% inline (bytes on disk vs pointer)");
 for (const c of caps) {
   const cells = ovfs.map((o) => {
@@ -430,5 +349,4 @@ for (const c of caps) {
   });
   console.log(`${`N=${c.n} ${c.label}`.padEnd(14)}${cells.join("")}`);
 }
-
 console.log("\nwrote results/grid.svg and results/summary.svg");

@@ -1,14 +1,3 @@
-//! #156 — coordinator commit path with the fsync barrier off the turn lock
-//! (Option A) and a configurable replication-log fsync policy (Option C).
-//!
-//! Drives the real Unix-socket protocol (client → coordinator) through all three
-//! `CoordFsync` modes and verifies:
-//!   1. commits succeed with monotonically increasing LSNs;
-//!   2. the durable replication log records every commit's opaque bytes in commit
-//!      order (proving the append is correct even though its fsync moved off the
-//!      turn critical section);
-//!   3. `never`/`periodic` still record (they only relax *when* the log is fsync'd).
-
 use forgedb_changefeed::durable::{DurableBroker, FsyncPolicy};
 use forgedb_coordinator::client::CoordinatorClient;
 use forgedb_coordinator::server::{CoordFsync, Coordinator};
@@ -16,7 +5,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 
-/// Start a coordinator with `fsync` in a background thread; return (tmp, socket).
 fn start(fsync: CoordFsync) -> (TempDir, std::path::PathBuf, Arc<Coordinator>) {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().to_owned();
@@ -26,7 +14,6 @@ fn start(fsync: CoordFsync) -> (TempDir, std::path::PathBuf, Arc<Coordinator>) {
     std::thread::spawn(move || {
         let _ = run.run();
     });
-    // Wait for the socket to appear.
     for _ in 0..200 {
         if sock.exists() {
             break;
@@ -36,13 +23,11 @@ fn start(fsync: CoordFsync) -> (TempDir, std::path::PathBuf, Arc<Coordinator>) {
     (tmp, sock, coord)
 }
 
-/// Run `n` sequential commits over the socket; assert monotonic LSNs.
 fn commit_n(sock: &std::path::Path, n: u64) -> Vec<u64> {
     let client = CoordinatorClient::connect(sock).expect("connect");
     let mut lsns = Vec::new();
     let mut snapshot = 0u64;
     for i in 0..n {
-        // Distinct key per commit → no conflict.
         let key = format!("row:{i}").into_bytes();
         let (turn_id, _reserved) = client.request_turn(vec![key], snapshot).expect("turn");
         let lsn = client
@@ -60,11 +45,8 @@ fn commit_n(sock: &std::path::Path, n: u64) -> Vec<u64> {
     lsns
 }
 
-/// The replication log recorded exactly `n` events at monotonic offsets 1..=n,
-/// with the opaque bytes intact — regardless of fsync mode.
 fn assert_log_recorded(root: &std::path::Path, n: u64) {
     let log = root.join("_coordinator_replication.log");
-    // Reopen the durable log and read every persisted event from offset 0.
     let broker = DurableBroker::open(&log, FsyncPolicy::Never, 64).expect("reopen log");
     assert_eq!(broker.watermark(), n, "log watermark == number of commits");
     let events = broker.read_from(0, n as usize + 8).expect("read log");
@@ -79,10 +61,7 @@ fn assert_log_recorded(root: &std::path::Path, n: u64) {
 fn run_mode(fsync: CoordFsync) {
     let (tmp, sock, coord) = start(fsync);
     let lsns = commit_n(&sock, 5);
-    // Monotonic, gap-free LSNs.
     assert_eq!(lsns, vec![1, 2, 3, 4, 5], "LSNs monotonic across commits");
-    // The append happened even though its fsync is off the turn lock (Option A)
-    // and possibly deferred (Never/Periodic) — the log content is identical.
     assert_log_recorded(tmp.path(), 5);
     coord.shutdown();
 }
@@ -99,7 +78,6 @@ fn commit_records_in_order_with_fsync_never() {
 
 #[test]
 fn commit_records_in_order_with_fsync_periodic() {
-    // Flush once per 2 commits — records must still all be present in order.
     run_mode(CoordFsync::Periodic(2));
 }
 

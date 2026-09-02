@@ -1,6 +1,3 @@
-// ForgeDB VSCode Extension
-// Integrates syntax highlighting, LSP, and commands
-
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
@@ -16,7 +13,6 @@ let statusBarItem: vscode.StatusBarItem;
 
 const EXE = process.platform === 'win32' ? '.exe' : '';
 
-/// Locate an executable named `bin` on the user's PATH.
 function findOnPath(bin: string): string | undefined {
     const name = bin + EXE;
     const paths = (process.env.PATH ?? '').split(path.delimiter);
@@ -28,18 +24,11 @@ function findOnPath(bin: string): string | undefined {
                 return candidate;
             }
         } catch {
-            // ignore unreadable PATH entries
         }
     }
     return undefined;
 }
 
-/// Resolve how to launch the language server, in priority order:
-///   1. `forgedb.lspServerPath` — an explicit `forgedb-lsp` binary;
-///   2. the installed `forgedb` CLI (config `forgedb.path`, else on PATH),
-///      launched via its `lsp` subcommand, which locates the sibling
-///      `forgedb-lsp` binary itself (epic #173).
-/// Returns undefined when no CLI/server can be found.
 function resolveServer(): { command: string; args: string[] } | undefined {
     const config = vscode.workspace.getConfiguration('forgedb');
 
@@ -56,8 +45,6 @@ function resolveServer(): { command: string; args: string[] } | undefined {
     return undefined;
 }
 
-/// Resolve the `forgedb` CLI command: explicit `forgedb.path` config, else the
-/// binary on PATH. Returns undefined if neither is available.
 function resolveCli(): string | undefined {
     const configured = vscode.workspace.getConfiguration('forgedb').get<string>('path')?.trim();
     if (configured) {
@@ -66,9 +53,6 @@ function resolveCli(): string | undefined {
     return findOnPath('forgedb');
 }
 
-/// The `forgedb` command to send to an integrated terminal — the resolved CLI
-/// path (quoted if it contains spaces), falling back to a bare `forgedb` so the
-/// terminal surfaces a clear "command not found" if it is genuinely absent.
 function cliCommand(): string {
     const cli = resolveCli() ?? 'forgedb';
     return cli.includes(' ') ? `"${cli}"` : cli;
@@ -77,30 +61,22 @@ function cliCommand(): string {
 export async function activate(context: vscode.ExtensionContext) {
     console.log('ForgeDB extension is now active');
 
-    // Create status bar item
     statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
     statusBarItem.text = "$(database) ForgeDB";
     statusBarItem.tooltip = "ForgeDB Language Server";
     statusBarItem.show();
     context.subscriptions.push(statusBarItem);
 
-    // Start LSP server
     await startLanguageServer(context);
 
-    // Register commands
     registerCommands(context);
 
-    // Watch for schema file changes
     setupFileWatcher(context);
 
     updateStatusBar('Active', true);
 }
 
 async function startLanguageServer(context: vscode.ExtensionContext) {
-    // The language server ships with the installed `forgedb` CLI (epic #173):
-    // the extension bundles no binary and downloads nothing. It resolves the
-    // server from the user's CLI so editor diagnostics stay in lockstep with the
-    // CLI's own compiler (single source of truth — see #175).
     const server = resolveServer();
     if (!server) {
         updateStatusBar('CLI not found', false);
@@ -137,7 +113,6 @@ async function startLanguageServer(context: vscode.ExtensionContext) {
         serverOptions,
         clientOptions
     );
-    // Tie the client's lifecycle to the extension so it is disposed on unload.
     context.subscriptions.push(client);
 
     try {
@@ -150,7 +125,6 @@ async function startLanguageServer(context: vscode.ExtensionContext) {
 }
 
 function registerCommands(context: vscode.ExtensionContext) {
-    // Command: Generate Code
     context.subscriptions.push(
         vscode.commands.registerCommand('forgedb.generateCode', async () => {
             const terminal = vscode.window.createTerminal('ForgeDB Generate');
@@ -160,7 +134,6 @@ function registerCommands(context: vscode.ExtensionContext) {
         })
     );
 
-    // Command: Validate Schema
     context.subscriptions.push(
         vscode.commands.registerCommand('forgedb.validateSchema', async () => {
             const editor = vscode.window.activeTextEditor;
@@ -169,13 +142,11 @@ function registerCommands(context: vscode.ExtensionContext) {
                 return;
             }
 
-            // The LSP server already validates, so just trigger diagnostics
             await vscode.commands.executeCommand('vscode.executeDocumentSymbolProvider', editor.document.uri);
             vscode.window.showInformationMessage('Schema validation complete. Check Problems panel for issues.');
         })
     );
 
-    // Command: Start Dev Mode (File Watcher)
     context.subscriptions.push(
         vscode.commands.registerCommand('forgedb.startDevMode', async () => {
             const terminal = vscode.window.createTerminal('ForgeDB Dev');
@@ -185,7 +156,6 @@ function registerCommands(context: vscode.ExtensionContext) {
         })
     );
 
-    // Command: Create New Model
     context.subscriptions.push(
         vscode.commands.registerCommand('forgedb.createModel', async () => {
             const modelName = await vscode.window.showInputBox({
@@ -221,7 +191,6 @@ function registerCommands(context: vscode.ExtensionContext) {
         })
     );
 
-    // Command: Restart Language Server
     context.subscriptions.push(
         vscode.commands.registerCommand('forgedb.restartServer', async () => {
             if (client) {
@@ -232,7 +201,6 @@ function registerCommands(context: vscode.ExtensionContext) {
         })
     );
 
-    // Command: Show Output
     context.subscriptions.push(
         vscode.commands.registerCommand('forgedb.showOutput', () => {
             if (client) {

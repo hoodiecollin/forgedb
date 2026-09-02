@@ -1,31 +1,3 @@
-//! The test gate guards itself (#390).
-//!
-//! ForgeDB ran no tests in CI at all. Every one of the eleven workflows was a release,
-//! publish, deploy or scope-gate job, so the suite ran only when a person chose to run
-//! it. That cost two defects before it was noticed: #381, whose generated driver called
-//! an API deleted two weeks earlier, and #386, which panicked before reaching its
-//! assertion. Both were found by hand.
-//!
-//! #390 adds the two jobs that close it. This file is the part that keeps them honest,
-//! and it runs in TIER 1 — so the control that guards the tiers is itself gated.
-//!
-//! ## What this can and cannot prove
-//!
-//! It cannot prove a workflow runs; only GitHub can. What it CAN prove is the set of
-//! properties that, when they break, break *silently* — where the job still runs, still
-//! goes green, and simply covers less than it claims:
-//!
-//!   * the tier-2 command stays workspace-level, rather than degrading into a
-//!     hand-maintained list of test binaries that looks complete and is not;
-//!   * the one test deliberately excluded from tier 2 still matches its `--skip`
-//!     pattern, and still has a home on the `main` surface;
-//!   * tier 1 still builds the examples, which no test flag covers;
-//!   * a failed nightly still has the permission and the step it needs to report.
-//!
-//! Every assertion below anchors on the token that does the WORK — the command string,
-//! the skip pattern, the permission — never on a name or a comment that merely labels
-//! it. A guard anchored on a label passes vacuously the moment the label moves.
-
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -40,15 +12,11 @@ fn read(rel: &str) -> String {
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()))
 }
 
-/// Collapse a shell continuation (`\` + newline + indent) so a recipe or a `run:` block
-/// can be matched as one line. Without this every assertion below would depend on where
-/// the author happened to wrap, which is not a property worth guarding.
 fn unwrap_continuations(s: &str) -> String {
     let joined = s.replace("\\\n", " ");
     Regex::new(r"\s+").unwrap().replace_all(&joined, " ").trim().to_string()
 }
 
-/// The body of a `make` target, with continuations joined.
 fn make_recipe(target: &str) -> String {
     let mk = read("Makefile");
     let head = format!("\n{target}:\n");
@@ -57,7 +25,6 @@ fn make_recipe(target: &str) -> String {
         .unwrap_or_else(|| panic!("Makefile has no `{target}:` target"))
         + head.len();
     let rest = &mk[start..];
-    // A recipe runs to the first line that is neither indented nor blank.
     let mut body = String::new();
     for line in rest.lines() {
         if line.starts_with('\t') || line.trim().is_empty() {
@@ -70,17 +37,6 @@ fn make_recipe(target: &str) -> String {
     unwrap_continuations(&body)
 }
 
-/// Every `#[ignore]`d test function in `tests/`, by name.
-///
-/// Derived from source rather than from a hardcoded list, so adding an ignored test
-/// cannot silently fall outside these guards.
-///
-/// Deliberately NOT derived from `cargo test -- --ignored --list`: that would mean a
-/// tier-1 test shelling out to a full workspace build. It also reports one entry more
-/// than there are tests — a ```rust,ignore``` doc-block in crates/codegen/src/rust.rs,
-/// which under `--ignored` reports ok in 0.00s having compiled nothing. That entry is
-/// vacuous; counting it as a test is how an earlier draft of #390's design reached the
-/// wrong conclusion about why this matters.
 fn ignored_tests() -> BTreeSet<String> {
     let re = Regex::new(r"#\[ignore[^\]]*\]\s*\n\s*(?:pub\s+)?fn\s+(\w+)").unwrap();
     let dir = repo_root().join("tests");
@@ -103,22 +59,11 @@ fn ignored_tests() -> BTreeSet<String> {
     out
 }
 
-/// The `--skip <pattern>` arguments of a command line.
 fn skip_patterns(cmd: &str) -> Vec<String> {
     let re = Regex::new(r"--skip\s+(\S+)").unwrap();
     re.captures_iter(cmd).map(|c| c[1].to_string()).collect()
 }
 
-/// A workflow's text **with whole-line `#` comments removed**.
-///
-/// Stripping is the default here, and that is not fastidiousness — it is a missing guard.
-/// These workflows carry long headers explaining exactly what each assertion below
-/// protects, so nearly every needle this file searches for also appears in prose a few
-/// lines above the thing that does the work. Three assertions were originally written
-/// against raw file text; the mutation harness found two of them still passing after the
-/// command they guard had been broken, satisfied by the comment justifying the assertion.
-///
-/// A guard that its own rationale can satisfy is not a guard.
 fn workflow(name: &str) -> String {
     let raw = read(&format!(".github/workflows/{name}"));
     raw.lines()
@@ -127,10 +72,29 @@ fn workflow(name: &str) -> String {
         .join("\n")
 }
 
-/// The shell command of the single-line `run:` step with the given `name:`.
-///
-/// Scoped to one step on purpose: asserting against the whole workflow means any other
-/// step — or any comment — can satisfy the assertion.
+fn trigger_block(workflow_file: &str) -> String {
+    let src = workflow(workflow_file);
+    let start = src.find("\non:\n").unwrap_or_else(|| {
+        panic!(
+            "{workflow_file} has no top-level `on:` block — it can never run, and \
+             every guard keyed to its triggers would pass vacuously"
+        )
+    }) + "\non:\n".len();
+    let mut out = String::new();
+    for line in src[start..].lines() {
+        if !line.trim().is_empty() && !line.starts_with(char::is_whitespace) {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    assert!(
+        !out.trim().is_empty(),
+        "{workflow_file}'s `on:` block is empty"
+    );
+    out
+}
+
 fn run_command(workflow_file: &str, step_name: &str) -> String {
     let src = workflow(workflow_file);
     let needle = format!("- name: {step_name}");
@@ -141,31 +105,29 @@ fn run_command(workflow_file: &str, step_name: &str) -> String {
     let run = rest.find("run:").unwrap_or_else(|| {
         panic!("step {step_name:?} in {workflow_file} has no `run:`")
     });
-    // Single-line `run:` — up to the newline, with continuations joined.
     let tail = &rest[run..];
     let end = tail.find('\n').unwrap_or(tail.len());
     unwrap_continuations(&tail[..end])
 }
 
-/// The shell of a step whose `run:` is a BLOCK SCALAR (`run: |`).
-///
-/// [`run_command`] reads to the end of the `run:` line, which for a block scalar
-/// is the literal `|` — so a `!contains` guard built on it passes having examined
-/// one character, and a `contains` guard fails for a reason that looks like the
-/// step being wrong. That is latent rather than live today (both existing callers
-/// key single-line steps), and it stays latent because the block-scalar form is
-/// here rather than because nobody has reached for it.
-///
-/// Comments are stripped, like [`workflow`] does: these steps explain themselves
-/// in prose, and a needle that its own rationale can satisfy is not a guard.
 fn run_block(workflow_file: &str, step_name: &str) -> String {
     let src = read(&format!(".github/workflows/{workflow_file}"));
     let needle = format!("- name: {step_name}");
     let start = src.find(&needle).unwrap_or_else(|| {
         panic!("{workflow_file} has no step named {step_name:?} — the guard keyed to it is now vacuous")
     });
+    let indent = src[..start]
+        .rfind('\n')
+        .map(|nl| start - nl - 1)
+        .unwrap_or(0);
+    let step_marker = format!("\n{}- name: ", " ".repeat(indent));
     let rest = &src[start..];
-    let run = rest.find("\n").map(|_| ()).and(rest.find("run: |")).unwrap_or_else(|| {
+    let rest = match rest[1..].find(&step_marker) {
+        Some(next) => &rest[..next + 1],
+        None => rest,
+    };
+
+    let run = rest.find("run: |").unwrap_or_else(|| {
         panic!(
             "step {step_name:?} in {workflow_file} has no block-scalar `run: |`. \
              If it became a single-line `run:`, use `run_command` — this helper \
@@ -174,12 +136,6 @@ fn run_block(workflow_file: &str, step_name: &str) -> String {
     });
     let body = &rest[run + "run: |".len()..];
 
-    // A block scalar runs to the first line that is neither blank nor indented
-    // deeper than the step's own `- name:` key.
-    let indent = src[..start]
-        .rfind('\n')
-        .map(|nl| start - nl - 1)
-        .unwrap_or(0);
     let mut out = String::new();
     for line in body.lines() {
         if line.trim().is_empty() {
@@ -199,17 +155,6 @@ fn run_block(workflow_file: &str, step_name: &str) -> String {
     out
 }
 
-// ---------------------------------------------------------------------------
-// S337 — the reclose LOADS what it built.
-// ---------------------------------------------------------------------------
-
-/// #337's delivered artifacts are only proven by loading them, and the reclose
-/// is the only place that happens against registry-resolved substrate.
-///
-/// Each assertion anchors on the COMMAND that does the work — the interpreter
-/// invocation, the compile — never on a step name or on a comment. Dropping one
-/// must fail loudly here rather than leaving an arm that still passes while
-/// covering less than it claims.
 #[test]
 fn s337_each_reclose_arm_loads_the_artifact_it_delivered() {
     for (step, needles) in [
@@ -238,21 +183,22 @@ fn s337_each_reclose_arm_loads_the_artifact_it_delivered() {
     }
 }
 
-/// The Go reclose must exercise the `init()` check's CALL SITE, not merely a
-/// matching pair.
-///
-/// A run where both halves agree proves the check does not false-positive. Only
-/// a deliberately mismatched pair proves it runs at all (#345's lesson). The
-/// mismatch is induced with a `[storage]` knob because that changes durability
-/// semantics and not one exported symbol — the case the linker cannot see.
+// REGRESSION(#486): this test used to assert the defect it was hiding.
+// It required the literal `fsync = "always"` — the scaffold's own default — so the
+// step it pinned changed no generated byte and induced nothing. The step ALSO
+// appended a second `[storage]` table to a config that already had one, so
+// `forgedb generate` died on a TOML duplicate-key error at exit 10 before any
+// assertion ran. Green for two weeks while the guard was inert.
+// The assertions below therefore anchor on PROPERTIES of the induction — the edit
+// is in place, the value is DERIVED from the template rather than restated, and the
+// fingerprint is proven to have moved — never on the knob's spelling. A `contains`
+// on the spelling is satisfied by a step that induces nothing.
 #[test]
 fn s337_the_go_reclose_proves_the_init_check_executes() {
     let body = run_block("go-reclose.yml", "Reclose — generate, build, link, run");
+
     for needle in [
-        // The induced mismatch: regenerate without rebuilding the archive.
-        "fsync = \"always\"",
         "generate go --runtime --force",
-        // …and the assertion that the binary REFUSES to run.
         "different schema",
         "forgedb build",
     ] {
@@ -263,37 +209,126 @@ fn s337_the_go_reclose_proves_the_init_check_executes() {
              — which proves it does not false-positive, and nothing else:\n{body}"
         );
     }
-    // `forgedb build` must NOT be re-run between the regenerate and the go
-    // build, or the pair matches again and the guard is vacuous.
+
+    assert!(
+        !body.contains("cat >> forgedb.toml"),
+        "the reclose appends to forgedb.toml instead of editing it in place. The \
+         scaffold already writes a `[storage]` table, so a second header is invalid \
+         TOML: `forgedb generate` exits 10 and every assertion below it is \
+         unreachable (#486):\n{body}"
+    );
+
+    let scaffold = read("src/templates.rs");
+    let defaults: Vec<&str> = scaffold
+        .lines()
+        .filter_map(|l| {
+            l.trim()
+                .strip_prefix("# fsync = \"")
+                .and_then(|r| r.strip_suffix('"'))
+        })
+        .collect();
+    assert_eq!(
+        defaults.len(),
+        1,
+        "expected exactly one `# fsync = \"...\"` default in src/templates.rs, found \
+         {}: {defaults:?}. With none this cross-check passes vacuously; with several \
+         it is comparing against an arbitrary one",
+        defaults.len()
+    );
+    let written: Vec<&str> = body
+        .lines()
+        .filter_map(|l| {
+            l.trim()
+                .strip_prefix("grep -q '^fsync = \"")
+                .and_then(|r| r.split('"').next())
+        })
+        .collect();
+    assert_eq!(
+        written.len(),
+        1,
+        "the reclose must verify exactly what it wrote to [storage].fsync — found {} \
+         such assertions: {written:?}. Without one this test cannot tell which value \
+         the step set, and (b) becomes unenforceable:\n{body}",
+        written.len()
+    );
+    assert_ne!(
+        written[0], defaults[0],
+        "the reclose sets [storage].fsync to `{}`, which src/templates.rs already \
+         scaffolds as the default. The regenerate then emits byte-identical source, \
+         the archive is not stale, the smoke binary runs, and the step fails saying \
+         init() did not execute — red for the wrong reason (#486):\n{body}",
+        written[0]
+    );
+
+    assert!(
+        body.contains(r#"if [ "$before_fp" = "$after_fp" ]"#),
+        "the reclose no longer compares the generated fingerprint across the \
+         regenerate, so it cannot distinguish the guard firing from there having \
+         been nothing to catch — the two outcomes this step exists to tell apart \
+         (#486):\n{body}"
+    );
+
+    let before = body.find("before_fp=").expect(
+        "the reclose must capture the fingerprint BEFORE the regenerate; with no \
+         baseline the comparison has nothing to compare against",
+    );
+    let regen = body
+        .find("generate go --runtime --force")
+        .expect("the induced mismatch is present");
     let after = body
+        .find("after_fp=")
+        .expect("the reclose must re-read the fingerprint after the regenerate");
+    assert!(
+        before < regen && regen < after,
+        "the reclose reads the fingerprint in the wrong order (before={before}, \
+         regenerate={regen}, after={after}); both reads must straddle the \
+         regenerate:\n{body}"
+    );
+
+    let after_regen = body
         .split_once("generate go --runtime --force")
         .expect("the induced mismatch is present")
         .1;
     assert!(
-        !after.contains("\"$FORGEDB\" build"),
+        !after_regen.contains("\"$FORGEDB\" build"),
         "the reclose rebuilds the archive after inducing the mismatch, so the two \
-         halves agree again and the init() check is never triggered:\n{after}"
+         halves agree again and the init() check is never triggered:\n{after_regen}"
     );
 }
 
-// ---------------------------------------------------------------------------
-// S5 — the tier-2 command stays workspace-level.
-// ---------------------------------------------------------------------------
+#[test]
+fn the_comment_rule_has_a_place_where_it_can_fail() {
+    let recipe = make_recipe("comment-check");
 
-/// The specific regression #390's design was built around.
-///
-/// A "run all the ignored tests" target is most naturally written as a loop over the
-/// per-scenario targets that already exist. That form covers 15 of the 29 ignored tests
-/// and looks complete: it silently drops every one in `build_cache_compile_test`,
-/// `in_tree_package_test`, `prompt_boundary_test`, `pyo3_component_compile_test`,
-/// `placement_flip_test`, `migrate_tests` and `core_utoipa_gate_test`, because those
-/// seven files have no target at all.
-///
-/// The count in that sentence is prose and drifts; the ASSERTIONS below derive their set
-/// from source, which is why a new ignored test cannot fall outside them.
-///
-/// `--workspace` needs no list, and so cannot have a stale one. This asserts the
-/// invocation has not been narrowed back down — by target, by package, or by both.
+    assert!(
+        recipe.contains("scripts/strip-comments.ts"),
+        "`make comment-check` must invoke the checker. A target that runs something else \
+         reports green on a tree full of comments, which is worse than no target: the rule \
+         then LOOKS enforced. Got: {recipe}"
+    );
+    assert!(
+        recipe.contains("--check"),
+        "`make comment-check` must pass --check. Without it the script defaults to `stats`, \
+         which prints a count and EXITS ZERO — the report-is-not-a-gate shape (§5.5). \
+         Got: {recipe}"
+    );
+
+    let cmd = run_command("test.yml", "No comments in ForgeDB's own source");
+    assert!(
+        cmd.contains("make comment-check"),
+        "test.yml must run `make comment-check`, or the rule is enforced by memory. \
+         Got: {cmd}"
+    );
+
+    let wf = unwrap_continuations(&workflow("test.yml"));
+    assert!(
+        wf.contains("setup-bun"),
+        "the comment check runs under bun, so test.yml must install it. Without the setup \
+         step the job fails on a missing interpreter rather than on a real finding, and \
+         the usual repair is to delete the step"
+    );
+}
+
 #[test]
 fn tier_two_runs_the_whole_workspace_not_a_list_of_binaries() {
     let recipe = make_recipe("test-ignored");
@@ -322,20 +357,6 @@ fn tier_two_runs_the_whole_workspace_not_a_list_of_binaries() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// S2 — the skip pattern still matches exactly the test it names.
-// ---------------------------------------------------------------------------
-
-/// `--skip` fails silently in BOTH directions, which is why this is a test and not a
-/// comment.
-///
-/// Rename the migrate test and the pattern matches *nothing*: migrate_tests quietly
-/// rejoins the nightly, where it compiles against the PUBLISHED substrate and so goes
-/// red for most of every cycle — for a completely correct reason, which is worse, because
-/// the job is then permanently red and stops being read.
-///
-/// Loosen the pattern and it matches more than one test: those disappear from tier 2 and
-/// the nightly still reports green.
 #[test]
 fn the_tier_two_skip_matches_exactly_one_real_test() {
     let recipe = make_recipe("test-ignored");
@@ -371,20 +392,8 @@ fn the_tier_two_skip_matches_exactly_one_real_test() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// S3 — excluding migrate_tests is a move, not a deletion.
-// ---------------------------------------------------------------------------
-
-/// Skipping a test in the only job that runs it is a deletion unless something else runs
-/// it. `migrate_tests` leaves the nightly precisely because it measures this repo's
-/// relationship to crates.io rather than the commit under test — which is what
-/// `substrate-reclose` already measures, on `main`. If that job stops running it, the
-/// skip above becomes silent dead coverage.
 #[test]
 fn migrate_tests_has_a_home_on_the_main_surface() {
-    // Scoped to the one step's command. Asserting against the whole file let the COMMENT
-    // above that step satisfy the `--ignored` check — the mutation harness caught it
-    // surviving. See `without_comments`.
     let cmd = run_command("substrate-reclose.yml", "Run migrate_tests");
 
     assert!(
@@ -399,14 +408,6 @@ fn migrate_tests_has_a_home_on_the_main_surface() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// S4 — tier 1 builds the examples.
-// ---------------------------------------------------------------------------
-
-/// The examples build is the assertion a reviewer skims past, and it has silently broken
-/// the tree twice. `--lib`, `--bins`, `--tests` AND `--doc` all exclude examples, so
-/// nothing in the test command compiles them: dropping this line costs no test results
-/// and produces no warning.
 #[test]
 fn tier_one_runs_the_suite_and_builds_the_examples() {
     let recipe = make_recipe("test");
@@ -425,8 +426,6 @@ fn tier_one_runs_the_suite_and_builds_the_examples() {
          twice. Got: {recipe}"
     );
 
-    // Same single-definition rule as the nightly: the workflow calls the target rather
-    // than repeating it, so the two assertions above describe what CI actually runs.
     let wf = unwrap_continuations(&workflow("test.yml"));
     assert!(
         wf.contains("make test"),
@@ -441,19 +440,8 @@ fn tier_one_runs_the_suite_and_builds_the_examples() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// S7 — the nightly and the aggregate cannot drift apart.
-// ---------------------------------------------------------------------------
-
-/// Two places that must agree will stop agreeing. The nightly invokes the `make` target
-/// rather than repeating its command, so `test-ignored` is the single definition and
-/// every assertion in this file applies to what CI actually runs.
 #[test]
 fn the_nightly_invokes_the_aggregate_target_rather_than_its_own_copy() {
-    // Scoped to the suite step's command, not the whole workflow. Matching file-wide let
-    // the "reproduce locally: `make test-ignored`" hint inside the auto-filed issue BODY
-    // satisfy this — the mutation harness caught it surviving the run: line being gutted
-    // to `echo`. Third instance of the same mistake in this file; hence `run_command`.
     let cmd = run_command("nightly-ignored.yml", "Tier 2 — the ignored suite");
 
     assert!(
@@ -469,15 +457,6 @@ fn the_nightly_invokes_the_aggregate_target_rather_than_its_own_copy() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// S6 — a failing nightly can actually report.
-// ---------------------------------------------------------------------------
-
-/// A scheduled job that fails into an inbox nobody opens is the same non-control #390
-/// replaces. The reporting step needs two things that are easy to lose independently:
-/// the `issues: write` permission (without it the step fails with a 403 *after* the
-/// suite has already failed, so the real failure is buried) and a `failure()` condition
-/// (without it the step never runs, because a failed job skips subsequent steps).
 #[test]
 fn a_failing_nightly_has_the_permission_and_the_condition_to_report() {
     let nightly = workflow("nightly-ignored.yml");
@@ -493,9 +472,6 @@ fn a_failing_nightly_has_the_permission_and_the_condition_to_report() {
         "nightly-ignored.yml has no `failure()`-conditioned step: by default a step after \
          a failed one is SKIPPED, so the failure would report nothing at all"
     );
-    // Scoped to the `gh issue create` invocation. Matching anywhere in the file let the
-    // `gh issue list --label bugfix` LOOKUP satisfy this — the mutation harness caught it
-    // surviving the removal of the label from the thing that actually files the issue.
     let create = flat
         .split("gh issue create")
         .nth(1)
@@ -511,14 +487,6 @@ fn a_failing_nightly_has_the_permission_and_the_condition_to_report() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// The nightly must run against `develop`, not against its own default branch.
-// ---------------------------------------------------------------------------
-
-/// `schedule:` only fires for workflow files on the DEFAULT branch, which here is `main`.
-/// So this workflow lives on `main` and has to reach over to the branch it is meant to
-/// watch. Without an explicit ref it would silently test `main` — a branch that moves
-/// once a cycle — and find rot at the release instead of the night it appeared.
 #[test]
 fn the_nightly_checks_out_develop_explicitly() {
     let flat = unwrap_continuations(&workflow("nightly-ignored.yml"));
@@ -531,12 +499,6 @@ fn the_nightly_checks_out_develop_explicitly() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Housekeeping: the guards above are keyed to files that must exist.
-// ---------------------------------------------------------------------------
-
-/// Each assertion above reads a workflow file. If one were deleted, `read` would panic
-/// with a filesystem error rather than a diagnosis — this names the actual problem.
 #[test]
 fn the_workflows_this_file_guards_still_exist() {
     for f in ["test.yml", "nightly-ignored.yml", "substrate-reclose.yml"] {
@@ -546,5 +508,376 @@ fn the_workflows_this_file_guards_still_exist() {
             "{f} is missing. #390 added it as the control that runs the test suite; \
              deleting it removes the gate and nothing else will report that."
         );
+    }
+}
+
+#[test]
+fn every_registry_resolving_job_runs_on_main_only() {
+    for file in ["substrate-reclose.yml", "go-reclose.yml"] {
+        let on = trigger_block(file);
+
+        for event in ["push:", "pull_request:"] {
+            assert!(
+                on.contains(event),
+                "{file}'s `on:` block no longer declares `{event}`. Got:\n{on}"
+            );
+        }
+
+        let filters: Vec<&str> = on
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("branches:"))
+            .collect();
+        assert_eq!(
+            filters.len(),
+            2,
+            "{file} must filter BOTH `push` and `pull_request` to a branch list; \
+             found {} `branches:` line(s). An event with no filter runs on every \
+             branch, including `develop`, where this job is red by design. Got:\n{on}",
+            filters.len(),
+        );
+        for f in &filters {
+            assert_eq!(
+                *f, "branches: [main]",
+                "{file} restricts a trigger to `{f}` rather than `branches: [main]`. \
+                 Any other branch here puts a registry-resolving job on a surface \
+                 that carries the publish gap. Got:\n{on}"
+            );
+        }
+    }
+}
+
+#[test]
+fn run_block_returns_the_whole_script_not_the_scalar_header() {
+    let ffi = run_block(
+        "substrate-reclose.yml",
+        "2/6 ffi — generate ffi, then forgedb build",
+    );
+    assert!(
+        ffi.lines().filter(|l| !l.trim().is_empty()).count() > 1,
+        "run_block returned a single line for a block-scalar step — it has \
+         degraded to `run_command`'s behaviour and every guard keyed on it is now \
+         vacuous. Got:\n{ffi}"
+    );
+    assert!(
+        ffi.contains("set -euxo pipefail"),
+        "run_block dropped the first line of the script:\n{ffi}"
+    );
+    assert!(
+        ffi.contains("./csmoke"),
+        "run_block dropped the LAST line of the script — a guard keyed on a \
+         trailing command would pass vacuously:\n{ffi}"
+    );
+
+    assert!(
+        !ffi.contains("#337: the delivered half"),
+        "run_block no longer strips comments; a guard can now be satisfied by the \
+         prose explaining it:\n{ffi}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "no step named \"a step that does not exist\"")]
+fn run_block_panics_on_a_missing_step_rather_than_widening() {
+    let _ = run_block("substrate-reclose.yml", "a step that does not exist");
+}
+
+#[test]
+#[should_panic(expected = "has no block-scalar `run: |`")]
+fn run_block_refuses_a_single_line_step_rather_than_taking_its_neighbours() {
+    let _ = run_block("substrate-reclose.yml", "Build the forgedb CLI");
+}
+
+#[test]
+fn every_reclose_job_sets_forgedb_home_outside_the_checkout() {
+    for (file, step) in [
+        (
+            "substrate-reclose.yml",
+            "Scaffold a project outside the checkout",
+        ),
+        ("go-reclose.yml", "Reclose — generate, build, link, run"),
+    ] {
+        let body = run_block(file, step);
+        assert!(
+            body.contains("export FORGEDB_HOME="),
+            "{file} / {step:?} no longer exports FORGEDB_HOME, so the cache lands \
+             in `~/.forgedb` — warm across runs, and a warm cache resolves nothing \
+             from the registry:\n{body}"
+        );
+        assert!(
+            body.contains("case \"$FORGEDB_HOME\" in") && body.contains("${GITHUB_WORKSPACE}"),
+            "{file} / {step:?} dropped the refusal that FORGEDB_HOME is not inside \
+             the checkout. Without it a cache under the workspace resolves \
+             `forgedb-*` by path and this job measures the checkout while \
+             passing:\n{body}"
+        );
+    }
+}
+
+#[test]
+fn the_bare_reclose_proves_its_cache_was_cold() {
+    let scaffold = run_block(
+        "substrate-reclose.yml",
+        "Scaffold a project outside the checkout",
+    );
+    for needle in [
+        "test ! -e \"$HOME/.forgedb\"",
+        "test ! -e \"$FORGEDB_HOME\"",
+        "test ! -e \"$FORGEDB_HOME/projects\"",
+    ] {
+        assert!(
+            scaffold.contains(needle),
+            "the reclose no longer asserts `{needle}` before generating. A warm \
+             cache masks a publish gap outright — the substrate is already \
+             resolved, so a version that no longer exists on crates.io is never \
+             looked up and the job goes green on an uninstallable \
+             branch:\n{scaffold}"
+        );
+    }
+
+    let last = run_block(
+        "substrate-reclose.yml",
+        "6/6 transform — migrate build over a real lineage",
+    );
+    assert!(
+        last.contains("test ! -e \"$HOME/.forgedb\""),
+        "the reclose's last arm no longer asserts the default cache home is still \
+         absent. Something writing there makes the next run warm, and the check \
+         then measures its own leftovers:\n{last}"
+    );
+}
+
+#[test]
+fn no_cache_action_names_the_forgedb_home() {
+    for file in ["substrate-reclose.yml", "go-reclose.yml"] {
+        let wf = workflow(file);
+
+        assert!(
+            !wf.contains("uses: actions/cache"),
+            "{file} uses `actions/cache`. This job's entire value is that it \
+             resolves from crates.io on every run; a restored cache is how it \
+             goes green while the branch is uninstallable."
+        );
+
+        for (idx, _) in wf.match_indices("uses: Swatinem/rust-cache") {
+            let tail = &wf[idx..];
+            let step = tail
+                .find("\n      - ")
+                .map(|e| &tail[..e])
+                .unwrap_or(tail);
+            for needle in [".forgedb", "FORGEDB_HOME", "forgedb-home", "cache-directories"] {
+                assert!(
+                    !step.contains(needle),
+                    "{file} hands `{needle}` to rust-cache. Restoring the ForgeDB \
+                     home makes the substrate resolve from a previous run rather \
+                     than from the registry, and the publish gap this job exists \
+                     to detect becomes invisible:\n{step}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_bare_job_asserts_an_exact_manifest_set() {
+    let body = run_block("substrate-reclose.yml", "0/6 generate all — emit every cache package");
+
+    assert!(
+        body.contains("find \"$APP\" -name Cargo.toml"),
+        "the reclose no longer enumerates the manifests under the app, so a \
+         second cargo package appearing in a user's tree would be \
+         invisible:\n{body}"
+    );
+    assert!(
+        body.contains("diff -u"),
+        "the manifest check no longer COMPARES the two sets. A `grep`/`test -f` \
+         form is a superset assertion, and a superset passes through the exact \
+         change this exists to catch — a placement default flipping on, or a new \
+         emitter nobody told CI about:\n{body}"
+    );
+    assert!(
+        body.contains("generated/rust-sdk/Cargo.toml"),
+        "the expected set no longer names the one manifest ForgeDB legitimately \
+         writes into the app (the class-A REST client crate). An empty expected \
+         set would fail always; a missing one would compare against \
+         nothing:\n{body}"
+    );
+}
+
+#[test]
+fn the_parent_workspace_job_still_does_its_work() {
+    let setup = run_block(
+        "substrate-reclose.yml",
+        "Scaffold a foreign workspace root, and an app beneath it",
+    );
+    for needle in ["[workspace]", "members = [\"consumer\"]", "sha256sum Cargo.toml"] {
+        assert!(
+            setup.contains(needle),
+            "the parent-workspace job no longer builds a foreign cargo workspace \
+             root (`{needle}` is gone). Without one it tests the same bare \
+             `mktemp -d` shape the job beside it already covers, and #330 case A \
+             is invisible again:\n{setup}"
+        );
+    }
+
+    let p1 = run_block("substrate-reclose.yml", "P1 foreign root — the cache is immune");
+    for needle in [
+        "cargo locate-project --workspace",
+        "--manifest-path $ROOT/Cargo.toml",
+        "test -f \"$ROOT/Cargo.lock\"",
+        "test -d \"$ROOT/target\"",
+    ] {
+        assert!(
+            p1.contains(needle),
+            "P1 no longer proves the cache is immune to the foreign root \
+             (`{needle}` is gone). That immunity is the epic's central claim — it \
+             is why the cache directory makes #328 mostly dissolve — and this is \
+             the only place it is checked against a real nested \
+             workspace:\n{p1}"
+        );
+    }
+
+    let p2 = run_block(
+        "substrate-reclose.yml",
+        "P2 foreign root — ForgeDB writes nothing it does not own",
+    );
+    assert!(
+        p2.contains("sha256sum Cargo.toml") && p2.contains("$ROOT_SHA"),
+        "P2 no longer COMPARES the foreign root's checksum against the one taken \
+         before `init`. A `test -f` or a `grep` here would pass on a file ForgeDB \
+         had rewritten:\n{p2}"
+    );
+    assert!(
+        p2.lines().any(|l| {
+            l.starts_with("grep ") && l.contains("members") && l.contains("consumer")
+        }),
+        "P2 no longer greps the foreign root for its `members` array. It is the \
+         specific edit #338 refuses to make, and a checksum failure alone does not \
+         say which line moved:\n{p2}"
+    );
+}
+
+#[test]
+fn the_sdk_arm_builds_rather_than_greps() {
+    let body = run_block(
+        "substrate-reclose.yml",
+        "P3 class-A output — the generated Rust SDK, adopted and built",
+    );
+
+    for needle in [
+        "forgedb-client = { path = \"../app/generated/rust-sdk\" }",
+        "cargo build -p consumer",
+        "cargo metadata --no-deps",
+        "ForgeDbClient::new(",
+        "$ROOT_SHA",
+    ] {
+        assert!(
+            body.contains(needle),
+            "the SDK arm no longer runs `{needle}`. Without it the step reads as \
+             coverage of a crate nothing compiles — `RustSdkGenerator` has only \
+             string snapshots and a parse check behind it:\n{body}"
+        );
+    }
+
+    assert!(
+        !body.contains("cd \"$APP/generated/rust-sdk\""),
+        "the SDK arm builds in place rather than by adoption. A package under a \
+         foreign workspace root that is not a member cannot build, and the fix \
+         that would make it — a `[workspace]` table in the generated package — is \
+         withdrawn (#430), because a nested one that any member path-depends on \
+         fails the entire workspace:\n{body}"
+    );
+}
+
+#[test]
+fn the_in_tree_arm_pastes_a_line_it_extracted() {
+    let body = run_block(
+        "substrate-reclose.yml",
+        "P4 in-tree — the consumer's own build graph resolves the substrate",
+    );
+
+    assert!(
+        body.contains("rust_package"),
+        "P4 no longer sets `[placement].rust_package`, so no in-tree package is \
+         emitted and the step measures the cache again:\n{body}"
+    );
+    let assign = {
+        let after = body.split_once("DEP_LINE=").unwrap_or_else(|| {
+            panic!("P4 no longer assigns DEP_LINE at all:\n{body}")
+        }).1;
+        after
+            .split_once("\ntest -n")
+            .unwrap_or_else(|| {
+                panic!("P4's DEP_LINE assignment is no longer followed by its non-empty check:\n{body}")
+            })
+            .0
+    };
+    assert!(
+        assign.contains("intree.log"),
+        "P4's DEP_LINE is not derived from the CLI's output — the assignment reads \
+         `{assign}`. The package name is derived (`<app>-core`), so a literal \
+         spelling here is wrong at the first rename, and the `package =` key is not \
+         optional: cargo matches a path dep's KEY against the package's own name."
+    );
+    assert!(
+        body.contains("test -n \"$DEP_LINE\""),
+        "P4 pastes the extracted line without asserting it is non-empty. An empty \
+         extraction makes the append a no-op; `cargo build` then succeeds having \
+         compiled nothing new, and the step reports green having proved \
+         nothing:\n{body}"
+    );
+    assert!(
+        body.contains("cargo build -p consumer"),
+        "P4 no longer builds the consumer. Emitting the package proves it was \
+         written, not that a user can compile it:\n{body}"
+    );
+    assert!(
+        body.contains("$WORK/Cargo.lock") && body.contains("crates.io-index"),
+        "P4 no longer inspects the CONSUMER's lockfile for the registry source. \
+         That resolution is the entire property — the package compiling is \
+         already covered by #338's own tier-2 tests, through a `[patch.crates-io]` \
+         that makes the registry lookup not happen:\n{body}"
+    );
+
+    assert!(
+        !body.contains("patch.crates-io"),
+        "P4 introduces a `[patch.crates-io]`. A patch table is exactly what makes \
+         a registry lookup not happen, so the step would prove only what #338's \
+         tier-2 tests already prove:\n{body}"
+    );
+}
+
+#[test]
+fn no_reclose_workflow_passes_a_tombstoned_cli_flag() {
+    let src = read("src/commands/migrate/mod.rs");
+    let re = Regex::new(r#"refuse_removed_flag\(\s*"(--[a-z0-9-]+)""#).unwrap();
+    let tombstoned: BTreeSet<String> = re
+        .captures_iter(&src)
+        .map(|c| c[1].to_string())
+        .collect();
+
+    assert!(
+        !tombstoned.is_empty(),
+        "found no `refuse_removed_flag` call sites — the parser has drifted from \
+         src/commands/migrate/mod.rs and this guard would now pass vacuously"
+    );
+
+    for file in ["substrate-reclose.yml", "go-reclose.yml"] {
+        let wf = workflow(file);
+        for line in wf.lines().map(str::trim) {
+            if !line.contains("$FORGEDB") {
+                continue;
+            }
+            for flag in &tombstoned {
+                assert!(
+                    !line.split_whitespace().any(|w| w == flag),
+                    "{file} invokes the CLI with `{flag}`, which \
+                     `refuse_removed_flag` rejects — so this step fails at run time, \
+                     and it only runs on `main`, once a cycle. That is exactly how \
+                     #374's removal sat broken in this workflow until #339 \
+                     dispatched it by hand.\nOffending line: {line}"
+                );
+            }
+        }
     }
 }

@@ -1,104 +1,117 @@
+use crate::diff::SimpleType;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Represents a change detected in a schema migration
+pub const RECORD_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Answer {
+    Constant { json: String },
+    CopyField { field: String },
+    Escape {
+        language: EscapeLanguage,
+        file: String,
+        scaffold_checksum: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EscapeLanguage {
+    Rust,
+    TypeScript,
+    Python,
+}
+
+impl EscapeLanguage {
+    pub fn extension(&self) -> &'static str {
+        match self {
+            EscapeLanguage::Rust => "rs",
+            EscapeLanguage::TypeScript => "ts",
+            EscapeLanguage::Python => "py",
+        }
+    }
+
+    pub fn transform_file(&self) -> String {
+        format!("transform.{}", self.extension())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SchemaChange {
-    /// A new model was added
     AddModel { model_name: String },
-    /// A model was removed
     RemoveModel { model_name: String },
-    /// A field was added to a model
     AddField {
         model_name: String,
         field_name: String,
-        field_type: String,
+        field_type: SimpleType,
         nullable: bool,
-        default_value: Option<String>,
+        #[serde(rename = "default_value")]
+        default_json: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answer: Option<Answer>,
     },
-    /// A field was removed from a model
     RemoveField {
         model_name: String,
         field_name: String,
     },
-    /// A field's type was changed
     ChangeFieldType {
         model_name: String,
         field_name: String,
-        old_type: String,
-        new_type: String,
+        old_type: SimpleType,
+        new_type: SimpleType,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answer: Option<Answer>,
     },
-    /// A field's nullability was changed
     ChangeFieldNullability {
         model_name: String,
         field_name: String,
         old_nullable: bool,
         new_nullable: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answer: Option<Answer>,
     },
-    /// A field was renamed
     RenameField {
         model_name: String,
         old_name: String,
         new_name: String,
     },
-    /// A model was renamed
     RenameModel { old_name: String, new_name: String },
-    /// An index was added
     AddIndex {
         model_name: String,
         field_name: String,
         index_type: String,
     },
-    /// An index was removed
     RemoveIndex {
         model_name: String,
         field_name: String,
     },
-    /// A unique constraint was added
     AddUniqueConstraint {
         model_name: String,
         field_name: String,
     },
-    /// A unique constraint was removed
     RemoveUniqueConstraint {
         model_name: String,
         field_name: String,
     },
-    /// A composite index was added
     AddCompositeIndex {
         model_name: String,
         fields: Vec<String>,
     },
-    /// A composite index was removed
     RemoveCompositeIndex {
         model_name: String,
         fields: Vec<String>,
     },
-    /// A constraint was added
     AddConstraint {
         model_name: String,
         field_name: String,
         constraint_name: String,
         constraint_params: Vec<String>,
     },
-    /// A constraint was removed
     RemoveConstraint {
         model_name: String,
         field_name: String,
         constraint_name: String,
     },
-    /// The variant list of an `enum` a stored field uses changed (#438).
-    ///
-    /// **Field-scoped on purpose.** The definition is schema-level, but the
-    /// *data* it endangers is a column, so the change is reported once per
-    /// storing field. That keeps [`target_model`](SchemaChange::target_model)
-    /// returning `&str` and keeps the authored scaffold's per-model grouping
-    /// working with no surface change.
-    ///
-    /// Carries the two **ordered lists**, never a pre-baked verdict: the
-    /// classification is derived by [`classify_positional`] and so re-derives
-    /// identically forever, which is what `HopBodyClass`'s frozen-at-`migrate
-    /// create` contract requires.
     ChangeEnumVariants {
         model_name: String,
         field_name: String,
@@ -106,11 +119,6 @@ pub enum SchemaChange {
         old_variants: Vec<String>,
         new_variants: Vec<String>,
     },
-    /// The layout of an inline `struct` a stored field uses changed (#438).
-    ///
-    /// `#[repr(C)]`, whole value transmuted into a `size_of::<T>()` slot — so
-    /// field order AND per-field width are both on disk. Carries `(name, type)`
-    /// in declaration order for the same reason as above.
     ChangeStructLayout {
         model_name: String,
         field_name: String,
@@ -120,41 +128,15 @@ pub enum SchemaChange {
     },
 }
 
-/// What happened to an **ordered, position-keyed** list of names (#438).
-///
-/// One classifier for both enum variants and struct field names, because both
-/// are stored positionally and the question "did the byte→meaning mapping move?"
-/// has exactly one right answer for either. `is_breaking`, `hop_body_class` and
-/// `description` all read this; none of them re-derives it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PositionalDelta {
-    /// The lists are identical.
     Unchanged,
-    /// Names were added and **nothing else moved or went away**, so every added
-    /// name necessarily landed at an index `>= old.len()`. Every existing byte
-    /// still decodes to what it did. The one safe edit an enum has.
     Appended { added: Vec<String> },
-    /// Exactly one name dropped and one added **at the same index**, nothing
-    /// moved. Mirrors the differ's existing single-unambiguous-rename heuristic
-    /// for fields. The slot is unchanged, but the *name* is what crosses the
-    /// transformer's JSON boundary — so this is not benign.
     Renamed { old_name: String, new_name: String },
-    /// A name that exists on both sides changed index. Every stored byte at or
-    /// past the first moved position now decodes as some other name, with no
-    /// byte out of range and therefore no failure mode at all.
     Reordered { moved: Vec<String> },
-    /// A name went away. The mapping moved *and* some stored byte may now be out
-    /// of range entirely.
     Dropped { dropped: Vec<String> },
 }
 
-/// Classify what moved in an ordered list of names (#438).
-///
-/// Precedence is deliberate and runs strictest-first once `Renamed` (a *narrower*
-/// reading of a drop+add pair) has had its chance: a removal in the middle both
-/// drops a name and moves its successors, and `Dropped` is the answer that costs
-/// the operator an authored body rather than silently promising them an automatic
-/// one.
 pub fn classify_positional(old: &[String], new: &[String]) -> PositionalDelta {
     if old == new {
         return PositionalDelta::Unchanged;
@@ -195,24 +177,12 @@ pub fn classify_positional(old: &[String], new: &[String]) -> PositionalDelta {
     PositionalDelta::Unchanged
 }
 
-/// What happened to an inline `struct`'s layout (#438).
-///
-/// A superset of [`PositionalDelta`]: a struct has one failure mode an enum does
-/// not, because its fields carry a *width* as well as a position.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LayoutDelta {
-    /// A field kept its name and position but changed type. Same-width retypes
-    /// (`i32` → `u32`) are the silent ones; different-width retypes re-frame the
-    /// column.
     Retyped { fields: Vec<String> },
-    /// Nothing was retyped; the field *names* moved (or did not).
     Names(PositionalDelta),
 }
 
-/// Classify an inline struct's layout change (#438).
-///
-/// A retype outranks a name move: it is the case the differ can prove least
-/// about, and every struct edit except a pure reorder is `Authored` anyway.
 pub fn classify_layout(old: &[(String, String)], new: &[(String, String)]) -> LayoutDelta {
     let retyped: Vec<String> = old
         .iter()
@@ -232,40 +202,13 @@ pub fn classify_layout(old: &[(String, String)], new: &[(String, String)]) -> La
     LayoutDelta::Names(classify_positional(&names(old), &names(new)))
 }
 
-/// How the transformer generator (#74 Phase 3) will produce the new-row body for
-/// a single schema change ("hop"), decided ONCE at `migrate create` time and
-/// frozen into the migration record (C8/C9).  This is a **dev-time codegen
-/// classification** — the transformer bin has no runtime mechanism-selection
-/// site; it just runs whichever body was baked in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HopBodyClass {
-    /// The differ can PROVE the new-row body from the diff alone —
-    /// **additive / constant / structural**: set a field's default, omit a
-    /// removed column, rename a field/model, or an index/constraint change that
-    /// leaves the row bytes identical.  The transformer generator emits the body
-    /// automatically; no developer authoring is required.
     Auto,
-    /// The new-row body needs **semantic understanding the diff cannot supply** —
-    /// re-encode a value whose type changed, choose a fill value when narrowing a
-    /// nullable field to NOT NULL, or supply a value for a newly-required field
-    /// with no default.  Scaffolded at `migrate create` for the developer to
-    /// author + freeze (`migrations/{id}/transform.rs`); the transformer embeds
-    /// that frozen source verbatim (C13).
     Authored,
 }
 
 impl SchemaChange {
-    /// The verdict table for an enum variant-list change (#438).
-    ///
-    /// **The one place** `ChangeEnumVariants`'s severity and hop class are
-    /// decided; `is_breaking`, `hop_body_class` and `description` all call it.
-    ///
-    /// | delta | breaking | class | why |
-    /// |---|---|---|---|
-    /// | `Appended` | no | `Auto` | every existing byte still decodes to itself; recorded only so the version moves and an older binary is told to migrate rather than panicking on an unknown byte |
-    /// | `Reordered` | **yes** | `Auto` | every stored row silently re-maps — but an enum crosses the transformer's JSON boundary as its **name**, so the existing identity hop body re-encodes it with no authoring |
-    /// | `Dropped` | **yes** | `Authored` | a row carrying the retired name has nothing to deserialize into |
-    /// | `Renamed` | **yes** | `Authored` | same reason: the old name does not deserialize |
     fn enum_verdict(old: &[String], new: &[String]) -> (bool, HopBodyClass) {
         match classify_positional(old, new) {
             PositionalDelta::Unchanged => (false, HopBodyClass::Auto),
@@ -277,57 +220,37 @@ impl SchemaChange {
         }
     }
 
-    /// The verdict table for an inline-struct layout change (#438).
-    ///
-    /// **There is no additive case for a struct.** Unlike an enum, every field's
-    /// offset is a function of the whole declaration, so the enum's one safe
-    /// edit has no struct analogue — `Appended` is breaking here.
-    ///
-    /// | delta | breaking | class |
-    /// |---|---|---|
-    /// | `Names(Reordered)` | **yes** | `Auto` (JSON transport is by field name) |
-    /// | `Retyped` / `Names(Appended)` / `Names(Dropped)` / `Names(Renamed)` | **yes** | `Authored` |
     fn struct_verdict(old: &[(String, String)], new: &[(String, String)]) -> (bool, HopBodyClass) {
         match classify_layout(old, new) {
             LayoutDelta::Names(PositionalDelta::Unchanged) => (false, HopBodyClass::Auto),
             LayoutDelta::Names(PositionalDelta::Reordered { .. }) => (true, HopBodyClass::Auto),
-            // Retyped, added, dropped, renamed: the width or the JSON key moved
-            // and the differ can prove no value for the result. Matches how
-            // `ChangeFieldType` and a required `AddField` are already classified.
             _ => (true, HopBodyClass::Authored),
         }
     }
 
-    /// Classify how this hop's new-row body is produced (#74 Phase 2, C8/C9).
-    ///
-    /// This is deliberately **distinct from [`is_breaking`](Self::is_breaking)**:
-    /// a change can be breaking yet still `Auto` (dropping a column or a model is
-    /// breaking for readers but the row transform is a pure structural omit; a
-    /// `&unique` add may fail on duplicates but the row bytes are identity —
-    /// uniqueness is *validated* during replay, not *transformed*).  Only the
-    /// residue the differ genuinely cannot PROVE a value for is `Authored`.
     pub fn hop_body_class(&self) -> HopBodyClass {
         match self {
-            // Re-encoding a value from one type to another is semantic — the
-            // differ cannot know the mapping (e.g. `u32 -> string`, `string ->
-            // enum`), so the developer authors it.
-            SchemaChange::ChangeFieldType { .. } => HopBodyClass::Authored,
-            // Narrowing nullable -> NOT NULL needs a fill value for the existing
-            // `None`s; the differ has none to offer.
+            SchemaChange::ChangeFieldType {
+                old_type, new_type, ..
+            } => {
+                if old_type.widens_to(new_type) {
+                    HopBodyClass::Auto
+                } else {
+                    HopBodyClass::Authored
+                }
+            }
             SchemaChange::ChangeFieldNullability {
                 old_nullable: true,
                 new_nullable: false,
                 ..
             } => HopBodyClass::Authored,
-            // A newly-required field with no default has no value the differ can
-            // synthesize for existing rows.
+            SchemaChange::ChangeFieldNullability { .. } => HopBodyClass::Auto,
             SchemaChange::AddField {
                 nullable: false,
-                default_value: None,
+                default_json: None,
                 ..
             } => HopBodyClass::Authored,
-            // #438: positional, so the answer depends on WHICH way the list
-            // moved. Delegated to the one classifier — never re-derived here.
+            SchemaChange::AddField { .. } => HopBodyClass::Auto,
             SchemaChange::ChangeEnumVariants {
                 old_variants,
                 new_variants,
@@ -338,17 +261,43 @@ impl SchemaChange {
                 new_fields,
                 ..
             } => Self::struct_verdict(old_fields, new_fields).1,
-            // Everything else is provable structural/constant: additive nullable/
-            // defaulted adds (backfill), removes (omit), renames (name map), and
-            // index/constraint changes (identity row body).
-            _ => HopBodyClass::Auto,
+            SchemaChange::AddModel { .. }
+            | SchemaChange::RemoveModel { .. }
+            | SchemaChange::RemoveField { .. }
+            | SchemaChange::RenameField { .. }
+            | SchemaChange::RenameModel { .. }
+            | SchemaChange::AddIndex { .. }
+            | SchemaChange::RemoveIndex { .. }
+            | SchemaChange::AddUniqueConstraint { .. }
+            | SchemaChange::RemoveUniqueConstraint { .. }
+            | SchemaChange::AddCompositeIndex { .. }
+            | SchemaChange::RemoveCompositeIndex { .. }
+            | SchemaChange::AddConstraint { .. }
+            | SchemaChange::RemoveConstraint { .. } => HopBodyClass::Auto,
         }
     }
 
-    /// The model this change targets, if it is a single-model change.  Used by the
-    /// authored-body scaffold (#74 Phase 2/3) to group `Authored` hops per model.
-    /// `RenameModel` reports its *new* name (the destination shape); `AddModel`/
-    /// `RemoveModel` report the model itself.
+    pub fn answer(&self) -> Option<&Answer> {
+        match self {
+            SchemaChange::AddField { answer, .. }
+            | SchemaChange::ChangeFieldType { answer, .. }
+            | SchemaChange::ChangeFieldNullability { answer, .. } => answer.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn set_answer(&mut self, value: Answer) -> bool {
+        match self {
+            SchemaChange::AddField { answer, .. }
+            | SchemaChange::ChangeFieldType { answer, .. }
+            | SchemaChange::ChangeFieldNullability { answer, .. } => {
+                *answer = Some(value);
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn target_model(&self) -> &str {
         match self {
             SchemaChange::AddModel { model_name }
@@ -372,7 +321,6 @@ impl SchemaChange {
         }
     }
 
-    /// Returns true if this change is considered breaking (requires manual intervention)
     pub fn is_breaking(&self) -> bool {
         match self {
             SchemaChange::RemoveModel { .. } => true,
@@ -383,17 +331,17 @@ impl SchemaChange {
                 new_nullable: false,
                 ..
             } => true,
-            // M4: Adding a NOT NULL column without a default to a populated table is
-            // breaking — existing rows have no value to fill in.
+            SchemaChange::ChangeFieldNullability { .. } => false,
             SchemaChange::AddField {
                 nullable: false,
-                default_value: None,
+                default_json: None,
                 ..
             } => true,
-            SchemaChange::RemoveUniqueConstraint { .. } => false, // Safe to remove constraints
-            SchemaChange::AddUniqueConstraint { .. } => true,     // May fail if duplicates exist
-            // #438: an append is benign at rest; every other shape re-maps
-            // stored bytes. Same classifier as `hop_body_class`.
+            SchemaChange::AddField { .. } => false,
+            SchemaChange::RenameField { .. } => true,
+            SchemaChange::RenameModel { .. } => true,
+            SchemaChange::RemoveUniqueConstraint { .. } => false,
+            SchemaChange::AddUniqueConstraint { .. } => true,
             SchemaChange::ChangeEnumVariants {
                 old_variants,
                 new_variants,
@@ -404,11 +352,16 @@ impl SchemaChange {
                 new_fields,
                 ..
             } => Self::struct_verdict(old_fields, new_fields).0,
-            _ => false,
+            SchemaChange::AddModel { .. }
+            | SchemaChange::AddIndex { .. }
+            | SchemaChange::RemoveIndex { .. }
+            | SchemaChange::AddCompositeIndex { .. }
+            | SchemaChange::RemoveCompositeIndex { .. }
+            | SchemaChange::AddConstraint { .. }
+            | SchemaChange::RemoveConstraint { .. } => false,
         }
     }
 
-    /// Returns a human-readable description of the change
     pub fn description(&self) -> String {
         match self {
             SchemaChange::AddModel { model_name } => {
@@ -444,6 +397,7 @@ impl SchemaChange {
                 field_name,
                 old_type,
                 new_type,
+                ..
             } => {
                 format!(
                     "Change type of '{}.{}' from {} to {} (⚠️  BREAKING)",
@@ -455,6 +409,7 @@ impl SchemaChange {
                 field_name,
                 old_nullable: _,
                 new_nullable,
+                ..
             } => {
                 let change = if *new_nullable {
                     "nullable"
@@ -553,10 +508,6 @@ impl SchemaChange {
                     constraint_name, model_name, field_name
                 )
             }
-            // #438. The description names the *stored* consequence, not the
-            // edit: "reorder" reads as a formatting change, and the operator's
-            // whole decision hangs on knowing that every already-written row
-            // re-maps.
             SchemaChange::ChangeEnumVariants {
                 model_name,
                 field_name,
@@ -629,94 +580,85 @@ impl SchemaChange {
         }
     }
 
-    /// The shared breaking marker the descriptions above append.
     fn breaking_marker(breaking: bool) -> &'static str {
         if breaking { " (⚠️  BREAKING)" } else { "" }
     }
 }
 
-/// Represents a migration file
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Migration {
-    /// Unique identifier (timestamp-based)
     pub id: String,
-    /// Human-readable description
     pub description: String,
-    /// Creation timestamp
     pub created_at: DateTime<Utc>,
-    /// List of changes in this migration
     pub changes: Vec<SchemaChange>,
-    /// Checksum of the migration file for integrity
     pub checksum: String,
-    /// On-disk schema serial this migration expects BEFORE it runs (#74
-    /// Phase 2 — the serial version interlock).  `0` for a legacy record written
-    /// before versioning existed; a real lineage is contiguous (`to_version` of
-    /// one migration == `from_version` of the next).
     #[serde(default)]
     pub from_version: u32,
-    /// On-disk schema serial this migration stamps AFTER it runs.  The current
-    /// expected version of the whole database is the highest `to_version` in the
-    /// lineage (see [`MigrationLineage`](crate::MigrationLineage)); that is what
-    /// codegen bakes into `EXPECTED_SCHEMA_VERSION` (red line #8 — lineage-sourced,
-    /// never hand-edited).
     #[serde(default)]
     pub to_version: u32,
+    #[serde(default, skip_serializing_if = "is_legacy_record_version")]
+    pub record_version: u32,
 }
 
-/// What a build can say about a migration file's stored checksum (#366).
+fn is_legacy_record_version(v: &u32) -> bool {
+    *v == 0
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChecksumStatus {
-    /// Recomputed and matched.
     Verified,
-    /// Recomputed and did NOT match — the file changed after it was written. The only
-    /// one of these four that means what the old error message said.
     Mismatch,
-    /// Written before #366, by a `DefaultHasher` value that is meaningless outside the
-    /// compiler that produced it. Nothing can check it, and nothing is wrong with it.
     Unverifiable,
-    /// Tagged with a digest this build does not know — written by a NEWER forgedb.
     UnknownAlgorithm(String),
 }
 
 impl Migration {
-    /// Create a new migration (version fields defaulted to `0` — used by callers
-    /// that do not track the lineage, and by the crate's own unit tests).
     pub fn new(description: String, changes: Vec<SchemaChange>) -> Self {
         Self::new_versioned(description, changes, 0, 0)
     }
 
-    /// Create a new migration stamped with its serial version interlock (#74
-    /// Phase 2).  `from_version`/`to_version` come from the committed lineage at
-    /// `migrate create` time; the checksum covers them like every other field.
     pub fn new_versioned(
         description: String,
         changes: Vec<SchemaChange>,
         from_version: u32,
         to_version: u32,
     ) -> Self {
-        let now = Utc::now();
-        let id = format!("{}", now.format("%Y%m%d%H%M%S"));
+        Self::with_id(Self::next_id(), description, changes, from_version, to_version)
+    }
 
+    pub fn next_id() -> String {
+        format!("{}", Utc::now().format("%Y%m%d%H%M%S"))
+    }
+
+    pub fn with_id(
+        id: String,
+        description: String,
+        changes: Vec<SchemaChange>,
+        from_version: u32,
+        to_version: u32,
+    ) -> Self {
         let mut migration = Migration {
-            id: id.clone(),
+            id,
             description,
-            created_at: now,
+            created_at: Utc::now(),
             changes,
             checksum: String::new(),
             from_version,
             to_version,
+            record_version: RECORD_VERSION,
         };
 
-        // Calculate checksum
         migration.checksum = migration.calculate_checksum();
         migration
     }
 
-    /// Classify each change's hop body (#74 Phase 2).  A migration is "fully
-    /// automatic" when every hop is [`HopBodyClass::Auto`]; any [`Authored`]
-    /// residue must be authored + frozen before the transformer can be generated.
-    ///
-    /// [`Authored`]: HopBodyClass::Authored
+    pub fn unanswered(&self) -> Vec<&SchemaChange> {
+        self.changes
+            .iter()
+            .filter(|c| c.hop_body_class() == HopBodyClass::Authored && c.answer().is_none())
+            .collect()
+    }
+
     pub fn authored_changes(&self) -> Vec<&SchemaChange> {
         self.changes
             .iter()
@@ -724,7 +666,6 @@ impl Migration {
             .collect()
     }
 
-    /// Calculate checksum for migration integrity
     fn calculate_checksum(&self) -> String {
         let mut temp = self.clone();
         temp.checksum = String::new();
@@ -732,28 +673,13 @@ impl Migration {
         checksum::compute(json.as_bytes())
     }
 
-    /// Verify migration integrity.
-    ///
-    /// Returns `true` for a file this build cannot verify as well as for one it verifies
-    /// successfully — see [`Migration::checksum_status`] for the distinction, which the
-    /// loader reports and this bool deliberately flattens for existing callers.
     pub fn verify_checksum(&self) -> bool {
-        // Verified and Unverifiable both load; Mismatch and UnknownAlgorithm do not.
-        // Written as a POSITIVE list on purpose: the negative form (`!= Mismatch`) let
-        // UnknownAlgorithm through here while the loader rejected it, so the bool and
-        // the loader disagreed about the same file. A new variant must now be classified
-        // deliberately rather than defaulting to "fine".
         matches!(
             self.checksum_status(),
             ChecksumStatus::Verified | ChecksumStatus::Unverifiable
         )
     }
 
-    /// What this build can actually say about the stored checksum (#366).
-    ///
-    /// Three answers, not two. Collapsing them is what made the old failure mode so
-    /// misleading: an unverifiable file and a modified file are not the same event, and
-    /// only one of them is the user's problem.
     pub fn checksum_status(&self) -> ChecksumStatus {
         match checksum::classify(&self.checksum) {
             checksum::Kind::Current => {
@@ -768,7 +694,6 @@ impl Migration {
         }
     }
 
-    /// Get the filename for this migration
     pub fn filename(&self) -> String {
         let safe_desc = self
             .description
@@ -780,23 +705,19 @@ impl Migration {
         format!("{}_{}.json", self.id, safe_desc)
     }
 
-    /// Check if migration has breaking changes
     pub fn has_breaking_changes(&self) -> bool {
         self.changes.iter().any(|c| c.is_breaking())
     }
 
-    /// Get list of breaking changes
     pub fn breaking_changes(&self) -> Vec<&SchemaChange> {
         self.changes.iter().filter(|c| c.is_breaking()).collect()
     }
 
-    /// Get list of safe changes
     pub fn safe_changes(&self) -> Vec<&SchemaChange> {
         self.changes.iter().filter(|c| !c.is_breaking()).collect()
     }
 }
 
-/// Migration status tracking
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MigrationRecord {
     pub migration_id: String,
@@ -804,7 +725,6 @@ pub struct MigrationRecord {
     pub checksum: String,
 }
 
-/// Migration state file
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MigrationState {
     pub applied_migrations: Vec<MigrationRecord>,
@@ -819,14 +739,12 @@ impl Default for MigrationState {
 }
 
 impl MigrationState {
-    /// Check if a migration has been applied
     pub fn is_applied(&self, migration_id: &str) -> bool {
         self.applied_migrations
             .iter()
             .any(|r| r.migration_id == migration_id)
     }
 
-    /// Add a migration record
     pub fn add_migration(&mut self, migration_id: String, checksum: String) {
         self.applied_migrations.push(MigrationRecord {
             migration_id,
@@ -835,67 +753,21 @@ impl MigrationState {
         });
     }
 
-    /// Remove the last migration record (for rollback)
     pub fn remove_last_migration(&mut self) -> Option<MigrationRecord> {
         self.applied_migrations.pop()
     }
 
-    /// Get the last applied migration
     pub fn last_migration(&self) -> Option<&MigrationRecord> {
         self.applied_migrations.last()
     }
 }
 
-/// The migration-file checksum: a **specified** digest, tagged with its own name.
-///
-/// ## What was here before
-///
-/// A module called `md5` that was not MD5. It wrapped `DefaultHasher`, whose algorithm
-/// std explicitly does not guarantee across releases — and the value it produced is
-/// written into the migration JSON and verified on load. So the checksum was only
-/// meaningful to the exact compiler that computed it.
-///
-/// `cargo install forgedb` builds with whatever toolchain the user has;
-/// `rust-toolchain.toml` pins this repo's builds and does not reach an installed user. A
-/// rustup upgrade, or two developers on one repo, was enough to make every committed
-/// migration file fail to load — reported as
-/// `"file may be corrupted"`, which sends you to look for disk damage, the one thing that
-/// did not happen (#366).
-///
-/// The name is part of the defect, not incidental to it: a thing called `md5` that is not
-/// MD5 is how this survived review.
-///
-/// ## Why FNV-1a and not SHA-2
-///
-/// This detects accidental edits to a file the user committed. It is not an adversarial
-/// integrity boundary — anyone who can rewrite the migration can rewrite the checksum
-/// beside it, whatever the algorithm. Priced against the shipped graph, `sha2` is +7
-/// crates and `twox-hash` +1, against +0 for a specified constant-driven loop.
-///
-/// ## Why this is NOT shared with `cache::member_hash`
-///
-/// `src/cache.rs` also implements FNV-1a, and deliberately keeps its own copy. Two
-/// reasons, and the first is structural: `crates/migrations` cannot depend on the root
-/// crate, which depends on it. The second is that they are the same *algorithm* serving
-/// unrelated *contracts* — one keys build-cache directories, this one detects edits to a
-/// user's committed file. Sharing them would couple two stability guarantees that have no
-/// reason to move together, and each is pinned by its own golden vectors.
 pub mod checksum {
-    /// The tag written into every checksum this module produces.
-    ///
-    /// Load-bearing: it is what lets a reader tell "hashed by a version that predates
-    /// #366" from "this file was edited". Without it, fixing the algorithm would make
-    /// every existing migration file fail with the same misleading corruption error the
-    /// fix exists to remove — the fix would detonate exactly the artifact it protects.
     pub const TAG: &str = "fnv1a64";
 
     const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x100_0000_01b3;
 
-    /// FNV-1a (64-bit), rendered as 16 lowercase hex digits behind the tag.
-    ///
-    /// Specified here in full rather than delegated, because the whole point is that the
-    /// bytes do not move when something else does.
     pub fn compute(data: &[u8]) -> String {
         let mut hash = FNV_OFFSET_BASIS;
         for byte in data {
@@ -905,17 +777,10 @@ pub mod checksum {
         format!("{TAG}:{hash:016x}")
     }
 
-    /// How a stored checksum relates to what this version can compute.
     #[derive(Debug, PartialEq, Eq)]
     pub enum Kind<'a> {
-        /// Written by this algorithm — comparable.
         Current,
-        /// No tag at all: written before #366, by a `DefaultHasher` value that is
-        /// meaningless outside the compiler that produced it. Unverifiable, not wrong.
         Legacy,
-        /// Tagged with something this build does not know — written by a NEWER forgedb.
-        /// Distinct from `Legacy` on purpose: downgrading is a real situation and
-        /// silently accepting an unknown digest would be the wrong answer.
         Unknown(&'a str),
     }
 

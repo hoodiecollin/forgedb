@@ -1,21 +1,11 @@
-/**
- * The docs navigation tree — the single source of truth for the sidebar,
- * prev/next paging, and the search index. Each `href` must have a matching MDX
- * file at `content/docs/<slug>.mdx` (the `scripts/build-search-index.ts` link
- * check enforces this at build time). Order here is the order shown in the
- * sidebar.
- */
-
 export interface NavItem {
   title: string;
   href: string;
 }
-
 export interface NavGroup {
   title: string;
   items: NavItem[];
 }
-
 export const docsNav: NavGroup[] = [
   {
     title: "Introduction",
@@ -97,11 +87,7 @@ export const docsNav: NavGroup[] = [
     ],
   },
 ];
-
-/** Flat, ordered list of every docs page — drives search + prev/next. */
 export const flatDocs: NavItem[] = docsNav.flatMap((g) => g.items);
-
-/** Map an href to its {group, title, prev, next} for page chrome. */
 export function docMeta(href: string) {
   const normalized = href.endsWith("/") ? href : `${href}/`;
   const idx = flatDocs.findIndex((i) => i.href === normalized);

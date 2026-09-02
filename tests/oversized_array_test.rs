@@ -1,64 +1,10 @@
-//! Oversized arrays (#243): generated code must compile and round-trip for every
-//! array shape wider than serde's built-in `[T; N]` ceiling of N = 32.
-//!
-//! # What was broken
-//!
-//! serde implements `Serialize`/`Deserialize` for arrays only up to N = 32. Generated
-//! model and inline-struct types carry `#[derive(Serialize, Deserialize)]`, so a
-//! single field past that width made the derive fail to resolve and the **entire**
-//! generated crate failed to compile.
-//!
-//! The issue that found it (#243) framed it as an *index* problem, because that is
-//! where it first surfaced — the pre-#230 index key ran the field through
-//! `serde_json::to_value`. That framing was too narrow in both directions:
-//!
-//! * #230 removed the index key's dependency on `Serialize`, but did **not** fix
-//!   this — the derive on the struct is a separate use.
-//! * A plain, unindexed field breaks it just the same, so "un-indexed `char(64)` was
-//!   fine" was never true.
-//!
-//! # The shapes
-//!
-//! Nested fixed arrays do not parse (`[[u32; 4]; 3]` is rejected at the type
-//! position), so a fixed array's element is always a scalar, a `bytes(N)`, or a
-//! struct. That bounds the surface to exactly three shapes, each with its own
-//! emitted helper:
-//!
-//! | schema | Rust | helper |
-//! |---|---|---|
-//! | `bytes(N)`, N > 32 | `[u8; N]` | `__forgedb_big_bytes` |
-//! | `[T; M]`, M > 32 | `[T; M]` | `__forgedb_big_array` |
-//! | `[bytes(N); M]`, N > 32 | `[[u8; N]; M]` | `__forgedb_big_bytes::array` |
-//!
-//! Each appears here in a model field, and the first two also in an inline struct —
-//! `generate_struct` is a second field-emission site, not a variant of the first, and
-//! it broke independently.
-//!
-//! # Why this test compiles a crate
-//!
-//! `crates/codegen` snapshot tests compare generated code as *strings*. A string
-//! assertion cannot tell you the output compiles, and compiling is the whole claim
-//! here. The string-level half — which fields get the attribute and, just as
-//! importantly, which do not — is pinned by
-//! `test_rust_generation_oversized_bytes_serde` in `crates/codegen/tests/`.
-//!
-//! It compiles a generated crate, so it is `#[ignore]`d out of the fast hermetic
-//! default suite. Run it explicitly:
-//!
-//! ```bash
-//! make oversized-array-test      # or:
-//! cargo test --test oversized_array_test -- --ignored --nocapture
-//! ```
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Repo root — `CARGO_MANIFEST_DIR` is the crate this test compiles under.
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Path dep line for a workspace substrate crate.
 fn dep(name: &str, crate_dir: &str) -> String {
     let path = repo_root().join("crates").join(crate_dir);
     format!("{name} = {{ path = {:?} }}\n", path.to_string_lossy())
@@ -71,8 +17,6 @@ fn write(path: &Path, contents: &str) {
     std::fs::write(path, contents).unwrap();
 }
 
-/// Every oversized shape, each paired with an under-ceiling twin so the boundary
-/// itself is exercised rather than just the far side of it.
 const SCHEMA: &str = r#"struct Fp {
   digest: bytes(64)
   small: bytes(8)
@@ -111,10 +55,6 @@ fn oversized_arrays_compile_and_round_trip() {
             "generate", "rust", "--output", "src", "--schema", "schema.forge",
         ])
         .current_dir(&proj)
-        // #333: `generate` claims this project id in the ledger under the
-        // ForgeDB home. Without an override that is the developer's real
-        // `~/.forgedb`, so two fixtures sharing a project name collide across
-        // unrelated test runs — and the suite writes outside the tempdir.
         .env("FORGEDB_HOME", proj.join(".forgedb-home"))
         .status()
         .expect("run forgedb generate");
@@ -150,8 +90,6 @@ fn oversized_arrays_compile_and_round_trip() {
         .env("CARGO_TARGET_DIR", &target)
         .status()
         .expect("run cargo build");
-    // Reaching a successful build IS the primary assertion: before #243 this failed
-    // with a wall of `the trait bound [u8; 64]: Serialize is not satisfied`.
     assert!(
         build.success(),
         "the generated crate must compile with oversized array fields"
@@ -171,9 +109,6 @@ fn oversized_arrays_compile_and_round_trip() {
     let _ = std::fs::remove_dir_all(&proj);
 }
 
-/// The driver: shape, round-trip, and length rejection. Length rejection is the half
-/// a hand-written array impl most often gets wrong — silently padding a short input
-/// with zeros would corrupt a digest rather than reject it.
 const DRIVER: &str = r##"mod database;
 use database::*;
 use forgedb_types::Uuid;
@@ -212,10 +147,6 @@ fn main() {
     let d = sample();
     let js = serde_json::to_value(&d).expect("serialize");
 
-    // --- shape: continuous across the ceiling ------------------------------
-    // A field's wire form must not change at N = 32. `boundary`/`few`/`small` use
-    // serde's own impl and `past`/`many`/`plain` use the generated one; if the two
-    // disagreed, the boundary is where a client would see it.
     for (key, len) in [
         ("plain", 64usize), ("past", 33), ("boundary", 32),
         ("many", 40), ("few", 4), ("many_uuid", 33),
@@ -226,11 +157,9 @@ fn main() {
     check("arr_big is 2 arrays of 64", js["arr_big"].as_array().map(|a| a.len()) == Some(2)
         && js["arr_big"][0].as_array().map(|a| a.len()) == Some(64));
     check("arr_small is 2 arrays of 8", js["arr_small"][0].as_array().map(|a| a.len()) == Some(8));
-    // The inline struct: a second emission site that broke independently.
     check("struct field digest is 64", js["fp"]["digest"].as_array().map(|a| a.len()) == Some(64));
     check("struct field wide is 40", js["fp"]["wide"].as_array().map(|a| a.len()) == Some(40));
 
-    // --- round-trip --------------------------------------------------------
     let back: Doc = serde_json::from_value(js.clone()).expect("deserialize");
     check("plain round-trips", back.plain == d.plain);
     check("past round-trips", back.past == d.past);
@@ -241,13 +170,11 @@ fn main() {
     check("many round-trips", back.many == d.many);
     check("many_uuid round-trips", back.many_uuid == d.many_uuid);
 
-    // --- nullable ----------------------------------------------------------
     let mut null_js = js.clone();
     null_js["opt_hash"] = serde_json::Value::Null;
     let n: Doc = serde_json::from_value(null_js).expect("deserialize null");
     check("an oversized nullable reads null as None", n.opt_hash.is_none());
 
-    // --- length rejection --------------------------------------------------
     for (key, bad) in [
         ("plain", serde_json::json!([1, 2, 3])),
         ("many", serde_json::json!([1, 2, 3])),

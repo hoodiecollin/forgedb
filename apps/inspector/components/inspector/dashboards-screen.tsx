@@ -1,12 +1,5 @@
 "use client";
 
-/**
- * Dashboards — tiles backed by saved Console queries, live tails, and at-rest
- * health. An inspector-level construct (it composes generated queries
- * client-side), not a ForgeDB engine feature — badges mark LIVE vs AT-REST vs
- * BACKUP sources.
- */
-
 import { useAtomValue, useSetAtom } from "jotai";
 import { toast } from "sonner";
 import { RefreshCw } from "lucide-react";
@@ -19,16 +12,13 @@ import {
 import { POST_STATUS, SNAPS } from "@/lib/inspector/mock";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-
 const tagColor = (k: string) =>
   k === "Added" ? "bg-ok" : k === "Updated" ? "bg-info" : "bg-danger";
-
 export function DashboardsScreen() {
   const stream = useAtomValue(streamAtom);
   const models = useAtomValue(modelsAtom);
   const setScreen = useSetAtom(screenAtom);
   const setConsoleTab = useSetAtom(consoleTabAtom);
-
   const goQuery = () => {
     setScreen("console");
     setConsoleTab("q1");
@@ -39,7 +29,6 @@ export function DashboardsScreen() {
     setConsoleTab("live");
     toast("Editing live tail");
   };
-
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex flex-none items-center gap-2.5 border-b border-border px-5 py-3.5">
@@ -56,9 +45,8 @@ export function DashboardsScreen() {
           + Add widget
         </Button>
       </div>
-
       <div className="grid min-h-0 flex-1 grid-cols-[repeat(auto-fill,minmax(300px,1fr))] content-start gap-4 overflow-auto p-5">
-        {/* active users metric */}
+        { }
         <Tile>
           <TileHead title="Active users · 30d" badge="LIVE" tone="ok" />
           <div className="my-1 text-[38px] leading-none font-bold">342</div>
@@ -67,8 +55,7 @@ export function DashboardsScreen() {
           </div>
           <EditLink onClick={goQuery} label="Edit query →" />
         </Tile>
-
-        {/* live comments tile */}
+        { }
         <Tile>
           <div className="flex items-center gap-2">
             <span className="size-1.5 animate-pulse rounded-full bg-ok" />
@@ -91,8 +78,7 @@ export function DashboardsScreen() {
           </div>
           <EditLink onClick={goLive} label="Edit live tail →" />
         </Tile>
-
-        {/* dead-row ratio health */}
+        { }
         <Tile>
           <TileHead title="Dead-row ratio" badge="AT-REST" tone="muted" />
           <div className="flex flex-col gap-2">
@@ -123,8 +109,7 @@ export function DashboardsScreen() {
             })}
           </div>
         </Tile>
-
-        {/* posts by status */}
+        { }
         <Tile>
           <TileHead title="Posts by status" badge="LIVE" tone="ok" />
           <div className="flex flex-col gap-2">
@@ -152,8 +137,7 @@ export function DashboardsScreen() {
             ))}
           </div>
         </Tile>
-
-        {/* total storage */}
+        { }
         <Tile>
           <TileHead title="Total storage" badge="AT-REST" tone="muted" />
           <div className="my-1 text-[38px] leading-none font-bold">
@@ -164,8 +148,7 @@ export function DashboardsScreen() {
           </div>
           <EditLink onClick={() => setScreen("atlas")} label="Open storage health →" />
         </Tile>
-
-        {/* snapshots */}
+        { }
         <Tile>
           <TileHead title="Recent snapshots" badge="BACKUP" tone="info" />
           {SNAPS.map((sn) => (
@@ -195,7 +178,6 @@ export function DashboardsScreen() {
     </div>
   );
 }
-
 function Tile({ children }: { children: React.ReactNode }) {
   return (
     <div className="flex flex-col gap-2 rounded-xl border border-border bg-card p-4">
@@ -203,7 +185,6 @@ function Tile({ children }: { children: React.ReactNode }) {
     </div>
   );
 }
-
 function TileHead({
   title,
   badge,
@@ -233,7 +214,6 @@ function TileHead({
     </div>
   );
 }
-
 function EditLink({ onClick, label }: { onClick: () => void; label: string }) {
   return (
     <button

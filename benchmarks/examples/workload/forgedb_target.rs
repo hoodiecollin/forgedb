@@ -1,36 +1,16 @@
-//! ForgeDB [`WorkloadTarget`], over the 22-column `Metric` model.
-//!
-//! `Metric` is deliberately the subject: every column is fixed-width, so a scan here
-//! exercises `FixedColumn::export` and nothing else. Running the same workload against
-//! a model carrying a `String` would additionally drag `VariableColumn::gather_buffered`
-//! through it, and the two costs would arrive summed and inseparable.
-//!
-//! Writes go through the storage-level `insert`/`update`/`delete` rather than the
-//! `Database::create_metric` wrappers: `Metric` has no relations, so the wrappers add
-//! only FK/cascade checks that would be pure no-op overhead here, and the point is to
-//! measure the storage path.
-
 use forgedb_benchmarks::forgedb_generated::{Database, Metric};
 use forgedb_benchmarks::ts_from_seconds;
 use uuid::Uuid;
 
 use crate::driver::{dir_size, OpOutcome, ScanKind, UpdateWidth, WorkloadTarget};
 
-/// Stable uuid for a workload key. Kind tag 4 keeps these from colliding with the
-/// shared corpus's user/post/tag ids (1/2/3).
 pub fn metric_id(key: u64) -> Uuid {
     Uuid::from_u128((4u128 << 96) | key as u128)
 }
 
 pub struct ForgeTarget {
-    /// `Option` purely so `reopen` can drop the live handle before reopening: the data
-    /// dir is under an exclusive `DirLock` (#89 single-writer-per-process), so opening
-    /// a second handle without dropping the first would panic rather than measure.
     db: Option<Database>,
     dir: tempfile::TempDir,
-    /// Bumped on every write so each update produces genuinely different bytes.
-    /// Without this, an engine could in principle detect an unchanged row and skip
-    /// the write, and the churn workload would quietly stop churning.
     generation: u64,
 }
 
@@ -50,8 +30,6 @@ impl ForgeTarget {
     }
 
     fn row(&self, key: u64, g: u64) -> Metric {
-        // Every field is a pure function of (key, generation): reproducible across
-        // runs and identical to what the SQLite/redb targets store.
         let m = key.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ g.wrapping_mul(0xBF58_476D_1CE4_E5B9);
         Metric {
             id: metric_id(key),
@@ -104,10 +82,6 @@ impl WorkloadTarget for ForgeTarget {
     fn update(&mut self, key: u64, width: UpdateWidth) -> OpOutcome {
         self.generation += 1;
         let id = metric_id(key);
-        // `update` requires the full record either way — ForgeDB writes the whole row
-        // regardless of what changed. OneField vs AllFields therefore differ in the
-        // *bytes that actually differ*, not in what gets written; that asymmetry IS
-        // the finding this axis exists to quantify.
         let rec = match width {
             UpdateWidth::AllFields => self.row(key, self.generation),
             UpdateWidth::OneField => match self.db().metric.get(id) {
@@ -134,13 +108,7 @@ impl WorkloadTarget for ForgeTarget {
 
     fn scan(&mut self, kind: ScanKind, limit: usize) -> OpOutcome {
         let n = match kind {
-            // Declared `@projection(hot: cpu_pct, mem_pct)` → column-pruned buffered
-            // scan → `FixedColumn::export`.
             ScanKind::Projection => self.db().metric.all_hot().len(),
-            // Internal narrow scan: id + every filterable/sortable column. A SCOPE
-            // since #228 (`__with_scan`) — the per-row refs are still built eagerly
-            // from the bulk-loaded column buffers, so this is the same decode the
-            // owned `__scan_all()` used to measure, minus the row materialization.
             ScanKind::Narrow => self
                 .db()
                 .metric
@@ -167,12 +135,9 @@ impl WorkloadTarget for ForgeTarget {
     }
 
     fn reopen(&mut self) -> Option<std::time::Duration> {
-        // Flush first, so what is measured is the open path rather than leftover WAL
-        // replay from an unclean shutdown — those are different costs and conflating
-        // them would overstate the reopen number.
         self.db_mut().checkpoint();
         let root = self.dir.path().to_path_buf();
-        drop(self.db.take()); // releases the DirLock
+        drop(self.db.take());
         let t = std::time::Instant::now();
         let db = Database::open_at(root);
         let elapsed = t.elapsed();

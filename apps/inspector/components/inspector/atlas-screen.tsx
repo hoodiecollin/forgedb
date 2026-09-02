@@ -1,12 +1,5 @@
 "use client";
 
-/**
- * Atlas — the schema as a navigable map. Two lenses make the brief's biggest
- * split a top-level control: Structure (reads files at rest) vs Live (typed data
- * over the running API). The graph is hand-placed SVG for now; the real
- * force/DAG layout lands via #67 (@xyflow/react + @dagrejs/dagre).
- */
-
 import { useAtom, useAtomValue, useSetAtom } from "jotai";
 import { Boxes, Activity } from "lucide-react";
 import {
@@ -25,10 +18,8 @@ import { Button } from "@/components/ui/button";
 import { NotAttached } from "./not-attached";
 import { RelationGraph } from "./relation-graph";
 import { cn } from "@/lib/utils";
-
 const relColor = (k: string) =>
   k === "m2m" ? "text-info border-info/50" : k === "hm" ? "text-ok border-ok/50" : "text-muted-foreground border-border";
-
 export function AtlasScreen() {
   const [lens, setLens] = useAtom(lensAtom);
   const [selModel, setSelModel] = useAtom(selModelAtom);
@@ -38,15 +29,11 @@ export function AtlasScreen() {
   const source = useAtomValue(projectSourceAtom);
   const browse = useSetAtom(browseModelAtom);
   const setScreen = useSetAtom(screenAtom);
-
   const sel = models.find((m) => m.key === selModel) ?? models[0];
   const structure = lens === "structure";
-  // The hand-composed SVG edges match the mock blog schema exactly; for a real
-  // loaded project they'd be wrong, so they show only for the mock. Real relation
-  // edges arrive with the graph lib (#67).
+
   const showMockEdges = source === "mock";
   const relCount = models.reduce((n, m) => n + (rel[m.key]?.length ?? 0), 0);
-
   if (!sel) {
     return (
       <div className="flex h-full items-center justify-center p-8">
@@ -57,11 +44,10 @@ export function AtlasScreen() {
       </div>
     );
   }
-
   return (
     <div className="flex h-full min-h-0">
       <div className="flex min-w-0 flex-1 flex-col">
-        {/* lens toolbar */}
+        { }
         <div className="flex flex-none items-center gap-3 border-b border-border px-4 py-2.5">
           <div className="flex items-center gap-0.5 rounded-[9px] border border-border bg-muted p-0.5">
             <LensButton active={structure} onClick={() => setLens("structure")} icon={Boxes} label="Structure · at rest" />
@@ -78,8 +64,7 @@ export function AtlasScreen() {
             </span>
           </div>
         </div>
-
-        {/* graph canvas — real DAG layout (#70): @xyflow/react + @dagrejs/dagre */}
+        { }
         <div className="min-h-0 flex-1">
           <RelationGraph
             models={models}
@@ -89,8 +74,7 @@ export function AtlasScreen() {
             onOpen={(key) => browse({ model: key })}
           />
         </div>
-
-        {/* health strip */}
+        { }
         {showMockEdges ? (
           <div className="flex flex-none items-center gap-4 border-t border-border px-4 py-2 font-mono text-[12px] text-muted-foreground">
             <span className="flex items-center gap-1.5 text-ok">
@@ -109,8 +93,7 @@ export function AtlasScreen() {
           <ProjectHealthStrip models={models} />
         )}
       </div>
-
-      {/* inspector aside */}
+      { }
       <aside className="flex w-[330px] flex-none flex-col border-l border-border bg-card/40">
         <div className="flex-none border-b border-border p-4">
           <div className="flex items-center gap-2">
@@ -126,7 +109,6 @@ export function AtlasScreen() {
             {structure ? "Structure lens · at rest" : "Live lens · attached"}
           </div>
         </div>
-
         <div className="min-h-0 flex-1 overflow-auto p-4">
           {structure ? (
             <StructurePane sel={sel} onBrowse={() => browse({ model: sel.key })} />
@@ -148,7 +130,6 @@ export function AtlasScreen() {
     </div>
   );
 }
-
 function StructurePane({
   sel,
   onBrowse,
@@ -183,7 +164,6 @@ function StructurePane({
           </div>
         ))}
       </div>
-
       <div className="mt-4 mb-2 text-[11px] uppercase tracking-wider text-muted-foreground">
         Storage · at rest
       </div>
@@ -205,7 +185,6 @@ function StructurePane({
         </div>
         <Row k="compaction reclaims" v={`${sel.reclaim} rows`} />
       </div>
-
       <div className="mt-4 flex gap-2">
         <Button variant="outline" size="sm">
           Raw column dump
@@ -217,7 +196,6 @@ function StructurePane({
     </div>
   );
 }
-
 function LivePane({
   sel,
   onBrowse,
@@ -280,8 +258,6 @@ function LivePane({
     </div>
   );
 }
-
-/** Real at-rest health summary computed from the loaded project's models. */
 function ProjectHealthStrip({ models }: { models: Model[] }) {
   const withStats = models.filter((m) => m.rows !== "—");
   const totalMB = withStats.reduce((s, m) => s + (parseFloat(m.dataMB) || 0), 0);
@@ -311,7 +287,6 @@ function ProjectHealthStrip({ models }: { models: Model[] }) {
     </div>
   );
 }
-
 function Row({ k, v }: { k: string; v: string }) {
   return (
     <div className="flex justify-between">
@@ -320,7 +295,6 @@ function Row({ k, v }: { k: string; v: string }) {
     </div>
   );
 }
-
 function LensButton({
   active,
   onClick,

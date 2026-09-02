@@ -1,23 +1,3 @@
-//! #337 — artifact delivery, load-time verification, and per-target destinations.
-//!
-//! Scenarios 7–22 of the gate 2 plan (#353).
-//!
-//! **Tier 1** (default `cargo test`) is everything that compiles nothing: the
-//! consumer-facing text, the structural properties of the delivery table, and a
-//! pure classifier over captured tool output.
-//!
-//! **Tier 2** (`#[ignore]`, `make test-ignored`, nightly) compiles a release
-//! cargo workspace and then *runs* the artifact. Those cases exist because a
-//! snapshot pass, a `cargo check` and a `cargo build` each miss a different
-//! failure: a `mod fingerprint;` naming a file the writer forgot is
-//! snapshot-clean and fails to compile, and a `PyInit_` stem mismatch is
-//! compile-clean and fails at import.
-//!
-//! **A missing runtime is a FAILURE here, not a skip.** `#388` set that
-//! precedent for `go`, and the reasoning carries: a guard that skips reports
-//! green having evaluated nothing, which is strictly worse than red because
-//! nobody investigates it.
-
 mod common;
 
 use common::{linked_libraries, load_commands};
@@ -51,7 +31,7 @@ fn write(path: &Path, body: &str) {
 
 fn config(name: &str, targets: &str) -> String {
     format!(
-        "[project]\nname = \"{name}\"\n\n[generate]\ntargets = [{targets}]\n\n[storage]\nfsync = \"never\"\n"
+        "[project]\nid = \"{name}\"\n\n[generate]\ntargets = [{targets}]\n\n[storage]\nfsync = \"never\"\n"
     )
 }
 
@@ -64,9 +44,6 @@ fn project(tag: &str, targets: &str) -> PathBuf {
     dir
 }
 
-/// Run the CLI in `dir` with a `FORGEDB_HOME` inside it. The override is
-/// correctness, not hygiene: without it `generate` claims a project id in the
-/// developer's real ledger and writes cache packages outside the tempdir.
 fn forgedb(dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_forgedb"))
         .args(args)
@@ -86,10 +63,6 @@ fn ok(out: &std::process::Output, what: &str) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// Read a file, PANICKING with the path on a miss.
-///
-/// Never `unwrap_or_default`: an assertion over an empty string stays live,
-/// aimed at nothing, and gets easier to satisfy as it becomes meaningless.
 fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
@@ -106,7 +79,6 @@ fn container(dir: &Path, name: &str) -> PathBuf {
     found.pop().unwrap()
 }
 
-/// The runtime this case needs, or a failure naming it.
 fn require_tool(tool: &str, arg: &str) {
     let found = Command::new(tool).arg(arg).output().is_ok();
     assert!(
@@ -118,12 +90,6 @@ fn require_tool(tool: &str, arg: &str) {
     );
 }
 
-// ===========================================================================
-// Tier 1 — consumer-facing text
-// ===========================================================================
-
-/// **Scenario 7.** The `package.json` is the consumer's file and lives with the
-/// module it names; the cache package holds none at all.
 #[test]
 fn scenario_7_the_package_json_moved_out_of_the_cache_and_names_the_entry_module() {
     let dir = project("s7", "\"rust\", \"node-runtime\"");
@@ -147,8 +113,6 @@ fn scenario_7_the_package_json_moved_out_of_the_cache_and_names_the_entry_module
     );
 }
 
-/// **Scenario 7b (deviation 2).** A pre-#337 `package.json` is repointed in
-/// place, and every other key survives.
 #[test]
 fn scenario_7b_a_pre_337_package_json_is_repointed_and_nothing_else_is_touched() {
     let dir = project("s7b", "\"rust\", \"node-runtime\"");
@@ -173,17 +137,12 @@ fn scenario_7b_a_pre_337_package_json_is_repointed_and_nothing_else_is_touched()
     assert_eq!(doc["scripts"]["test"].as_str(), Some("echo mine"));
 }
 
-/// **Scenario 8.** Ignoring lives in exactly one place, and that place cannot
-/// swallow generated source.
 #[test]
 fn scenario_8_ignoring_lives_in_exactly_one_place() {
-    // `init` scaffolds into a FRESH directory — it refuses to overwrite a
-    // project that already exists, and a scaffolded project is what the root
-    // `.gitignore` half of this scenario is about.
     let parent = std::env::temp_dir().join(format!("forgedb-deliver-s8-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&parent);
     std::fs::create_dir_all(&parent).unwrap();
-    ok(&forgedb(&parent, &["init", "s8app", "--project-name", "s8-init"]), "init");
+    ok(&forgedb(&parent, &["init", "s8app"]), "init");
     let dir = parent.join("s8app");
     write(&dir.join("schema.forge"), SCHEMA);
     write(&dir.join("forgedb.toml"), &config("s8-init", "\"rust\", \"node-runtime\""));
@@ -198,8 +157,6 @@ fn scenario_8_ignoring_lives_in_exactly_one_place() {
     }
 
     let out = read(&dir.join("generated/.gitignore"));
-    // Compared as PATTERN LINES, not as substrings: the file explains itself in
-    // prose, and a substring check would be satisfiable by the comment.
     let patterns: Vec<&str> = out
         .lines()
         .map(str::trim)
@@ -212,8 +169,6 @@ fn scenario_8_ignoring_lives_in_exactly_one_place() {
             "<output>/.gitignore is missing the pattern `{want}`: {patterns:?}"
         );
     }
-    // The #338 constraint: an in-tree ForgeDB-owned cargo package is committed
-    // source, so nothing here may name a directory, a Rust file or a manifest.
     for pattern in &patterns {
         assert!(
             !pattern.contains('/'),
@@ -227,16 +182,8 @@ fn scenario_8_ignoring_lives_in_exactly_one_place() {
     }
 }
 
-/// **Scenario 12.** One spelling of the extension stem.
-///
-/// CPython resolves `PyInit_<stem>` from the delivered filename, so the
-/// `#[pymodule]` name and the delivery table's filename are ONE decision. A
-/// second literal is how they come apart, and the failure — `dynamic module does
-/// not define module export function` — is invisible to `cargo build`, to
-/// `cargo check` and to every snapshot.
 #[test]
 fn scenario_12_the_extension_stem_has_one_spelling() {
-    // Assembled at runtime so this file's own source cannot satisfy the search.
     let stem = format!("_forgedb{}native", "_");
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
@@ -256,8 +203,6 @@ fn scenario_12_the_extension_stem_has_one_spelling() {
                 continue;
             }
             let src = std::fs::read_to_string(&path).unwrap();
-            // Comments are stripped: a doc comment naming the stem must not be
-            // able to satisfy — or to break — this count.
             for (n, line) in src.lines().enumerate() {
                 let code = line.split("//").next().unwrap_or("");
                 if code.contains(&stem) {
@@ -281,17 +226,6 @@ fn scenario_12_the_extension_stem_has_one_spelling() {
     );
 }
 
-/// **Scenario 9.** No version strings and no timestamps in generated code.
-///
-/// Scanned over the emitted OUTPUT, not over the generators' source, so a
-/// comment explaining the rule cannot satisfy it. Manifests are excluded on
-/// purpose — they carry pins, which is the point of hashing them.
-///
-/// The allow-list has exactly one entry, named and justified: `ffi.rs` emits
-/// `env!("CARGO_PKG_VERSION")` into generated Rust, where it expands to the
-/// generated crate's own hardcoded `0.1.0` and never to the CLI's. It is a
-/// version-bearing token that is NOT a CLI-version coupling, and a guard written
-/// without knowing it is there would "fix" a non-bug.
 #[test]
 fn scenario_9_generated_code_carries_no_version_string_and_no_timestamp() {
     use forgedb_codegen::{FfiGenerator, GoGenerator, NapiGenerator, PyO3Generator};
@@ -311,11 +245,6 @@ fn scenario_9_generated_code_carries_no_version_string_and_no_timestamp() {
         ("go/forgedb.go", GoGenerator::generate(&schema, SYM, FP).unwrap().code),
     ];
 
-    // `x.y.z` and an ISO date. Deliberately crude: this is about a CLASS of
-    // token, and a precise matcher would be one more thing to keep in step.
-    // Punctuation is trimmed off each end FIRST. Without it `0.4.1.` at the end
-    // of a sentence tokenises to four parts and slips through — which is exactly
-    // how a version would enter generated code, in a comment.
     fn strip(w: &str) -> &str {
         w.trim_matches(|c| c == '.' || c == '-')
     }
@@ -339,7 +268,6 @@ fn scenario_9_generated_code_carries_no_version_string_and_no_timestamp() {
                 }
             }
         }
-        // Timestamp CALLS, which produce a value rather than a literal.
         for banned in ["SystemTime::now", "Utc::now", "Local::now", "Instant::now"] {
             assert!(
                 !code.contains(banned),
@@ -354,7 +282,6 @@ fn scenario_9_generated_code_carries_no_version_string_and_no_timestamp() {
         violations.join("\n")
     );
 
-    // The allow-list, asserted as an EXACT set rather than tolerated.
     let carriers: Vec<&str> = artifacts
         .iter()
         .filter(|(_, code)| code.contains("CARGO_PKG_VERSION"))
@@ -369,14 +296,6 @@ fn scenario_9_generated_code_carries_no_version_string_and_no_timestamp() {
     );
 }
 
-/// **Scenario 10.** The delivery table is total over `PackageKind`.
-///
-/// A wildcard arm makes a newly added kind a silent non-delivery — the exact
-/// failure this issue removes. Rust cannot express "adding a variant must break
-/// this" as a test, so the guard is structural, and it is scoped to the
-/// FUNCTION BODY with a lookup that PANICS on a miss: a scoping query that
-/// degrades to the whole file leaves the assertion live and aimed at the wrong
-/// subject, where it only gets easier to satisfy.
 #[test]
 fn scenario_10_the_delivery_table_has_no_wildcard_arm() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/commands/build/deliver.rs");
@@ -390,9 +309,6 @@ fn scenario_10_the_delivery_table_has_no_wildcard_arm() {
         .unwrap_or_else(|| panic!("`destinations_for` in {} is unterminated", path.display()))
         + start;
 
-    // Comments are stripped BEFORE the scan: the arms are explained in prose,
-    // and good comments restate an invariant in the words the assertion greps
-    // for, which would make a well-commented file easier to pass.
     let body: String = src[start..end]
         .lines()
         .map(|l| l.split("//").next().unwrap_or(""))
@@ -404,7 +320,6 @@ fn scenario_10_the_delivery_table_has_no_wildcard_arm() {
         "the delivery table has a wildcard arm, so adding a PackageKind is a \
          silent non-delivery rather than a compile error:\n{body}"
     );
-    // A body that matched nothing would satisfy the assertion above vacuously.
     for kind in ["Napi", "Pyo3", "Ffi", "Core", "Server", "Wasm", "Transform", "Engine"] {
         assert!(
             body.contains(kind),
@@ -413,11 +328,6 @@ fn scenario_10_the_delivery_table_has_no_wildcard_arm() {
     }
 }
 
-/// **Scenario 11.** Delivery never guesses.
-///
-/// A report naming a path that does not exist is an error NAMING the path. It
-/// does not skip, and — the property that matters — it does not reconstruct a
-/// path under `target/`, which is #292's defect one layer down.
 #[test]
 fn scenario_11_delivery_errors_on_a_reported_path_that_is_not_there() {
     use forgedb::commands::build::deliver;
@@ -450,9 +360,6 @@ fn scenario_11_delivery_errors_on_a_reported_path_that_is_not_there() {
         err.contains(&ghost.display().to_string()),
         "the error does not name the missing path: {err}"
     );
-    // The message must say WHY this is not a path ForgeDB could have guessed
-    // wrong. `fs::copy`'s own ENOENT names the syscall, and a reader who has
-    // just been burned by #292 will assume delivery reconstructed the path.
     assert!(
         err.contains("does not reconstruct"),
         "the error does not distinguish a moved file from a guessed path: {err}"
@@ -462,8 +369,6 @@ fn scenario_11_delivery_errors_on_a_reported_path_that_is_not_there() {
         "delivery produced a file from a source that does not exist"
     );
 
-    // …and an EMPTY report against an existing destination is the other half:
-    // a hard error naming what the build did produce, never a silent skip.
     let empty = BuildReport {
         version: 1,
         project: dir.clone(),
@@ -480,7 +385,6 @@ fn scenario_11_delivery_errors_on_a_reported_path_that_is_not_there() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// **Scenario 13.** `--check` covers the shims.
 #[test]
 fn scenario_13_check_mode_sees_an_edited_shim() {
     let dir = project("s13", "\"rust\", \"node-runtime\", \"python-runtime\"");
@@ -510,20 +414,8 @@ fn scenario_13_check_mode_sees_an_edited_shim() {
     }
 }
 
-/// **Scenario 14.** The macOS install name is not a dependency.
-///
-/// `otool -L` prints `LC_ID_DYLIB` first, and for a rustc cdylib it is the
-/// ABSOLUTE build directory — so a naive "no cache path anywhere in `otool -L`"
-/// assertion fails on macOS and would send napi and pyo3 to the archive rule for
-/// a reason that is not a defect.
-///
-/// A pure function over captured text, so it runs on any host. That is the
-/// lesson `parses_both_tools_output` already encodes: a rule written against the
-/// output of one host, on a test that only ever ran on that host, is how #409's
-/// Linux-only bug survived.
 #[test]
 fn scenario_14_the_install_name_is_not_a_loaded_library() {
-    // Verbatim from a real delivered `forgedb.node`, cache path included.
     let install_name = "/tmp/fp337/home/projects/fp337/target/release/deps/libfp337_napi.dylib";
     let otool = format!(
         "napi/forgedb.node:\n\
@@ -536,8 +428,6 @@ fn scenario_14_the_install_name_is_not_a_loaded_library() {
     assert_eq!(entries.len(), 3, "the header line must be dropped: {entries:?}");
     assert_eq!(entries[0], install_name);
 
-    // The classification: everything EXCEPT the `otool -D` entry must resolve
-    // outside the cache.
     let dependencies: Vec<&String> = entries.iter().filter(|e| *e != install_name).collect();
     assert_eq!(dependencies.len(), 2);
     for dep in dependencies {
@@ -548,11 +438,6 @@ fn scenario_14_the_install_name_is_not_a_loaded_library() {
     }
 }
 
-// ===========================================================================
-// Tier 2 — the artifact is compiled, delivered, and RUN
-// ===========================================================================
-
-/// Generate + build a project, and return its directory.
 fn generate_and_build(tag: &str, targets: &str) -> PathBuf {
     let dir = project(tag, targets);
     ok(&forgedb(&dir, &["generate", "all"]), "generate all");
@@ -560,19 +445,12 @@ fn generate_and_build(tag: &str, targets: &str) -> PathBuf {
     dir
 }
 
-/// The C8 garbage collection, in full. The deletion IS the test; a run that
-/// skips it proves nothing.
 fn delete_the_cache(dir: &Path) {
     let home = dir.join(".home");
     assert!(home.is_dir(), "no cache to delete at {}", home.display());
     std::fs::remove_dir_all(&home).unwrap();
 }
 
-/// **Scenario 15 ★.** Nothing delivered reaches back into the cache.
-///
-/// Gate 1's carried verification step, executed rather than asserted about: if
-/// either the `.node` or the Python extension shows a genuine dependency into
-/// the cache, that target joins the archive rule.
 #[test]
 #[ignore = "compiles a release cargo workspace"]
 fn scenario_15_nothing_delivered_depends_on_the_cache() {
@@ -584,10 +462,6 @@ fn scenario_15_nothing_delivered_depends_on_the_cache() {
     ] {
         assert!(delivered.is_file(), "not delivered: {}", delivered.display());
 
-        // The file's OWN install name, excluded by what it is rather than by
-        // position. rustc stamps an absolute build path there and it is not a
-        // dependency — scenarios 16 and 17 are the ground truth this only
-        // proxies.
         let own = if cfg!(target_os = "macos") {
             let out = Command::new("otool")
                 .args(["-D".as_ref(), delivered.as_os_str()])
@@ -615,7 +489,6 @@ fn scenario_15_nothing_delivered_depends_on_the_cache() {
     }
 }
 
-/// **Scenario 16 ★.** Node loads it with the cache deleted, and it works.
 #[test]
 #[ignore = "compiles a release cargo workspace and runs node"]
 fn scenario_16_node_loads_the_delivered_addon_after_the_cache_is_deleted() {
@@ -651,10 +524,6 @@ fn scenario_16_node_loads_the_delivered_addon_after_the_cache_is_deleted() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("OK"));
 }
 
-/// **Scenario 17 ★.** Python imports it with the cache deleted.
-///
-/// This is the only check that can see a `PyInit_<stem>` mismatch: it is
-/// invisible to `cargo build`, to `cargo check` and to every snapshot.
 #[test]
 #[ignore = "compiles a release cargo workspace and runs python3"]
 fn scenario_17_python_imports_the_delivered_extension_after_the_cache_is_deleted() {
@@ -688,12 +557,6 @@ fn scenario_17_python_imports_the_delivered_extension_after_the_cache_is_deleted
     assert!(String::from_utf8_lossy(&out.stdout).contains("OK"));
 }
 
-/// **Scenario 18 ★ — the CALL-SITE mutation.**
-///
-/// Scenarios 1–4 prove the comparison is correct. Only this proves it *runs*
-/// (#345's lesson: mutating a predicate proves the check works, mutating the
-/// call site proves it executes). The schema changes, only `generate` runs, and
-/// both runtimes must refuse to load with a message naming the remedy.
 #[test]
 #[ignore = "compiles a release cargo workspace and runs node + python3"]
 fn scenario_18_a_stale_artifact_fails_at_load_with_the_remedy() {
@@ -701,7 +564,6 @@ fn scenario_18_a_stale_artifact_fails_at_load_with_the_remedy() {
     require_tool("python3", "--version");
     let dir = generate_and_build("s18", "\"rust\", \"node-runtime\", \"python-runtime\"");
 
-    // A schema change, then GENERATE ONLY — the `forgedb dev` shape.
     let schema = dir.join("schema.forge");
     std::fs::write(
         &schema,
@@ -740,12 +602,6 @@ fn scenario_18_a_stale_artifact_fails_at_load_with_the_remedy() {
     );
 }
 
-/// **Scenario 19.** Go's `init()` sees what the linker cannot.
-///
-/// A `[storage]` knob change alters durability semantics and no exported symbol,
-/// so `go build` still succeeds — and the binary must fail at start with the
-/// named message. That is the case the linker's undefined-symbol error cannot
-/// reach, and the honest description of what this check adds.
 #[test]
 #[ignore = "compiles a release cargo workspace and a cgo binary"]
 fn scenario_19_go_init_catches_a_config_only_change_the_linker_cannot_see() {
@@ -757,7 +613,6 @@ fn scenario_19_go_init_catches_a_config_only_change_the_linker_cannot_see() {
         "the Go smoke binary failed before the config change"
     );
 
-    // Durability semantics change; not one exported symbol does.
     std::fs::write(
         dir.join("forgedb.toml"),
         config("s19", "\"rust\", \"go-runtime\"").replace("fsync = \"never\"", "fsync = \"always\""),
@@ -779,9 +634,6 @@ fn scenario_19_go_init_catches_a_config_only_change_the_linker_cannot_see() {
     );
 }
 
-/// Compile the Go smoke consumer against the delivered archive, returning the
-/// binary. The Arrow file pulls an external module, so it is dropped — it is
-/// orthogonal to how the engine links.
 fn build_go_smoke(dir: &Path) -> PathBuf {
     let go_dir = dir.join("generated/go");
     assert!(
@@ -841,8 +693,6 @@ func main() {
 }
 "#;
 
-/// **Scenario 21 ★.** A C consumer builds against what was delivered, WITH THE
-/// CACHE DELETED, and the accessor agrees with the header's macro.
 #[test]
 #[ignore = "compiles a release cargo workspace and a C program"]
 fn scenario_21_a_c_consumer_links_the_delivered_archive_with_the_cache_deleted() {
@@ -891,8 +741,6 @@ fn scenario_21_a_c_consumer_links_the_delivered_archive_with_the_cache_deleted()
     );
 }
 
-/// **Scenario 22.** Idempotence: `generate` + `build` again with no schema
-/// change leaves `--check` clean and the delivered files byte-identical.
 #[test]
 #[ignore = "compiles a release cargo workspace"]
 fn scenario_22_a_second_generate_and_build_changes_nothing() {
@@ -921,16 +769,6 @@ fn scenario_22_a_second_generate_and_build_changes_nothing() {
     }
 }
 
-/// **Scenario 20 — C6, and the epic's main drift guard.**
-///
-/// Two different schemas at ONE app path must produce different exported
-/// surfaces **and** different fingerprints. Two assertions, deliberately not
-/// collapsed: the fingerprint is over SOURCE, and C6 is about the exported
-/// surface. An artifact ForgeDB could build once and hand to everybody cannot be
-/// per-schema — it would have to read a schema at runtime, which is the red line.
-///
-/// This is not `scenario_3_the_two_staticlibs_export_disjoint_symbols`: that one
-/// is about two APPS, which is placement. This is about two SCHEMAS.
 #[test]
 #[ignore = "compiles two release cargo workspaces"]
 fn scenario_20_two_schemas_at_one_path_differ_in_symbols_and_in_fingerprint() {
@@ -941,8 +779,6 @@ fn scenario_20_two_schemas_at_one_path_differ_in_symbols_and_in_fingerprint() {
     let first_syms = defined_symbols(&archive);
     let first_fp = header_fingerprint(&dir.join("generated/ffi/forgedb.h"));
 
-    // A DIFFERENT schema at the same path: same project, same app, same symbol
-    // prefix. Only the models change.
     std::fs::write(
         dir.join("schema.forge"),
         "Widget {\n  id: +uuid\n  sku: &string\n  weight: f64\n}\n",
@@ -954,8 +790,6 @@ fn scenario_20_two_schemas_at_one_path_differ_in_symbols_and_in_fingerprint() {
     let second_syms = defined_symbols(&archive);
     let second_fp = header_fingerprint(&dir.join("generated/ffi/forgedb.h"));
 
-    // C6: the EXPORTED SURFACE differs. Named symbols, not a count — a count
-    // would pass for two schemas with the same number of models.
     let gone: Vec<&String> = first_syms.difference(&second_syms).collect();
     let arrived: Vec<&String> = second_syms.difference(&first_syms).collect();
     assert!(
@@ -970,18 +804,12 @@ fn scenario_20_two_schemas_at_one_path_differ_in_symbols_and_in_fingerprint() {
         "the second schema's model has no symbol of its own: {arrived:?}"
     );
 
-    // …and the FINGERPRINT differs. A separate claim over a separate input.
     assert_ne!(
         first_fp, second_fp,
         "two different schemas produced the same source fingerprint"
     );
 }
 
-/// Every defined text symbol in an archive.
-///
-/// The exit status is deliberately not asserted: Xcode's `nm` reports `Unknown
-/// attribute kind` on rustc bitcode and exits 1 while still printing tens of
-/// thousands of symbols. Emptiness is the real failure, and it panics.
 fn defined_symbols(archive: &Path) -> std::collections::BTreeSet<String> {
     let nm = Command::new("nm").arg("-g").arg(archive).output().expect("nm runs");
     let out: std::collections::BTreeSet<String> = String::from_utf8_lossy(&nm.stdout)
@@ -1002,8 +830,6 @@ fn defined_symbols(archive: &Path) -> std::collections::BTreeSet<String> {
     out
 }
 
-/// The `FORGEDB_FINGERPRINT` macro's value. PANICS on a miss rather than
-/// degrading to the whole file.
 fn header_fingerprint(header: &Path) -> String {
     let src = read(header);
     let key = "#define FORGEDB_FINGERPRINT \"";
