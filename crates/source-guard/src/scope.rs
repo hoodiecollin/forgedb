@@ -1,42 +1,7 @@
-//! Scoping queries — locate a named item and assert *within* it.
-//!
-//! This is the dominant need, and the parent issue understates it. Classifying all 77
-//! `.find(` probes in `codegen_snapshots.rs`:
-//!
-//! | Class | Count |
-//! |---|---|
-//! | window / offset-binding-for-a-window | **~42** |
-//! | ordering (two offsets compared) | ~5 |
-//! | existence (`find` used as `contains`) | 1 |
-//! | other | 29 |
-//!
-//! So the headline `stmt_index_of` API addresses the *smaller* class. Scoping is what the
-//! suite actually does with substring search, and scoping is where a miss is most
-//! dangerous.
-//!
-//! # The rule
-//!
-//! **A scope that cannot be located is an error.** Never an empty scope, never a wider one.
-//!
-//! The idiom being replaced degrades in the worst possible direction. `&code[code.find(x)
-//! .unwrap_or(0)..]` widens to the whole file when `x` rots, and even on a hit it runs to
-//! EOF. Measured on one real schema: the "insert body" covered 237 KB of a 261 KB file and
-//! contained eight `.write(&forgedb_wal::WalEntry` calls belonging to seven *other*
-//! methods, so the guard passed with the call it names deleted outright.
-//!
-//! A vacuous pass at least stops claiming anything. A widened scope keeps claiming the same
-//! thing about a bigger haystack — so it gets *easier* to satisfy exactly as it becomes
-//! meaningless. That asymmetry is why every query here returns `Result` and every failure
-//! lists what *is* present.
-
 use std::fmt;
 
 use crate::RustSource;
 
-/// A scope that could not be located.
-///
-/// An error type rather than an `Option`, deliberately: an `Option` invites `unwrap_or`,
-/// and `unwrap_or` is the exact defect this crate exists to delete.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeError {
     what: String,
@@ -50,8 +15,6 @@ impl fmt::Display for ScopeError {
         if self.available.is_empty() {
             write!(f, " — nothing of that kind is present at all")
         } else {
-            // Name what IS there. A guard that rots because of a rename is far cheaper to
-            // repair when the failure hands you the new spelling instead of just "false".
             write!(f, " — available: {}", self.available.join(", "))
         }
     }
@@ -59,10 +22,6 @@ impl fmt::Display for ScopeError {
 
 impl std::error::Error for ScopeError {}
 
-/// A located function, and the things worth asserting about its body.
-///
-/// `Debug` is hand-written rather than derived: the `syn` nodes inside would dump an entire
-/// syntax tree into any `expect_err` failure message, which buries the actual assertion.
 pub struct FnScope<'a> {
     pub(crate) item: &'a syn::ItemFn,
     pub(crate) sig: &'a syn::Signature,
@@ -70,7 +29,6 @@ pub struct FnScope<'a> {
     origin: String,
 }
 
-/// A located method inside an `impl`. See [`FnScope`] on why `Debug` is hand-written.
 pub struct MethodScope<'a> {
     pub(crate) sig: &'a syn::Signature,
     pub(crate) block: &'a syn::Block,
@@ -80,23 +38,14 @@ pub struct MethodScope<'a> {
 macro_rules! body_queries {
     ($t:ty) => {
         impl<'a> $t {
-            /// The body block. `block.stmts` **is** statement order — that is the whole
-            /// point of comparing indices into it rather than byte offsets into a blob.
             pub fn block(&self) -> &'a syn::Block {
                 self.block
             }
 
-            /// The signature.
             pub fn sig(&self) -> &'a syn::Signature {
                 self.sig
             }
 
-            /// How many times this body calls a function or method named `name`.
-            ///
-            /// Counts by AST node, so it does not match the name in a comment, in a string
-            /// literal, or as part of a longer identifier — the three things a substring
-            /// cannot separate. Bare paths (`foo()`), associated paths (`T::foo()`) and
-            /// method calls (`x.foo()`) all count.
             pub fn call_count(&self, name: &str) -> usize {
                 let mut v = CallCounter {
                     name,
@@ -106,27 +55,20 @@ macro_rules! body_queries {
                 v.count
             }
 
-            /// Whether this body calls `name` at all.
             pub fn calls(&self, name: &str) -> bool {
                 self.call_count(name) > 0
             }
 
-            /// How many times this body *reads* a field named `name` (`expr.name`).
-            ///
-            /// Distinct from the field's declaration and from a struct-literal
-            /// initializer — three different `syn` nodes that one substring conflates.
             pub fn field_read_count(&self, name: &str) -> usize {
                 let mut v = FieldReadCounter { name, count: 0 };
                 syn::visit::visit_block(&mut v, self.block);
                 v.count
             }
 
-            /// Index of the first statement satisfying `pred`, for ordering assertions.
             pub fn stmt_index_of(&self, pred: impl Fn(&syn::Stmt) -> bool) -> Option<usize> {
                 self.block.stmts.iter().position(pred)
             }
 
-            /// Where this scope came from, for messages.
             pub fn origin(&self) -> &str {
                 &self.origin
             }
@@ -150,15 +92,10 @@ impl fmt::Debug for MethodScope<'_> {
 }
 
 impl<'a> FnScope<'a> {
-    /// The whole item, when a query needs attributes or visibility.
     pub fn item(&self) -> &'a syn::ItemFn {
         self.item
     }
 }
-
-// ---------------------------------------------------------------------------
-// visitors
-// ---------------------------------------------------------------------------
 
 struct CallCounter<'n> {
     name: &'n str,
@@ -168,7 +105,6 @@ struct CallCounter<'n> {
 impl<'ast, 'n> syn::visit::Visit<'ast> for CallCounter<'n> {
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
         if let syn::Expr::Path(p) = &*node.func {
-            // Last segment: matches both `foo()` and `Type::foo()`.
             if p.path
                 .segments
                 .last()
@@ -204,10 +140,6 @@ impl<'ast, 'n> syn::visit::Visit<'ast> for FieldReadCounter<'n> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// lookups
-// ---------------------------------------------------------------------------
-
 impl RustSource {
     pub(crate) fn scope_error(&self, what: impl Into<String>, available: Vec<String>) -> ScopeError {
         ScopeError {
@@ -217,7 +149,6 @@ impl RustSource {
         }
     }
 
-    /// A free function named `name`.
     pub fn fn_named(&self, name: &str) -> Result<FnScope<'_>, ScopeError> {
         let mut found = self.ast().items.iter().filter_map(|it| match it {
             syn::Item::Fn(f) if f.sig.ident == name => Some(f),
@@ -249,13 +180,6 @@ impl RustSource {
         }
     }
 
-    /// A method named `name`, which must be declared **exactly once** across all `impl`
-    /// blocks in this file.
-    ///
-    /// Ambiguity is an error rather than "first wins". Generated code repeats method names
-    /// across per-model impls — `insert` exists once per model — and silently taking the
-    /// first is how a guard ends up asserting about a model it was not written for. The
-    /// error names every owner so the caller can pick with [`RustSource::method_in`].
     pub fn method_named(&self, name: &str) -> Result<MethodScope<'_>, ScopeError> {
         let hits = self.methods_matching(|imp, m| {
             let _ = imp;
@@ -282,7 +206,6 @@ impl RustSource {
         }
     }
 
-    /// A method named `name` on the impl whose self type renders as `ty`.
     pub fn method_in(&self, ty: &str, name: &str) -> Result<MethodScope<'_>, ScopeError> {
         let hits = self.methods_matching(|imp, m| imp == ty && m.sig.ident == name);
 
@@ -306,7 +229,6 @@ impl RustSource {
         }
     }
 
-    /// A struct named `name`.
     pub fn struct_named(&self, name: &str) -> Result<&syn::ItemStruct, ScopeError> {
         let mut found = self.ast().items.iter().filter_map(|it| match it {
             syn::Item::Struct(s) if s.ident == name => Some(s),
@@ -333,10 +255,6 @@ impl RustSource {
         }
     }
 
-    /// The declared type of `field` on `struct_name`, rendered as source text.
-    ///
-    /// Replaces `flat.contains("pubid:String")`, which matches `pub id: String` in *any*
-    /// struct in the file and also matches `pub id: Stringify`.
     pub fn field_type(&self, struct_name: &str, field: &str) -> Result<String, ScopeError> {
         let s = self.struct_named(struct_name)?;
         let names: Vec<String> = s
@@ -379,7 +297,6 @@ impl RustSource {
     }
 }
 
-/// Render a type as compact source text (`Option < Vec < usize > >` → `Option<Vec<usize>>`).
 fn render_type(ty: &syn::Type) -> String {
     use quote::ToTokens;
     ty.to_token_stream()

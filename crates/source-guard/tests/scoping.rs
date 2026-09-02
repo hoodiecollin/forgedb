@@ -1,12 +1,5 @@
-//! Guards for the scoping queries.
-//!
-//! The acceptance criteria are the failure modes, not the happy path. A scoping query that
-//! finds things is easy; one that *refuses to widen* is the point.
-
 use forgedb_source_guard::RustSource;
 
-/// Two models' worth of methods, which is what generated `database.rs` actually looks
-/// like: `insert` exists once per model, so "find the insert body" is ambiguous.
 const TWO_MODELS: &str = r#"
 pub struct UserStore { rows: Vec<u8> }
 pub struct PostStore { rows: Vec<u8> }
@@ -24,7 +17,6 @@ impl UserStore {
 
 impl PostStore {
     pub fn insert(&mut self, r: Post) -> usize {
-        // No WAL write here at all.
         self.rows.len()
     }
 }
@@ -44,10 +36,6 @@ fn src() -> RustSource {
     RustSource::generated("two_models.rs", TWO_MODELS)
 }
 
-// ---------------------------------------------------------------------------
-// The rule: a miss is an error, never a wider scope.
-// ---------------------------------------------------------------------------
-
 #[test]
 fn a_missing_method_is_an_error_not_the_whole_file() {
     let s = src();
@@ -57,7 +45,6 @@ fn a_missing_method_is_an_error_not_the_whole_file() {
 
     let msg = err.to_string();
     assert!(msg.contains("nonexistent_method"), "names what was sought: {msg}");
-    // The repair hint: list what IS there, so a rename is cheap to fix.
     assert!(
         msg.contains("UserStore::insert"),
         "a miss must list what is actually present: {msg}"
@@ -80,9 +67,6 @@ fn a_missing_struct_is_an_error() {
 
 #[test]
 fn an_ambiguous_method_is_an_error_not_first_wins() {
-    // THE case substring matching cannot express, and the one that silently mis-targets:
-    // `insert` exists on both stores. `code.find("pub fn insert(")` takes the first, so a
-    // guard written for PostStore silently asserts about UserStore.
     let s = src();
     let err = s
         .method_named("insert")
@@ -93,15 +77,8 @@ fn an_ambiguous_method_is_an_error_not_first_wins() {
     assert!(msg.contains("UserStore") && msg.contains("PostStore"), "names both: {msg}");
 }
 
-// ---------------------------------------------------------------------------
-// Scoping actually scopes.
-// ---------------------------------------------------------------------------
-
 #[test]
 fn a_scope_does_not_leak_into_the_next_method() {
-    // This is the #170 defect in miniature. `UserStore::insert` writes WAL; `update` also
-    // does; `PostStore::insert` does not. An EOF-unbounded window starting at either
-    // `insert` would see the others' writes and pass regardless.
     let s = src();
 
     assert_eq!(
@@ -118,13 +95,10 @@ fn a_scope_does_not_leak_into_the_next_method() {
 
 #[test]
 fn a_call_in_a_comment_or_string_is_not_a_call() {
-    // The two things a substring cannot separate, and the reason two hand-rolled comment
-    // strippers already exist in this repo's test suite.
     let s = RustSource::generated(
         "prose.rs",
         r#"
 pub fn only_prose() {
-    // self.wal.write(&WalEntry::raw("x", p));
     let doc = "call write() here";
     let _ = doc;
 }
@@ -152,15 +126,8 @@ fn a_longer_identifier_is_not_a_match() {
     assert_eq!(s.fn_named("f").unwrap().call_count("write_batched"), 1);
 }
 
-// ---------------------------------------------------------------------------
-// Node-kind discrimination.
-// ---------------------------------------------------------------------------
-
 #[test]
 fn a_field_read_is_distinct_from_a_declaration_and_an_initializer() {
-    // Three `syn` nodes that the current `.auto_sequences` guard conflates behind one
-    // substring plus a `starts_with("//")` heuristic: Expr::Field (a read, forbidden),
-    // Field (the declaration, allowed), FieldValue (a struct literal, allowed).
     let s = RustSource::generated(
         "kinds.rs",
         r#"
@@ -184,10 +151,6 @@ pub fn reads_it(m: &M) -> u64 { m.auto_sequences }
     );
 }
 
-// ---------------------------------------------------------------------------
-// Field types.
-// ---------------------------------------------------------------------------
-
 #[test]
 fn field_type_is_exact_not_a_prefix_match() {
     let s = src();
@@ -197,7 +160,6 @@ fn field_type_is_exact_not_a_prefix_match() {
 
 #[test]
 fn field_type_does_not_match_a_similarly_named_type() {
-    // `flat.contains("pubid:String")` also matches `pub id: Stringify`.
     let s = RustSource::generated("s.rs", "pub struct T { pub id: Stringify }");
     assert_eq!(
         s.field_type("T", "id").unwrap(),
@@ -215,15 +177,8 @@ fn a_missing_field_is_an_error_listing_the_real_fields() {
     assert!(msg.contains("id") && msg.contains("count"), "lists real fields: {msg}");
 }
 
-// ---------------------------------------------------------------------------
-// Ordering.
-// ---------------------------------------------------------------------------
-
 #[test]
 fn statement_order_is_structural_not_positional() {
-    // `block.stmts` IS the order. The #281 mutation — resolve a probe into an earlier
-    // binding and rebind at the old site — leaves the *name* where it was, so a
-    // byte-offset comparison stays green while the work moved. An index into stmts cannot.
     let s = RustSource::generated(
         "order.rs",
         r#"
