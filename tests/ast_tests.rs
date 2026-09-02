@@ -2,7 +2,6 @@ use forgedb_parser::ast::*;
 
 #[test]
 fn test_detect_many_to_many() {
-    // Create a simple schema with M:N relations
     let schema = Schema {
         structs: vec![],
         enums: vec![],
@@ -88,7 +87,6 @@ fn test_detect_many_to_many() {
 
 #[test]
 fn test_no_m2m_with_fk() {
-    // Schema with 1:N relationship (should not be detected as M:N)
     let schema = Schema {
         structs: vec![],
         enums: vec![],
@@ -164,7 +162,6 @@ fn test_no_m2m_with_fk() {
         ],
     };
 
-    // Should not detect M:N because User.posts has a corresponding FK in Post.author
     let m2m = schema.detect_many_to_many_relations();
     assert_eq!(m2m.len(), 0);
 }

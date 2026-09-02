@@ -13,13 +13,13 @@ fn test_generate_and_load_migration() {
         SchemaChange::AddField {
             model_name: "User".to_string(),
             field_name: "email".to_string(),
-            field_type: "string".to_string(),
+            field_type: "string".parse().unwrap(),
             nullable: false,
-            default_value: None,
+            default_json: None,
+            answer: None,
         },
     ];
 
-    // Generate migration
     let migration = MigrationGenerator::generate(
         migrations_dir,
         "Create User model".to_string(),
@@ -30,7 +30,6 @@ fn test_generate_and_load_migration() {
     assert_eq!(migration.changes.len(), 2);
     assert_eq!(migration.description, "Create User model");
 
-    // Load it back
     let migrations = MigrationGenerator::load_all_migrations(migrations_dir).unwrap();
     assert_eq!(migrations.len(), 1);
     assert_eq!(migrations[0].id, migration.id);
@@ -43,9 +42,10 @@ fn test_migration_report() {
         SchemaChange::AddField {
             model_name: "User".to_string(),
             field_name: "name".to_string(),
-            field_type: "string".to_string(),
+            field_type: "string".parse().unwrap(),
             nullable: false,
-            default_value: None,
+            default_json: None,
+            answer: None,
         },
         SchemaChange::RemoveField {
             model_name: "User".to_string(),

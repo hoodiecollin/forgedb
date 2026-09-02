@@ -449,7 +449,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -516,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-codegen"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "forgedb-parser",
@@ -574,7 +574,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-migrations"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "serde",
@@ -667,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-watcher"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "crossbeam-channel",
  "forgedb-parser",

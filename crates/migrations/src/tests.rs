@@ -3,8 +3,6 @@ use tempfile::TempDir;
 
 #[test]
 fn test_migration_generate_and_load_roundtrip() {
-    // The record/track/load lifecycle (data-at-rest transformation now lives in
-    // the offline transformer bin, #74 Phase 3 — not a runtime executor).
     let temp_dir = TempDir::new().unwrap();
     let migrations_dir = temp_dir.path().join("migrations");
 
@@ -15,9 +13,10 @@ fn test_migration_generate_and_load_roundtrip() {
         SchemaChange::AddField {
             model_name: "User".to_string(),
             field_name: "age".to_string(),
-            field_type: "u32".to_string(),
+            field_type: "u32".parse().unwrap(),
             nullable: true,
-            default_value: Some("0".to_string()),
+            default_json: Some("0".to_string()),
+            answer: None,
         },
     ];
 
@@ -26,7 +25,6 @@ fn test_migration_generate_and_load_roundtrip() {
             .unwrap();
     assert_eq!(migration.changes.len(), 2);
 
-    // Create tracker
     let mut tracker = MigrationTracker::new(&migrations_dir).unwrap();
     assert!(!tracker.is_applied(&migration.id));
     tracker
@@ -34,7 +32,6 @@ fn test_migration_generate_and_load_roundtrip() {
         .unwrap();
     assert!(tracker.is_applied(&migration.id));
 
-    // Verify we can load migrations
     let all_migrations = MigrationGenerator::load_all_migrations(&migrations_dir).unwrap();
     assert_eq!(all_migrations.len(), 1);
     assert_eq!(all_migrations[0].id, migration.id);
@@ -46,9 +43,10 @@ fn test_breaking_change_detection() {
         SchemaChange::AddField {
             model_name: "User".to_string(),
             field_name: "name".to_string(),
-            field_type: "string".to_string(),
+            field_type: "string".parse().unwrap(),
             nullable: false,
-            default_value: None,
+            default_json: None,
+            answer: None,
         },
         SchemaChange::RemoveField {
             model_name: "User".to_string(),
@@ -57,15 +55,15 @@ fn test_breaking_change_detection() {
         SchemaChange::ChangeFieldType {
             model_name: "User".to_string(),
             field_name: "age".to_string(),
-            old_type: "u32".to_string(),
-            new_type: "u64".to_string(),
+            old_type: "u32".parse().unwrap(),
+            new_type: "u64".parse().unwrap(),
+            answer: None,
         },
     ];
 
     let migration = Migration::new("Update User model".to_string(), changes);
 
     assert!(migration.has_breaking_changes());
-    // M4: AddField { nullable: false, default_value: None } is also breaking now
     assert_eq!(migration.breaking_changes().len(), 3);
     assert_eq!(migration.safe_changes().len(), 0);
 }
@@ -102,7 +100,7 @@ fn test_schema_differ() {
             name: "User".to_string(),
             fields: vec![SimpleField {
                 name: "id".to_string(),
-                field_type: "uuid".to_string(),
+                ty: "uuid".parse().unwrap(),
                 nullable: false,
                 unique: true,
                 indexed: false,
@@ -122,7 +120,7 @@ fn test_schema_differ() {
             fields: vec![
                 SimpleField {
                     name: "id".to_string(),
-                    field_type: "uuid".to_string(),
+                    ty: "uuid".parse().unwrap(),
                     nullable: false,
                     unique: true,
                     indexed: false,
@@ -132,7 +130,7 @@ fn test_schema_differ() {
                 },
                 SimpleField {
                     name: "email".to_string(),
-                    field_type: "string".to_string(),
+                    ty: "string".parse().unwrap(),
                     nullable: false,
                     unique: true,
                     indexed: true,
@@ -150,12 +148,10 @@ fn test_schema_differ() {
         structs: vec![],
     };
 
-    let changes = SchemaDiffer::diff(&old_schema, &new_schema);
+    let changes = SchemaDiffer::diff(&old_schema, &new_schema).changes;
 
-    // Should detect: AddField, AddIndex, AddUniqueConstraint, AddConstraint
     assert!(changes.len() >= 1);
 
-    // Check that we detected the new field
     let has_add_field = changes
         .iter()
         .any(|c| matches!(c, SchemaChange::AddField { .. }));
@@ -164,30 +160,28 @@ fn test_schema_differ() {
 
 #[test]
 fn test_diff_classifies_authored_body_residue() {
-    // #74 Phase 2 (C8/C9): each hop's new-row body is classified ONCE at create
-    // time as `Auto` (the differ can PROVE it) or `Authored` (semantic residue the
-    // developer must supply).  Crucially the classifier is DISTINCT from
-    // `is_breaking()` — a change can be breaking yet `Auto`.
 
-    // Authored residue: only what the differ genuinely cannot prove a value for.
     let type_change = SchemaChange::ChangeFieldType {
         model_name: "User".to_string(),
         field_name: "age".to_string(),
-        old_type: "u32".to_string(),
-        new_type: "string".to_string(),
+        old_type: "u32".parse().unwrap(),
+        new_type: "string".parse().unwrap(),
+        answer: None,
     };
     let narrow_nullable = SchemaChange::ChangeFieldNullability {
         model_name: "User".to_string(),
         field_name: "email".to_string(),
         old_nullable: true,
         new_nullable: false,
+        answer: None,
     };
     let required_no_default = SchemaChange::AddField {
         model_name: "User".to_string(),
         field_name: "role".to_string(),
-        field_type: "string".to_string(),
+        field_type: "string".parse().unwrap(),
         nullable: false,
-        default_value: None,
+        default_json: None,
+        answer: None,
     };
     for c in [&type_change, &narrow_nullable, &required_no_default] {
         assert_eq!(
@@ -197,10 +191,6 @@ fn test_diff_classifies_authored_body_residue() {
         );
     }
 
-    // Breaking-but-Auto: the residue is NOT just "everything breaking".  Dropping a
-    // field/model is breaking for readers but the row transform is a pure omit;
-    // adding a &unique may fail on dups but the row bytes are identity.  These are
-    // Auto despite being breaking — proving the classifier ≠ is_breaking().
     let remove_field = SchemaChange::RemoveField {
         model_name: "User".to_string(),
         field_name: "legacy".to_string(),
@@ -221,13 +211,13 @@ fn test_diff_classifies_authored_body_residue() {
         );
     }
 
-    // Additive / structural provable hops are Auto.
     let add_nullable = SchemaChange::AddField {
         model_name: "User".to_string(),
         field_name: "bio".to_string(),
-        field_type: "string".to_string(),
+        field_type: "string".parse().unwrap(),
         nullable: true,
-        default_value: None,
+        default_json: None,
+        answer: None,
     };
     let rename = SchemaChange::RenameField {
         model_name: "User".to_string(),
@@ -243,7 +233,6 @@ fn test_diff_classifies_authored_body_residue() {
         assert_eq!(c.hop_body_class(), HopBodyClass::Auto, "{c:?}");
     }
 
-    // A migration exposes exactly its Authored residue.
     let mig = Migration::new(
         "mixed".to_string(),
         vec![add_nullable.clone(), type_change.clone(), remove_field.clone()],
@@ -255,19 +244,13 @@ fn test_diff_classifies_authored_body_residue() {
 
 #[test]
 fn test_migration_lineage_expands_range() {
-    // #74 Phase 2: the committed migrations form a serial version lineage; the
-    // transformer generator (Phase 3) walks it to expand a `--from B --to G` range
-    // into the ordered hop sequence between those versions (C1 — a closed, fixed
-    // serial range; never a synthesized jump).
     let temp = TempDir::new().unwrap();
     let dir = temp.path().join("migrations");
 
-    // Empty lineage → baseline version 1, next span 1→2.
     let empty = MigrationLineage::load(&dir).unwrap();
     assert_eq!(empty.current_schema_version(), BASELINE_SCHEMA_VERSION);
     assert_eq!(empty.next_version_span(), (1, 2));
 
-    // Record three contiguous hops: v1→2, v2→3, v3→4.
     for (i, (from, to)) in [(1u32, 2u32), (2, 3), (3, 4)].iter().enumerate() {
         MigrationGenerator::generate_versioned(
             &dir,
@@ -275,9 +258,10 @@ fn test_migration_lineage_expands_range() {
             vec![SchemaChange::AddField {
                 model_name: "User".to_string(),
                 field_name: format!("f{i}"),
-                field_type: "string".to_string(),
+                field_type: "string".parse().unwrap(),
                 nullable: true,
-                default_value: None,
+                default_json: None,
+                answer: None,
             }],
             *from,
             *to,
@@ -286,62 +270,54 @@ fn test_migration_lineage_expands_range() {
     }
 
     let lineage = MigrationLineage::load(&dir).unwrap();
-    // Current version is the highest to_version; next span continues the chain.
     assert_eq!(lineage.current_schema_version(), 4);
     assert_eq!(lineage.next_version_span(), (4, 5));
 
-    // Full range expands to all three hops in version order.
     let full = lineage.expand_range(1, 4).unwrap();
     assert_eq!(full.len(), 3);
     assert_eq!(full[0].from_version, 1);
     assert_eq!(full[0].to_version, 2);
     assert_eq!(full[2].to_version, 4);
 
-    // A sub-range is a contiguous slice.
     let sub = lineage.expand_range(2, 4).unwrap();
     assert_eq!(sub.len(), 2);
     assert_eq!(sub[0].from_version, 2);
 
-    // Empty range (from == to) is a valid no-op.
     assert!(lineage.expand_range(3, 3).unwrap().is_empty());
 
-    // A range beyond the recorded lineage is refused (never synthesized).
     assert!(lineage.expand_range(1, 9).is_err());
     assert!(lineage.expand_range(4, 2).is_err());
 }
 
 #[test]
 fn test_scaffold_authored_body_only_for_residue() {
-    // #74 Phase 2 (C8/C9/C13): a migration with an Authored hop scaffolds a frozen
-    // `migrations/{id}/transform.rs` for the developer; a fully-automatic migration
-    // scaffolds nothing; and an existing authored body is NEVER clobbered.
     let temp = TempDir::new().unwrap();
     let dir = temp.path().join("migrations");
     std::fs::create_dir_all(&dir).unwrap();
 
-    // Fully automatic (nullable add) → no scaffold.
     let auto = Migration::new_versioned(
         "auto".to_string(),
         vec![SchemaChange::AddField {
             model_name: "User".to_string(),
             field_name: "bio".to_string(),
-            field_type: "string".to_string(),
+            field_type: "string".parse().unwrap(),
             nullable: true,
-            default_value: None,
+            default_json: None,
+            answer: None,
         }],
         1,
         2,
     );
     assert!(scaffold_authored_body(&dir, &auto).unwrap().is_none());
 
-    // Authored (type change) → scaffold written.
     let authored = Migration::new_versioned(
         "authored".to_string(),
         vec![SchemaChange::ChangeFieldType {
             model_name: "User".to_string(),
             field_name: "age".to_string(),
-            old_type: "u32".to_string(),
-            new_type: "string".to_string(),
+            old_type: "u32".parse().unwrap(),
+            new_type: "string".parse().unwrap(),
+            answer: None,
         }],
         2,
         3,
@@ -352,10 +328,220 @@ fn test_scaffold_authored_body_only_for_residue() {
     let body = std::fs::read_to_string(&path).unwrap();
     assert!(body.contains("TODO"), "scaffold documents the residue to author");
 
-    // Freeze the developer's authored body, then re-scaffold: must NOT clobber.
     std::fs::write(&path, "// FROZEN AUTHORED BODY\n").unwrap();
     let (path2, created2) = scaffold_authored_body(&dir, &authored).unwrap().unwrap();
     assert_eq!(path, path2);
     assert!(!created2, "an existing authored body is never clobbered");
     assert_eq!(std::fs::read_to_string(&path2).unwrap(), "// FROZEN AUTHORED BODY\n");
+}
+
+#[test]
+fn simple_type_round_trips_through_its_wire_form() {
+    use crate::SimpleType as S;
+    let corpus = vec![
+        S::U32,
+        S::U64,
+        S::I32,
+        S::I64,
+        S::F64,
+        S::Bool,
+        S::Str,
+        S::StrN { chars: 1, exact: false },
+        S::StrN { chars: 255, exact: true },
+        S::Bytes(16),
+        S::Uuid,
+        S::Timestamp(0),
+        S::Timestamp(1),
+        S::Timestamp(2),
+        S::Json,
+        S::Decimal,
+        S::Enum("Status".to_string()),
+        S::Struct("Point".to_string()),
+        S::Array(Box::new(S::U32), 4),
+        S::Array(Box::new(S::Array(Box::new(S::U32), 2)), 3),
+        S::Array(Box::new(S::Struct("Point".to_string())), 4),
+        S::Relation("User".to_string()),
+        S::Collection("Post".to_string()),
+    ];
+    for t in corpus {
+        let rendered = t.to_string();
+        let back: S = rendered.parse().unwrap();
+        assert_eq!(back, t, "{rendered:?} did not round-trip");
+        let json = serde_json::to_string(&t).unwrap();
+        assert_eq!(json, format!("{:?}", rendered), "wire form is a plain string");
+        let de: S = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, t);
+    }
+}
+
+#[test]
+fn a_pre_374_type_string_loads_as_opaque() {
+    use crate::SimpleType as S;
+    for legacy in ["U32", "Nullable(String)", "Enum(\"Status\")", "Timestamp(Millis)"] {
+        let t: S = serde_json::from_str(&format!("{legacy:?}")).unwrap();
+        assert_eq!(t, S::Opaque(legacy.to_string()), "{legacy} must stay opaque");
+        assert!(
+            !t.widens_to(&S::U64) && !S::U32.widens_to(&t),
+            "an opaque type is never provable in either direction"
+        );
+    }
+}
+
+#[test]
+fn scenario_2_widenings_are_provable_and_everything_else_is_not() {
+    use crate::SimpleType as S;
+
+    let ints = [S::U32, S::U64, S::I32, S::I64, S::F64];
+    let provable: &[(S, S)] = &[
+        (S::U32, S::U64),
+        (S::I32, S::I64),
+        (S::U32, S::I64),
+    ];
+    for a in &ints {
+        for b in &ints {
+            let expected = provable.iter().any(|(x, y)| x == a && y == b);
+            assert_eq!(
+                a.widens_to(b),
+                expected,
+                "{a} -> {b} should be {}provable",
+                if expected { "" } else { "un" }
+            );
+        }
+    }
+
+    let sn = |chars: usize, exact: bool| S::StrN { chars, exact };
+    assert!(sn(4, false).widens_to(&sn(8, false)));
+    assert!(sn(4, true).widens_to(&sn(8, true)));
+    assert!(!sn(8, false).widens_to(&sn(4, false)), "shrinking truncates");
+    assert!(!sn(4, false).widens_to(&sn(8, true)), "gaining `!` is a new constraint");
+    assert!(!sn(4, true).widens_to(&sn(8, false)), "dropping `!` is a constraint change");
+    assert!(!sn(4, false).widens_to(&S::Str), "fixed slot -> variable column");
+    assert!(!S::Str.widens_to(&sn(4, false)), "variable column -> fixed slot");
+
+    assert!(S::Timestamp(0).widens_to(&S::Timestamp(1)));
+    assert!(S::Timestamp(0).widens_to(&S::Timestamp(2)));
+    assert!(S::Timestamp(1).widens_to(&S::Timestamp(2)));
+    assert!(!S::Timestamp(2).widens_to(&S::Timestamp(1)), "finer -> coarser floors");
+    assert!(!S::Timestamp(1).widens_to(&S::Timestamp(0)), "finer -> coarser floors");
+
+    assert!(!S::U32.widens_to(&S::U32));
+
+    assert!(!S::U32.widens_to(&S::Str));
+    assert!(!S::Str.widens_to(&S::U32));
+    assert!(!S::Uuid.widens_to(&S::Str));
+    assert!(!S::Decimal.widens_to(&S::F64));
+    assert!(!S::Enum("A".into()).widens_to(&S::Str));
+}
+
+fn code_of(fn_signature: &str) -> String {
+    let src = include_str!("types.rs");
+    let start = src
+        .find(fn_signature)
+        .unwrap_or_else(|| panic!("`{fn_signature}` is not in types.rs — did it get renamed?"));
+    let rest = &src[start..];
+    let end = rest
+        .find("\n    }\n")
+        .unwrap_or_else(|| panic!("no closing brace found for `{fn_signature}`"));
+    rest[..end]
+        .lines()
+        .map(|l| match l.find("//") {
+            Some(i) => &l[..i],
+            None => l,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn scenario_3_neither_classifier_has_a_catch_all_arm() {
+    for sig in [
+        "pub fn hop_body_class(&self) -> HopBodyClass {",
+        "pub fn is_breaking(&self) -> bool {",
+    ] {
+        let code = code_of(sig);
+        assert!(
+            !code.contains("_ =>"),
+            "`{sig}` has a catch-all arm again. Every `SchemaChange` variant must \
+             be classified deliberately; a wildcard makes the next variant \
+             silently provable (or silently safe). Body:\n{code}"
+        );
+    }
+}
+
+#[test]
+fn scenario_2_the_classifier_calls_the_widening_table() {
+    use crate::SimpleType as S;
+    let change = |old: S, new: S| SchemaChange::ChangeFieldType {
+        model_name: "Post".into(),
+        field_name: "views".into(),
+        old_type: old,
+        new_type: new,
+        answer: None,
+    };
+
+    for (old, new) in [
+        (S::U32, S::U64),
+        (S::I32, S::I64),
+        (S::U32, S::I64),
+        (S::StrN { chars: 4, exact: false }, S::StrN { chars: 8, exact: false }),
+        (S::Timestamp(0), S::Timestamp(2)),
+    ] {
+        let c = change(old.clone(), new.clone());
+        assert_eq!(
+            c.hop_body_class(),
+            HopBodyClass::Auto,
+            "{old} -> {new} is value-preserving and must need no author"
+        );
+        assert!(c.is_breaking(), "{old} -> {new} still rewrites data at rest");
+    }
+
+    for (old, new) in [
+        (S::U64, S::U32),
+        (S::I32, S::U32),
+        (S::U64, S::I64),
+        (S::U32, S::F64),
+        (S::StrN { chars: 8, exact: false }, S::StrN { chars: 4, exact: false }),
+        (S::Timestamp(2), S::Timestamp(0)),
+        (S::Str, S::U32),
+        (S::Opaque("U32".into()), S::Opaque("U64".into())),
+    ] {
+        assert_eq!(
+            change(old.clone(), new.clone()).hop_body_class(),
+            HopBodyClass::Authored,
+            "{old} -> {new} is NOT value-preserving and must reach a human"
+        );
+    }
+}
+
+#[test]
+fn scenario_3b_widening_nullability_is_provable_and_narrowing_is_not() {
+    let n = |old: bool, new: bool| SchemaChange::ChangeFieldNullability {
+        model_name: "Post".into(),
+        field_name: "views".into(),
+        old_nullable: old,
+        new_nullable: new,
+        answer: None,
+    };
+    assert_eq!(n(false, true).hop_body_class(), HopBodyClass::Auto);
+    assert!(!n(false, true).is_breaking());
+    assert_eq!(n(true, false).hop_body_class(), HopBodyClass::Authored);
+    assert!(n(true, false).is_breaking());
+}
+
+#[test]
+fn a_rename_is_breaking_even_though_it_needs_no_author() {
+    let f = SchemaChange::RenameField {
+        model_name: "Post".into(),
+        old_name: "views".into(),
+        new_name: "hits".into(),
+    };
+    assert!(f.is_breaking(), "a rename needs the offline transformer");
+    assert_eq!(f.hop_body_class(), HopBodyClass::Auto, "…but no human");
+
+    let m = SchemaChange::RenameModel {
+        old_name: "Post".into(),
+        new_name: "Article".into(),
+    };
+    assert!(m.is_breaking());
+    assert_eq!(m.hop_body_class(), HopBodyClass::Auto);
 }

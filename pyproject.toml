@@ -1,23 +1,8 @@
-# PyPI packaging for the `forgedb` CLI — epic #173 / issue #185.
-#
-# maturin `bindings = "bin"` wraps the compiled `forgedb` binary (plus the
-# bundled `forgedb-lsp`, via `features = ["lsp"]`) into platform wheels, so
-# `uv tool install hoodiecollin-forgedb` / `pip install hoodiecollin-forgedb`
-# (or `uvx --from hoodiecollin-forgedb forgedb`) deliver the CLI with no Rust
-# toolchain. This is the one distribution channel cargo-dist
-# can't handle (dist does not publish to PyPI); everything else is driven by
-# dist-workspace.toml. The wheel version is read from the crate version in
-# Cargo.toml (`dynamic = ["version"]`), keeping this channel in lockstep with the
-# `v*` tag that drives all the others.
 [build-system]
 requires = ["maturin>=1.7,<2"]
 build-backend = "maturin"
 
 [project]
-# The PyPI project is `hoodiecollin-forgedb`: bare `forgedb` is blocked by PyPI's
-# similarity guard (the existing `forge-db` normalizes to the same name), so we
-# mirror the `@hoodiecollin` npm scope. The installed command is still `forgedb`
-# (maturin `bindings = "bin"` ships the cargo binary names, not the project name).
 name = "hoodiecollin-forgedb"
 description = "ForgeDB — an application database generator. Compiles a declarative .forge schema into tailored Rust database code, a TypeScript SDK, and a REST API."
 readme = "README.md"
@@ -42,8 +27,6 @@ Homepage = "https://github.com/hoodiecollin/forgedb"
 Repository = "https://github.com/hoodiecollin/forgedb"
 
 [tool.maturin]
-# Package the crate's binaries (`forgedb` + the feature-gated `forgedb-lsp`) as a
-# console wheel rather than a Python extension module.
 bindings = "bin"
 features = ["lsp"]
 manifest-path = "Cargo.toml"

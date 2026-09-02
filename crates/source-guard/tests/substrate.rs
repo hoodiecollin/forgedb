@@ -1,8 +1,3 @@
-//! The testkit's own guards.
-//!
-//! A framework that mis-parses reports clean, with far more leverage than any single
-//! `contains` it replaces. These tests are the reason it is allowed to have that leverage.
-
 use forgedb_source_guard::{cache_stats, cached_parse, cached_source, RustSource};
 
 const SAMPLE: &str = r#"
@@ -22,8 +17,6 @@ fn parses_and_exposes_the_tree() {
 
 #[test]
 fn identical_content_hits_the_cache() {
-    // Unique to this test so another test's parses cannot supply the hit — a shared
-    // fixture would let this pass without the cache doing anything.
     let unique = format!("{SAMPLE}\n// identical_content_hits_the_cache\n");
 
     let before = cache_stats();
@@ -50,10 +43,6 @@ fn identical_content_hits_the_cache() {
 
 #[test]
 fn different_content_does_not_collide() {
-    // The failure this guards is the one the design rejected: keying the cache on the
-    // SCHEMA rather than the content. Two generators consuming one schema emit different
-    // Rust, and both are valid `syn::File`s — so a mis-keyed cache hands back the wrong
-    // tree silently, with nothing to notice.
     let a = RustSource::generated("a.rs", "pub struct A;");
     let b = RustSource::generated("b.rs", "pub struct B;");
 
@@ -72,9 +61,6 @@ fn cached_source_generates_once() {
     static CALLS: AtomicUsize = AtomicUsize::new(0);
 
     let key = "cached_source_generates_once";
-    // A fresh closure each call: `cached_source` takes `FnOnce`, and passing two separate
-    // closures is also the stricter test — the counter, not the closure identity, is what
-    // proves the memo fired.
     let first = cached_source(key, || {
         CALLS.fetch_add(1, Ordering::SeqCst);
         "pub struct Generated;".to_string()
@@ -95,8 +81,6 @@ fn cached_source_generates_once() {
 
 #[test]
 fn reads_a_real_repo_file() {
-    // Handwritten source carries no parse guarantee from generation, unlike generated
-    // output. This crate's own lib.rs is a convenient real file that must parse.
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs");
     let src = RustSource::repo_file(path);
     assert!(
@@ -108,7 +92,6 @@ fn reads_a_real_repo_file() {
 #[test]
 #[should_panic(expected = "did not parse")]
 fn unparseable_source_is_fatal_not_silent() {
-    // The whole crate exists because a guard that cannot evaluate must not report green.
     cached_parse("pub fn ( ) ) not rust");
 }
 

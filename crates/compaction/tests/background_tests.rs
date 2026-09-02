@@ -6,7 +6,6 @@ use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 
-/// Write a minimal `manifest.json` with the given row_count into `model_dir`.
 fn write_manifest(model_dir: &std::path::Path, row_count: usize) {
     let manifest = format!(
         r#"{{"format_version":1,"row_count":{},"columns":[],"wal_enabled":false,"last_checkpoint":0}}"#,
@@ -23,7 +22,7 @@ fn test_background_compactor_lifecycle() {
     let config = CompactionConfig {
         dead_space_threshold: 0.3,
         auto_compact: true,
-        check_interval_secs: 1, // Short interval for testing
+        check_interval_secs: 1,
         max_compaction_time_secs: 60,
     };
 
@@ -35,11 +34,9 @@ fn test_background_compactor_lifecycle() {
     bg_compactor.start();
     assert!(bg_compactor.is_running());
 
-    // Wait a bit
     thread::sleep(Duration::from_millis(100));
 
     bg_compactor.stop();
-    // Drop joins the thread; no sleep needed (C5 fix)
 }
 
 #[test]
@@ -48,19 +45,15 @@ fn test_manual_trigger() {
     let data_dir = temp_dir.path();
     let model_dir = data_dir.join("User");
 
-    // Create test model with dead space
     fs::create_dir_all(model_dir.join("fixed")).unwrap();
 
-    // 8 rows (1 byte = 8 tombstone bits), 50% deleted
-    // Manifest required by C1 fix
     write_manifest(&model_dir, 8);
 
-    // 8 rows, rows 0,2,4,6 deleted (50% dead): one byte per row.
     let mut tombstone_file = fs::File::create(model_dir.join("tombstones.bin")).unwrap();
     tombstone_file.write_all(&[1u8, 0, 1, 0, 1, 0, 1, 0]).unwrap();
 
     let mut id_file = fs::File::create(model_dir.join("fixed/id.bin")).unwrap();
-    id_file.write_all(&[0u8; 128]).unwrap(); // 8 rows * 16 bytes
+    id_file.write_all(&[0u8; 128]).unwrap();
 
     let config = CompactionConfig {
         dead_space_threshold: 0.3,
@@ -73,13 +66,11 @@ fn test_manual_trigger() {
 
     bg_compactor.trigger_manual().unwrap();
 
-    // Wait for compaction to complete
     thread::sleep(Duration::from_secs(1));
 
     let results = bg_compactor.last_results();
     assert!(!results.is_empty());
 
-    // Should have compacted User model
     let user_result = results.iter().find(|r| r.model_name == "User");
     assert!(user_result.is_some());
     assert!(user_result.unwrap().success);

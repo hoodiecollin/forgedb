@@ -4,17 +4,9 @@ version = "0.0.0"
 edition.workspace = true
 description = "Test-only: assert properties of Rust source through its AST, so a guard cannot pass vacuously."
 
-# NEVER published. This is a dev-only testkit; it is not substrate, not a compiler
-# internal, and nothing generated links it. See the note in the root Cargo.toml about
-# how consumers must declare it (path-only, NO `version` key) — a `version` here would
-# not help, because the trap is on the consumer's side.
 publish = false
 
 [dependencies]
-# `visit` is declared EXPLICITLY and deliberately. In `crates/codegen` the enabled syn
-# feature set is `full, parsing, printing, extra-traits, derive, clone-impls, proc-macro`,
-# and `full` is *inherited from prettyplease* rather than declared — so nothing there
-# guarantees `visit` is on. This crate walks trees, so it declares what it needs.
 syn = { version = "2.0", features = ["full", "parsing", "printing", "extra-traits", "visit"] }
 # `ToTokens`, to render a type back to text for a readable failure message.
 quote = "1.0"

@@ -181,7 +181,7 @@ These keep the two axes clean and the derived views trivial. **Enforce them on e
   (§5.2).
 - **`hotfix` ⇒ `bugfix` + a milestone, and `hotfix` ⊕ {`experiment`, `epic`}** (PM014). A hotfix is
   a *form* of bugfix, not a fourth type (§5.6).
-- **A patch milestone holds one hotfix, its gates, and any `release-gate` — no other work** (PM015).
+- **A patch milestone holds exactly one work item, its gates, and any `release-gate` — no other work** (PM015).
   A `release-gate` is a release obligation rather than work, so it was never what "nothing else"
   excluded; §5.6 says where a patch's asset ledger lives.
 
@@ -626,7 +626,7 @@ may run at all is what keeps that safe, and it stays strict.
 
 ---
 
-### 5.6 Hotfixes — the bounded exception, with a warrant
+### 5.6 The patch line — hotfixes, and the bounded exception generally
 
 A **hotfix** is a `bugfix` that also carries the `hotfix` label. It takes the **same two gates** —
 the bugfix path is already short, so there is no separate sequence to learn. What differs is
@@ -662,8 +662,20 @@ eligibility test 3 rather than asserting it.
 A hotfix gets **its own `vX.Y.Z` milestone**, opened when the warrant is accepted, and it is never
 folded into the cycle in flight.
 
-**One hotfix, one milestone.** A patch milestone that accumulates "while we're in there" work has
-lost the boundedness that made it cheap, which is why this is an invariant (PM015) and not a habit.
+**One work item, one patch milestone.** A patch milestone that accumulates "while we're in there"
+work has lost the boundedness that made it cheap, which is why this is an invariant (PM015) and not
+a habit.
+
+**The limit is a count, not a type.** A hotfix is the *motivating* inhabitant of a patch line and
+the only one with eligibility tests, but it is not the only legal one: a single bounded change that
+alters no released behavior — a CI repair, a source-hygiene sweep — can warrant its own patch
+milestone too, and refusing it only invites mislabelling the work `hotfix` to get it there. What
+must not happen is a *second* item joining it, which is the accumulation this section exists to
+prevent and the property PM015 now actually measures.
+
+The eligibility tests above are unchanged and still govern one question: whether a **bugfix** may
+jump the release spine. They were never lintable — "waiting is unacceptable" is a judgement — so
+they live where they always did, asserted in gate 1.
 
 **"Nothing else" means no other *work*.** A `release-gate` may — and for the ledger below, must —
 sit on a patch milestone. It is a release obligation, not something anyone could defer, which is

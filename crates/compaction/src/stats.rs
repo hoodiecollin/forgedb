@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Collects statistics about database storage
 pub struct StatsCollector {
     data_dir: PathBuf,
 }
@@ -16,14 +15,6 @@ impl StatsCollector {
         }
     }
 
-    /// Read the authoritative row count from the tombstone file length.
-    ///
-    /// `tombstones.bin` stores 1 byte/row and is appended last in each insert
-    /// (#65), so its byte length is the count of physically-committed rows.
-    /// This is the same anchor generated `open()`/reopen uses — no manifest
-    /// required (generated databases do not write one).  Replaces the previous
-    /// dependency on a `manifest.json` `row_count`, and the size-guessing
-    /// heuristic before that (which failed for mixed column widths).
     fn read_row_count(model_dir: &Path) -> Result<usize, String> {
         let tombstone_path = model_dir.join("tombstones.bin");
         if !tombstone_path.exists() {
@@ -37,7 +28,6 @@ impl StatsCollector {
             .map_err(|e| format!("Failed to stat {:?}: {}", tombstone_path, e))
     }
 
-    /// Collect statistics for a specific model
     pub fn collect_model_stats(&self, model_name: &str) -> Result<ModelStats, String> {
         let model_dir = self.data_dir.join(model_name);
 
@@ -45,7 +35,6 @@ impl StatsCollector {
             return Err(format!("Model directory not found: {:?}", model_dir));
         }
 
-        // C1: use authoritative row count from the tombstone file length (#65)
         let row_count = Self::read_row_count(&model_dir)?;
 
         let mut stats = ModelStats {
@@ -62,21 +51,18 @@ impl StatsCollector {
             last_compaction: None,
         };
 
-        // Read tombstone bitmap using manifest row_count
         let tombstone_path = model_dir.join("tombstones.bin");
         let tombstones = self.read_tombstone_bitmap(&tombstone_path, row_count)?;
         stats.total_rows = tombstones.len();
         stats.deleted_rows = tombstones.iter().filter(|&&t| t).count();
         stats.active_rows = stats.total_rows - stats.deleted_rows;
 
-        // Collect fixed column stats
         let fixed_dir = model_dir.join("fixed");
         if fixed_dir.exists() {
             let fixed_columns = self.collect_fixed_column_stats(&fixed_dir, &tombstones)?;
             stats.columns.extend(fixed_columns);
         }
 
-        // Collect variable column stats
         let variable_dir = model_dir.join("variable");
         if variable_dir.exists() {
             let variable_columns =
@@ -84,10 +70,8 @@ impl StatsCollector {
             stats.columns.extend(variable_columns);
         }
 
-        // Collect index statistics
         stats.index_sizes = self.collect_index_stats(&model_dir)?;
 
-        // Calculate totals
         for column in &stats.columns {
             stats.total_disk_bytes += column.total_bytes;
             stats.used_bytes += column.used_bytes;
@@ -96,12 +80,11 @@ impl StatsCollector {
 
         for size in stats.index_sizes.values() {
             stats.total_disk_bytes += size;
-            stats.used_bytes += size; // Indexes don't have dead space
+            stats.used_bytes += size;
         }
 
         stats.calculate_ratio();
 
-        // Check for last compaction timestamp
         let compaction_marker = model_dir.join(".last_compaction");
         if compaction_marker.exists() {
             if let Ok(content) = fs::read_to_string(&compaction_marker) {
@@ -117,7 +100,6 @@ impl StatsCollector {
         Ok(stats)
     }
 
-    /// Collect statistics for all models in the database
     pub fn collect_database_stats(&self) -> Result<DatabaseStats, String> {
         let mut db_stats = DatabaseStats {
             models: Vec::new(),
@@ -145,7 +127,6 @@ impl StatsCollector {
                                 db_stats.models.push(model_stats);
                             }
                             Err(e) => {
-                                // C4: use log facade instead of eprintln! in library code
                                 log::warn!(
                                     "Failed to collect stats for model '{}': {}",
                                     model_name,
@@ -163,17 +144,6 @@ impl StatsCollector {
         Ok(db_stats)
     }
 
-    /// Read the tombstone file and return exactly `row_count` booleans.
-    ///
-    /// The storage layer (`forgedb_storage::Tombstones`) writes one byte per row:
-    /// `0x00` = alive, any non-zero value = deleted.  Reads exactly `row_count`
-    /// bytes and maps each to a bool.  Pads with `false` if the file is shorter
-    /// than `row_count` (defensively handles partially-written files).
-    ///
-    /// The previous heuristic that inferred row count by trying element sizes
-    /// [16,8,4,1] against the first fixed column file has been removed; it picked
-    /// the wrong row count for models with mixed column widths, propagating wrong
-    /// `tombstones.len()` into every downstream element_size calculation.
     fn read_tombstone_bitmap(
         &self,
         path: &Path,
@@ -184,15 +154,12 @@ impl StatsCollector {
         }
 
         let bytes = fs::read(path).map_err(|e| e.to_string())?;
-        // One byte per row: 0x00 = alive, non-zero = deleted.
         let mut tombstones: Vec<bool> =
             bytes.iter().take(row_count).map(|&b| b != 0).collect();
-        // Pad with false if the file is shorter than expected.
         tombstones.resize(row_count, false);
         Ok(tombstones)
     }
 
-    /// Collect stats for fixed-size columns
     fn collect_fixed_column_stats(
         &self,
         fixed_dir: &Path,
@@ -218,8 +185,6 @@ impl StatsCollector {
                 let active_rows = tombstones.iter().filter(|&&t| !t).count();
                 let deleted_rows = tombstones.iter().filter(|&&t| t).count();
 
-                // tombstones.len() == row_count (guaranteed by manifest-based
-                // read_tombstone_bitmap), so element_size is always correct.
                 let element_size = if tombstones.is_empty() {
                     0
                 } else {
@@ -248,7 +213,6 @@ impl StatsCollector {
         Ok(columns)
     }
 
-    /// Collect stats for variable-length columns
     fn collect_variable_column_stats(
         &self,
         variable_dir: &Path,
@@ -262,11 +226,6 @@ impl StatsCollector {
             let entry = entry.map_err(|e| e.to_string())?;
             let path = entry.path();
 
-            // Match variable *data* files by `*.bin` + `_data` substring, deriving
-            // the offsets name via `_data` → `_offsets` — same broadened rule as
-            // the compactor, so this covers the generated `string_data_<idx>.bin`
-            // layout (the old `ends_with("_data.bin")` silently skipped it, making
-            // variable bytes invisible to stats).
             let name = path.file_name().and_then(|s| s.to_str()).map(|s| s.to_string());
             if path.is_file()
                 && name
@@ -298,8 +257,6 @@ impl StatsCollector {
 
                 let total_bytes = data_size + offset_size;
 
-                // Derive a display name from the data filename (drop the trailing
-                // `_data.bin` / `_data_<idx>.bin` suffix for readability).
                 let column_name = path
                     .file_stem()
                     .and_then(|s| s.to_str())
@@ -325,7 +282,6 @@ impl StatsCollector {
         Ok(columns)
     }
 
-    /// Read offset file
     fn read_offsets(&self, path: &Path) -> Result<Vec<(u64, u64)>, String> {
         let bytes = fs::read(path).map_err(|e| e.to_string())?;
         let mut offsets = Vec::new();
@@ -339,7 +295,6 @@ impl StatsCollector {
         Ok(offsets)
     }
 
-    /// Calculate used vs dead bytes for variable column
     fn calculate_variable_column_usage(
         &self,
         offsets: &[(u64, u64)],
@@ -361,9 +316,7 @@ impl StatsCollector {
         (used_bytes, dead_bytes)
     }
 
-    /// Collect index statistics
     fn collect_index_stats(&self, _model_dir: &Path) -> Result<HashMap<String, u64>, String> {
-        // In-memory indexes don't have disk representation in current implementation
         Ok(HashMap::new())
     }
 }

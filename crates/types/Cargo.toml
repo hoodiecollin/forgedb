@@ -12,11 +12,6 @@ categories = ["database"]
 serde = { version = "1.0", features = ["derive"] }
 uuid = { version = "1.6", features = ["v4", "serde"] }
 
-# On `wasm32-unknown-unknown` the `uuid` crate needs an explicit randomness
-# backend for `v4` generation — enable its `js` feature (which pulls the
-# `getrandom` JS/`crypto.getRandomValues` source). Cargo unions features, so
-# native builds are unaffected. This is what lets the generated crate that
-# depends on `forgedb-types` compile for the browser read-replica target (#110).
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 uuid = { version = "1.6", features = ["v4", "serde", "js"] }
 

@@ -10,7 +10,6 @@ pub struct CreateOptions {
 }
 
 pub struct RestoreOptions {
-    /// A single full archive, or a base followed by its incrementals in order.
     pub archives: Vec<PathBuf>,
     pub output: PathBuf,
     pub overwrite: bool,
@@ -25,8 +24,6 @@ fn map_err(e: forgedb_backup::BackupError) -> CliError {
     CliError::Backup(e.to_string())
 }
 
-/// Create a snapshot archive of a database directory — a full lock-free
-/// snapshot, or an incremental byte-tail delta against a base (`--incremental`).
 pub fn create(opts: CreateOptions) -> Result<(), CliError> {
     let (summary, kind) = if opts.incremental {
         let base = opts.base.ok_or_else(|| {
@@ -67,8 +64,6 @@ pub fn create(opts: CreateOptions) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Restore a snapshot archive (or a base + incremental chain) into a data
-/// directory (atomic temp + rename). Pass the base first, then each delta.
 pub fn restore(opts: RestoreOptions) -> Result<(), CliError> {
     let summary =
         forgedb_backup::restore_chain(&opts.archives, &opts.output, opts.overwrite)
@@ -96,7 +91,6 @@ pub fn restore(opts: RestoreOptions) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Inspect an archive's header without materializing it.
 pub fn list(opts: ListOptions) -> Result<(), CliError> {
     let header = forgedb_backup::read_header(&opts.archive).map_err(map_err)?;
 
@@ -128,9 +122,6 @@ pub fn list(opts: ListOptions) -> Result<(), CliError> {
     );
     println!("{}", "=".repeat(65));
     for m in &header.models {
-        // `SchemaV` is the app's migration serial and `EngineV` ForgeDB's
-        // byte-format generation (#254) — two orthogonal counters.  Before #254
-        // this column copied a manifest constant that was always `1`.
         println!(
             "{:<24} {:>10} {:>10} {:>8} {:>8}",
             m.dir, m.row_count, m.compaction_epoch, m.schema_version, m.engine_version

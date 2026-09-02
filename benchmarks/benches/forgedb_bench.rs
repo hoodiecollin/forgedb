@@ -1,7 +1,3 @@
-//! ForgeDB generated-code benchmark suite. Drives the real generated `Database`
-//! API (`benchmarks/gen/database.rs`) over the shared seeded corpus. Scenario
-//! numbers match docs/BENCHMARKS.md and the SQLite suite so the groups line up.
-
 use std::cell::Cell;
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
@@ -10,9 +6,6 @@ use forgedb_benchmarks::forgedb_generated::{Database, Post, Tag, User};
 use forgedb_benchmarks::ts_from_seconds;
 use uuid::Uuid;
 
-// Fixed corpus for the read/traversal scenarios (built once, outside timing).
-// Kept modest because ForgeDB's `FsyncPolicy::Always` makes setup fsync-bound
-// (one fsync per insert); point/probe latency is O(1) so this is representative.
 const READ_USERS: usize = 1_000;
 const READ_POSTS: usize = 10_000;
 
@@ -46,8 +39,6 @@ fn tag_of(row: &forgedb_benchmarks::TagRow) -> Tag {
     }
 }
 
-/// Open a fresh on-disk database under a unique temp dir and load `data` into it
-/// (users, posts, tags, then the M2M links). Returns the db + its tempdir guard.
 fn populated(data: &Dataset) -> (Database, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut db = Database::open_at(dir.path().to_path_buf());
@@ -66,12 +57,9 @@ fn populated(data: &Dataset) -> (Database, tempfile::TempDir) {
     (db, dir)
 }
 
-// --- Scenario 2: single-row insert latency -----------------------------------
 fn bench_insert(c: &mut Criterion) {
     let mut group = c.benchmark_group("forgedb/insert_user");
     group.throughput(Throughput::Elements(1));
-    // A large pool of unique records; each iteration consumes the next so no
-    // unique-email collision and the durable write path (WAL fsync) is timed.
     let pool = dataset(200_000, 0);
     let dir = tempfile::tempdir().unwrap();
     let mut db = Database::open_at(dir.path().to_path_buf());
@@ -79,9 +67,6 @@ fn bench_insert(c: &mut Criterion) {
     group.bench_function("insert_one", |b| {
         b.iter_batched(
             || {
-                // Build a fully-unique record in setup — criterion fills a whole
-                // batch of inputs BEFORE running the routine, so the uniqueness
-                // must be baked into each input, not read from the counter later.
                 let i = next.get();
                 next.set(i + 1);
                 let mut u = user_of(&pool.users[i % pool.users.len()]);
@@ -98,13 +83,6 @@ fn bench_insert(c: &mut Criterion) {
     group.finish();
 }
 
-// --- Scenario 1: bulk load (per-row durable — ANTI-PATTERN baseline) ---------
-// This loads via per-row `insert()`, so EVERY row pays its own `F_FULLFSYNC`
-// barrier (~3.5 ms). It is NOT the fair cross-engine bulk comparison — SQLite's
-// and DuckDB's `bulk_load` wrap the whole load in ONE transaction (one durability
-// event), so compare those against `bulk_load_grouped` below (ForgeDB's #170
-// transaction path), not against this. Kept only to measure the fsync-bound
-// per-row write ceiling deliberately; do not read it as "ForgeDB bulk load".
 fn bench_bulk_load(c: &mut Criterion) {
     let mut group = c.benchmark_group("forgedb/bulk_load_posts");
     group.sample_size(10);
@@ -123,7 +101,7 @@ fn bench_bulk_load(c: &mut Criterion) {
                         db.post.insert(post_of(p)).unwrap();
                     }
                     db.checkpoint();
-                    dir // keep dir alive until after timing
+                    dir
                 },
                 BatchSize::PerIteration,
             );
@@ -132,11 +110,6 @@ fn bench_bulk_load(c: &mut Criterion) {
     group.finish();
 }
 
-// --- Scenario 1b: bulk load with GROUP COMMIT (#170) -------------------------
-// The same bulk load, but inside ONE transaction: staged rows use the buffered
-// (no-fsync) WAL append and pay a SINGLE `F_FULLFSYNC` barrier at commit instead
-// of one per row. This is the group-commit fix — durability preserved (the whole
-// transaction commits atomically or rolls back), barrier amortized across N rows.
 fn bench_bulk_load_grouped(c: &mut Criterion) {
     let mut group = c.benchmark_group("forgedb/bulk_load_grouped");
     group.sample_size(10);
@@ -148,10 +121,6 @@ fn bench_bulk_load_grouped(c: &mut Criterion) {
                 || tempfile::tempdir().unwrap(),
                 |dir| {
                     let mut db = Database::open_at(dir.path().to_path_buf());
-                    // Two transactions (not one): a post's `author` FK is validated
-                    // against COMMITTED rows, so the users must commit before the
-                    // posts that reference them. Two barriers for N rows — still the
-                    // group-commit win vs one barrier per row.
                     db.transaction(|tx| {
                         for u in &data.users {
                             tx.create_user(user_of(u))?;
@@ -166,7 +135,7 @@ fn bench_bulk_load_grouped(c: &mut Criterion) {
                         Ok(())
                     })
                     .expect("group-commit posts");
-                    dir // keep dir alive until after timing
+                    dir
                 },
                 BatchSize::PerIteration,
             );
@@ -175,12 +144,10 @@ fn bench_bulk_load_grouped(c: &mut Criterion) {
     group.finish();
 }
 
-// --- Read / traversal scenarios (5, 6, 8, 10, 11) ----------------------------
 fn bench_reads(c: &mut Criterion) {
     let data = dataset(READ_USERS, READ_POSTS);
     let (db, _dir) = populated(&data);
 
-    // Scenario 5: point lookup by PK.
     c.benchmark_group("forgedb/point_lookup")
         .throughput(Throughput::Elements(1))
         .bench_function("get_post_by_id", |b| {
@@ -192,7 +159,6 @@ fn bench_reads(c: &mut Criterion) {
             });
         });
 
-    // Scenario 6: secondary-index probe (unique email, O(1)).
     c.benchmark_group("forgedb/index_probe")
         .throughput(Throughput::Elements(1))
         .bench_function("get_user_by_email", |b| {
@@ -204,7 +170,6 @@ fn bench_reads(c: &mut Criterion) {
             });
         });
 
-    // Scenario 8: FK-index probe / Scenario 10: reverse one-to-many.
     c.benchmark_group("forgedb/reverse_fk")
         .throughput(Throughput::Elements(1))
         .bench_function("user_posts", |b| {
@@ -216,7 +181,6 @@ fn bench_reads(c: &mut Criterion) {
             });
         });
 
-    // Scenario 11: many-to-many traversal (linear junction scan today).
     c.benchmark_group("forgedb/m2m")
         .throughput(Throughput::Elements(1))
         .bench_function("post_tags", |b| {
@@ -229,19 +193,10 @@ fn bench_reads(c: &mut Criterion) {
         });
 }
 
-// --- Scenario 7: filtered scan + aggregate + top-N ---------------------------
-// The columnar-scan path. For the aggregate, ForgeDB reads ONLY the queried
-// columns via a declared `@projection(agg: views, published)` — the buffered
-// narrow scan `all_agg()` bulk-loads just those two fixed-width columns and never
-// touches the `title` `String` (#167/#168 column-pruning). This is the fair
-// apples-to-apples with a columnar engine that also reads only queried columns.
-// For the top-N, #169's ordered index serves the range directly.
 fn bench_scan(c: &mut Criterion) {
     let data = dataset(READ_USERS, READ_POSTS);
     let (db, _dir) = populated(&data);
 
-    // 7a: filtered aggregate — COUNT + SUM(views) WHERE published, over the
-    // projected (views, published) buffered scan — no `title` decode/alloc.
     c.benchmark_group("forgedb/scan_aggregate")
         .throughput(Throughput::Elements(READ_POSTS as u64))
         .bench_function("sum_views_where_published", |b| {
@@ -258,16 +213,10 @@ fn bench_scan(c: &mut Criterion) {
             });
         });
 
-    // 7b: top-10 posts by views (>= threshold), DESC. Since #169, `views: ^u64`
-    // carries an ORDERED index, so this is served by `find_by_views_range` — an
-    // O(offset+limit) ordered range walk + page materialize, the same shape as
-    // SQLite's index-served 4.35 µs (its `idx_post_views` B-tree). Before #169
-    // this was a full narrow scan + sort + truncate (kept below for reference).
     c.benchmark_group("forgedb/scan_sort_top10")
         .throughput(Throughput::Elements(READ_POSTS as u64))
         .bench_function("top10_by_views", |b| {
             b.iter(|| {
-                // min=50_000, max=unbounded, descending, limit 10.
                 let page = db
                     .post
                     .find_by_views_range(Some(50_000), None, true, Some(10));

@@ -5,10 +5,6 @@ edition = "2024"
 publish = false
 description = "Experiment #261 — inline string(N) slot vs pointer indirection. See the issue for the verdict."
 
-# Detached from both the root workspace and `benchmarks/`: this measures the
-# storage substrate directly and must not drag in the comparative-DB deps
-# (SQLite/DuckDB/PG) or the generated `gen/database.rs`, which tracks a schema
-# that has nothing to do with this question.
 [workspace]
 
 [dependencies]

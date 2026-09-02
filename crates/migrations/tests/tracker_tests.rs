@@ -13,7 +13,6 @@ fn test_migration_tracker() {
         .unwrap();
     assert!(tracker.is_applied("20241014000000"));
 
-    // Create a new tracker instance to verify persistence
     let tracker2 = MigrationTracker::new(temp_dir.path()).unwrap();
     assert!(tracker2.is_applied("20241014000000"));
 }

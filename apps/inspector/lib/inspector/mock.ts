@@ -1,13 +1,3 @@
-/**
- * Mock database — a small `blog.forge`-style schema used to drive the shell
- * until the real lenses land (#12 at-rest, #13 live). Ported from the design
- * prototype so the UI has realistic, domain-shaped content to render.
- *
- * This is the ONLY place the inspector fabricates data. Every screen reads from
- * these tables through the atoms; swapping in real reads means replacing this
- * module's exports, not touching the components.
- */
-
 import type {
   Field,
   GridData,
@@ -17,7 +7,6 @@ import type {
   SavedQuery,
   Snapshot,
 } from "./types";
-
 export const MODELS: Model[] = [
   { key: "User", rows: "1,204", deadPct: 2.5, deadCount: "31", health: "ok", x: 250, y: 64, dataMB: "14.2", offMB: "1.1", reclaim: "31", idxCount: "3" },
   { key: "Post", rows: "8,932", deadPct: 6, deadCount: "541", health: "ok", x: 460, y: 62, dataMB: "96.4", offMB: "7.8", reclaim: "541", idxCount: "2" },
@@ -44,7 +33,6 @@ export const REL: Record<string, Relation[]> = {
   ],
   Org: [{ kind: "has-many", label: "users → User", to: "User", k: "hm" }],
 };
-
 export const SCHEMA: Record<string, Field[]> = {
   User: [
     { name: "id", typeLabel: "uuid", mods: ["+", "&", "^"], control: "uuid", value: "7b10a4c2-9f3d-4e21-b8a0-2c1e44f1" },
@@ -93,7 +81,6 @@ export const SCHEMA: Record<string, Field[]> = {
     { name: "seats", typeLabel: "u32", mods: [], control: "int", min: 1, value: "25" },
   ],
 };
-
 export const GRID: Record<string, GridData> = {
   User: {
     cols: [{ k: "id", l: "id · uuid", mono: true }, { k: "email", l: "email &^", mono: true }, { k: "name", l: "name" }, { k: "role", l: "role" }, { k: "age", l: "age", mono: true }, { k: "created", l: "created_at", mono: true }, { k: "org", l: "org →", rel: true }],
@@ -140,33 +127,27 @@ export const GRID: Record<string, GridData> = {
     ],
   },
 };
-
 export const SAVED: SavedQuery[] = [
   { name: "active users · 30d", model: "User" },
   { name: "orphan posts", model: "Post" },
   { name: "admins by org", model: "User" },
 ];
-
 export const TAILS = [
   { name: "new comments", k: "ok" as const },
   { name: "edits → Post", k: "info" as const },
 ];
-
 export const SNAPS: Snapshot[] = [
   { name: "before-migration", time: "Nov 8 · 14:03" },
   { name: "nightly backup", time: "Nov 8 · 03:00" },
   { name: "pre-compaction", time: "Nov 6 · 22:10" },
 ];
-
 export const POST_STATUS = [
   { label: "published", pct: 72, n: "6,431" },
   { label: "draft", pct: 19, n: "1,697" },
   { label: "review", pct: 9, n: "804" },
 ];
-
 export const DEFAULT_PREDICATES: Predicate[] = [
   { field: "email", op: "=", val: '"lin@forge.dev"', idx: true },
   { field: "created_at", op: "≥", val: "1727740800000", idx: true },
 ];
-
 export const DB_NAME = "blog.forge";

@@ -89,14 +89,16 @@ deploy path; and a stated [semver policy](./SEMVER.md).
   in-process; there is no cross-process broker or distributed coordination.
 
 ### Migrations
-- **Additive-only automatic path.** Adding a model or a nullable/appended field
-  is data-preserving on reopen. **Breaking** changes (type change, field/model
-  removal, non-null add, adding `&unique`) require the documented **dump →
-  regenerate → reload** path — there is **no runtime data-transform engine** in
-  v1. `forgedb migrate create --auto` accepts additive deltas and **refuses**
-  breaking ones with a non-zero exit. New non-null fields backfill to type-zero
-  (not `@default`) and must be appended at the end. See
-  [MIGRATIONS.md](./MIGRATIONS.md).
+- **Offline, explicit, app-stopped migration.** There is **no runtime
+  data-transform engine**: a breaking change (a type change, a field/model
+  removal, a non-null add, adding `&unique`) is carried by a per-range
+  **offline transformer bin** ForgeDB generates and compiles for you. It is not
+  refused — that gate went with #74 Phase 4 — and it is not applied by the
+  running app either. Anything ForgeDB cannot prove a value for is **asked at
+  `migrate create` time** and recorded as data; a non-interactive session gets a
+  hard error naming the change rather than a guess. A resolvable `@default` is
+  applied to existing rows on a migration; new fields must still be appended at
+  the end. See [MIGRATIONS.md](./MIGRATIONS.md).
 
 ### Auth
 - **Verify-only.** ForgeDB verifies asymmetric JWTs your identity provider issues

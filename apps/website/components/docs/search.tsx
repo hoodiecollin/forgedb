@@ -16,7 +16,6 @@ import {
   CommandList,
 } from "@/components/ui/command";
 
-/** Small header button that opens the palette; shows the ⌘K hint. */
 export function SearchTrigger() {
   const [, setOpen] = useAtom(searchOpenAtom);
   return (
@@ -33,13 +32,11 @@ export function SearchTrigger() {
   );
 }
 
-/** The ⌘K command palette. Mounted once in the root layout. */
 export function CommandMenu() {
   const [open, setOpen] = useAtom(searchOpenAtom);
   const [docs, setDocs] = React.useState<SearchDoc[]>([]);
   const router = useRouter();
 
-  // Global ⌘K / Ctrl-K shortcut.
   React.useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "k" && (e.metaKey || e.ctrlKey)) {
@@ -51,7 +48,6 @@ export function CommandMenu() {
     return () => document.removeEventListener("keydown", onKey);
   }, [setOpen]);
 
-  // Lazy-load the static index the first time the palette opens.
   React.useEffect(() => {
     if (open && docs.length === 0) {
       fetch("/search-index.json")
@@ -66,7 +62,6 @@ export function CommandMenu() {
     router.push(href);
   };
 
-  // Group entries by their nav group for a tidy palette.
   const groups = React.useMemo(() => {
     const m = new Map<string, SearchDoc[]>();
     for (const d of docs) {
@@ -85,8 +80,7 @@ export function CommandMenu() {
       description="Find pages across the ForgeDB docs"
       className="max-w-xl"
     >
-      {/* This shadcn variant's CommandDialog is only the Dialog shell — it does
-          not provide the cmdk <Command> store, so we wrap the content here. */}
+      { }
       <Command shouldFilter>
         <CommandInput placeholder="Search the docs…" />
         <CommandList>

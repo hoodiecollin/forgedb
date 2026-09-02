@@ -1,11 +1,5 @@
 "use client";
 
-/**
- * Studio — grid-first browse/edit. Pick a model, compose predicates (bound to
- * the generated closed set, index-vs-scan flagged), see the generated request,
- * click a row to open the type-aware editor. Reverse/M2M nav pivots in place.
- */
-
 import { useAtom, useAtomValue, useSetAtom } from "jotai";
 import { toast } from "sonner";
 import { Network, Plus, Search, TerminalSquare, X } from "lucide-react";
@@ -44,17 +38,13 @@ import {
 } from "@/components/ui/table";
 import { NotAttached } from "./not-attached";
 import { cn } from "@/lib/utils";
-
-/** Render a live wire scalar into the grid's `string | null` cell shape. */
 function cellText(v: unknown): string | null {
   if (v == null) return null;
   if (typeof v === "object") return JSON.stringify(v);
   return String(v);
 }
-
 const dotColor = (h: string) =>
   h === "warn" ? "bg-warn" : h === "danger" ? "bg-danger" : "bg-ok";
-
 export function StudioScreen() {
   const connected = useAtomValue(connectedAtom);
   const [studioModel] = useAtom(studioModelAtom);
@@ -68,12 +58,9 @@ export function StudioScreen() {
   const models = useAtomValue(modelsAtom);
   const schema = useAtomValue(schemaAtom);
   const live = useLiveRows();
-
   const model = models.find((m) => m.key === studioModel) ?? models[0];
   const selCount = Object.keys(selection).length;
 
-  // Live rows when attached to a real project's API; otherwise the mock grid
-  // (falling back to the mock User grid for a real model with no sample).
   const usingLive = live.active;
   const cols = usingLive ? live.cols : (GRID[studioModel] ?? GRID.User!).cols;
   const rawRows: Record<string, unknown>[] = usingLive
@@ -81,12 +68,9 @@ export function StudioScreen() {
     : (GRID[studioModel] ?? GRID.User!).rows;
   const rowId = (r: Record<string, unknown>) =>
     String(usingLive ? r.id : r._id);
-
-  // Predicates bind to the generated closed set (equality on scalar fields).
   const available = filterableFields(schema[studioModel] ?? []);
   const usedFields = new Set(predicates.map((p) => p.field));
   const addable = available.filter((f) => !usedFields.has(f.name));
-
   const scans = predicates.filter((p) => !p.idx).length;
   const req = `GET /api/${studioModel
     .replace(/([a-z0-9])([A-Z])/g, "$1-$2")
@@ -98,7 +82,6 @@ export function StudioScreen() {
           .join("&")}`
       : ""
   }`;
-
   const toggleSel = (id: string) =>
     setSelection((s) => {
       const n = { ...s };
@@ -106,7 +89,6 @@ export function StudioScreen() {
       else n[id] = true;
       return n;
     });
-
   const removePredicate = (i: number) =>
     setPredicates((ps) => ps.filter((_, j) => j !== i));
   const addPredicate = (fieldName: string) => {
@@ -119,10 +101,9 @@ export function StudioScreen() {
   };
   const setPredicateVal = (i: number, val: string) =>
     setPredicates((ps) => ps.map((p, j) => (j === i ? { ...p, val } : p)));
-
   return (
     <div className="flex h-full min-h-0">
-      {/* model rail */}
+      { }
       <aside className="flex w-52 flex-none flex-col border-r border-border bg-card/40">
         <div className="p-3">
           <div className="flex items-center gap-2 rounded-lg border border-border bg-muted px-2.5 py-1.5 text-[12.5px] text-muted-foreground">
@@ -174,10 +155,9 @@ export function StudioScreen() {
           </button>
         </div>
       </aside>
-
-      {/* grid column */}
+      { }
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-        {/* title + pivot + new */}
+        { }
         <div className="flex flex-none items-center gap-2.5 border-b border-border px-4 py-2.5">
           <span className="text-[16px] font-semibold">{studioModel}</span>
           {pivot ? (
@@ -201,8 +181,7 @@ export function StudioScreen() {
             <Plus className="size-3.5" /> New record
           </Button>
         </div>
-
-        {/* filter bar */}
+        { }
         <div className="flex flex-none flex-wrap items-center gap-2 border-b border-border px-4 py-2.5">
           <span className="font-mono text-[11px] font-semibold text-muted-foreground">
             WHERE
@@ -273,8 +252,7 @@ export function StudioScreen() {
             </Button>
           </span>
         </div>
-
-        {/* generated request line */}
+        { }
         <div className="flex flex-none items-center gap-2 overflow-hidden border-b border-border px-4 py-1.5 font-mono text-[11px] text-muted-foreground">
           <span className="truncate">{req}</span>
           {live.error ? (
@@ -296,8 +274,7 @@ export function StudioScreen() {
             </span>
           )}
         </div>
-
-        {/* body: not-connected overlay OR grid */}
+        { }
         {!connected ? (
           <div className="flex flex-1 items-center justify-center p-10">
             <NotAttached
@@ -382,8 +359,7 @@ export function StudioScreen() {
                 </TableBody>
               </Table>
             </div>
-
-            {/* footer */}
+            { }
             <div className="flex flex-none items-center gap-3 border-t border-border px-4 py-2 text-[12px] text-muted-foreground">
               {selCount > 0 ? (
                 <span className="flex items-center gap-2.5">

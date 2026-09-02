@@ -1,8 +1,5 @@
-//! HTTP-specific validation extensions for Sprint 9
-
 use crate::ValidationError;
 
-/// HTTP validation error that maps to status codes
 #[derive(Debug, Clone)]
 pub struct HttpValidationError {
     pub status_code: u16,
@@ -10,7 +7,6 @@ pub struct HttpValidationError {
 }
 
 impl HttpValidationError {
-    /// Create a bad request error (400)
     pub fn bad_request(errors: Vec<ValidationError>) -> Self {
         Self {
             status_code: 400,
@@ -18,7 +14,6 @@ impl HttpValidationError {
         }
     }
 
-    /// Create a not found error (404)
     pub fn not_found(message: impl Into<String>) -> Self {
         Self {
             status_code: 404,
@@ -26,7 +21,6 @@ impl HttpValidationError {
         }
     }
 
-    /// Create a conflict error (409)
     pub fn conflict(message: impl Into<String>) -> Self {
         Self {
             status_code: 409,
@@ -34,7 +28,6 @@ impl HttpValidationError {
         }
     }
 
-    /// Create an unprocessable entity error (422)
     pub fn unprocessable_entity(errors: Vec<ValidationError>) -> Self {
         Self {
             status_code: 422,
@@ -42,7 +35,6 @@ impl HttpValidationError {
         }
     }
 
-    /// Create an internal server error (500)
     pub fn internal_error(message: impl Into<String>) -> Self {
         Self {
             status_code: 500,
@@ -50,17 +42,14 @@ impl HttpValidationError {
         }
     }
 
-    /// Check if this is a client error (4xx)
     pub fn is_client_error(&self) -> bool {
         self.status_code >= 400 && self.status_code < 500
     }
 
-    /// Check if this is a server error (5xx)
     pub fn is_server_error(&self) -> bool {
         self.status_code >= 500 && self.status_code < 600
     }
 
-    /// Get the primary error message
     pub fn message(&self) -> String {
         if self.errors.is_empty() {
             "Unknown error".to_string()
@@ -78,11 +67,9 @@ impl std::fmt::Display for HttpValidationError {
 
 impl std::error::Error for HttpValidationError {}
 
-/// Validation rules for HTTP requests
 pub struct HttpValidator;
 
 impl HttpValidator {
-    /// Validate required fields are present
     pub fn validate_required_fields(
         fields: &[(&str, Option<&str>)],
     ) -> Result<(), Vec<ValidationError>> {
@@ -107,7 +94,6 @@ impl HttpValidator {
         }
     }
 
-    /// Validate email format (basic check)
     pub fn validate_email(email: &str) -> Result<(), ValidationError> {
         if email.contains('@') && email.contains('.') && email.len() >= 5 {
             Ok(())
@@ -117,7 +103,6 @@ impl HttpValidator {
         }
     }
 
-    /// Validate string length
     pub fn validate_length(
         field_name: &str,
         value: &str,
@@ -140,7 +125,6 @@ impl HttpValidator {
         }
     }
 
-    /// Validate numeric range
     pub fn validate_range<T: PartialOrd + std::fmt::Display>(
         field_name: &str,
         value: T,
@@ -162,4 +146,3 @@ impl HttpValidator {
         }
     }
 }
-

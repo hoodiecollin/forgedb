@@ -42,10 +42,13 @@ compatible within `1.x`.
   its request or response;
 - tightening validation such that a previously-valid schema is rejected.
 
-This is the same additive-vs-breaking boundary the migration gate enforces at
-the *data* level (`forgedb migrate create --auto` accepts additive deltas and
-refuses breaking ones with a non-zero exit — Phase 4 W3). The schema-language
-policy and the data-migration policy therefore agree on what "breaking" means.
+This is the same additive-vs-breaking boundary the migration machinery works to
+at the *data* level: `forgedb migrate create` records every detected change as a
+versioned hop, and a breaking one routes through the offline transformer rather
+than the reopen backfill. (It has not *refused* breaking changes since #74
+Phase 4; what it refuses is a change it cannot prove a value for and cannot ask
+about — see [MIGRATIONS.md](MIGRATIONS.md).) The schema-language policy and the
+data-migration policy therefore agree on what "breaking" means.
 
 ## 2. Substrate ABI
 

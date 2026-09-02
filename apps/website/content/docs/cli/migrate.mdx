@@ -17,7 +17,7 @@ Nothing is inferred from your working directory.
 
 | Command | Purpose |
 |---|---|
-| `create <description>` | Record a migration; with `--auto`, diff the schema and classify/scaffold the change. |
+| `create <description>` | Diff the schema against the recorded snapshot, record + classify the change, and ask about anything it cannot prove. |
 | `status` | Report an app's lineage. |
 | `build --from F --to T` | Generate + compile the offline transformer for a version range. |
 | `run --from F --to T --src S --dest D` | Run a built transformer over a source → destination data directory. |
@@ -26,14 +26,25 @@ Nothing is inferred from your working directory.
 ### create
 
 ```bash
-forgedb migrate create <description> --schema <PATH> [--auto]
+forgedb migrate create <description> --schema <PATH> [--no-auto]
 ```
 
 | Flag | Type / default | Meaning |
 |---|---|---|
 | `<description>` | string (required) | Human description of the migration. |
 | `-s`, `--schema <PATH>` | path (**required**) | The app this migration belongs to. `migrations/` is read beside it. |
-| `-a`, `--auto` | bool (false) | Auto-detect schema changes by diffing against the recorded snapshot; record, classify (`Auto`/`Authored`), and scaffold any authored body. |
+| `--no-auto` | bool (false) | Opt out of the interactive **prompt**, not of detection. The diff is identical either way; what this decides is whether a change ForgeDB cannot prove a value for stops the run with a hard error naming it, or asks you a question. A session with no terminal behaves as if this were passed. |
+
+Detection is what `create` does, so there is no flag for it — `--auto` was removed in 0.5.0 and
+errors, naming `--no-auto`. There is also no way to create a migration ForgeDB did not detect: a
+record's `changes` array is derived from a schema diff, so it cannot disagree with
+`migrations/schemas/vN.forge`.
+
+A change ForgeDB **can** prove needs no input: a nullable add, a drop, a value-preserving
+widening, or an add whose field carries a resolvable `@default`. Anything else is asked about at
+`create` time — a constant, a copy of another field, or "I'll write the transform" — and your
+answer is recorded as data in the migration record, which `migrate build` then lowers into the
+generated transformer.
 
 ### status
 
@@ -110,7 +121,7 @@ and `--from` auto-detection that left with `up` are tracked for restoration as #
 Record an additive change and regenerate:
 
 ```bash
-forgedb migrate create "add note field" --auto --schema schema.forge
+forgedb migrate create "add note field" --schema schema.forge
 forgedb generate
 ```
 

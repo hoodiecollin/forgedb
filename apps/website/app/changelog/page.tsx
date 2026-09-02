@@ -18,7 +18,6 @@ const MONTHS = [
   "July", "August", "September", "October", "November", "December",
 ];
 
-/** Format "YYYY-MM-DD" without constructing a Date (avoids build-env TZ drift). */
 function formatDate(iso: string): string {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso);
   if (!m) return iso;
@@ -27,10 +26,6 @@ function formatDate(iso: string): string {
   return `${month} ${Number(d)}, ${y}`;
 }
 
-// The generated changes carry inline HTML (### group headings + bullet lists).
-// Style them here via scoped arbitrary variants so the changelog reads tight
-// without pulling in the docs' heavier MDX component set. Inline `code` inherits
-// the global chip (`code:not(pre code)` in globals.css).
 const BODY_PROSE = cn(
   "[&_h3]:mt-6 [&_h3]:mb-2 [&_h3]:text-xs [&_h3]:font-semibold [&_h3]:uppercase [&_h3]:tracking-wider [&_h3]:text-muted-foreground [&_h3:first-child]:mt-0",
   "[&_ul]:mb-5 [&_ul]:list-disc [&_ul]:space-y-1.5 [&_ul]:pl-5 [&_ul:last-child]:mb-0",

@@ -1,13 +1,8 @@
-//! Basic usage example for forgedb-types
-//!
-//! This example demonstrates creating and working with ForgeDB types.
-
 use forgedb_types::{Timestamp, Uuid, Value};
 
 fn main() {
     println!("=== ForgeDB Types - Basic Usage ===\n");
 
-    // Working with timestamps
     println!("--- Timestamps ---");
     let now = Timestamp::now();
     println!("Current timestamp: {}", now.as_micros());
@@ -16,7 +11,6 @@ fn main() {
     println!("Past timestamp: {}", past.as_micros());
     println!("Past < Now: {}\n", past < now);
 
-    // Working with UUIDs
     println!("--- UUIDs ---");
     let id1 = Uuid::new_v4();
     let id2 = Uuid::new_v4();
@@ -24,7 +18,6 @@ fn main() {
     println!("UUID 2: {}", id2);
     println!("Same? {}\n", id1 == id2);
 
-    // Working with Value enum
     println!("--- Generic Values ---");
     let values = vec![
         Value::U32(4_294_967_295_u32),
@@ -48,7 +41,6 @@ fn main() {
         );
     }
 
-    // Type conversions
     println!("\n--- Type Conversions ---");
     let val: Value = 42_i32.into();
     println!("i32 -> Value: {:?}", val);

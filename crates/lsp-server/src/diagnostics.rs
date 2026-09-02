@@ -1,18 +1,6 @@
-// Map compiler diagnostics onto LSP diagnostics.
-//
-// The LSP does NOT reimplement validation. `forgedb_parser::Parser::parse_recover`
-// returns every diagnostic the compiler would — recovered syntax errors merged with
-// the semantic errors from `forgedb_parser::validate_schema` — each carrying a 1-based
-// source `Position`. This module is the thin adapter that turns those into 0-based LSP
-// `Diagnostic`s, so editor squiggles match `forgedb validate` exactly (#173 parity).
-
 use forgedb_validation::{Severity, ValidationError};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
-/// Map a compiler [`Severity`] onto the LSP one (#237).
-///
-/// Before the severity axis existed this was hardcoded to `ERROR`, which made a
-/// deprecation indistinguishable from a broken schema in the editor.
 pub(crate) fn to_lsp_severity(severity: Severity) -> DiagnosticSeverity {
     match severity {
         Severity::Error => DiagnosticSeverity::ERROR,
@@ -20,10 +8,6 @@ pub(crate) fn to_lsp_severity(severity: Severity) -> DiagnosticSeverity {
     }
 }
 
-/// Convert compiler diagnostics (1-based line/column) into LSP diagnostics (0-based).
-///
-/// `content` is consulted only to size each squiggle to the identifier under the
-/// reported position; the diagnostics themselves come straight from the compiler.
 pub fn to_lsp_diagnostics(errors: &[ValidationError], content: &str) -> Vec<Diagnostic> {
     let lines: Vec<&str> = content.lines().collect();
 
@@ -54,9 +38,6 @@ pub fn to_lsp_diagnostics(errors: &[ValidationError], content: &str) -> Vec<Diag
         .collect()
 }
 
-/// Build a 0-based LSP range covering the identifier starting at a 1-based
-/// (`line`, `column`) source position. Falls back to a single-character span when
-/// the position lands past end-of-line (e.g. a "missing token" diagnostic).
 fn range_at(lines: &[&str], line: usize, column: usize) -> Range {
     let line0 = line.saturating_sub(1);
     let col0 = column.saturating_sub(1);
@@ -89,7 +70,6 @@ mod tests {
     use super::*;
     use forgedb_parser::Parser;
 
-    /// A duplicate-name schema produces a positioned ERROR diagnostic sourced "forgedb".
     #[test]
     fn duplicate_model_maps_to_positioned_error() {
         let src = "User {\n  id: +uuid\n}\n\nUser {\n  id: +uuid\n}\n";
@@ -101,7 +81,6 @@ mod tests {
         assert_eq!(d.source.as_deref(), Some("forgedb"));
     }
 
-    /// A naming-convention violation surfaces the compiler's suggestion in the message.
     #[test]
     fn suggestion_is_appended_to_message() {
         let src = "user {\n  id: +uuid\n}\n";
@@ -114,9 +93,6 @@ mod tests {
         );
     }
 
-    /// A warning-severity diagnostic publishes as `WARNING`, not `ERROR` (#237).
-    /// Before the severity axis existed this site was hardcoded, which would have
-    /// made every deprecation look like a broken schema in the editor.
     #[test]
     fn warning_severity_maps_to_lsp_warning() {
         use forgedb_validation::{Severity, ValidationError};
@@ -138,11 +114,10 @@ mod tests {
         );
     }
 
-    /// 1-based compiler positions become 0-based LSP ranges spanning the identifier.
     #[test]
     fn positions_convert_to_zero_based_word_ranges() {
         let lines = ["User {", "  bad name: string", "}"];
-        let r = range_at(&lines, 2, 3); // 1-based line 2, col 3 -> "bad"
+        let r = range_at(&lines, 2, 3);
         assert_eq!(r.start.line, 1);
         assert_eq!(r.start.character, 2);
         assert_eq!(r.end.character, 5, "should span the 3-char word 'bad'");
