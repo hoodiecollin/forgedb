@@ -2,14 +2,12 @@ use crate::types::{MigrationRecord, MigrationState};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Tracks applied migrations
 pub struct MigrationTracker {
     state_file: PathBuf,
     state: MigrationState,
 }
 
 impl MigrationTracker {
-    /// Create a new migration tracker
     pub fn new<P: AsRef<Path>>(migrations_dir: P) -> Result<Self, String> {
         let state_file = migrations_dir.as_ref().join(".migration_state.json");
         let state = if state_file.exists() {
@@ -21,7 +19,6 @@ impl MigrationTracker {
         Ok(MigrationTracker { state_file, state })
     }
 
-    /// Load migration state from file
     fn load_state<P: AsRef<Path>>(path: P) -> Result<MigrationState, String> {
         let contents = fs::read_to_string(path.as_ref())
             .map_err(|e| format!("Failed to read migration state: {}", e))?;
@@ -30,7 +27,6 @@ impl MigrationTracker {
             .map_err(|e| format!("Failed to parse migration state: {}", e))
     }
 
-    /// Save migration state to file
     fn save_state(&self) -> Result<(), String> {
         let json = serde_json::to_string_pretty(&self.state)
             .map_err(|e| format!("Failed to serialize migration state: {}", e))?;
@@ -39,12 +35,10 @@ impl MigrationTracker {
             .map_err(|e| format!("Failed to write migration state: {}", e))
     }
 
-    /// Check if a migration has been applied
     pub fn is_applied(&self, migration_id: &str) -> bool {
         self.state.is_applied(migration_id)
     }
 
-    /// Mark a migration as applied
     pub fn mark_applied(&mut self, migration_id: String, checksum: String) -> Result<(), String> {
         if self.is_applied(&migration_id) {
             return Err(format!("Migration {} is already applied", migration_id));
@@ -54,24 +48,20 @@ impl MigrationTracker {
         self.save_state()
     }
 
-    /// Mark last migration as rolled back
     pub fn mark_rolled_back(&mut self) -> Result<Option<MigrationRecord>, String> {
         let record = self.state.remove_last_migration();
         self.save_state()?;
         Ok(record)
     }
 
-    /// Get list of applied migrations
     pub fn applied_migrations(&self) -> &[MigrationRecord] {
         &self.state.applied_migrations
     }
 
-    /// Get the last applied migration
     pub fn last_migration(&self) -> Option<&MigrationRecord> {
         self.state.last_migration()
     }
 
-    /// Get pending migrations (those not yet applied)
     pub fn pending_migrations(&self, all_migrations: &[String]) -> Vec<String> {
         all_migrations
             .iter()
@@ -80,7 +70,6 @@ impl MigrationTracker {
             .collect()
     }
 
-    /// Verify checksum of applied migration
     pub fn verify_checksum(
         &self,
         migration_id: &str,
@@ -103,7 +92,6 @@ impl MigrationTracker {
         ))
     }
 
-    /// Get migration status summary
     pub fn status_summary(&self, total_migrations: usize) -> String {
         let applied = self.state.applied_migrations.len();
         let pending = total_migrations.saturating_sub(applied);

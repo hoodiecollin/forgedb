@@ -1,27 +1,12 @@
-# A STANDALONE WORKSPACE (#411), deliberately not a member of the repo root's.
-#
-# The inspector is a separately shippable surface with its own build and release line, and
-# its Tauri shell needs GTK/WebKit system libraries on Linux. As a root member it imposed
-# that dependency on every core `--workspace` command, including the tier-1 CI gate — for
-# a desktop app that gate does not otherwise touch.
-#
-# Consequence to know about: this crate now resolves its own `Cargo.lock` and builds into
-# its own `target/` (already gitignored). It is NOT covered by `cargo test --workspace`
-# from the repo root; `make inspector-*` targets are how it is built.
 [workspace]
 
 [package]
 name = "forgedb-inspector"
 version = "0.1.0"
 description = "ForgeDB Inspector — desktop app to browse, edit, and inspect ForgeDB-generated databases"
-# A literal, not `edition.workspace = true`: workspace inheritance does not cross a
-# workspace boundary, and this is now its own root. Keep in step with the repo root's
-# `[workspace.package] edition`.
 edition = "2024"
 publish = false
 
-# Tauri v2 desktop layout: the shell lives in a lib (`run()`), `main.rs` is a
-# thin entry point. `crate-type` keeps the mobile targets available for free.
 [lib]
 name = "forgedb_inspector_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -33,17 +18,10 @@ tauri-build = { version = "2.6.3", features = [] }
 tauri = { version = "2.11.5", features = [] }
 tauri-plugin-opener = "2.5.4"
 tauri-plugin-dialog = "2.7.1"
-# Live lens (#13) transport: HTTP + WebSocket issued from Rust, so requests reach
-# a running generated API on any localhost port without the webview's CORS/CSP
-# getting in the way (we don't control the generated server's CORS headers).
 tauri-plugin-http = "2.5.9"
 tauri-plugin-websocket = "2.4.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Workspace substrate — schema-blind, tooling-grade reads only. The parser turns
-# a `.forge` into an AST (exactly what the CLI does at runtime); the compaction
-# crate's StatsCollector reads a data dir's physical layout (tombstones/columns
-# as opaque bytes) for storage-health stats. Neither is a runtime schema engine.
 forgedb-parser = { path = "../../../crates/parser" }
 forgedb-compaction = { path = "../../../crates/compaction" }

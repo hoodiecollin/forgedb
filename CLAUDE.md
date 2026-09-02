@@ -67,9 +67,8 @@ cargo clippy --workspace             # no dead-code warnings (style lints remain
 ```
 
 CLI commands: `init`, `generate`, `validate`, `build`, `dev`, `migrate`, `compact`, `backup`,
-`project` (`name|claim|release|show` — #367; records the two identity decisions a flag cannot
-make *stick*, since the id keys the cache directory and the invocations that would carry a flag
-are ones ForgeDB itself scaffolds),
+`project` (`show` — #367/#479; reports identity and decides nothing. The three sibling verbs that
+recorded identity decisions were deleted when the id became something `init` mints),
 `tenant` (`create|list|drop` — #59 multi-tenancy dir management),
 `coordinate <root>` (#75/#84 MVCC Tier 3 — run the multi-process write coordinator for a data dir).
 Example: `cargo run -- generate all --output ./generated`.
@@ -147,23 +146,27 @@ they own (epic #332) — do not re-derive either inline:
   directories: knobs from `Chain::nearest()`, identity from `Chain::project_root()` (nearest
   `[project].isolated`, else outermost). Also the **single entry point for reading config** —
   `config::{parse_config, load_config_file}` are reached from here and nowhere else, which is
-  the greppable form of #361's one-loader invariant. Id order: `[project].name` → exactly one
-  ecosystem manifest → hash of the root's **absolute** path. The claim ledger under
-  `~/.forgedb/ledger/` **detects** collisions; a resolution is recorded in the project's own
-  `forgedb.toml`, never in the cache. The ledger is **append-only** — nothing removes a
-  `.claim` — so a moved project collides with its own ghost; that case has its own
-  diagnostic and its own remedy (`forgedb project claim --take-over`), and a *live* holder
-  is never displaced without `--force`.
+  the greppable form of #361's one-loader invariant. **Id order (#479): `[project].id` → hash of
+  the root's **absolute** path.** Two branches, both collision-free by construction — the id is
+  **minted by `forgedb init`** (`mint_id`: a directory slug plus `RandomState` entropy, no new
+  dep) and committed, never derived from a package name. The manifest-name branch, the ambiguity
+  case and every remedy built on them were deleted together, because each existed only because
+  a derived id could collide. The claim ledger under `~/.forgedb/ledger/` survives as a **pure
+  detector** with ONE cause — a copied project directory whose copy inherited the original's
+  `[project].id` — and its diagnostic names the file and key to change rather than a command:
+  there is no take-over, no release, and nothing that edits a config on the user's behalf.
 - `src/ask.rs` (#367) — **may ForgeDB ask a question, and who answers it.** The ONE
   `IsTerminal` call in the tree, behind `Askability` — a pure predicate over four booleans
   (stdin tty, stderr tty, `--quiet`, `forbid()`), each a veto for a different reason. Prompts
   render to **stderr**, unlike `ui.rs`. `ask::forbid()` latches the contexts that must never
   ask however the process was started: `build`'s machine-readable modes and `dev`'s watch
-  loop. The `Asker` trait is the seam that makes the interactive path testable with no pty —
-  the decision and the persisting act are on this side of it, the widget on the far side, and
-  **the widget must stay the last and smallest layer**. `FORGEDB_ASK_TRACE=<path>` appends
-  the boundary's reason, which is the only way a piped harness can tell "did not ask because
-  forbidden" from "did not ask because piped".
+  loop. The `Prompt` trait is the seam that makes the interactive path testable with no pty —
+  the decision is on this side of it, the widget on the far side, and **the widget must stay the
+  last and smallest layer**. `FORGEDB_ASK_TRACE=<path>` appends the boundary's reason, which is
+  how a piped harness tells "did not ask because forbidden" from "did not ask because piped".
+  **Since #479 `migrate create` is the ONLY consumer**: identity asked the other two questions,
+  and `generate`/`build` now reach no asking boundary at all — so a build's trace is *empty*
+  rather than carrying a reason, and `forbid()` traces its own call so the latch stays visible.
 - `src/cache.rs` (#334) — **where generated code is built.** `~/.forgedb/projects/<id>/` as a
   ForgeDB-owned cargo workspace: virtual manifest pinning `resolver = "3"`, one `Cargo.lock`
   and one `target/` shared by every member, `apps/<member-hash>/` per app. The member hash is
@@ -319,6 +322,14 @@ The root `forgedb` crate is now published **with** that `lsp` feature (2026-07-2
 `codegen` for the REST-SDK generators and `compaction`/`query-params` for bugfixes), so
 `cargo install forgedb --features lsp` builds both `forgedb` + `forgedb-lsp` from the registry.
 - `parser` — lexer + parser → AST (`crates/parser/src/ast.rs`)
+- `migrations` — the differ + the migration record. Since #374 the record carries the operator's
+  **`Answer`** (`Constant` / `CopyField` / `Escape`) beside each change the differ cannot prove, plus a
+  `record_version`; `migrate build` **lowers** an answer into the emitted hop and refuses a hop that has
+  none (decided from the record + the recorded scaffold hash, never a `TODO` grep). `SimpleField.ty` is a
+  structured `SimpleType` — the crate still has **no parser dependency**, and the AST projection stays in
+  the CLI's `to_simple_type`. `SchemaDiffer::diff` returns a `DiffResult`: the changes it is sure of plus
+  `RenameProposal`s, because a drop+add of the same type is a *guess* and the two readings produce
+  opposite data.
 - `codegen` — code generators; exports `RustGenerator`, `TypeScriptGenerator`,
   `ApiGenerator`, `StubGenerator`, and the REST client SDK generators
   `RustSdkGenerator` / `PythonSdkGenerator` / `GoSdkGenerator` (#206/#118/#205 — the
@@ -431,7 +442,13 @@ ones are `@min @max @length @email @url @pattern`/`@regex` `@utf8`, all ENFORCED
 single-arg `@length(n)` means **exactly** n, NOT a maximum (#235); `@pattern` is a per-field `LazyLock<Regex>`,
 #104). **Semantic-only markers** (parsed, carried,
 never checked at write): `@default @index @computed @fulltext @materialized` — for a real index use the `^`
-modifier. Per-directive truth table: `docs/SCHEMA.md`. **`@on_delete(restrict|cascade|set_null)`
+modifier. **`@default` is the one exception, and only outside the write path (#374):** it is the value
+existing rows get when a required field is added, applied identically by the generated reopen backfill and by
+the offline transformer through ONE lowering (`forgedb_codegen::default_fill`), which is why such an add needs
+no answer from the operator. It resolves for `bool`, the integer types, `f64`, bare `string`, `json`, `decimal`
+and a declared enum variant — never for a nullable field, `timestamp`, `uuid`, `bytes(N)`, `string(N)`, arrays,
+structs, relations, or a literal that does not fit its field; each of those routes to the prompt instead of to
+a substituted zero. Insert still requires the field. Per-directive truth table: `docs/SCHEMA.md`. **`@on_delete(restrict|cascade|set_null)`
 ENFORCED** (relation-FK field; default `restrict` refuses deleting a referenced parent → 409, `cascade` recursive,
 `set_null` optional-FK only), `@soft_delete` + composite `@index(a,b)` + `@projection(name: a, b)` (#113 —
 model-level; generates a partial-read struct/methods over PK + the named columns), `@relations(*|fields)`
@@ -704,6 +721,43 @@ of truth.
 
 ## Conventions
 
+- **ForgeDB's own source carries NO comments (#488).** Not doc comments (`///`, `//!`,
+  `#[doc]`, JSDoc), not inline `//` prose, on any surface — Rust, TS/TSX, `Cargo.toml`,
+  the workflows, the Makefile. A comment drifts the moment the code moves, and it sits in
+  a coding agent's grep path where a stale line reads as authoritative and steers a whole
+  session down a path that looks correct the entire way. Code is read by reading it; when
+  a piece of code needs explaining, rename or restructure until it doesn't.
+
+  **All user-facing documentation lives on the site** (`apps/website/content/docs`), never
+  in a source file. `docs/*.md` and the MDX are prose *files*, not comments — untouched.
+
+  **Where the rationale goes instead**, in order of preference: a name, a test name, an
+  `assert!` failure message (a string literal — it survives, and it is read at exactly the
+  moment it matters), a commit message, an issue body, a site page.
+
+  **The ONE exception** is bugfix commentary whose loss would likely reinvite the defect.
+  It lives *with the test that covers it*, never at the defect site, and it is written in
+  a form one grep can audit:
+
+  ```
+  // REGRESSION(#486): <what the defect was, and why the assertion is shaped this way>
+  ```
+
+  Continuation lines are ordinary `//` lines under that marker. Two exist in the whole
+  tree (`tests/ci_gate_test.rs`, `tests/integration_test.rs`); reaching for a third is a
+  signal to check whether a test name and an assert message can carry it instead.
+
+  **Two things are NOT comments and must never be stripped**, both verified by the lexer:
+  *directives* (`//export`, `//go:*`, `// @ts-*`, `// eslint-*`, `//# sourceMappingURL`,
+  `/// <reference`, `#!`, `#include`/`#define`) and *generated-file markers*
+  (`// Code generated by ForgeDB. DO NOT EDIT.` — Go tooling matches it by regex). The
+  cgo preamble before `import "C"` is C source cgo COMPILES, not a comment.
+
+  Enforced by `make comment-check` (`scripts/strip-comments.ts --check`), run in CI by
+  `.github/workflows/test.yml` and guarded against silent removal by
+  `tests/ci_gate_test.rs::the_comment_rule_has_a_place_where_it_can_fail`. `--write`
+  fixes a tree in place. It is a real lexer, not a regex, because this repo is a code
+  generator whose sources are full of raw strings holding Rust that itself contains `///`.
 - No time estimates (hours/days/weeks) anywhere — describe scope, not duration.
 - Don't `git commit` without the user's consent (an in-the-moment "commit when done"
   counts as consent for that scope; it doesn't carry to follow-up changes). When you do
@@ -720,7 +774,7 @@ of truth.
 - `rust-core-library` — idiomatic Rust for core library/crate work.
 
 <!-- pm-playbook:begin -->
-## Project management — pm-playbook v2.3.0
+## Project management — pm-playbook v3.0.0
 
 Issue tracking in this repo follows the **pm-playbook** two-axis model. The full doctrine is
 vendored at `.pm-playbook/` and is authoritative; this block is only a summary.

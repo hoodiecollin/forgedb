@@ -2,11 +2,9 @@ use crate::types::{ChecksumStatus, Migration, SchemaChange};
 use std::fs;
 use std::path::Path;
 
-/// Generates migration files from schema changes
 pub struct MigrationGenerator;
 
 impl MigrationGenerator {
-    /// Generate a new migration file (version fields defaulted to `0`).
     pub fn generate<P: AsRef<Path>>(
         migrations_dir: P,
         description: String,
@@ -15,11 +13,6 @@ impl MigrationGenerator {
         Self::generate_versioned(migrations_dir, description, changes, 0, 0)
     }
 
-    /// Generate a new migration file stamped with its serial version interlock
-    /// (#74 Phase 2).  The caller derives `from_version`/`to_version` from the
-    /// committed lineage ([`MigrationLineage::next_version_span`]).
-    ///
-    /// [`MigrationLineage::next_version_span`]: crate::MigrationLineage::next_version_span
     pub fn generate_versioned<P: AsRef<Path>>(
         migrations_dir: P,
         description: String,
@@ -29,17 +22,26 @@ impl MigrationGenerator {
     ) -> Result<Migration, String> {
         let migrations_dir = migrations_dir.as_ref();
 
-        // Create migrations directory if it doesn't exist
         if !migrations_dir.exists() {
             fs::create_dir_all(migrations_dir)
                 .map_err(|e| format!("Failed to create migrations directory: {}", e))?;
         }
 
-        // Create migration
-        let migration =
-            Migration::new_versioned(description, changes, from_version, to_version);
+        Self::write_migration(
+            migrations_dir,
+            Migration::new_versioned(description, changes, from_version, to_version),
+        )
+    }
 
-        // Write migration file
+    pub fn write_migration<P: AsRef<Path>>(
+        migrations_dir: P,
+        migration: Migration,
+    ) -> Result<Migration, String> {
+        let migrations_dir = migrations_dir.as_ref();
+        if !migrations_dir.exists() {
+            fs::create_dir_all(migrations_dir)
+                .map_err(|e| format!("Failed to create migrations directory: {}", e))?;
+        }
         let migration_path = migrations_dir.join(migration.filename());
         let json = serde_json::to_string_pretty(&migration)
             .map_err(|e| format!("Failed to serialize migration: {}", e))?;
@@ -50,7 +52,6 @@ impl MigrationGenerator {
         Ok(migration)
     }
 
-    /// Load a migration from a file
     pub fn load_migration<P: AsRef<Path>>(path: P) -> Result<Migration, String> {
         let contents = fs::read_to_string(path.as_ref())
             .map_err(|e| format!("Failed to read migration file: {}", e))?;
@@ -58,10 +59,6 @@ impl MigrationGenerator {
         let migration: Migration = serde_json::from_str(&contents)
             .map_err(|e| format!("Failed to parse migration file: {}", e))?;
 
-        // #366: three distinguishable outcomes, not one. The old message said
-        // "may be corrupted" for every failure, including the one caused by upgrading
-        // rustup — which sent the reader to look for disk damage, the one thing that had
-        // not happened.
         match migration.checksum_status() {
             ChecksumStatus::Verified | ChecksumStatus::Unverifiable => {}
             ChecksumStatus::Mismatch => {
@@ -86,7 +83,6 @@ impl MigrationGenerator {
         Ok(migration)
     }
 
-    /// Load all migrations from a directory
     pub fn load_all_migrations<P: AsRef<Path>>(
         migrations_dir: P,
     ) -> Result<Vec<Migration>, String> {
@@ -104,7 +100,6 @@ impl MigrationGenerator {
             let entry = entry.map_err(|e| format!("Failed to read directory entry: {}", e))?;
             let path = entry.path();
 
-            // Only process .json files
             if path.extension().and_then(|s| s.to_str()) == Some("json") {
                 match Self::load_migration(&path) {
                     Ok(migration) => migrations.push(migration),
@@ -113,13 +108,11 @@ impl MigrationGenerator {
             }
         }
 
-        // Sort migrations by ID (timestamp)
         migrations.sort_by(|a, b| a.id.cmp(&b.id));
 
         Ok(migrations)
     }
 
-    /// Generate a migration summary report
     pub fn generate_report(migration: &Migration) -> String {
         let mut report = String::new();
 

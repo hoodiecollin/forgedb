@@ -1,4 +1,3 @@
-/// Default blank schema template
 pub fn blank_schema() -> &'static str {
     r#"// ForgeDB Schema
 // Define your models below
@@ -11,7 +10,6 @@ User {
 "#
 }
 
-/// Blog template schema
 pub fn blog_schema() -> &'static str {
     r#"// Blog Schema
 
@@ -45,7 +43,6 @@ Tag {
 "#
 }
 
-/// E-commerce template schema
 pub fn ecommerce_schema() -> &'static str {
     r#"// E-commerce Schema
 
@@ -86,7 +83,6 @@ OrderItem {
 "#
 }
 
-/// Todo app template schema
 pub fn todo_schema() -> &'static str {
     r#"// Todo App Schema
 
@@ -111,23 +107,16 @@ Todo {
 "#
 }
 
-/// Default forgedb.toml configuration.
-///
-/// `isolated` is written **explicitly, always** (#333). The field's absent value
-/// is `true`, so writing it changes nothing today — it exists so that "these are
-/// separate projects" is a declaration rather than an absence. An absence is
-/// fragile: someone adds a config above this one for an unrelated reason and
-/// every app beneath it silently regroups into one build cache.
-pub fn default_config(project_name: &str, isolated: bool) -> String {
-    // `name` is written ONLY when this config is a project root. A nested,
-    // non-isolated config that declares a name is a contradiction ForgeDB rejects
-    // (#333 §6) — it reads as authoritative and is not — so scaffolding one would
-    // make `init` emit a config that fails on the very next `generate`.
-    let name = if isolated {
-        format!("name = \"{project_name}\"\n")
+pub fn default_config(project_id: &str, isolated: bool) -> String {
+    let id = if isolated {
+        format!(
+            "# Generated once, here. COMMIT IT: this id keys the build cache, and a\n\
+             # teammate or CI resolving a different one is a different project.\n\
+             id = \"{project_id}\"\n"
+        )
     } else {
-        "# No `name`: this config joins the enclosing project, and only a project root\n\
-         # may name one. Set `isolated = true` below to make this a project of its own.\n"
+        "# No `id`: this config joins the enclosing project, and only a project root\n\
+         # carries one. Set `isolated = true` below to make this a project of its own.\n"
             .to_string()
     };
     format!(
@@ -245,17 +234,10 @@ enabled = false
 #                                  # e.g. ["RS256", "ES256"] (default ["RS256"])
 # leeway_secs = 60                 # clock-skew leeway seconds (default)
 "#,
-        name, isolated
+        id, isolated
     )
 }
 
-/// Default .gitignore
-///
-/// **Generated TEXT is committed; only compiled output is ignored** (#335 §15).
-/// This file used to ignore `/generated/` wholesale, which contradicted the rule
-/// outright — and after #335 it is plainly wrong: ForgeDB compiles the generated
-/// Rust in its own cache under `$FORGEDB_HOME`, so nothing under `generated/` is
-/// a build artifact any more. It holds reviewable, diffable source.
 pub fn default_gitignore() -> &'static str {
     r#"# ForgeDB generated code is COMMITTED, not ignored.
 #
@@ -299,7 +281,6 @@ Thumbs.db
 "#
 }
 
-/// README template
 pub fn readme_template(project_name: &str) -> String {
     format!(
         r#"# {}

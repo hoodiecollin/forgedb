@@ -1,8 +1,3 @@
-// Hover information for ForgeDB schemas.
-//
-// Type/directive/modifier docs track the REAL grammar, and model/struct/enum
-// hovers render the actual `forgedb_parser` AST.
-
 use forgedb_parser::{FieldType, RelationType, Schema};
 use tower_lsp::lsp_types::{Hover, HoverContents, MarkedString, Position};
 
@@ -15,12 +10,10 @@ pub fn get_hover_info(content: &str, position: Position, schema: &Schema) -> Opt
     let line = lines[position.line as usize];
     let word = get_word_at_position(line, position.character as usize)?;
 
-    // Type keyword
     if let Some(type_info) = get_type_info(&word) {
         return Some(scalar_hover(type_info));
     }
 
-    // Directive
     if word.starts_with('@') || line[..position.character as usize].ends_with('@') {
         let directive_name = word.trim_start_matches('@');
         if let Some(directive_info) = get_directive_info(directive_name) {
@@ -28,7 +21,6 @@ pub fn get_hover_info(content: &str, position: Position, schema: &Schema) -> Opt
         }
     }
 
-    // Model / struct / enum reference
     if let Some(model) = schema.models.iter().find(|m| m.name == word) {
         let mut info = format!("## Model: {}\n\n### Fields:\n", model.name);
         for field in &model.fields {
@@ -63,7 +55,6 @@ pub fn get_hover_info(content: &str, position: Position, schema: &Schema) -> Opt
         return Some(scalar_hover(info));
     }
 
-    // Modifier symbol
     if let Some(modifier_info) = get_modifier_info(&word) {
         return Some(scalar_hover(modifier_info));
     }
@@ -87,14 +78,12 @@ fn get_word_at_position(line: &str, char_pos: usize) -> Option<String> {
     let mut start = char_pos;
     let mut end = char_pos;
 
-    // Go backwards to find start (`@` may lead a directive word)
     while start > 0
         && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_' || chars[start - 1] == '@')
     {
         start -= 1;
     }
 
-    // Go forwards to find end
     while end < chars.len() && (chars[end].is_alphanumeric() || chars[end] == '_') {
         end += 1;
     }
@@ -149,7 +138,6 @@ fn get_directive_info(directive_name: &str) -> Option<String> {
 }
 
 fn get_modifier_info(symbol: &str) -> Option<String> {
-    // ForgeDB has NO `~` auto-update modifier.
     let s = match symbol {
         "+" => "**+** Auto-generate on create\n\nu32/u64 auto-increment, uuid, or timestamp.\n\n```\nid: +uuid\n```",
         "^" => "**^** Index\n\nCreates a database index on this field.\n\n```\nusername: ^string\n```",
@@ -176,8 +164,6 @@ fn format_field_type(field_type: &FieldType) -> String {
         FieldType::Timestamp(_) => "timestamp".to_string(),
         FieldType::Enum(name) => name.clone(),
         FieldType::Bytes(n) => format!("bytes({n})"),
-        // #238: render the declaration back verbatim, `!` and all — the width and
-        // its exactness are the whole point of hovering an inline string.
         FieldType::StringN { chars, exact } => {
             format!("string({chars}{})", if *exact { "!" } else { "" })
         }
@@ -204,29 +190,26 @@ mod tests {
         Parser::new(src).unwrap().parse_recover().schema
     }
 
-    /// Hovering a struct name reports "Struct" and lists its fields.
     #[test]
     fn hover_struct_name_shows_struct_info() {
         let content = "struct Address {\n  street: string\n}\n\nUser {\n  home: Address\n}\n";
         let schema = parse(content);
-        let position = Position { line: 5, character: 8 }; // "Address" on the home line
+        let position = Position { line: 5, character: 8 };
         let text = hover_text(get_hover_info(content, position, &schema));
         assert!(text.contains("Struct"), "got: {text}");
         assert!(text.contains("street"), "got: {text}");
     }
 
-    /// Hovering an enum name reports "Enum" and lists its variants.
     #[test]
     fn hover_enum_name_shows_variants() {
         let content = "enum Status {\n  Active\n  Inactive\n}\n\nUser {\n  status: Status\n}\n";
         let schema = parse(content);
-        let position = Position { line: 6, character: 12 }; // "Status" on the status line
+        let position = Position { line: 6, character: 12 };
         let text = hover_text(get_hover_info(content, position, &schema));
         assert!(text.contains("Enum"), "got: {text}");
         assert!(text.contains("Active"), "got: {text}");
     }
 
-    /// Hovering the `decimal` keyword yields real type documentation.
     #[test]
     fn hover_decimal_type_documented() {
         let content = "User {\n  price: decimal\n}\n";

@@ -1,38 +1,4 @@
-# Docker image for the `forgedb` CLI — epic #181 / Docker channel.
-#
-# Triggered by the "Release" workflow (cargo-dist / release.yml) COMPLETING, via
-# `workflow_run`. That ordering is load-bearing: the Dockerfile's `fetch` stage
 # does an UNAUTHENTICATED `curl` of `releases/download/v<version>/forgedb-<triple>
-# .tar.xz`, so the image can only build once release.yml's `host` job has created
-# the (published, non-draft) GitHub Release and uploaded every per-platform
-# tarball. `workflow_run: [completed]` fires only after the whole Release run
-# (build → host → announce) finishes, so the assets are guaranteed present.
-#
-# Why not `on: release: [published]`? cargo-dist creates the Release with the
-# built-in GITHUB_TOKEN, and GitHub suppresses `release` events for
-# GITHUB_TOKEN-authored releases — that trigger would never fire. `workflow_run`
-# keys off the *workflow completing* (the Release run was triggered by a human tag
-# push), so it is not subject to that suppression.
-#
-# Why not a cargo-dist custom publish job (like publish-npm.yml)? dist hardcodes
-# custom-publish call-site permissions to {id-token, packages} with no way to add
-# `contents: read`, and this job needs checkout (for the Dockerfile / build
-# context). A reusable workflow requesting a scope the caller didn't grant fails
-# the caller at startup, so Docker must stay a standalone workflow_run job with
-# its own permissions.
-#
-# workflow_run runs the copy of this file on the DEFAULT branch (main). Builds a
-# multi-arch image (linux/amd64 + linux/arm64), pushes to GHCR always and to
-# Docker Hub when its credentials are configured.
-#
-# Registries / go-live gating:
-#   - GHCR (ghcr.io/hoodiecollin/forgedb): auth via the built-in GITHUB_TOKEN — no
-#     secret to provision (this workflow grants itself `packages: write`).
-#   - Docker Hub (docker.io/hoodiecollin/forgedb): needs `DOCKERHUB_USERNAME` +
-#     `DOCKERHUB_TOKEN` secrets. Absent → the image still ships to GHCR; Docker Hub
-#     is skipped (not failed).
-#
-# `workflow_dispatch` stays for manual rebuilds of an already-published tag.
 name: Docker
 
 on:
@@ -47,16 +13,12 @@ on:
 
 permissions:
   contents: read
-  packages: write # push to GHCR
+  packages: write
 
 jobs:
   image:
     name: build & push (multi-arch)
     runs-on: ubuntu-22.04
-    # Manual dispatch always runs. For a workflow_run trigger, require the upstream
-    # Release to have SUCCEEDED and the tag to be a stable `v*` (skip prereleases —
-    # a `-rc`/`-beta` tag gets no image or `latest`). head_branch is the tag name
-    # for a tag-triggered upstream run.
     if: >-
       ${{ github.event_name == 'workflow_dispatch' ||
           (github.event.workflow_run.conclusion == 'success' &&
@@ -70,8 +32,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Resolve the tag from the upstream Release run's head_branch (workflow_run)
-      # or the manual dispatch input, then the bare version the Dockerfile fetches by.
       - name: Resolve version
         id: v
         shell: bash
@@ -80,8 +40,6 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
 
-      # Only push to Docker Hub when creds exist (secrets can't be used in `if:`
-      # directly, so surface presence as a step output first).
       - name: Detect Docker Hub credentials
         id: hub
         shell: bash

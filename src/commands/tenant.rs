@@ -1,11 +1,3 @@
-//! `forgedb tenant` — manage physical, dir-per-tenant data directories (#59).
-//!
-//! Multi-tenancy is filesystem-enforced: each tenant's data lives under
-//! `<root>/<tenant>/`, and one `forgedb serve` process serves exactly one
-//! tenant (process-per-tenant). This command makes tenant existence explicit
-//! and auditable — a peer to `migrate` / `compact` / `backup`. It only ever
-//! creates, lists, or removes directories; it never reads a `.forge` schema.
-
 use std::path::PathBuf;
 
 use crate::error::{CliError, Result};
@@ -13,8 +5,6 @@ use crate::error::{CliError, Result};
 pub struct CreateOptions {
     pub name: String,
     pub root: PathBuf,
-    /// `FORGEDB_*` auth exports derived from `[auth]` (empty when auth is off),
-    /// printed alongside the serve incantation so the operator gets the full env.
     pub auth_env: Vec<(String, String)>,
 }
 
@@ -29,8 +19,6 @@ pub struct DropOptions {
     pub force: bool,
 }
 
-/// Reject names that would escape the root or collide with path syntax. A tenant
-/// name is a single directory segment — no separators, no `.`/`..`.
 fn validate_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name != "."
@@ -47,9 +35,6 @@ fn validate_name(name: &str) -> Result<()> {
     }
 }
 
-/// Create a tenant's data directory. The generated server populates it lazily on
-/// first `open_at`; this just reserves the (empty) directory so the tenant is
-/// explicit and listable.
 pub fn create(opts: CreateOptions) -> Result<()> {
     validate_name(&opts.name)?;
     let dir = opts.root.join(&opts.name);
@@ -63,8 +48,6 @@ pub fn create(opts: CreateOptions) -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     println!("✓ Created tenant '{}' at {}", opts.name, dir.display());
 
-    // The process-per-tenant serve incantation: env selects the tenant + data
-    // root; when `[auth]` is enabled the guard's env is appended.
     let mut env = format!(
         "FORGEDB_TENANT={} FORGEDB_DATA={}",
         opts.name,
@@ -77,7 +60,6 @@ pub fn create(opts: CreateOptions) -> Result<()> {
     Ok(())
 }
 
-/// List tenant directories under the root (immediate subdirectories).
 pub fn list(opts: ListOptions) -> Result<()> {
     let mut tenants: Vec<String> = Vec::new();
     if opts.root.exists() {
@@ -93,10 +75,9 @@ pub fn list(opts: ListOptions) -> Result<()> {
     tenants.sort();
 
     if opts.json {
-        // Minimal, dependency-free JSON array of names.
         let items: Vec<String> = tenants
             .iter()
-            .map(|t| format!("{:?}", t)) // quoted + escaped
+            .map(|t| format!("{:?}", t))
             .collect();
         println!("[{}]", items.join(","));
     } else if tenants.is_empty() {
@@ -110,7 +91,6 @@ pub fn list(opts: ListOptions) -> Result<()> {
     Ok(())
 }
 
-/// Remove a tenant's data directory and everything under it (destructive).
 pub fn drop(opts: DropOptions) -> Result<()> {
     validate_name(&opts.name)?;
     let dir = opts.root.join(&opts.name);

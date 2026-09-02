@@ -19,8 +19,6 @@ export function DocsSidebar() {
               </p>
               <ul className="flex flex-col gap-0.5">
                 {group.items.map((item) => {
-                  // A Build-C detailed variant (`.../detailed/`) highlights its
-                  // base entry, which is the only one in the nav.
                   const active =
                     pathname === item.href ||
                     pathname === `${item.href}detailed/`;

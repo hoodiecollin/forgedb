@@ -126,7 +126,7 @@ field: +uuid?               // auto-gen + nullable
 ```
 username: &^string @length(3, 50)       // unique, indexed string with a length constraint
 age: ?i32 @min(0) @max(120)             // optional int with numeric range constraints
-status: string? @default("pending")     // nullable string with a default (semantic-only marker)
+status: string? @default("pending")     // not applied at write; see the directive table
 ```
 
 ---
@@ -501,7 +501,7 @@ Order {
 | `@url`                 | (none)          | `string`            | URL format — **ENFORCED** (violation → 422)        | `website: string @url` |
 | `@pattern`             | `(regex_string)` | `string`           | Regex match — **ENFORCED** via `LazyLock<Regex>` (non-match → 422) | `phone: string @pattern("^[0-9]+$")` |
 | `@regex`               | `(pattern)`     | `string`            | Regex match — **ENFORCED** (non-match → 422)       | `handle: string @regex("[a-z]+")` |
-| `@default`             | `(value)`       | Any                 | Default value on insert — **semantic-only marker** (not applied at write) | `status: string @default("pending")` |
+| `@default`             | `(value)`       | Any                 | **Not applied at write** — but it IS applied to *existing rows* on a migration (see below) | `status: string @default("pending")` |
 | `@index`               | (none)          | Any                 | Field-level index marker — **semantic-only**; use the `^` modifier to actually index | `slug: string @index` |
 | `@computed`            | (none)          | Any                 | Field is computed (read-only) — **semantic-only marker** | `full_name: string @computed` |
 | `@fulltext`            | (none)          | `string`            | Full-text search — **semantic-only marker** (no index generated) | `content: string @fulltext` |
@@ -541,7 +541,15 @@ Order {
 > parse — the lexer tokenizes `"..."` (escapes `\" \\ \n \t \r`; unterminated/multiline strings are
 > a lex error). Values are stored as `ConstraintParam::String`, so `@default(pending)` and
 > `@default("pending")` are equivalent. `@pattern`/`@regex` are **enforced** (non-match → 422);
-> `@default` remains a **semantic-only marker** (parsed, not enforced).
+> `@default` is **not enforced at write** — inserting a record still requires the field. What it
+> *is* used for is **migration backfill** (#374): when a required field is added to a model that
+> already has rows, a resolvable `@default` is the value those rows get, applied identically by
+> the reopen backfill and by the offline transformer, and the add therefore needs no answer from
+> you. It resolves for `bool`, the integer types, `f64`, bare `string`, `json`, `decimal` and a
+> declared `enum` variant — not for `timestamp`, `uuid`, `bytes(N)`, `string(N)`, a fixed array, a
+> struct, a relation, a nullable field (whose zero is already `None`), or a literal that does not
+> fit its field. In every one of those cases `migrate create` asks you instead of substituting
+> something.
 > Superseded the earlier limitation note that said `"` was an unexpected character.
 
 **Parser source:** `crates/parser/src/parser/core.rs:113-184` (constraint parsing, incl. the `Token::Str` arm), `crates/parser/src/parser/core.rs:381-447` (directive parsing); string-literal lexing in `crates/parser/src/lexer.rs` (`read_string`)
@@ -974,7 +982,7 @@ The rules in this reference are grounded in the parser and validator source:
 2. **Use type modifiers** (`+`, `&`, `^`) **before type**, nullable `?` **after type**
 3. **Valid scalar types:** u32, u64, i32, i64, f64, bool, string, string(N) / string(N!), json, decimal, uuid, timestamp / timestamp(s|ms|us), bytes(N)
 4. **Relations:** `[Model]` (one-to-many), `*Model` (required FK), `?Model` (optional FK)
-5. **Constraints are ENFORCED at write (violation → 422):** `@min`/`@max` (numeric only, `decimal` included — each compares in its own domain, so a `decimal` bound stays exact and a 64-bit integer bound never rounds; bounds may be negative or fractional, and `>n`/`<n` make them exclusive on `f64`/`decimal`), `@length` (string length in characters; `min:`/`max:` named args, and single-arg `@length(n)` means **exactly** n), `@email`, `@url`, `@pattern`/`@regex`, `@utf8` (inline strings only). Still semantic-only markers (parsed, not applied): `@default`, `@computed`, `@fulltext`, `@materialized`, field-level `@index`
+5. **Constraints are ENFORCED at write (violation → 422):** `@min`/`@max` (numeric only, `decimal` included — each compares in its own domain, so a `decimal` bound stays exact and a 64-bit integer bound never rounds; bounds may be negative or fractional, and `>n`/`<n` make them exclusive on `f64`/`decimal`), `@length` (string length in characters; `min:`/`max:` named args, and single-arg `@length(n)` means **exactly** n), `@email`, `@url`, `@pattern`/`@regex`, `@utf8` (inline strings only). Not applied at write: `@default` (but it IS the backfill value on a migration, #374 — see the `@default` row above), `@computed`, `@fulltext`, `@materialized`, field-level `@index`
 6. **Composite indexes:** `@index(field1, field2, ...)` at model level (≥2 fields)
 7. **Structs:** Define with `struct Name { ... }` and use in models (fixed-size only)
 7b. **Enums:** Define with `enum Name { V1, V2, ... }` (PascalCase variants) and reference by bare name; stored as a 1-byte discriminant, serialized as the variant name string, filterable/sortable/indexable

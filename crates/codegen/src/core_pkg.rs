@@ -1,80 +1,10 @@
-//! The `core/` cache package: the one generated database, as a library crate
-//! (#335 §1, epic #332).
-//!
-//! # Why this package exists
-//!
-//! Four independent code paths emitted `database.rs`, and two of them emitted a
-//! **different database** than the other two.  `generate_all` threads the app's
-//! `GenConfig`; the four binding arms called `generate_with_schema_version`,
-//! which is `generate_with_config(schema, sv, GenConfig::DEFAULT)`.  Under
-//! default config all five are byte-identical, which is why it went unnoticed —
-//! but add `[runtime] replication = true` plus `[storage] fsync = "never"` and
-//! the `rust` arm emits one database while `python --runtime` emits another,
-//! differing in fifteen `FsyncPolicy` sites, `MAX_CASCADE_DEPTH`, and whether
-//! the replication broker is attached at all.  **One `generate` run wrote two
-//! databases with different durability semantics.**
-//!
-//! With `core/` there is one, and every consumer — the server, the three native
-//! bindings, the wasm replica — links it.  The divergence becomes
-//! *unrepresentable* rather than merely fixed, and it costs no cargo feature,
-//! which C11 forbids.
-//!
-//! # Why the emitted `database.rs` drops in unedited
-//!
-//! It is position-independent: the 20,313-line `blog-cms` emission contains zero
-//! `crate::` or `super::` paths, and its inner attributes are legal at a crate
-//! root.  The wrappers' entire coupling to it is a set of top-level `pub struct`s
-//! whose fields are already `pub`.
-//!
-//! # One `core` serves native and wasm
-//!
-//! Target splitting already lives *inside* the generated source
-//! (`#[cfg(not(target_arch = "wasm32"))]`), so the only manifest-level split is
-//! `forgedb-coordinator`, which the replica cfg-gates out entirely.
-
 use std::path::Path;
 
 use crate::GenConfig;
 
-/// The `core/` package manifest.
 pub struct CorePackage;
 
 impl CorePackage {
-    /// Render `core/Cargo.toml` for the app this `config` generated.
-    ///
-    /// **It takes the `GenConfig`, not a `bool`, and that is the fix for #445.**
-    /// The `utoipa` pin is one half of a matched pair whose other half —
-    /// `use utoipa::ToSchema;` and the per-model derives — is emitted into
-    /// *this same package's* `src/lib.rs` by [`crate::RustGenerator`] reading
-    /// [`GenConfig::needs_utoipa`]. A `bool` parameter let the call site compute
-    /// a **second** condition (`cache.api.is_some()` — "did the command I just
-    /// ran emit an api"), and the two disagree for exactly the invocations that
-    /// narrow: `generate rust` under `targets = ["all"]`, and `build --no-api`.
-    /// The result is a `core` whose source names a crate its own manifest does
-    /// not pin — `error[E0432]: unresolved import 'utoipa'`.
-    ///
-    /// Taking the config removes the parameter a divergent condition could be
-    /// passed through. There is one definition, in [`GenConfig::needs_utoipa`],
-    /// and both sides read it.
-    ///
-    /// It is a generate-time decision baked into source, deliberately **not** a
-    /// cargo feature: C11 forbids a generate-time knob becoming a feature of a
-    /// shared member, and a feature is exactly what an implementer reaches for
-    /// here by reflex.
-    ///
-    /// It has to be decided here rather than left on unconditionally, because
-    /// once `database.rs` and `api.rs` are separate crates the `ToSchema` derive
-    /// and its `#[openapi(components(schemas(...)))]` consumer live in different
-    /// crates, and **the orphan rule blocks supplying the impl from `server`** —
-    /// `error[E0277]: the trait bound 'oc::Post: ToSchema' is not satisfied`.
-    /// Gating utoipa is therefore a precondition of the package split, not a
-    /// tidy-up beside it.  (This is what absorbed #336.)
-    ///
-    /// There is **no `[profile.*]` table**.  A profile in a workspace member is
-    /// silently ignored (`warning: profiles for the non root package will be
-    /// ignored`), and a block that reads as applied and is not is precisely what
-    /// #333's strict parsing exists to prevent.  The release profile floor is
-    /// applied by the build driver on the cargo invocation.
     pub fn cargo_toml(crate_name: &str, config: &GenConfig) -> String {
         let utoipa = if config.needs_utoipa() {
             "utoipa = { version = \"5\", features = [\"uuid\"] }\n"
@@ -120,33 +50,10 @@ forgedb-coordinator = "0.2"
         )
     }
 
-    /// The `src/lib.rs` a `core` package holds: the generated database plus the
-    /// substrate re-exports, exactly as the caller assembled it.
-    ///
-    /// Named rather than inlined so [`Self::files`] has one entry per file and
-    /// no call site has to remember which relative path goes with which string.
     pub const LIB_RS: &'static str = "src/lib.rs";
 
-    /// The manifest's relative path.
     pub const CARGO_TOML: &'static str = "Cargo.toml";
 
-    /// **Every file of a `core` package**, as (relative path, contents).
-    ///
-    /// This is the ONE definition of what a `core` package *is*. The cache
-    /// emitter, the in-tree emitter (#338) and `generate --check`'s comparer all
-    /// read it — which is what makes "one renderer, two destinations" a
-    /// structural property rather than a rule three call sites are trusted to
-    /// keep.
-    ///
-    /// It takes the `GenConfig`, not a `bool`, for #445's reason: a `bool` is a
-    /// parameter a call site can compute a *second*, divergent condition into,
-    /// and the two halves of the utoipa pairing then disagree for exactly the
-    /// invocations that narrow. There is nothing here left to compute.
-    ///
-    /// The list is exhaustive on purpose. `#338` scenario 2 asserts the emitted
-    /// directory holds **nothing else**, and it can only do that against a
-    /// complete enumeration — a renderer that returned "the files I happened to
-    /// think of" would make that assertion vacuous.
     pub fn files(crate_name: &str, config: &GenConfig, lib_rs: &str) -> Vec<(&'static str, String)> {
         vec![
             (Self::CARGO_TOML, Self::cargo_toml(crate_name, config)),
@@ -154,19 +61,6 @@ forgedb-coordinator = "0.2"
         ]
     }
 
-    /// The dependency line a consumer pastes into their own `Cargo.toml`.
-    ///
-    /// **`package =` is not optional.** Cargo matches a path dependency's *key*
-    /// against the package's own name, and this package is named
-    /// `<app_name>-core` — so the obvious `forgedb_core = { path = "…" }` is a
-    /// hard error (`no matching package named 'forgedb_core' found`), not a
-    /// stylistic choice. The rename is the same idiom
-    /// [`crate::ServerPackage::cargo_toml`] already uses for the same reason:
-    /// no generated `.rs` byte carries the app's derived name.
-    ///
-    /// ForgeDB **prints** this line; it never writes it. Which of a consumer's
-    /// crates should depend on the database is not knowable — a workspace may
-    /// hold many — and picking one is guessing in a file ForgeDB does not own.
     pub fn dep_line(package: &str, path: &Path) -> String {
         format!(
             "forgedb_core = {{ package = {}, path = {} }}",
@@ -176,12 +70,6 @@ forgedb-coordinator = "0.2"
     }
 }
 
-
-/// A TOML basic string, escaped.
-///
-/// Hand-rolled rather than reached for through `toml`: that crate is a
-/// dev-dependency here, and pulling a serializer into the shipped graph to quote
-/// two strings is a poor trade. The escape set is TOML's own for basic strings.
 fn toml_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
@@ -203,7 +91,6 @@ fn toml_string(value: &str) -> String {
 mod tests {
     use super::*;
 
-    /// A `GenConfig` with `web` set explicitly — the one input this manifest reads.
     fn cfg(web: bool) -> GenConfig {
         GenConfig {
             web,
@@ -223,14 +110,6 @@ mod tests {
         );
     }
 
-    /// **The #445 pairing, asserted directly**: the manifest pins `utoipa`
-    /// exactly when the source that manifest compiles names it.
-    ///
-    /// Both sides are rendered from the SAME `GenConfig` here, which is what the
-    /// shipped call site failed to do — it computed a second condition
-    /// (`cache.api.is_some()`) and passed it as a `bool`. This is the cheap,
-    /// string-level half; `tests/core_utoipa_gate_test.rs` proves it end to end
-    /// by compiling what the CLI wrote.
     #[test]
     fn the_pin_and_the_import_agree_for_every_config() {
         let src = "User {\n  id: +uuid\n  email: &string\n  name: string\n}\n";
@@ -255,17 +134,6 @@ mod tests {
         }
     }
 
-
-    /// **#338 scenario 4a.** The printed dep line carries `package =` and a
-    /// `path`, and it parses as TOML.
-    ///
-    /// The `package =` half is the one gate 1 got wrong: cargo matches a path
-    /// dep's KEY against the package's own name, so `forgedb_core = { path = … }`
-    /// against a package named `demo-core` fails with `no matching package named
-    /// 'forgedb_core' found`. Asserted here as a string property and, in
-    /// `tests/in_tree_package_test.rs`, against the manifest ForgeDB actually
-    /// wrote — never against a literal, which is how the wrong line survived a
-    /// design gate.
     #[test]
     fn the_dep_line_renames_the_package_and_parses() {
         let line = CorePackage::dep_line("demo-core", Path::new("generated/core"));
@@ -280,10 +148,6 @@ mod tests {
         );
     }
 
-    /// A path with a character TOML must escape does not produce a broken line.
-    ///
-    /// Reachable: `[placement].rust_package` resolves against the schema's
-    /// directory, and nothing forbids a backslash or a quote in a directory name.
     #[test]
     fn the_dep_line_escapes_its_path() {
         let line = CorePackage::dep_line("demo-core", Path::new("gen\"er\\ated/core"));
@@ -294,13 +158,6 @@ mod tests {
         );
     }
 
-    /// **#338 scenario 2 (the renderer half).** `files` enumerates the WHOLE
-    /// package: two entries, and the manifest is rendered from the same config
-    /// the source was.
-    ///
-    /// The count is asserted because the emitters that consume this are what
-    /// makes "the emitted directory holds nothing else" true — a third file
-    /// appearing here must be a deliberate edit, not a silent one.
     #[test]
     fn files_enumerates_the_whole_package() {
         for web in [true, false] {
@@ -316,8 +173,6 @@ mod tests {
         }
     }
 
-    /// A `[profile.*]` table in a workspace member is silently ignored, so
-    /// emitting one would read as applied while doing nothing.
     #[test]
     fn no_profile_table_is_emitted() {
         for web in [true, false] {
@@ -326,7 +181,6 @@ mod tests {
         }
     }
 
-    /// The coordinator must be host-only or `core` cannot build for the replica.
     #[test]
     fn the_coordinator_is_target_gated() {
         let manifest = CorePackage::cargo_toml("app-core", &cfg(false));

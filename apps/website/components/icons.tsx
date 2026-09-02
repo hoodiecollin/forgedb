@@ -1,11 +1,6 @@
 import type { SVGProps } from "react";
 import { cn } from "@/lib/utils";
 
-/**
- * ForgeDB logomark (docs/brand `forgemark-primary.svg`) — a schema "F" node
- * fanning into streams; the top stream runs molten (what's being forged now),
- * the rest violet. Colors are fixed brand hex, not `currentColor`.
- */
 export function ForgeMark(props: SVGProps<SVGSVGElement>) {
   return (
     <svg viewBox="0 0 120 120" fill="none" aria-hidden {...props}>
@@ -27,11 +22,6 @@ export function ForgeMark(props: SVGProps<SVGSVGElement>) {
     </svg>
   );
 }
-
-/**
- * ForgeDB wordmark — two-tone "Forge" (foreground) + "DB" (violet primary),
- * set in the brand display face (Space Grotesk, via `--font-sans`).
- */
 export function ForgeWordmark({ className, ...props }: React.ComponentProps<"span">) {
   return (
     <span className={cn("font-semibold tracking-tight", className)} {...props}>
@@ -39,7 +29,6 @@ export function ForgeWordmark({ className, ...props }: React.ComponentProps<"spa
     </span>
   );
 }
-
 export function GitHubIcon(props: SVGProps<SVGSVGElement>) {
   return (
     <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden {...props}>

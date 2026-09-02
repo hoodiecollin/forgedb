@@ -1,8 +1,3 @@
-//! SQLite benchmark suite (rusqlite, bundled). Mirrors the ForgeDB suite's
-//! scenarios over the same seeded corpus and the 1:1 `schema.sql` DDL, so the
-//! Criterion groups line up for direct comparison. Durability is matched to
-//! ForgeDB's `FsyncPolicy::Always`: WAL journal + `synchronous = FULL`.
-
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use forgedb_benchmarks::{
     dataset, id_for, list_sql, ts_from_seconds, uuid_of, Dataset, PostJson, LIST_CORE_LIMIT,
@@ -15,12 +10,6 @@ const READ_POSTS: usize = 10_000;
 
 const SCHEMA: &str = include_str!("../schema.sql");
 
-/// WAL journal + `synchronous = FULL`. `fullfsync` decides the *strength* of the
-/// flush, which is the whole fsync-parity question (see docs/BENCHMARKS.md):
-///   - `false` → SQLite's default `fsync()`. On macOS that flushes to the drive
-///     cache only (~113 µs) — NOT a barrier, a weaker guarantee than ForgeDB.
-///   - `true`  → `fcntl(F_FULLFSYNC)` (~4 ms), the same true barrier ForgeDB's
-///     WAL `sync_all()` issues on macOS. This is the like-for-like durability.
 fn apply_pragmas(conn: &Connection, fullfsync: bool) {
     conn.pragma_update(None, "journal_mode", "WAL").unwrap();
     conn.pragma_update(None, "synchronous", "FULL").unwrap();
@@ -36,13 +25,10 @@ fn fresh_conn_dur(path: &std::path::Path, fullfsync: bool) -> Connection {
     conn
 }
 
-/// Default durability (plain fsync). Reads don't touch the fsync path, so the
-/// read/bulk fixtures use this.
 fn fresh_conn(path: &std::path::Path) -> Connection {
     fresh_conn_dur(path, false)
 }
 
-/// Load `data` into `conn` in one transaction (setup — not timed).
 fn load(conn: &mut Connection, data: &Dataset) {
     let tx = conn.transaction().unwrap();
     for u in &data.users {
@@ -74,17 +60,11 @@ fn load(conn: &mut Connection, data: &Dataset) {
     tx.commit().unwrap();
 }
 
-// --- Scenario 2: single-row insert latency (autocommit → fsync per row) ------
-// Measured at BOTH durability levels so the fsync-parity comparison is explicit:
-// `default` is SQLite out-of-box (plain fsync), `fullfsync` matches ForgeDB's
-// per-commit F_FULLFSYNC barrier. See docs/BENCHMARKS.md.
 fn bench_insert(c: &mut Criterion) {
     let mut group = c.benchmark_group("sqlite/insert_user");
     group.throughput(Throughput::Elements(1));
     for &fullfsync in &[false, true] {
         let dir = tempfile::tempdir().unwrap();
-        // `dir`/`conn` are locals that live until the end of this loop body,
-        // which is after `bench_function` returns (it measures synchronously).
         let conn = fresh_conn_dur(&dir.path().join("bench.db"), fullfsync);
         let mut stmt_i = 0usize;
         let label = if fullfsync { "fullfsync" } else { "default" };
@@ -113,7 +93,6 @@ fn bench_insert(c: &mut Criterion) {
     group.finish();
 }
 
-// --- Scenario 1: bulk load (autocommit → fsync per row, matching ForgeDB) ----
 fn bench_bulk_load(c: &mut Criterion) {
     let mut group = c.benchmark_group("sqlite/bulk_load_posts");
     group.sample_size(10);
@@ -149,21 +128,16 @@ fn bench_bulk_load(c: &mut Criterion) {
     group.finish();
 }
 
-// --- Read / traversal scenarios (5, 6, 8/10, 11) -----------------------------
 fn bench_reads(c: &mut Criterion) {
     let data = dataset(READ_USERS, READ_POSTS);
     let dir = tempfile::tempdir().unwrap();
     let mut conn = fresh_conn(&dir.path().join("bench.db"));
     load(&mut conn, &data);
 
-    // Full-row materializers so SQLite builds the SAME records ForgeDB's
-    // get/user_posts/post_tags return — otherwise `SELECT id` would flatter
-    // SQLite by skipping the column reads ForgeDB pays for.
     type PostRowOut = (Vec<u8>, String, i64, i64, Vec<u8>, i64);
     type UserRowOut = (Vec<u8>, String, String, i64);
     type TagRowOut = (Vec<u8>, String);
 
-    // Scenario 5: point lookup by PK (materialize the full post record).
     c.benchmark_group("sqlite/point_lookup")
         .throughput(Throughput::Elements(1))
         .bench_function("get_post_by_id", |b| {
@@ -183,7 +157,6 @@ fn bench_reads(c: &mut Criterion) {
             });
         });
 
-    // Scenario 6: secondary-index probe (unique email → full user record).
     c.benchmark_group("sqlite/index_probe")
         .throughput(Throughput::Elements(1))
         .bench_function("get_user_by_email", |b| {
@@ -203,7 +176,6 @@ fn bench_reads(c: &mut Criterion) {
             });
         });
 
-    // Scenario 8/10: FK-index probe → reverse one-to-many (full post records).
     c.benchmark_group("sqlite/reverse_fk")
         .throughput(Throughput::Elements(1))
         .bench_function("user_posts", |b| {
@@ -225,7 +197,6 @@ fn bench_reads(c: &mut Criterion) {
             });
         });
 
-    // Scenario 11: many-to-many traversal (indexed junction join → full tags).
     c.benchmark_group("sqlite/m2m")
         .throughput(Throughput::Elements(1))
         .bench_function("post_tags", |b| {
@@ -249,14 +220,12 @@ fn bench_reads(c: &mut Criterion) {
         });
 }
 
-// --- Scenario 7: filtered scan + aggregate + top-N ---------------------------
 fn bench_scan(c: &mut Criterion) {
     let data = dataset(READ_USERS, READ_POSTS);
     let dir = tempfile::tempdir().unwrap();
     let mut conn = fresh_conn(&dir.path().join("bench.db"));
     load(&mut conn, &data);
 
-    // 7a: full scan + aggregate.
     c.benchmark_group("sqlite/scan_aggregate")
         .throughput(Throughput::Elements(READ_POSTS as u64))
         .bench_function("sum_views_where_published", |b| {
@@ -269,7 +238,6 @@ fn bench_scan(c: &mut Criterion) {
             });
         });
 
-    // 7b: filtered scan + sort + page (top-10 by views, full records).
     type PostRowOut = (Vec<u8>, String, i64, i64, Vec<u8>, i64);
     c.benchmark_group("sqlite/scan_sort_top10")
         .throughput(Throughput::Elements(READ_POSTS as u64))
@@ -293,10 +261,6 @@ fn bench_scan(c: &mut Criterion) {
         });
 }
 
-
-/// Decode the page into `PostJson`. A cursor engine must COPY the strings ForgeDB's page
-/// view borrows out of its column buffer; that asymmetry is a property of the shipped read
-/// paths and is disclosed in docs/BENCHMARKS.md rather than engineered away.
 fn sqlite_page(stmt: &mut rusqlite::Statement<'_>) -> Vec<PostJson> {
     stmt.query_map([], |r| {
         Ok(PostJson {
@@ -315,7 +279,6 @@ fn sqlite_page(stmt: &mut rusqlite::Statement<'_>) -> Vec<PostJson> {
 }
 
 fn bench_list(c: &mut Criterion) {
-    // The core grid: four shapes at the core point.
     {
         let data = dataset(READ_USERS, LIST_CORE_ROWS);
         let dir = tempfile::tempdir().unwrap();
@@ -345,8 +308,6 @@ fn bench_list(c: &mut Criterion) {
         g.finish();
     }
 
-    // Size sweep, unfiltered. The core point recurs here on purpose — it is the sweep's
-    // middle point — which is legal because this is a DIFFERENT group.
     {
         let mut g = c.benchmark_group("sqlite/list_unfiltered");
         for rows in LIST_SIZES {
@@ -359,9 +320,6 @@ fn bench_list(c: &mut Criterion) {
             let sql = list_sql(clause, limit, 0);
             let label = format!("{name}/rows={rows}/limit={limit}");
 
-            // BDD-3: every engine's page must hold the same number of rows at the same
-            // (rows, limit) point. A LIMIT that clamped differently would make the
-            // cross-engine comparison meaningless while every number looked plausible.
             {
                 let mut stmt = conn.prepare(&sql).unwrap();
                 let n = sqlite_page(&mut stmt).len();
@@ -386,7 +344,6 @@ fn bench_list(c: &mut Criterion) {
         g.finish();
     }
 
-    // Limit sweep, unfiltered, at the core size.
     {
         let data = dataset(READ_USERS, LIST_CORE_ROWS);
         let dir = tempfile::tempdir().unwrap();

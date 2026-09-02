@@ -401,7 +401,7 @@ rm -rf "$SCRATCH" && mkdir -p "$SCRATCH"
 cp examples/blog-cms/schema.forge "$SCRATCH/"
 cat > "$SCRATCH/forgedb.toml" <<'TOML'
 [project]
-name = "forgedb-codegen-scratch"
+id = "forgedb-codegen-scratch"
 isolated = true
 
 [generate]

@@ -1,6 +1,5 @@
 ---
 source: crates/codegen/tests/codegen_snapshots.rs
-assertion_line: 4658
 expression: main
 ---
 #![allow(warnings)]
@@ -46,12 +45,6 @@ fn transform_v2_to_v3(
     __dst.commit().map_err(|e| format!("commit v{}: {}", 3u32, e))?;
     Ok(())
 }
-/// Replay the fixed embedded version sequence over a src→dest data dir.
-/// Each hop writes an intermediate destination-version dir under a work
-/// dir; the fully-materialized final dir is atomic-renamed into place at
-/// the end (all-or-nothing at the range level — the retained source dir
-/// is the rollback). A crash mid-replay leaves either the pristine
-/// source or a cleanly-versioned intermediate the app refuses (DV-6).
 fn run(
     __src: &std::path::Path,
     __final_dst: &std::path::Path,

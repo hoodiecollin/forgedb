@@ -1,42 +1,3 @@
-//! NAPI-RS language-binding generator (#52 Node / #117 Bun) — the ergonomic
-//! JavaScript-runtime wrapper over the SAME generated `database.rs`, a sibling of
-//! the PyO3 wrapper (`pyo3.rs`), the native FFI spine (`ffi.rs`), and the wasm
-//! replica (`wasm.rs`).
-//!
-//! **Option A (Node + Bun unified).** Node and Bun both run Node-API, so a SINGLE
-//! NAPI-RS crate → one `.node` artifact serves both (`generate node --runtime` and
-//! `generate bun --runtime` emit identical code — any Node-vs-Bun difference is
-//! packaging/loader glue, not a second binding). This is why there is one emitter,
-//! not two.
-//!
-//! It emits a per-schema `#[napi]` surface: a `ForgeDb` class whose methods mirror
-//! the generated `Database` CRUD **1:1**, calling the integrity wrappers
-//! (`create_<m>`/`update_<m>`/`delete_<m>`) and storage reads (`get`/`row_count`/
-//! `all`) by name.
-//!
-//! **Typed row structs (Phase 5b/6b follow-up).** Each identity model gets a
-//! `#[napi(object)]` struct (`Napi<Model>`) with typed `pub` fields so napi-rs
-//! auto-emits a fully-typed TypeScript interface in the `.d.ts`. Row-returning
-//! methods (`get_<m>`, `all_<m>`, relation getters) return the typed struct (or
-//! `Vec<struct>` / `Option<struct>`) instead of `JsUnknown`. Input methods
-//! (`create_<m>`, `update_<m>`) continue to accept `JsUnknown` via the serde
-//! bridge (`from_js_value`) — the existing single marshalling contract for input.
-//!
-//! Field-type mapping for `#[napi(object)]` matches the serde JSON wire shape so
-//! values are identical whether reached through the typed or serde path:
-//! `uuid`/`timestamp`→`i64`/`decimal`/`enum` serialize as strings in serde and are
-//! typed `String` in the napi struct; `bool`/`f64`/`i32`/`i64`/`u32` are native;
-//! `u64` is mapped to `i64` (serde emits a JSON number, napi `u64` would emit
-//! `BigInt` — incompatible shapes); `json` uses `serde_json::Value`; `char(N)` uses
-//! `Vec<u8>`. Virtual relation fields (`OneToMany`/`ManyToMany`) carry no stored
-//! value and are excluded from the napi object.
-//!
-//! Identity: every schema-specific surface is generated per-model (constraint 2);
-//! there is **no** generic `query`/`filter`/`predicate` entry point and no
-//! `match model` dispatch (constraint 1). `Env::to_js_value` is schema-agnostic
-//! (like `serde_json` in the FFI / `pythonize` in PyO3). The methods are named
-//! from the schema, which IS the tailoring.
-
 use crate::{GeneratedCode, Result};
 use forgedb_parser::Schema;
 use proc_macro2::TokenStream;
@@ -44,52 +5,62 @@ use quote::{format_ident, quote};
 
 use crate::rust::RustGenerator;
 
-/// `blog_post` -> `BlogPost`. napi-rs's automatic JS rename of a Rust method
-/// stem, reproduced for the declaration file so the `.d.ts` names what the
-/// addon actually exports.
-fn pascal_of_snake(snake: &str) -> String {
-    snake
-        .split('_')
-        .filter(|p| !p.is_empty())
-        .map(|p| {
-            let mut c = p.chars();
-            match c.next() {
-                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-                None => String::new(),
-            }
-        })
-        .collect()
+struct JsDecl {
+    name: String,
+    params: String,
+    ret: String,
+}
+
+impl JsDecl {
+    fn new(name: impl Into<String>, params: impl Into<String>, ret: impl Into<String>) -> Self {
+        Self { name: name.into(), params: params.into(), ret: ret.into() }
+    }
+
+    fn render(&self) -> String {
+        format!("  {}({}): {};\n", self.name, self.params, self.ret)
+    }
+}
+
+fn push_item(methods: &mut Vec<NapiItem>, js: Vec<JsDecl>, item: TokenStream) {
+    methods.push(NapiItem { item, js });
+}
+
+struct NapiItem {
+    item: TokenStream,
+    js: Vec<JsDecl>,
+}
+
+fn lower_camel_of_snake(snake: &str) -> String {
+    let mut out = String::with_capacity(snake.len());
+    let mut upper_next = false;
+    for ch in snake.chars() {
+        if ch == '_' {
+            upper_next = true;
+        } else if upper_next {
+            out.extend(ch.to_uppercase());
+            upper_next = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 pub struct NapiGenerator;
 
 impl NapiGenerator {
-    /// Generate the NAPI-RS wrapper (`napi/src/lib.rs`) for a schema.
     pub fn generate(schema: &Schema) -> Result<GeneratedCode> {
         let row_structs = Self::generate_row_structs(schema);
-        let db_methods = Self::generate_db_methods(schema);
-        let relation_methods = Self::generate_relation_methods(schema);
-        let arrow_methods = Self::generate_arrow_methods(schema);
+        let db_methods: Vec<TokenStream> =
+            Self::generate_db_methods(schema).into_iter().map(|m| m.item).collect();
+        let relation_methods: Vec<TokenStream> =
+            Self::generate_relation_methods(schema).into_iter().map(|m| m.item).collect();
+        let arrow_methods: Vec<TokenStream> =
+            Self::generate_arrow_methods(schema).into_iter().map(|m| m.item).collect();
 
         let tokens = quote! {
-            //! Generated by ForgeDB — Node/Bun binding (NAPI-RS, #52/#117).
-            //! DO NOT EDIT - This file is auto-generated.
-            //!
-            //! Class-2 transport glue: the ergonomic JavaScript surface over the
-            //! generated `Database`. A `ForgeDb` whose methods mirror the generated
-            //! CRUD 1:1. The tailored data logic lives in the generated
-            //! `database.rs`; this file binds it. It invents no query API (the
-            //! identity red line). Node and Bun share this ONE `.node` (Option A).
             #![allow(warnings)]
 
-            // #335 §1: the one generated database for this app is the sibling
-            // `core` package, linked as an ordinary rlib. It used to be a
-            // `mod database;` compiled from a COPY of `database.rs` dropped
-            // beside this file — the copy is what let one `generate` run ship
-            // two databases with different durability semantics.
-            //
-            // The dependency is renamed to `forgedb_core` by the MANIFEST, so no
-            // generated byte in this file carries this app's package name.
             use forgedb_core as database;
 
             use napi::bindgen_prelude::*;
@@ -99,46 +70,19 @@ impl NapiGenerator {
             use std::sync::{Arc, RwLock};
 
             use database::Database;
-            // Names the primary-key type of UUID-keyed models (`id_type_tokens`
-            // emits a bare `Uuid`); integer-PK models use std types.
-            //
-            // Reached THROUGH `core`'s `pub use forgedb_types;` re-export rather
-            // than through a pin of this crate's own (#335 §1): this crate pins
-            // ZERO substrate, so its `Uuid` is the same type as the database's
-            // by construction, instead of only when one lockfile happens to
-            // resolve two independently-authored pin lists identically.
             use forgedb_core::forgedb_types::Uuid;
 
-            // #337: the source fingerprint of this package. Written beside this
-            // file by `forgedb generate` as `src/fingerprint.rs`, and excluded
-            // from its own hash input by name, or the definition is circular.
-            //
-            // It lives HERE rather than in `core`: `core/src/lib.rs` is the exact
-            // `String` also written to `<output>/database.rs` as the compatibility
-            // mirror, and a `mod fingerprint;` line in that mirror would name a
-            // file that does not exist beside it.
             mod fingerprint;
 
-            /// The fingerprint of the generated source this addon was compiled
-            /// from. `index.js` compares the value IT was generated with against
-            /// this one at `require()` time and throws when they disagree.
-            ///
-            /// `js_name` is explicit so napi-rs's automatic camelCase rename
-            /// cannot silently move the name the entry module calls.
             #[napi(js_name = "__forgedbFingerprint")]
             pub fn forgedb_fingerprint() -> String {
                 fingerprint::FINGERPRINT.to_string()
             }
 
-            /// Map any engine error (`ValidationError`, `io::Error`, …) to the
-            /// JS-visible `napi::Error` (thrown as a JS `Error`).
             fn to_napi_err<E: std::fmt::Display>(e: E) -> Error {
                 Error::from_reason(e.to_string())
             }
 
-            /// Convert a caught panic payload into a `napi::Error` so an engine
-            /// panic (e.g. the single-writer `DirLock`) never unwinds across the
-            /// Node-API boundary as a raw abort.
             fn panic_to_napi_err(payload: Box<dyn std::any::Any + Send>) -> Error {
                 let msg = payload
                     .downcast_ref::<&str>()
@@ -148,17 +92,6 @@ impl NapiGenerator {
                 Error::from_reason(msg)
             }
 
-            /// A generic asynchronous engine op run on the libuv thread-pool.
-            ///
-            /// Holds a boxed closure that locks the shared `Arc<RwLock<Database>>`,
-            /// runs exactly one engine call (panic-guarded), and yields its result
-            /// as a `serde_json::Value` — all on the pool thread, so a slow op never
-            /// blocks the JS event loop. `resolve` marshals that value to JS on the
-            /// JS thread. Ops serialize on the single `RwLock`: read ops take a
-            /// shared guard (concurrent), write ops the exclusive guard — the
-            /// single-writer contract lives in the engine, not here (the async layer
-            /// only avoids event-loop stalls and lets reads run in parallel; it never
-            /// conjures write concurrency). Returned as an `AsyncTask` → a JS Promise.
             pub struct AsyncOp {
                 op: Option<Box<dyn FnOnce() -> std::result::Result<serde_json::Value, String> + Send>>,
             }
@@ -191,21 +124,13 @@ impl NapiGenerator {
 
             #(#row_structs)*
 
-            /// A ForgeDB database handle — one single-writer process over a data
-            /// directory. Methods mirror the generated `Database` surface 1:1.
             #[napi(js_name = "ForgeDb")]
             pub struct ForgeDb {
-                // Shared behind an `RwLock` so async ops (which run on a libuv
-                // pool thread) can hold the SAME single engine handle: read ops
-                // take a shared guard and run concurrently, write ops the exclusive
-                // guard. `Arc` lets each `AsyncOp` clone the handle onto its thread.
                 inner: Arc<RwLock<Database>>,
             }
 
             #[napi]
             impl ForgeDb {
-                /// Open (or create) the database at `root`. Holds the single-writer
-                /// lock; a second writer throws rather than aborting the runtime.
                 #[napi(factory)]
                 pub fn open(root: String) -> Result<Self> {
                     let root = std::path::PathBuf::from(root);
@@ -215,7 +140,6 @@ impl NapiGenerator {
                     }
                 }
 
-                /// Flush every column to disk (fsync on native).
                 #[napi]
                 pub fn commit(&self) -> Result<()> {
                     match catch_unwind(AssertUnwindSafe(|| self.write().commit())) {
@@ -224,7 +148,6 @@ impl NapiGenerator {
                     }
                 }
 
-                /// Force a WAL checkpoint (fsync columns, then truncate the WAL).
                 #[napi]
                 pub fn checkpoint(&self) -> Result<()> {
                     match catch_unwind(AssertUnwindSafe(|| self.write().checkpoint())) {
@@ -233,8 +156,6 @@ impl NapiGenerator {
                     }
                 }
 
-                /// Reclaim dead (superseded/tombstoned) row versions in-process.
-                /// Explicit only — never reached from a read path (constraint 4).
                 #[napi]
                 pub fn compact(&self) -> Result<()> {
                     match catch_unwind(AssertUnwindSafe(|| self.write().compact())) {
@@ -243,7 +164,6 @@ impl NapiGenerator {
                     }
                 }
 
-                /// Flush every column to disk asynchronously (resolves to `null`).
                 #[napi(js_name = "commitAsync")]
                 pub fn commit_async(&self) -> AsyncTask<AsyncOp> {
                     let inner = self.inner.clone();
@@ -262,15 +182,10 @@ impl NapiGenerator {
             }
 
             impl ForgeDb {
-                /// A shared (concurrent) read guard over the engine, recovering from
-                /// a poisoned lock (a caught panic still poisons on unwind — every
-                /// engine call is `catch_unwind`-wrapped, so the state is intact).
                 fn read(&self) -> std::sync::RwLockReadGuard<'_, Database> {
                     self.inner.read().unwrap_or_else(|e| e.into_inner())
                 }
 
-                /// The exclusive write guard over the engine, with the same poison
-                /// recovery as [`read`].
                 fn write(&self) -> std::sync::RwLockWriteGuard<'_, Database> {
                     self.inner.write().unwrap_or_else(|e| e.into_inner())
                 }
@@ -290,8 +205,6 @@ impl NapiGenerator {
         })
     }
 
-    /// The identity models a binding surface is generated for — those with an
-    /// `id` field or an auto-generated PK (same filter as the FFI / PyO3 spines).
     fn identity_models(schema: &Schema) -> impl Iterator<Item = &forgedb_parser::Model> {
         schema
             .models
@@ -299,7 +212,6 @@ impl NapiGenerator {
             .filter(|m| m.has_identity())
     }
 
-    /// Whether a field type is a virtual relation (no stored column).
     fn is_virtual_relation(field_type: &forgedb_parser::FieldType) -> bool {
         use forgedb_parser::{FieldType, RelationType};
         matches!(
@@ -309,156 +221,97 @@ impl NapiGenerator {
         )
     }
 
-    /// The napi-object field type for a `.forge` field type, matching the serde
-    /// JSON wire shape so values are identical through the typed and serde paths.
-    ///
-    /// * `uuid` → `String` (serde: hyphenated UUID string)
-    /// * `timestamp` → `i64`  (serde: i64 seconds since epoch)
-    /// * `decimal` → `String` (serde: decimal string via `serde-with-str`)
-    /// * `enum(X)` → `String` (serde: variant name string)
-    /// * `u64` → `i64`        (serde: JSON number — napi `u64` maps to `BigInt`,
-    ///                          incompatible with the serde JSON-number wire shape)
-    /// * `json` → `serde_json::Value` (napi serde-json feature handles the mapping)
-    /// * `char(N)` → `Vec<u8>` (serde: array of u8; napi maps Vec<u8> → Buffer)
-    /// * `struct` / complex → `serde_json::Value` (inline structs lack a
-    ///    `#[napi(object)]` peer; marshal via the serde bridge as before)
-    /// * Nullable/optional → `Option<inner_napi_type>`
-    ///
-    /// Returns `None` for virtual relation fields (no stored column → excluded).
     fn napi_field_type(schema: &Schema, field_type: &forgedb_parser::FieldType) -> Option<TokenStream> {
         use forgedb_parser::{FieldType, RelationType};
         match field_type {
-            // Virtual relation fields carry no stored value.
             FieldType::Relation(RelationType::OneToMany(_))
             | FieldType::Relation(RelationType::ManyToMany(_)) => None,
 
-            // Primitive numerics — native napi types.
             FieldType::U32 => Some(quote! { u32 }),
-            // u64: serde emits a JSON number; napi `u64` maps to BigInt (different
-            // wire shape). Map to i64 to stay wire-compatible.
             FieldType::U64 => Some(quote! { i64 }),
             FieldType::I32 => Some(quote! { i32 }),
             FieldType::I64 => Some(quote! { i64 }),
             FieldType::F64 => Some(quote! { f64 }),
             FieldType::Bool => Some(quote! { bool }),
 
-            // String-typed fields. #238: an inline `string(N)` is a `String` in
-            // the generated record and a string on every wire.
             FieldType::String | FieldType::StringN { .. } => Some(quote! { String }),
 
-            // uuid serializes as a hyphenated string in serde.
             FieldType::Uuid => Some(quote! { String }),
 
-            // timestamp serializes as an RFC 3339 string since #254.  This has
-            // to track serde, not the in-memory representation: the async ops
-            // return raw `serde_json::Value`, so a typed struct that disagreed
-            // would give the same field two shapes depending on which method
-            // was called.
             FieldType::Timestamp(_) => Some(quote! { String }),
 
-            // decimal serializes as a string (serde-with-str feature).
             FieldType::Decimal => Some(quote! { String }),
 
-            // enum serializes as its variant-name string in serde.
             FieldType::Enum(_) => Some(quote! { String }),
 
-            // json is serde_json::Value — napi's serde-json feature handles it.
             FieldType::Json => Some(quote! { serde_json::Value }),
 
-            // char(N) is [u8; N] in the generated struct; serde serializes as an
-            // array of u8 integers; napi maps Vec<u8> to a JS Buffer.
             FieldType::Bytes(_) => Some(quote! { Vec<u8> }),
 
-            // FixedArray — map element type recursively.
             FieldType::FixedArray(inner, _) => {
                 let inner_ty = Self::napi_field_type(schema, inner)?;
                 Some(quote! { Vec<#inner_ty> })
             }
 
-            // Inline struct types — marshal via serde_json::Value (the struct
-            // itself is not a `#[napi(object)]`; using Value preserves the serde
-            // contract without requiring a parallel napi struct per embedded type).
             FieldType::StructType(_) | FieldType::OptionalStructType(_) => {
                 Some(quote! { serde_json::Value })
             }
 
-            // #266: an FK surfaces with the SAME JS type as the target's own
-            // `id`. Hardcoding `String` compiled for a `u64` key and shipped an
-            // object whose `post` was `"42"` beside a `Post.id` of `42`.
             FieldType::Relation(
                 RelationType::RequiredReference(_) | RelationType::OptionalReference(_),
             ) => Self::napi_field_type(schema, &RustGenerator::resolved_type(schema, field_type)),
 
-            // Nullable wraps the inner mapped type.
             FieldType::Nullable(inner) => {
                 let inner_ty = Self::napi_field_type(schema, inner)?;
                 Some(quote! { Option<#inner_ty> })
             }
 
-            // Fallback — should not be reached for stored fields.
             _ => Some(quote! { serde_json::Value }),
         }
     }
 
-    /// Generate the conversion expression from a `database::<Model>` field
-    /// (`source.#field_name`) to the corresponding napi object field value.
-    fn napi_field_conv(schema: &Schema, 
+    fn napi_field_conv(schema: &Schema,
         field_type: &forgedb_parser::FieldType,
         field_name: &proc_macro2::Ident,
     ) -> TokenStream {
         use forgedb_parser::{FieldType, RelationType};
         match field_type {
-            // Virtual relations have no column — excluded by the caller.
             FieldType::Relation(RelationType::OneToMany(_))
             | FieldType::Relation(RelationType::ManyToMany(_)) => quote! { () },
 
-            // Native primitives — copy directly.
             FieldType::U32 | FieldType::I32 | FieldType::I64 | FieldType::F64 | FieldType::Bool => {
                 quote! { __src.#field_name }
             }
 
-            // u64 is mapped to i64 — cast (wrapping, but safe for realistic row
-            // counts; the serde path also truncates via JSON number).
             FieldType::U64 => quote! { __src.#field_name as i64 },
 
-            // String — clone (String → String). `string(N)` too (#238).
             FieldType::String | FieldType::StringN { .. } => {
                 quote! { __src.#field_name.clone() }
             }
 
-            // uuid → hyphenated string (matches serde's `Serialize for Uuid`).
             FieldType::Uuid => quote! { __src.#field_name.to_string() },
 
-            // timestamp → its RFC 3339 rendering (#254), matching serde.
             FieldType::Timestamp(_) => quote! { __src.#field_name.to_string() },
 
-            // decimal → string (matches serde-with-str).
             FieldType::Decimal => quote! { __src.#field_name.to_string() },
 
-            // enum → variant-name string (matches serde's default string repr).
             FieldType::Enum(_) => {
                 quote! { serde_json::to_value(&__src.#field_name).unwrap_or_default().as_str().unwrap_or_default().to_string() }
             }
 
-            // json → serde_json::Value (already that type in the generated struct).
             FieldType::Json => quote! { __src.#field_name.clone() },
 
-            // char(N): [u8; N] → Vec<u8>.
             FieldType::Bytes(_) => quote! { __src.#field_name.to_vec() },
 
-            // FixedArray: [T; N] → Vec<napi_type(T)>.
             FieldType::FixedArray(inner, _) => {
                 let elem_conv = Self::napi_scalar_conv(inner, &quote! { __e });
                 quote! { __src.#field_name.iter().map(|__e| #elem_conv).collect() }
             }
 
-            // Inline struct → serde_json::Value via serde.
             FieldType::StructType(_) | FieldType::OptionalStructType(_) => {
                 quote! { serde_json::to_value(&__src.#field_name).unwrap_or_default() }
             }
 
-            // #266: convert through the target key's own arm, so the FK and the
-            // target's `id` can never disagree.
             FieldType::Relation(
                 RelationType::RequiredReference(_) | RelationType::OptionalReference(_),
             ) => Self::napi_field_conv(
@@ -467,7 +320,6 @@ impl NapiGenerator {
                 field_name,
             ),
 
-            // Nullable(inner) → Option<inner_conv>.
             FieldType::Nullable(inner) => {
                 let inner_conv = Self::napi_nullable_inner_conv(inner, field_name);
                 quote! { #inner_conv }
@@ -477,8 +329,6 @@ impl NapiGenerator {
         }
     }
 
-    /// Conversion for the inner type of a nullable field expression
-    /// (`__src.#field_name` is `Option<InnerType>`).
     fn napi_nullable_inner_conv(
         inner: &forgedb_parser::FieldType,
         field_name: &proc_macro2::Ident,
@@ -512,7 +362,6 @@ impl NapiGenerator {
         }
     }
 
-    /// Conversion for an element in a FixedArray (value expression `elem_expr`).
     fn napi_scalar_conv(inner: &forgedb_parser::FieldType, elem_expr: &TokenStream) -> TokenStream {
         use forgedb_parser::FieldType;
         match inner {
@@ -525,21 +374,13 @@ impl NapiGenerator {
         }
     }
 
-    /// Per-identity-model `#[napi(object)]` typed row structs (`Napi<Model>`).
-    ///
-    /// Each struct has one `pub` field per stored model field (virtual relation
-    /// fields are excluded — they carry no stored value). Field types match the
-    /// serde JSON wire shape (see `napi_field_type` for the mapping). A
-    /// `from_record` constructor converts `database::<Model>` → `Napi<Model>`.
     fn generate_row_structs(schema: &Schema) -> Vec<TokenStream> {
         Self::identity_models(schema)
             .map(|model| {
                 let model_ident = format_ident!("{}", model.name);
                 let napi_ident = format_ident!("Napi{}", model.name);
                 let napi_name_str = model.name.as_str();
-                let doc = format!("Typed `{}` row returned by `ForgeDb` read methods.", model.name);
 
-                // Stored fields with their napi types.
                 let fields: Vec<_> = model
                     .fields
                     .iter()
@@ -547,10 +388,6 @@ impl NapiGenerator {
                     .filter_map(|f| {
                         let fname = format_ident!("{}", f.name);
                         let ty = Self::napi_field_type(schema, &f.field_type)?;
-                        // Pin the JS key to the exact `.forge` field name. Without this,
-                        // `#[napi(object)]` camelCases multi-word fields (`view_count` ->
-                        // `viewCount`), which would diverge from the serde snake_case wire
-                        // shape used by `create`/`update` input, REST, and the TS SDK.
                         let js_key = f.name.as_str();
                         Some(quote! {
                             #[napi(js_name = #js_key)]
@@ -559,29 +396,25 @@ impl NapiGenerator {
                     })
                     .collect();
 
-                // Conversion expressions from a `database::<Model>` value (__src).
                 let conv_exprs: Vec<_> = model
                     .fields
                     .iter()
                     .filter(|f| !Self::is_virtual_relation(&f.field_type))
                     .filter_map(|f| {
                         let fname = format_ident!("{}", f.name);
-                        let _ = Self::napi_field_type(schema, &f.field_type)?; // skip excluded
+                        let _ = Self::napi_field_type(schema, &f.field_type)?;
                         let conv = Self::napi_field_conv(schema, &f.field_type, &fname);
                         Some(quote! { #fname: #conv })
                     })
                     .collect();
 
                 quote! {
-                    #[doc = #doc]
                     #[napi(object, js_name = #napi_name_str)]
                     pub struct #napi_ident {
                         #(#fields),*
                     }
 
                     impl #napi_ident {
-                        /// Convert a generated `database::<Model>` record into the
-                        /// typed napi row struct, matching the serde JSON wire shape.
                         fn from_record(__src: &database::#model_ident) -> Self {
                             Self {
                                 #(#conv_exprs),*
@@ -593,14 +426,7 @@ impl NapiGenerator {
             .collect()
     }
 
-    /// The per-model CRUD methods on `ForgeDb`, mirroring the generated `Database`
-    /// integrity wrappers + storage reads 1:1.
-    ///
-    /// `get_<m>` and `all_<m>` return the typed `Napi<Model>` struct (or
-    /// `Option<Napi<Model>>` / `Vec<Napi<Model>>`). `create_<m>` and `update_<m>`
-    /// continue to accept `JsUnknown` via the serde bridge — one marshalling contract
-    /// for input, typed output.
-    fn generate_db_methods(schema: &Schema) -> Vec<TokenStream> {
+    fn generate_db_methods(schema: &Schema) -> Vec<NapiItem> {
         Self::identity_models(schema)
             .map(|model| {
                 let snake = RustGenerator::to_snake_case(&model.name);
@@ -620,8 +446,6 @@ impl NapiGenerator {
                 let update_m = format_ident!("update_{}", snake);
                 let delete_m = format_ident!("delete_{}", snake);
 
-                // Async (Promise-returning) variants. `js_name` gives them a camelCase
-                // JS name (`createUserAsync`); the Rust ident stays snake for clarity.
                 let create_async_m = format_ident!("create_{}_async", snake);
                 let get_async_m = format_ident!("get_{}_async", snake);
                 let all_async_m = format_ident!("all_{}_async", snake);
@@ -633,25 +457,23 @@ impl NapiGenerator {
                 let update_async_js = format!("update{}Async", model.name);
                 let delete_async_js = format!("delete{}Async", model.name);
 
-                let create_doc = format!(
-                    "Insert a `{}` (FK-checked + validated); returns the new id.",
-                    model.name
-                );
-                let get_doc =
-                    format!("Fetch a `{}` by id, or `null` if absent.", model.name);
-                let all_doc = format!("Every live `{}`.", model.name);
-                let count_doc = format!("Physical `{}` row-count watermark.", model.name);
-                let update_doc = format!(
-                    "Update a `{}` by id; `true` if present, `false` if absent.",
-                    model.name
-                );
-                let delete_doc = format!(
-                    "Delete a `{}` by id (referential integrity enforced); `true`/`false`.",
-                    model.name
-                );
+                let n = &model.name;
+                let js = vec![
+                    JsDecl::new(lower_camel_of_snake(&format!("create_{snake}")), "record: unknown", "unknown"),
+                    JsDecl::new(lower_camel_of_snake(&format!("get_{snake}")), "id: unknown", format!("{n} | null")),
+                    JsDecl::new(lower_camel_of_snake(&format!("all_{snake}")), "", format!("{n}[]")),
+                    JsDecl::new(lower_camel_of_snake(&format!("count_{snake}")), "", "number"),
+                    JsDecl::new(lower_camel_of_snake(&format!("update_{snake}")), "id: unknown, record: unknown", "boolean"),
+                    JsDecl::new(lower_camel_of_snake(&format!("delete_{snake}")), "id: unknown", "boolean"),
+                    JsDecl::new(create_async_js.clone(), "record: unknown", "Promise<unknown>"),
+                    JsDecl::new(get_async_js.clone(), "id: unknown", "Promise<unknown>"),
+                    JsDecl::new(all_async_js.clone(), "", "Promise<unknown>"),
+                    JsDecl::new(update_async_js.clone(), "id: unknown, record: unknown", "Promise<unknown>"),
+                    JsDecl::new(delete_async_js.clone(), "id: unknown", "Promise<unknown>"),
+                ];
 
-                quote! {
-                    #[doc = #create_doc]
+
+                let item = quote! {
                     #[napi]
                     pub fn #create_m(&self, env: Env, record: JsUnknown) -> Result<JsUnknown> {
                         let record: database::#model_ident =
@@ -663,7 +485,6 @@ impl NapiGenerator {
                         env.to_js_value(&id).map_err(to_napi_err)
                     }
 
-                    #[doc = #get_doc]
                     #[napi]
                     pub fn #get_m(&self, env: Env, id: JsUnknown) -> Result<Option<#napi_ident>> {
                         let id: #id_ty = env.from_js_value(id).map_err(to_napi_err)?;
@@ -674,7 +495,6 @@ impl NapiGenerator {
                         Ok(opt.as_ref().map(#napi_ident::from_record))
                     }
 
-                    #[doc = #all_doc]
                     #[napi]
                     pub fn #all_m(&self) -> Result<Vec<#napi_ident>> {
                         let rows = match catch_unwind(AssertUnwindSafe(|| self.read().#storage.all())) {
@@ -684,7 +504,6 @@ impl NapiGenerator {
                         Ok(rows.iter().map(#napi_ident::from_record).collect())
                     }
 
-                    #[doc = #count_doc]
                     #[napi]
                     pub fn #count_m(&self) -> Result<i64> {
                         match catch_unwind(AssertUnwindSafe(|| self.read().#storage.row_count())) {
@@ -693,7 +512,6 @@ impl NapiGenerator {
                         }
                     }
 
-                    #[doc = #update_doc]
                     #[napi]
                     pub fn #update_m(
                         &self,
@@ -710,7 +528,6 @@ impl NapiGenerator {
                         }
                     }
 
-                    #[doc = #delete_doc]
                     #[napi]
                     pub fn #delete_m(&self, env: Env, id: JsUnknown) -> Result<bool> {
                         let id: #id_ty = env.from_js_value(id).map_err(to_napi_err)?;
@@ -720,13 +537,6 @@ impl NapiGenerator {
                         }
                     }
 
-                    // --- Async (Promise-returning) CRUD variants ------------------
-                    // Args decode on the JS thread; the engine call runs on a libuv
-                    // pool thread under the shared lock (reads concurrent, writes
-                    // exclusive) and yields serde JSON, so a slow op never stalls the
-                    // event loop. These resolve to the JSON shape (snake_case, same as
-                    // the sync serde bridge) — typed async structs are a follow-up.
-                    #[doc = "Async insert; resolves to the new id."]
                     #[napi(js_name = #create_async_js)]
                     pub fn #create_async_m(&self, env: Env, record: JsUnknown) -> Result<AsyncTask<AsyncOp>> {
                         let record: database::#model_ident =
@@ -739,7 +549,6 @@ impl NapiGenerator {
                         })))
                     }
 
-                    #[doc = "Async fetch by id; resolves to the row or `null`."]
                     #[napi(js_name = #get_async_js)]
                     pub fn #get_async_m(&self, env: Env, id: JsUnknown) -> Result<AsyncTask<AsyncOp>> {
                         let id: #id_ty = env.from_js_value(id).map_err(to_napi_err)?;
@@ -751,7 +560,6 @@ impl NapiGenerator {
                         })))
                     }
 
-                    #[doc = "Async list of every live row."]
                     #[napi(js_name = #all_async_js)]
                     pub fn #all_async_m(&self) -> AsyncTask<AsyncOp> {
                         let inner = self.inner.clone();
@@ -762,7 +570,6 @@ impl NapiGenerator {
                         }))
                     }
 
-                    #[doc = "Async update by id; resolves to `true`/`false`."]
                     #[napi(js_name = #update_async_js)]
                     pub fn #update_async_m(&self, env: Env, id: JsUnknown, record: JsUnknown) -> Result<AsyncTask<AsyncOp>> {
                         let id: #id_ty = env.from_js_value(id).map_err(to_napi_err)?;
@@ -776,7 +583,6 @@ impl NapiGenerator {
                         })))
                     }
 
-                    #[doc = "Async delete by id; resolves to `true`/`false`."]
                     #[napi(js_name = #delete_async_js)]
                     pub fn #delete_async_m(&self, env: Env, id: JsUnknown) -> Result<AsyncTask<AsyncOp>> {
                         let id: #id_ty = env.from_js_value(id).map_err(to_napi_err)?;
@@ -787,34 +593,19 @@ impl NapiGenerator {
                             serde_json::to_value(ok).map_err(|e| e.to_string())
                         })))
                     }
-                }
+                };
+                NapiItem { item, js }
             })
             .collect()
     }
 
-    /// The relation-traversal methods on `ForgeDb`, mirroring the generated
-    /// `Database` traversal getters **one-for-one** — same names, derived from the
-    /// same schema in the same order, sharing a `seen` dedup set that tracks
-    /// `RustGenerator::generate_traversal_impl` exactly (so a method is never
-    /// emitted for a getter that was deduped away). Three families, all id-keyed
-    /// (a fixed generated edge walk, never a runtime predicate):
-    ///   * **Forward FK** `<model>_<field>(id) -> Option<Napi<Target>>`;
-    ///   * **Reverse 1:M** `<parent>_<field>[_by_<child_field>](id) -> Vec<Napi<Child>>`;
-    ///   * **M2M** `link_<a>_<b>(l, r)` / `unlink_<a>_<b>(l, r) -> bool` + the query
-    ///     getters `<a>_<field1>(id) -> Vec<Napi<B>>` / `<b>_<field2>(id) -> Vec<Napi<A>>`.
-    ///
-    /// Row-returning methods return typed `Napi<Model>` structs. Identity: no generic
-    /// query surface — each getter is a fixed, generated edge walk by name.
-    fn generate_relation_methods(schema: &Schema) -> Vec<TokenStream> {
+    fn generate_relation_methods(schema: &Schema) -> Vec<NapiItem> {
         use forgedb_parser::{FieldType, RelationType};
         use std::collections::{HashMap, HashSet};
 
-        let mut methods = Vec::new();
-        // ONE `seen` set spanning all three families, inserted in the SAME order as
-        // `generate_traversal_impl`, so first-occurrence-wins agrees exactly.
+        let mut methods: Vec<NapiItem> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
 
-        // --- A. Forward FK getters (`*Target` / `?Target`) --------------------
         for model in &schema.models {
             let model_snake = RustGenerator::to_snake_case(&model.name);
             let model_has_id = model.has_identity();
@@ -833,26 +624,21 @@ impl NapiGenerator {
                 if !seen.insert(method_name.clone()) {
                     continue;
                 }
-                // Needs the source id-addressable (to `get` it before resolving the
-                // FK); the target marshals via the typed napi struct. The `seen` slot
-                // is consumed either way, matching the impl's ordering.
                 if !model_has_id {
                     continue;
                 }
                 let method_ident = format_ident!("{}", method_name);
                 let napi_target = format_ident!("Napi{}", target.name);
-                let doc = format!(
-                    "Resolve the `{}` foreign key of a `{}` (by id) to its record, or `null`.",
-                    field.name, model.name
-                );
-                methods.push(quote! {
-                    #[doc = #doc]
+                let js = vec![JsDecl::new(
+                    lower_camel_of_snake(&method_name),
+                    "id: unknown",
+                    format!("{} | null", target.name),
+                )];
+                push_item(&mut methods, js, quote! {
                     #[napi]
                     pub fn #method_ident(&self, env: Env, id: JsUnknown) -> Result<Option<#napi_target>> {
                         let id: #source_id_ty = env.from_js_value(id).map_err(to_napi_err)?;
                         let resolved = match catch_unwind(AssertUnwindSafe(|| {
-                            // ONE read guard for both hops — two `self.read()` calls
-                            // in a single expression could same-thread deadlock.
                             let __db = self.read();
                             __db.#storage.get(id).and_then(|__rec| __db.#method_ident(&__rec))
                         })) {
@@ -865,7 +651,6 @@ impl NapiGenerator {
             }
         }
 
-        // --- B. Reverse one-to-many collection getters ------------------------
         let pairs = schema.detect_relations();
         let mut group_counts: HashMap<(String, String), usize> = HashMap::new();
         for p in &pairs {
@@ -898,14 +683,13 @@ impl NapiGenerator {
             };
             let method_ident = format_ident!("{}", method_name);
             let napi_child = format_ident!("Napi{}", child.name);
-            // #266: the id arrives as the PARENT's own key type.
             let parent_id_ty = RustGenerator::id_type_tokens(schema, parent);
-            let doc = format!(
-                "All `{}` whose `{}` references the given `{}` id.",
-                p.child_model, p.child_field, p.parent_model
-            );
-            methods.push(quote! {
-                #[doc = #doc]
+            let js = vec![JsDecl::new(
+                lower_camel_of_snake(&method_name),
+                "id: unknown",
+                format!("{}[]", child.name),
+            )];
+            push_item(&mut methods, js, quote! {
                 #[napi]
                 pub fn #method_ident(&self, env: Env, id: JsUnknown) -> Result<Vec<#napi_child>> {
                     let id: #parent_id_ty = env.from_js_value(id).map_err(to_napi_err)?;
@@ -918,20 +702,17 @@ impl NapiGenerator {
             });
         }
 
-        // --- C. Many-to-many link / unlink + query getters --------------------
         for m in RustGenerator::valid_m2m(schema) {
             let snake1 = RustGenerator::to_snake_case(&m.model1);
             let snake2 = RustGenerator::to_snake_case(&m.model2);
-            // #266: each junction endpoint decodes as its OWN identity type.
             let (lk, rk) = RustGenerator::junction_key_idents(schema, &m);
 
-            // link_<a>_<b>
             let link_name = format!("link_{snake1}_{snake2}");
             if seen.insert(link_name.clone()) {
                 let link_ident = format_ident!("{}", link_name);
-                let doc = format!("Link a `{}` (left) and a `{}` (right) in the junction.", m.model1, m.model2);
-                methods.push(quote! {
-                    #[doc = #doc]
+                let js = vec![JsDecl::new(
+                    lower_camel_of_snake(&link_name), "left: unknown, right: unknown", "void")];
+                push_item(&mut methods, js, quote! {
                     #[napi]
                     pub fn #link_ident(&self, env: Env, left: JsUnknown, right: JsUnknown) -> Result<()> {
                         let left: #lk = env.from_js_value(left).map_err(to_napi_err)?;
@@ -944,13 +725,12 @@ impl NapiGenerator {
                 });
             }
 
-            // unlink_<a>_<b>
             let unlink_name = format!("unlink_{snake1}_{snake2}");
             if seen.insert(unlink_name.clone()) {
                 let unlink_ident = format_ident!("{}", unlink_name);
-                let doc = format!("Unlink a `{}` (left) / `{}` (right); `true` if a pair was removed.", m.model1, m.model2);
-                methods.push(quote! {
-                    #[doc = #doc]
+                let js = vec![JsDecl::new(
+                    lower_camel_of_snake(&unlink_name), "left: unknown, right: unknown", "boolean")];
+                push_item(&mut methods, js, quote! {
                     #[napi]
                     pub fn #unlink_ident(&self, env: Env, left: JsUnknown, right: JsUnknown) -> Result<bool> {
                         let left: #lk = env.from_js_value(left).map_err(to_napi_err)?;
@@ -963,14 +743,13 @@ impl NapiGenerator {
                 });
             }
 
-            // model1.field1 -> Vec<Napi<model2>>  (forward M2M query)
             let fwd_name = format!("{snake1}_{}", m.field1);
             if seen.insert(fwd_name.clone()) {
                 let fwd_ident = format_ident!("{}", fwd_name);
                 let napi_b = format_ident!("Napi{}", m.model2);
-                let doc = format!("All linked `{}` for the given `{}` id.", m.model2, m.model1);
-                methods.push(quote! {
-                    #[doc = #doc]
+                let js = vec![JsDecl::new(
+                    lower_camel_of_snake(&fwd_name), "id: unknown", format!("{}[]", m.model2))];
+                push_item(&mut methods, js, quote! {
                     #[napi]
                     pub fn #fwd_ident(&self, env: Env, id: JsUnknown) -> Result<Vec<#napi_b>> {
                         let id: #lk = env.from_js_value(id).map_err(to_napi_err)?;
@@ -983,14 +762,13 @@ impl NapiGenerator {
                 });
             }
 
-            // model2.field2 -> Vec<Napi<model1>>  (reverse M2M query)
             let rev_name = format!("{snake2}_{}", m.field2);
             if seen.insert(rev_name.clone()) {
                 let rev_ident = format_ident!("{}", rev_name);
                 let napi_a = format_ident!("Napi{}", m.model1);
-                let doc = format!("All linked `{}` for the given `{}` id.", m.model1, m.model2);
-                methods.push(quote! {
-                    #[doc = #doc]
+                let js = vec![JsDecl::new(
+                    lower_camel_of_snake(&rev_name), "id: unknown", format!("{}[]", m.model1))];
+                push_item(&mut methods, js, quote! {
                     #[napi]
                     pub fn #rev_ident(&self, env: Env, id: JsUnknown) -> Result<Vec<#napi_a>> {
                         let id: #rk = env.from_js_value(id).map_err(to_napi_err)?;
@@ -1007,23 +785,8 @@ impl NapiGenerator {
         methods
     }
 
-    /// The per-(model, exportable-column) Arrow export methods on `ForgeDb` — the
-    /// zero-copy selling point (#52/#117). `<m>_<col>_arrow() -> { buffer, format,
-    /// length }` where `buffer` is an **external `ArrayBuffer`** aliasing the live
-    /// column bytes zero-copy (`napi_create_external_arraybuffer` over the private
-    /// column's `ColumnExport` — an `mmap` alias of the on-disk column when the
-    /// live rows are a dense prefix, a gathered copy otherwise; transparent). The
-    /// backing is freed when the `ArrayBuffer` is GC'd (the finalize drops the
-    /// `ColumnExport`). `format` is the Arrow C-Data format string (`l`/`g`/`I`/…),
-    /// `length` the row count — so a thin JS helper builds an `arrow-js` `Vector`
-    /// (`new Int64Array(buffer)` etc.) with no per-row copy.
-    ///
-    /// The exportable set + format come from `RustGenerator::arrow_export_format`
-    /// (the SAME source of truth as `export_col_<f>` and the FFI Arrow op), so they
-    /// can never drift. Identity: the set is fixed by the schema at codegen time
-    /// (never a runtime column list); the export takes opaque row indices.
-    fn generate_arrow_methods(schema: &Schema) -> Vec<TokenStream> {
-        let mut methods = Vec::new();
+    fn generate_arrow_methods(schema: &Schema) -> Vec<NapiItem> {
+        let mut methods: Vec<NapiItem> = Vec::new();
         for model in Self::identity_models(schema) {
             let snake = RustGenerator::to_snake_case(&model.name);
             let storage = format_ident!("{}", snake);
@@ -1033,13 +796,12 @@ impl NapiGenerator {
                 };
                 let method_ident = format_ident!("{}_{}_arrow", snake, field.name);
                 let export_method = format_ident!("export_col_{}", field.name);
-                let doc = format!(
-                    "Export the live `{}.{}` column as a zero-copy Arrow buffer (`{}`) — \
-                     `{{ buffer: ArrayBuffer, format, length }}`.",
-                    model.name, field.name, fmt
-                );
-                methods.push(quote! {
-                    #[doc = #doc]
+                let js = vec![JsDecl::new(
+                    lower_camel_of_snake(&format!("{snake}_{}_arrow", field.name)),
+                    "",
+                    "ArrowColumn",
+                )];
+                push_item(&mut methods, js, quote! {
                     #[napi]
                     pub fn #method_ident(&self, env: Env) -> Result<JsUnknown> {
                         let (export, length) = match catch_unwind(AssertUnwindSafe(|| {
@@ -1052,9 +814,6 @@ impl NapiGenerator {
                             Ok(Err(e)) => return Err(to_napi_err(e)),
                             Err(p) => return Err(panic_to_napi_err(p)),
                         };
-                        // Zero-copy: alias the export's backing into an external
-                        // ArrayBuffer; the finalize drops the `ColumnExport` (freeing
-                        // the copy or `munmap`ing the alias) when the buffer is GC'd.
                         let data_ptr = export.as_ptr() as *mut u8;
                         let byte_len = export.len();
                         let ab = unsafe {
@@ -1062,9 +821,6 @@ impl NapiGenerator {
                                 data_ptr,
                                 byte_len,
                                 export,
-                                // Through `core`'s re-export — this crate pins no
-                                // substrate, so the `ColumnExport` it frees is the
-                                // same type the database exported (#335 §1).
                                 |_export: forgedb_core::forgedb_storage::ColumnExport, _env: Env| {},
                             )
                         }.map_err(to_napi_err)?;
@@ -1080,41 +836,6 @@ impl NapiGenerator {
         methods
     }
 
-    /// The napi **cache package**'s `Cargo.toml` (#335 §1).
-    ///
-    /// Not a scaffold any more: nothing in the cache is user-editable, so this is
-    /// rewritten in full on every generate. Carried forward unchanged, a CLI
-    /// upgrade that bumps a substrate pin would never reach an existing member.
-    ///
-    /// # Zero substrate pins
-    ///
-    /// The only ForgeDB dependency is the app's own `core`, renamed to
-    /// `forgedb_core`. Every substrate type the emitted `lib.rs` names
-    /// (`forgedb_types::Uuid`, `forgedb_storage::ColumnExport`) is reached
-    /// through `core`'s re-exports, which is what makes those types UNIFY with
-    /// the database's rather than merely resolve to the same version because one
-    /// lockfile happened to agree. It also drops `forgedb-query-params`, which
-    /// this crate never used — every occurrence was in a doc comment.
-    ///
-    /// # No `[lib] name`
-    ///
-    /// It used to be pinned to `"forgedb"`, in *both* this generator and the
-    /// PyO3 one. Two apps in one cache workspace then declare the same lib name:
-    /// cargo **warns and exits 0**, leaving one `libforgedb.dylib` on disk. Cargo
-    /// derives the lib name from the per-app package name instead, which makes
-    /// the silent collision unrepresentable. Nothing needs the name pinned — the
-    /// delivered `forgedb.node` is a delivery-time rename, and `napi build`, the
-    /// one tool that derived an input filename from it, is gone.
-    ///
-    /// # No `[profile.release]`
-    ///
-    /// This used to carry `panic = "unwind"` with a comment calling it
-    /// load-bearing for the `catch_unwind` boundary. **A `[profile.*]` table in a
-    /// workspace member is silently ignored** (`warning: profiles for the non
-    /// root package will be ignored`), so it read as applied and was not. Panic
-    /// strategy is irreducibly project-wide in cargo; the build driver applies
-    /// the floor on the cargo invocation, where a hostile `$CARGO_HOME` cannot
-    /// override it.
     pub fn cargo_toml(crate_name: &str, core_package: &str) -> String {
         format!(
             r#"# Generated by ForgeDB. Do not edit — rewritten in full on every generate.
@@ -1150,18 +871,6 @@ napi-build = "2"
         )
     }
 
-    /// The NAPI-RS `build.rs` (schema-invariant). `napi_build::setup()` wires the
-    /// platform linker args (incl. macOS `-undefined dynamic_lookup` so the
-    /// `.node` resolves Node-API symbols at load time), so a **plain
-    /// `cargo build`** links standalone.
-    ///
-    /// That is now the only build path: `@napi-rs/cli` is gone (#335), and it
-    /// could not have built this crate anyway — `napi build` derives the input
-    /// filename from `[package] name` while the old scaffold overrode
-    /// `[lib] name`, so the two never agreed.
-    ///
-    /// Name kept as `*_scaffold` for symmetry with the PyO3 sibling; the file is
-    /// a cache-package member and is rewritten on every generate.
     pub fn build_rs_scaffold() -> &'static str {
         "// Generated by ForgeDB — NAPI-RS build script (schema-invariant).\n\
          fn main() {\n    \
@@ -1169,19 +878,6 @@ napi-build = "2"
          }\n"
     }
 
-    /// The `package.json` for the generated binding. **User-editable — written
-    /// only when absent**, and it stays in the user's output directory when the
-    /// crate itself moves into the cache.
-    ///
-    /// It no longer carries a build script or a `devDependencies` block:
-    /// `@napi-rs/cli` is not a dependency of anything any more. `forgedb build`
-    /// compiles the cdylib with plain cargo and delivers it as `forgedb.node`
-    /// beside this file, which is why `main` names the addon directly rather
-    /// than the `index.js` loader `napi build` used to generate.
-    ///
-    /// `index.d.ts` comes from `TypeScriptGenerator`, not from napi-cli's
-    /// `.d.ts` emission — the typed `#[napi(object)]` row structs exist so the
-    /// two agree, but the file on disk is ours.
     pub fn package_json_scaffold() -> &'static str {
         r#"{
   "name": "forgedb",
@@ -1193,43 +889,15 @@ napi-build = "2"
 "#
     }
 
-    /// The pre-#337 `main`/`types` pair, so `generate` can recognise a
-    /// `package.json` written by an older CLI and repoint it.
-    ///
-    /// This is not tidiness. If `main` still names the addon directly,
-    /// `require('<output>/napi')` resolves `forgedb.node` and [`Self::entry_module`]
-    /// **never executes** — a load check that is present, correct, and never run,
-    /// which is strictly worse than an absent one because it reads as coverage.
     pub const LEGACY_MAIN: &str = "forgedb.node";
 
-    /// The Node/Bun entry module (`index.js`) — the consumer-facing half of the
-    /// load-time check.
-    ///
-    /// CommonJS, because it is `require`d by both Node and Bun and must work
-    /// with no build step, no bundler and no `type` field beyond what the
-    /// scaffold writes.
-    ///
-    /// Three failure modes, each with its own message, because they have
-    /// different remedies: the addon is missing (never built), the addon is
-    /// present but was built from different source (stale), and anything else
-    /// (rethrown untouched — swallowing a real load error into a ForgeDB
-    /// diagnostic is how a linker problem becomes a wild goose chase).
-    ///
-    /// It carries NO version string and NO timestamp: the whole point of a
-    /// source fingerprint is that a CLI upgrade changing nothing about the
-    /// output invalidates nothing.
     pub fn entry_module(fingerprint: &str) -> GeneratedCode {
         let code = format!(
             r#"// Generated by ForgeDB (#337). DO NOT EDIT.
-//
-// The Node/Bun entry point. `forgedb build` compiles the addon and delivers it
-// here as `forgedb.node`; this module loads it and refuses to hand it to you if
-// it was built from different generated source than this file was written from.
 'use strict';
 
 const path = require('path');
 
-// The fingerprint of the generated source THIS file was written from.
 const FINGERPRINT = '{fingerprint}';
 
 const ADDON = path.join(__dirname, 'forgedb.node');
@@ -1269,18 +937,9 @@ module.exports = addon;
         }
     }
 
-    /// The TypeScript declarations for the addon (`index.d.ts`).
-    ///
-    /// Hand-emitted rather than taken from napi-rs's `.d.ts` emission, which is
-    /// gone with `@napi-rs/cli` (#335). The row interfaces mirror the
-    /// `#[napi(object)]` structs; the method names are napi-rs's automatic
-    /// camelCase of the Rust ones, which is why they are derived here from the
-    /// same snake_case stem rather than written out.
     pub fn type_declarations(schema: &Schema) -> Result<GeneratedCode> {
         let mut d = String::new();
-        d.push_str(
-            "// Generated by ForgeDB (#337). DO NOT EDIT.\n             //\n             // Declarations for the native addon `index.js` re-exports.\n\n",
-        );
+        d.push_str("// Generated by ForgeDB (#337). DO NOT EDIT.\n");
 
         for model in schema.models.iter() {
             d.push_str(&format!("export interface {} {{\n", model.name));
@@ -1292,41 +951,43 @@ module.exports = addon;
             d.push_str("}\n\n");
         }
 
+        let methods: Vec<NapiItem> = Self::generate_db_methods(schema)
+            .into_iter()
+            .chain(Self::generate_relation_methods(schema))
+            .chain(Self::generate_arrow_methods(schema))
+            .collect();
+        let decls: Vec<&JsDecl> = methods.iter().flat_map(|m| m.js.iter()).collect();
+
+        if decls.iter().any(|j| j.ret == "ArrowColumn") {
+            d.push_str("export interface ArrowColumn {\n");
+            d.push_str("  buffer: ArrayBuffer;\n");
+            d.push_str("  format: string;\n");
+            d.push_str("  length: number;\n");
+            d.push_str("}\n\n");
+        }
+
         d.push_str("export declare class ForgeDb {\n");
         d.push_str("  static open(root: string): ForgeDb;\n");
         d.push_str("  commit(): void;\n");
         d.push_str("  checkpoint(): void;\n");
         d.push_str("  compact(): void;\n");
         d.push_str("  commitAsync(): Promise<void>;\n");
-        for model in schema.models.iter().filter(|m| m.has_identity()) {
-            // napi-rs renames a Rust `create_blog_post` to JS `createBlogPost`.
-            // Derived from the SAME snake stem the Rust method is derived from,
-            // rather than written out, so the two cannot drift apart per model.
-            let stem = pascal_of_snake(&crate::rust::RustGenerator::to_snake_case(&model.name));
-            let n = &model.name;
-            d.push_str(&format!("  create{stem}(record: unknown): unknown;\n"));
-            d.push_str(&format!("  get{stem}(id: unknown): {n} | null;\n"));
-            d.push_str(&format!("  all{stem}(): {n}[];\n"));
-            d.push_str(&format!("  count{stem}(): number;\n"));
-            d.push_str(&format!("  update{stem}(id: unknown, record: unknown): number;\n"));
-            d.push_str(&format!("  delete{stem}(id: unknown): boolean;\n"));
-            d.push_str(&format!("  create{stem}Async(record: unknown): Promise<unknown>;\n"));
-            d.push_str(&format!("  get{stem}Async(id: unknown): Promise<unknown>;\n"));
-            d.push_str(&format!("  all{stem}Async(): Promise<unknown>;\n"));
-            d.push_str(&format!("  update{stem}Async(id: unknown, record: unknown): Promise<unknown>;\n"));
-            d.push_str(&format!("  delete{stem}Async(id: unknown): Promise<unknown>;\n"));
+        for js in &decls {
+            d.push_str(&js.render());
         }
         d.push_str("}\n\n");
-        d.push_str("/** The fingerprint of the generated source this addon was built from (#337). */\n");
         d.push_str("export declare function __forgedbFingerprint(): string;\n");
 
         Ok(GeneratedCode {
             code: d,
-            description: format!("Node/Bun type declarations ({} models)", schema.models.len()),
+            description: format!(
+                "Node/Bun type declarations ({} models, {} methods)",
+                schema.models.len(),
+                decls.len() + 5
+            ),
         })
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1335,8 +996,166 @@ mod tests {
     const CORE_PKG: &str = "blog-3f2a1b4c5d6e7f80-core";
     const NAPI_PKG: &str = "blog-3f2a1b4c5d6e7f80-napi";
 
-    /// A schema with an Arrow-exportable column, so the export path (the one
-    /// site that names `ColumnExport`) is actually emitted.
+    const RELATIONAL_SRC: &str = r#"
+User {
+  id: +uuid
+  email: string
+  views: i32
+  posts: [Post]
+}
+
+Post {
+  id: +uuid
+  title: string
+  author: *User
+  tags: [Tag]
+}
+
+Tag {
+  id: +uuid
+  name: string
+  posts: [Post]
+}
+"#;
+
+    fn relational_schema() -> forgedb_parser::Schema {
+        let mut parser = forgedb_parser::Parser::new(RELATIONAL_SRC).unwrap();
+        parser.parse().unwrap()
+    }
+
+    fn exported_js_methods(code: &str) -> Vec<String> {
+        const HEAD: &str = "#[napi]\nimpl ForgeDb {";
+        let start = code
+            .find(HEAD)
+            .expect("the generated binding must contain a `#[napi] impl ForgeDb` block");
+        let rest = &code[start + HEAD.len()..];
+        let end = rest
+            .find("\n}\n")
+            .expect("the `impl ForgeDb` block must close at column 0");
+        let block = &rest[..end];
+
+        let mut out = Vec::new();
+        for (i, line) in block.lines().enumerate() {
+            let t = line.trim_start();
+            if !t.starts_with("#[napi") {
+                continue;
+            }
+            if let Some(js) = t.split("js_name = \"").nth(1).and_then(|r| r.split('"').next()) {
+                out.push(js.to_string());
+                continue;
+            }
+            let Some(sig) = block
+                .lines()
+                .skip(i + 1)
+                .find(|l| l.trim_start().starts_with("pub fn "))
+            else {
+                continue;
+            };
+            let name = sig.trim_start()["pub fn ".len()..]
+                .split(['(', '<'])
+                .next()
+                .unwrap()
+                .trim()
+                .to_string();
+            out.push(super::lower_camel_of_snake(&name));
+        }
+        out
+    }
+
+    fn declared_js_methods(dts: &str) -> Vec<String> {
+        let start = dts
+            .find("export declare class ForgeDb {")
+            .expect("the declarations must contain the `ForgeDb` class");
+        let rest = &dts[start..];
+        let end = rest
+            .find("\n}\n")
+            .expect("the class body must close at column 0");
+        rest[..end]
+            .lines()
+            .filter_map(|l| {
+                let t = l.trim_start().trim_start_matches("static ");
+                let (name, tail) = t.split_once('(')?;
+                if !tail.contains(')') || name.is_empty() {
+                    return None;
+                }
+                name.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    .then(|| name.to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_declared_surface_is_the_exported_surface() {
+        let schema = relational_schema();
+        let code = NapiGenerator::generate(&schema).unwrap().code;
+        let dts = NapiGenerator::type_declarations(&schema).unwrap().code;
+
+        let exported = exported_js_methods(&code);
+        let declared = declared_js_methods(&dts);
+
+        assert!(
+            exported.len() > 40,
+            "extractor found only {} exported methods — it stopped matching: {:?}",
+            exported.len(),
+            exported
+        );
+        let e: std::collections::BTreeSet<_> = exported.iter().collect();
+        let d: std::collections::BTreeSet<_> = declared.iter().collect();
+        let undeclared: Vec<_> = e.difference(&d).collect();
+        let phantom: Vec<_> = d.difference(&e).collect();
+        assert!(
+            undeclared.is_empty(),
+            "exported by the addon, undeclared in index.d.ts (a type error to call): {undeclared:?}"
+        );
+        assert!(
+            phantom.is_empty(),
+            "declared in index.d.ts but not exported (a runtime TypeError): {phantom:?}"
+        );
+        assert_eq!(
+            exported.len(),
+            declared.len(),
+            "the same names, but not the same number of them — one side has a duplicate"
+        );
+    }
+
+    #[test]
+    fn the_relation_families_reach_the_declarations() {
+        let dts = NapiGenerator::type_declarations(&relational_schema())
+            .unwrap()
+            .code;
+        for (needle, why) in [
+            ("postAuthor(id: unknown): User | null", "forward FK getter"),
+            ("userPosts(id: unknown): Post[]", "reverse one-to-many getter"),
+            ("linkPostTag(left: unknown, right: unknown): void", "m2m link"),
+            (
+                "unlinkPostTag(left: unknown, right: unknown): boolean",
+                "m2m unlink",
+            ),
+            ("postTags(id: unknown): Tag[]", "m2m forward query"),
+            ("tagPosts(id: unknown): Post[]", "m2m reverse query"),
+            ("userViewsArrow(): ArrowColumn", "Arrow column export"),
+            ("export interface ArrowColumn", "the Arrow result shape"),
+        ] {
+            assert!(dts.contains(needle), "{why} missing from index.d.ts: {needle}");
+        }
+    }
+
+    #[test]
+    fn update_is_declared_boolean_not_number() {
+        let dts = NapiGenerator::type_declarations(&relational_schema())
+            .unwrap()
+            .code;
+        assert!(
+            dts.contains("updateUser(id: unknown, record: unknown): boolean"),
+            "update must be declared `boolean`: {dts}"
+        );
+        assert!(
+            !dts.contains("): number;\n  deleteUser"),
+            "the old `number` return survived"
+        );
+    }
+
     const SRC: &str = r#"
 User {
   id: +uuid
@@ -1351,14 +1170,10 @@ User {
         NapiGenerator::generate(&schema).unwrap().code
     }
 
-    /// Whitespace-insensitive: `prettyplease` decides the line breaks.
     fn flat(code: &str) -> String {
         code.chars().filter(|c| !c.is_whitespace()).collect()
     }
 
-    /// The wrapper links the app's `core` package instead of compiling a COPY of
-    /// `database.rs` dropped beside it. The copy is what let one `generate` run
-    /// emit two databases with different durability semantics.
     #[test]
     fn the_seam_links_core_rather_than_a_sibling_copy() {
         let flat = flat(&generated());
@@ -1376,13 +1191,6 @@ User {
         );
     }
 
-    /// Every substrate type is reached THROUGH `core`. Naming one absolutely
-    /// would mean a pin of this crate's own, and the two `Uuid`s would then unify
-    /// only because one lockfile happened to resolve two pin lists identically.
-    ///
-    /// The negative assertion is the load-bearing half: `forgedb_types::Uuid` is a
-    /// SUBSTRING of `forgedb_core::forgedb_types::Uuid`, so a positive test alone
-    /// passes while the bug is present.
     #[test]
     fn the_substrate_is_reached_through_core() {
         let flat = flat(&generated());
@@ -1411,8 +1219,6 @@ User {
             .unwrap_or_else(|e| panic!("napi manifest is not valid TOML: {e}\n{manifest}"));
     }
 
-    /// Zero substrate pins: `core` is the only ForgeDB dependency, and it is a
-    /// PATH dependency so the two crates share one compilation of it.
     #[test]
     fn the_manifest_pins_no_substrate() {
         let manifest = NapiGenerator::cargo_toml(NAPI_PKG, CORE_PKG);
@@ -1434,12 +1240,6 @@ User {
         assert_eq!(core["path"].as_str(), Some("../core"));
     }
 
-    /// `[lib] name` pinned to `"forgedb"` in two generators made two apps in one
-    /// cache workspace collide at a cargo WARNING and exit 0, leaving one
-    /// `libforgedb.dylib`. Cargo derives it from the per-app package name now.
-    ///
-    /// Anchored on the KEY inside `[lib]`, not on the string `"forgedb"`, which
-    /// also appears in the package.json and in comments.
     #[test]
     fn the_manifest_sets_no_lib_name() {
         let manifest = NapiGenerator::cargo_toml(NAPI_PKG, CORE_PKG);
@@ -1455,9 +1255,6 @@ User {
         );
     }
 
-    /// A `[profile.*]` table in a workspace MEMBER is silently ignored. This one
-    /// declared `panic = "unwind"` with a comment calling it load-bearing for the
-    /// `catch_unwind` boundary, so it read as applied and was not.
     #[test]
     fn the_manifest_emits_no_profile_table() {
         let manifest = NapiGenerator::cargo_toml(NAPI_PKG, CORE_PKG);
@@ -1466,9 +1263,6 @@ User {
         assert!(doc.get("profile").is_none(), "{manifest}");
     }
 
-    /// Dropping napi-cli for plain cargo is the point: `napi build` could never
-    /// have built this crate anyway (it derives the input filename from
-    /// `[package] name`, which the old `[lib] name` override contradicted).
     #[test]
     fn the_package_json_does_not_reach_for_napi_cli() {
         let pkg = NapiGenerator::package_json_scaffold();
@@ -1486,14 +1280,10 @@ User {
             !pkg.contains("napi build") && !pkg.contains("@napi-rs/cli"),
             "{pkg}"
         );
-        // `main` must name a file ForgeDB actually delivers. `index.js` was
-        // generated by napi-cli's loader and no longer exists.
         assert_eq!(doc["main"].as_str(), Some("index.js"));
         assert_eq!(doc["types"].as_str(), Some("index.d.ts"));
     }
 
-    /// `napi_build::setup()` is what makes a plain `cargo build` link the addon
-    /// standalone, so the build script survives the removal of napi-cli.
     #[test]
     fn the_build_script_still_wires_the_platform_link_args() {
         assert!(

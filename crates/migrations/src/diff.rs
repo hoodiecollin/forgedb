@@ -2,32 +2,10 @@ use crate::types::SchemaChange;
 use std::collections::{HashMap, HashSet};
 use std::collections::BTreeMap;
 
-/// Simple schema representation for diffing.
-///
-/// # Why `enums` and `structs` are here and not only `models` (#438)
-///
-/// A field's *type* is compared as a string, and for an `enum`/`struct` field
-/// that string carries only the **name** (`Enum("Status")`) — the definition
-/// lives beside the models, not inside the reference. So a schema that reorders
-/// `Status`'s variants produces two `SimpleSchema` values whose models compare
-/// **equal**, and the differ, handed two equal values, correctly reports
-/// nothing.
-///
-/// That silence is not cosmetic. An enum is stored as a **positional 1-byte
-/// discriminant** (variants map to `0..N` in declaration order), so a reorder
-/// re-maps every already-written row to a different variant with no byte on
-/// disk changing and no version moving; an inline `struct` is `#[repr(C)]` and
-/// every field's offset is a function of the whole declaration. Carrying the
-/// ordered definitions here is what lets the differ *see* those edits, record a
-/// hop, and bump the schema version that arms the generated open guard.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SimpleSchema {
     pub models: Vec<SimpleModel>,
-    /// Every declared `enum`, with its variants in **declaration order**. The
-    /// order is the payload: it is the byte→meaning map.
     pub enums: Vec<SimpleEnum>,
-    /// Every declared inline `struct`, with its fields in **declaration
-    /// order**. Order and per-field width are both load-bearing on disk.
     pub structs: Vec<SimpleStruct>,
 }
 
@@ -38,45 +16,211 @@ pub struct SimpleModel {
     pub composite_indexes: Vec<Vec<String>>,
 }
 
-/// A declared `enum`, projected for diffing (#438).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SimpleEnum {
     pub name: String,
-    /// Declaration order — this IS the stored discriminant mapping.
     pub variants: Vec<String>,
 }
 
-/// A declared inline `struct`, projected for diffing (#438).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SimpleStruct {
     pub name: String,
-    /// Declaration order — this IS the `#[repr(C)]` field layout.
     pub fields: Vec<SimpleField>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SimpleType {
+    U32,
+    U64,
+    I32,
+    I64,
+    F64,
+    Bool,
+    Str,
+    StrN { chars: usize, exact: bool },
+    Bytes(usize),
+    Uuid,
+    Timestamp(u8),
+    Json,
+    Decimal,
+    Enum(String),
+    Struct(String),
+    Array(Box<SimpleType>, usize),
+    Relation(String),
+    Collection(String),
+    Opaque(String),
+}
+
+impl SimpleType {
+    fn int_rank(&self) -> Option<(u8, bool)> {
+        match self {
+            SimpleType::U32 => Some((32, false)),
+            SimpleType::U64 => Some((64, false)),
+            SimpleType::I32 => Some((32, true)),
+            SimpleType::I64 => Some((64, true)),
+            _ => None,
+        }
+    }
+
+    pub fn widens_to(&self, other: &SimpleType) -> bool {
+        if self == other {
+            return false;
+        }
+        match (self, other) {
+            (a, b) if a.int_rank().is_some() && b.int_rank().is_some() => {
+                let (ab, asig) = a.int_rank().unwrap();
+                let (bb, bsig) = b.int_rank().unwrap();
+                match (asig, bsig) {
+                    (false, false) | (true, true) => bb > ab,
+                    (false, true) => bb > ab,
+                    (true, false) => false,
+                }
+            }
+            (
+                SimpleType::StrN {
+                    chars: n,
+                    exact: ea,
+                },
+                SimpleType::StrN {
+                    chars: m,
+                    exact: eb,
+                },
+            ) => ea == eb && m > n,
+            (SimpleType::Timestamp(a), SimpleType::Timestamp(b)) => b > a,
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Display for SimpleType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SimpleType::U32 => write!(f, "u32"),
+            SimpleType::U64 => write!(f, "u64"),
+            SimpleType::I32 => write!(f, "i32"),
+            SimpleType::I64 => write!(f, "i64"),
+            SimpleType::F64 => write!(f, "f64"),
+            SimpleType::Bool => write!(f, "bool"),
+            SimpleType::Str => write!(f, "string"),
+            SimpleType::StrN { chars, exact } => {
+                write!(f, "string({}{})", chars, if *exact { "!" } else { "" })
+            }
+            SimpleType::Bytes(n) => write!(f, "bytes({n})"),
+            SimpleType::Uuid => write!(f, "uuid"),
+            SimpleType::Timestamp(q) => write!(
+                f,
+                "timestamp({})",
+                match q {
+                    0 => "s",
+                    2 => "us",
+                    _ => "ms",
+                }
+            ),
+            SimpleType::Json => write!(f, "json"),
+            SimpleType::Decimal => write!(f, "decimal"),
+            SimpleType::Enum(n) => write!(f, "enum {n}"),
+            SimpleType::Struct(n) => write!(f, "struct {n}"),
+            SimpleType::Array(inner, n) => write!(f, "[{inner}; {n}]"),
+            SimpleType::Relation(m) => write!(f, "*{m}"),
+            SimpleType::Collection(m) => write!(f, "[{m}]"),
+            SimpleType::Opaque(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+impl std::str::FromStr for SimpleType {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(parse_simple_type(s))
+    }
+}
+
+fn parse_simple_type(s: &str) -> SimpleType {
+    let t = s.trim();
+    match t {
+        "u32" => return SimpleType::U32,
+        "u64" => return SimpleType::U64,
+        "i32" => return SimpleType::I32,
+        "i64" => return SimpleType::I64,
+        "f64" => return SimpleType::F64,
+        "bool" => return SimpleType::Bool,
+        "string" => return SimpleType::Str,
+        "uuid" => return SimpleType::Uuid,
+        "json" => return SimpleType::Json,
+        "decimal" => return SimpleType::Decimal,
+        _ => {}
+    }
+    if let Some(rest) = t.strip_prefix("enum ") {
+        return SimpleType::Enum(rest.to_string());
+    }
+    if let Some(rest) = t.strip_prefix("struct ") {
+        return SimpleType::Struct(rest.to_string());
+    }
+    if let Some(rest) = t.strip_prefix('*') {
+        return SimpleType::Relation(rest.to_string());
+    }
+    if let Some(inner) = t.strip_prefix("timestamp(").and_then(|r| r.strip_suffix(')')) {
+        return match inner {
+            "s" => SimpleType::Timestamp(0),
+            "ms" => SimpleType::Timestamp(1),
+            "us" => SimpleType::Timestamp(2),
+            _ => SimpleType::Opaque(s.to_string()),
+        };
+    }
+    if let Some(inner) = t.strip_prefix("bytes(").and_then(|r| r.strip_suffix(')')) {
+        return match inner.parse::<usize>() {
+            Ok(n) => SimpleType::Bytes(n),
+            Err(_) => SimpleType::Opaque(s.to_string()),
+        };
+    }
+    if let Some(inner) = t.strip_prefix("string(").and_then(|r| r.strip_suffix(')')) {
+        let (digits, exact) = match inner.strip_suffix('!') {
+            Some(d) => (d, true),
+            None => (inner, false),
+        };
+        return match digits.parse::<usize>() {
+            Ok(chars) => SimpleType::StrN { chars, exact },
+            Err(_) => SimpleType::Opaque(s.to_string()),
+        };
+    }
+    if let Some(inner) = t.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+        return match inner.rfind(';') {
+            Some(i) => {
+                let (t_src, n_src) = inner.split_at(i);
+                match n_src[1..].trim().parse::<usize>() {
+                    Ok(n) => SimpleType::Array(Box::new(parse_simple_type(t_src)), n),
+                    Err(_) => SimpleType::Opaque(s.to_string()),
+                }
+            }
+            None => SimpleType::Collection(inner.to_string()),
+        };
+    }
+    SimpleType::Opaque(s.to_string())
+}
+
+impl serde::Serialize for SimpleType {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SimpleType {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(de)?;
+        Ok(parse_simple_type(&s))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SimpleField {
     pub name: String,
-    pub field_type: String,
+    pub ty: SimpleType,
     pub nullable: bool,
     pub unique: bool,
     pub indexed: bool,
     pub index_type: String,
     pub constraints: Vec<SimpleConstraint>,
-    /// The names of every `enum` / `struct` this field's type reaches
-    /// **transitively** (#438).
-    ///
-    /// This is how a definition change is projected back onto the model fields
-    /// that store it. Transitivity is the whole point and is easy to get wrong:
-    /// an enum can sit inside an inline struct, and a struct inside a struct
-    /// (`[Point; 4]` inside `Shape`, `Color` inside `Point`). When `Color`
-    /// changes, the outer field's own declaration text does not — so a
-    /// dependency list that stops at depth one is the same blindness wearing a
-    /// smaller hat.
-    ///
-    /// Populated where the full AST is (the CLI's `to_simple_schema`), so this
-    /// crate stays a pure comparison over its own value types with no parser
-    /// dependency.
     pub depends_on: Vec<String>,
 }
 
@@ -86,18 +230,32 @@ pub struct SimpleConstraint {
     pub params: Vec<String>,
 }
 
-/// Schema differ - compares two schemas and generates change list
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenameProposal {
+    Field {
+        model_name: String,
+        old_name: String,
+        new_name: String,
+    },
+    Model {
+        old_name: String,
+        new_name: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiffResult {
+    pub changes: Vec<SchemaChange>,
+    pub rename_proposals: Vec<RenameProposal>,
+}
+
 pub struct SchemaDiffer;
 
 impl SchemaDiffer {
-    /// Diff two schemas and return the list of changes.
-    ///
-    /// The returned list is sorted deterministically so that checksums are stable
-    /// across runs (M2).
-    pub fn diff(old_schema: &SimpleSchema, new_schema: &SimpleSchema) -> Vec<SchemaChange> {
+    pub fn diff(old_schema: &SimpleSchema, new_schema: &SimpleSchema) -> DiffResult {
         let mut changes = Vec::new();
+        let mut proposals = Vec::new();
 
-        // Build ordered maps (BTreeMap) for deterministic iteration (M2)
         let old_models: BTreeMap<_, _> = old_schema
             .models
             .iter()
@@ -109,9 +267,6 @@ impl SchemaDiffer {
             .map(|m| (m.name.clone(), m))
             .collect();
 
-        // H4: Detect model renames — when exactly one model is removed and one is
-        // added AND both have the same set of field names with matching types, treat
-        // this as a rename rather than a drop+recreate to avoid data loss.
         let removed_model_names: Vec<_> = old_models
             .keys()
             .filter(|k| !new_models.contains_key(*k))
@@ -123,71 +278,54 @@ impl SchemaDiffer {
             .cloned()
             .collect();
 
-        // Track which models were resolved as renames so they are not also emitted
-        // as add/remove.
-        let mut renamed_old: HashSet<String> = HashSet::new();
-        let mut renamed_new: HashSet<String> = HashSet::new();
-
         if removed_model_names.len() == 1 && added_model_names.len() == 1 {
             let old_name = &removed_model_names[0];
             let new_name = &added_model_names[0];
-            let old_model = old_models[old_name];
-            let new_model = new_models[new_name];
-            if Self::models_structurally_equal(old_model, new_model) {
-                changes.push(SchemaChange::RenameModel {
+            if Self::models_structurally_equal(old_models[old_name], new_models[new_name]) {
+                proposals.push(RenameProposal::Model {
                     old_name: old_name.clone(),
                     new_name: new_name.clone(),
                 });
-                renamed_old.insert(old_name.clone());
-                renamed_new.insert(new_name.clone());
             }
         }
 
-        // Detect removed models (M2: sorted by key via BTreeMap)
         for old_model_name in old_models.keys() {
-            if !new_models.contains_key(old_model_name) && !renamed_old.contains(old_model_name) {
+            if !new_models.contains_key(old_model_name) {
                 changes.push(SchemaChange::RemoveModel {
                     model_name: old_model_name.clone(),
                 });
             }
         }
 
-        // Detect added models
         for new_model_name in new_models.keys() {
-            if !old_models.contains_key(new_model_name) && !renamed_new.contains(new_model_name) {
+            if !old_models.contains_key(new_model_name) {
                 changes.push(SchemaChange::AddModel {
                     model_name: new_model_name.clone(),
                 });
             }
         }
 
-        // Detect field changes in existing models (M2: sorted by model name via BTreeMap)
         for (model_name, new_model) in new_models.iter() {
             if let Some(old_model) = old_models.get(model_name) {
-                let field_changes = Self::diff_fields(model_name, old_model, new_model);
+                let (field_changes, field_proposals) =
+                    Self::diff_fields(model_name, old_model, new_model);
                 changes.extend(field_changes);
+                proposals.extend(field_proposals);
 
                 let index_changes = Self::diff_composite_indexes(model_name, old_model, new_model);
                 changes.extend(index_changes);
             }
         }
 
-        // #438: the definitions themselves. A field's type string carries only
-        // the enum/struct NAME, so these edits are invisible to `diff_fields`
-        // above by construction — nothing there is wrong, it is comparing two
-        // values that are equal.
         changes.extend(Self::diff_enums(old_schema, new_schema));
         changes.extend(Self::diff_structs(old_schema, new_schema));
 
-        changes
+        DiffResult {
+            changes,
+            rename_proposals: proposals,
+        }
     }
 
-    /// Diff the declared `enum`s and project each change onto the model fields
-    /// that store it (#438).
-    ///
-    /// Only an enum present on **both** sides is diffed. A newly-declared enum
-    /// has no stored rows, and a removed one is already reported through the
-    /// referencing field (which must itself have changed type or gone away).
     fn diff_enums(old_schema: &SimpleSchema, new_schema: &SimpleSchema) -> Vec<SchemaChange> {
         let mut changes = Vec::new();
 
@@ -223,11 +361,6 @@ impl SchemaDiffer {
         changes
     }
 
-    /// Diff the declared inline `struct`s and project each change onto the model
-    /// fields that store one (#438).
-    ///
-    /// A struct's layout is `(name, type)` per field, in declaration order —
-    /// both halves are load-bearing on disk, so both are carried.
     fn diff_structs(old_schema: &SimpleSchema, new_schema: &SimpleSchema) -> Vec<SchemaChange> {
         let mut changes = Vec::new();
 
@@ -265,21 +398,20 @@ impl SchemaDiffer {
         changes
     }
 
-    /// A struct's on-disk layout as `(field name, field type)` in declaration order.
     fn layout(fields: &[SimpleField]) -> Vec<(String, String)> {
         fields
             .iter()
-            .map(|f| (f.name.clone(), f.field_type.clone()))
+            .map(|f| {
+                let ty = if f.nullable {
+                    format!("{}?", f.ty)
+                } else {
+                    f.ty.to_string()
+                };
+                (f.name.clone(), ty)
+            })
             .collect()
     }
 
-    /// Every `(model, field)` that stores a value reaching `type_name`, in a
-    /// deterministic order (#438).
-    ///
-    /// Restricted to models AND fields present on **both** sides: a newly-added
-    /// model or field has no rows written under the old mapping, so there is
-    /// nothing about it to migrate, and a removed one is already reported as its
-    /// own change.
     fn dependent_fields(
         old_schema: &SimpleSchema,
         new_schema: &SimpleSchema,
@@ -317,30 +449,31 @@ impl SchemaDiffer {
         out
     }
 
-    /// Return true when two models have the same set of field names and matching types.
-    /// Used for rename detection (H4).
     fn models_structurally_equal(old: &SimpleModel, new: &SimpleModel) -> bool {
         if old.fields.len() != new.fields.len() {
             return false;
         }
-        let old_map: HashMap<_, _> = old.fields.iter().map(|f| (&f.name, &f.field_type)).collect();
-        let new_map: HashMap<_, _> = new.fields.iter().map(|f| (&f.name, &f.field_type)).collect();
+        let old_map: HashMap<_, _> = old
+            .fields
+            .iter()
+            .map(|f| (&f.name, (&f.ty, f.nullable)))
+            .collect();
+        let new_map: HashMap<_, _> = new
+            .fields
+            .iter()
+            .map(|f| (&f.name, (&f.ty, f.nullable)))
+            .collect();
         old_map == new_map
     }
 
-    /// Diff fields between two models.
-    ///
-    /// Uses BTreeMap for deterministic ordering (M2).
-    /// Detects field renames when exactly one field is removed and one is added
-    /// with the same type (H4).
     fn diff_fields(
         model_name: &str,
         old_model: &SimpleModel,
         new_model: &SimpleModel,
-    ) -> Vec<SchemaChange> {
+    ) -> (Vec<SchemaChange>, Vec<RenameProposal>) {
         let mut changes = Vec::new();
+        let mut proposals = Vec::new();
 
-        // M2: BTreeMap gives stable, sorted iteration
         let old_fields: BTreeMap<_, _> = old_model
             .fields
             .iter()
@@ -363,29 +496,22 @@ impl SchemaDiffer {
             .cloned()
             .collect();
 
-        // H4: single unambiguous field rename — one removed, one added, same type
-        let mut renamed_old_fields: HashSet<String> = HashSet::new();
-        let mut renamed_new_fields: HashSet<String> = HashSet::new();
-
         if removed_field_names.len() == 1 && added_field_names.len() == 1 {
             let old_name = &removed_field_names[0];
             let new_name = &added_field_names[0];
-            if old_fields[old_name].field_type == new_fields[new_name].field_type {
-                changes.push(SchemaChange::RenameField {
+            if old_fields[old_name].ty == new_fields[new_name].ty
+                && old_fields[old_name].nullable == new_fields[new_name].nullable
+            {
+                proposals.push(RenameProposal::Field {
                     model_name: model_name.to_string(),
                     old_name: old_name.clone(),
                     new_name: new_name.clone(),
                 });
-                renamed_old_fields.insert(old_name.clone());
-                renamed_new_fields.insert(new_name.clone());
             }
         }
 
-        // Detect removed fields (M2: sorted via BTreeMap)
         for old_field_name in old_fields.keys() {
-            if !new_fields.contains_key(old_field_name)
-                && !renamed_old_fields.contains(old_field_name)
-            {
+            if !new_fields.contains_key(old_field_name) {
                 changes.push(SchemaChange::RemoveField {
                     model_name: model_name.to_string(),
                     field_name: old_field_name.clone(),
@@ -393,32 +519,29 @@ impl SchemaDiffer {
             }
         }
 
-        // Detect added and modified fields (M2: sorted via BTreeMap)
         for (field_name, new_field) in new_fields.iter() {
             if let Some(old_field) = old_fields.get(field_name) {
-                // Field exists in both - check for changes
 
-                // Type change
-                if old_field.field_type != new_field.field_type {
+                if old_field.ty != new_field.ty {
                     changes.push(SchemaChange::ChangeFieldType {
                         model_name: model_name.to_string(),
                         field_name: field_name.clone(),
-                        old_type: old_field.field_type.clone(),
-                        new_type: new_field.field_type.clone(),
+                        old_type: old_field.ty.clone(),
+                        new_type: new_field.ty.clone(),
+                        answer: None,
                     });
                 }
 
-                // Nullability change
                 if old_field.nullable != new_field.nullable {
                     changes.push(SchemaChange::ChangeFieldNullability {
                         model_name: model_name.to_string(),
                         field_name: field_name.clone(),
                         old_nullable: old_field.nullable,
                         new_nullable: new_field.nullable,
+                        answer: None,
                     });
                 }
 
-                // Index changes
                 if old_field.indexed != new_field.indexed {
                     if new_field.indexed {
                         changes.push(SchemaChange::AddIndex {
@@ -434,7 +557,6 @@ impl SchemaDiffer {
                     }
                 }
 
-                // Unique constraint changes
                 if old_field.unique != new_field.unique {
                     if new_field.unique {
                         changes.push(SchemaChange::AddUniqueConstraint {
@@ -449,30 +571,24 @@ impl SchemaDiffer {
                     }
                 }
 
-                // Constraint changes
                 let constraint_changes =
                     Self::diff_constraints(model_name, field_name, old_field, new_field);
                 changes.extend(constraint_changes);
-            } else if !renamed_new_fields.contains(field_name) {
-                // New field
+            } else {
                 changes.push(SchemaChange::AddField {
                     model_name: model_name.to_string(),
                     field_name: field_name.clone(),
-                    field_type: new_field.field_type.clone(),
+                    field_type: new_field.ty.clone(),
                     nullable: new_field.nullable,
-                    default_value: None,
+                    default_json: None,
+                    answer: None,
                 });
             }
         }
 
-        changes
+        (changes, proposals)
     }
 
-    /// Diff constraints between two fields.
-    ///
-    /// Uses BTreeMap for deterministic ordering (M2).
-    /// Compares constraint *params* as well as names so that `@min(10)` → `@min(20)`
-    /// is detected as a change (M3).
     fn diff_constraints(
         model_name: &str,
         field_name: &str,
@@ -481,7 +597,6 @@ impl SchemaDiffer {
     ) -> Vec<SchemaChange> {
         let mut changes = Vec::new();
 
-        // M2: BTreeMap for deterministic ordering
         let old_constraints: BTreeMap<_, _> = old_field
             .constraints
             .iter()
@@ -493,7 +608,6 @@ impl SchemaDiffer {
             .map(|c| (c.name.clone(), c))
             .collect();
 
-        // Removed constraints (sorted by name)
         for (constraint_name, _) in old_constraints.iter() {
             if !new_constraints.contains_key(constraint_name) {
                 changes.push(SchemaChange::RemoveConstraint {
@@ -504,12 +618,9 @@ impl SchemaDiffer {
             }
         }
 
-        // Added or changed constraints (sorted by name)
         for (constraint_name, new_constraint) in new_constraints.iter() {
             if let Some(old_constraint) = old_constraints.get(constraint_name) {
-                // M3: detect param changes (e.g. @min(10) → @min(20))
                 if old_constraint.params != new_constraint.params {
-                    // Emit a remove + add pair to represent the param update
                     changes.push(SchemaChange::RemoveConstraint {
                         model_name: model_name.to_string(),
                         field_name: field_name.to_string(),
@@ -535,9 +646,6 @@ impl SchemaDiffer {
         changes
     }
 
-    /// Diff composite indexes.
-    ///
-    /// Iterates in sorted order for deterministic change output (M2).
     fn diff_composite_indexes(
         model_name: &str,
         old_model: &SimpleModel,
@@ -545,12 +653,9 @@ impl SchemaDiffer {
     ) -> Vec<SchemaChange> {
         let mut changes = Vec::new();
 
-        // Convert to HashSets for membership testing, but collect results in
-        // sorted order (M2) by converting from a sorted BTreeSet-like iteration.
         let old_indexes: HashSet<_> = old_model.composite_indexes.iter().cloned().collect();
         let new_indexes: HashSet<_> = new_model.composite_indexes.iter().cloned().collect();
 
-        // Removed indexes — sort for determinism
         let mut removed: Vec<_> = old_indexes.iter().filter(|idx| !new_indexes.contains(*idx)).collect();
         removed.sort();
         for old_idx in removed {
@@ -560,7 +665,6 @@ impl SchemaDiffer {
             });
         }
 
-        // Added indexes — sort for determinism
         let mut added: Vec<_> = new_indexes.iter().filter(|idx| !old_indexes.contains(*idx)).collect();
         added.sort();
         for new_idx in added {

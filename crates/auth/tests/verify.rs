@@ -1,14 +1,9 @@
-//! Verify-only JWT + tenant cross-check tests. Tokens are signed in-test with a
-//! throwaway RSA keypair (below), so the whole path — signature, claims, tenant
-//! cross-check, principal extraction — is exercised fully offline.
-
 use std::collections::HashMap;
 
 use forgedb_auth::{AuthConfig, AuthError, Authenticator, KeySource};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde_json::json;
 
-// Throwaway 2048-bit RSA keypair — TEST ONLY, never a real key.
 const TEST_PRIV_PEM: &str = "-----BEGIN PRIVATE KEY-----
 MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC00dZHGD92WIm2
 4EojxoYOUmYT6XOEhoUEI7EJ3kzfLwdE2stVPA2LuWuRUFmbjT/5rOFXR8Pujznm
@@ -48,8 +43,7 @@ fHp1zJld/n/Uk51zv+WR4DMjk+RwO5sojbeClZPlCy/sh5Sk2iAsljicuPD2fsbg
 XQIDAQAB
 -----END PUBLIC KEY-----";
 
-/// Far-future expiry so tokens don't age out of the test suite.
-const FAR_FUTURE_EXP: u64 = 4_102_444_800; // 2100-01-01
+const FAR_FUTURE_EXP: u64 = 4_102_444_800;
 
 fn sign(claims: serde_json::Value) -> String {
     let key = EncodingKey::from_rsa_pem(TEST_PRIV_PEM.as_bytes()).unwrap();
@@ -93,7 +87,6 @@ fn accepts_valid_token_for_this_tenant() {
 #[test]
 fn rejects_token_for_a_different_tenant_with_403() {
     let auth = authenticator_for("acme");
-    // A perfectly valid token — but its tenant is "globex", not this process.
     let token = sign(valid_claims("globex"));
     let err = auth.authenticate(&token).unwrap_err();
     assert!(matches!(err, AuthError::TenantMismatch { .. }), "got {err:?}");
@@ -104,7 +97,6 @@ fn rejects_token_for_a_different_tenant_with_403() {
 fn rejects_bad_signature_with_401() {
     let auth = authenticator_for("acme");
     let mut token = sign(valid_claims("acme"));
-    // Corrupt the signature segment.
     token.pop();
     token.push(if token.ends_with('A') { 'B' } else { 'A' });
     let err = auth.authenticate(&token).unwrap_err();
@@ -138,7 +130,7 @@ fn rejects_expired_token() {
     let auth = authenticator_for("acme");
     let token = sign(json!({
         "sub": "u", "iss": "https://idp.example", "aud": "forgedb",
-        "exp": 1_000_000_000u64, // 2001 — long past, beyond leeway
+        "exp": 1_000_000_000u64,
         "tenant": "acme",
     }));
     let err = auth.authenticate(&token).unwrap_err();
@@ -147,7 +139,6 @@ fn rejects_expired_token() {
 
 #[test]
 fn rejects_algorithm_off_the_allowlist() {
-    // Allowlist ES256 only, but the token is signed RS256.
     let cfg = AuthConfig {
         algorithms: vec![Algorithm::ES256],
         issuer: None,
@@ -168,7 +159,7 @@ fn rejects_missing_tenant_claim() {
     let auth = authenticator_for("acme");
     let token = sign(json!({
         "sub": "u", "iss": "https://idp.example", "aud": "forgedb",
-        "exp": FAR_FUTURE_EXP, // no tenant claim
+        "exp": FAR_FUTURE_EXP,
     }));
     let err = auth.authenticate(&token).unwrap_err();
     assert!(matches!(err, AuthError::MissingTenantClaim { .. }), "got {err:?}");
@@ -188,12 +179,10 @@ fn enforces_required_custom_claims() {
     let keys = KeySource::static_pem(None, TEST_PUB_PEM, Algorithm::RS256);
     let auth = Authenticator::new(cfg, keys, "acme");
 
-    // Missing org_id -> rejected.
     let token = sign(json!({ "sub": "u", "exp": FAR_FUTURE_EXP, "tenant": "acme" }));
     let err = auth.authenticate(&token).unwrap_err();
     assert!(matches!(err, AuthError::MissingRequiredClaim(_)), "got {err:?}");
 
-    // With org_id -> accepted.
     let token = sign(json!({ "sub": "u", "exp": FAR_FUTURE_EXP, "tenant": "acme", "org_id": "x" }));
     assert!(auth.authenticate(&token).is_ok());
 }

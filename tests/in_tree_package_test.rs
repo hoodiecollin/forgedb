@@ -1,26 +1,3 @@
-//! In-tree Rust placement — `[placement].rust_package` (#338, epic #332 class D).
-//!
-//! Gate 2 (#356) numbers fourteen scenarios; the ones that do not compile a
-//! crate live here and run by default. The three that build a real consumer
-//! workspace (5, 11c, 16b) are `#[ignore]`d at the bottom of this file and run
-//! under `make test-ignored` — they are the only end-to-end proof the feature
-//! has, and a build-only check cannot substitute for running them.
-//!
-//! Everything here drives the real `forgedb` binary as a subprocess with an
-//! explicit `current_dir` and its own `FORGEDB_HOME`, so the cases are hermetic
-//! and run in parallel — the convention `tests/placement_flip_test.rs` already
-//! follows. The `FORGEDB_HOME` override is correctness, not hygiene: without it
-//! `generate` claims a project id in the developer's real `~/.forgedb` ledger.
-//!
-//! **What the tier-2 coverage does and does not prove.** The compiling
-//! scenarios build the consumer workspace with a `[patch.crates-io]` block
-//! pointing at this checkout, so they prove the emitted package **compiles**.
-//! They say nothing about **registry resolution** — a patch table is precisely
-//! the thing that makes a registry lookup not happen. The only check that proves
-//! an installed user can build is the outside-repo reclose on `main`
-//! (`.github/workflows/substrate-reclose.yml`), which does not yet have an
-//! in-tree arm. That gap is #339's, and it is a row on release gate #378.
-
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -48,18 +25,13 @@ fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-/// A fresh project directory holding a schema and a `forgedb.toml`.
-///
-/// `placement` is the whole `[placement]` table, or the empty string for the
-/// opt-out — which is what makes scenario 1 and scenario 2 the same fixture with
-/// one difference.
 fn project(tag: &str, targets: &str, placement: &str) -> tempfile::TempDir {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     write(&tmp.path().join("schema.forge"), SCHEMA);
     write(
         &tmp.path().join("forgedb.toml"),
         &format!(
-            "[project]\nname = \"{tag}\"\n\n[generate]\ntargets = [{targets}]\n\n[storage]\nfsync = \"never\"\n{placement}"
+            "[project]\nid = \"{tag}\"\n\n[generate]\ntargets = [{targets}]\n\n[storage]\nfsync = \"never\"\n{placement}"
         ),
     );
     tmp
@@ -87,9 +59,6 @@ fn ok(out: &Output, what: &str) -> String {
     combined(out)
 }
 
-/// The app's single container under the cache, found by SCANNING rather than by
-/// recomputing the member hash — a second derivation of the hash in a test is a
-/// way for the test to agree with itself while disagreeing with the CLI.
 fn container(root: &Path, name: &str) -> PathBuf {
     let apps = root.join(".home/projects").join(name).join("apps");
     let mut found: Vec<PathBuf> = std::fs::read_dir(&apps)
@@ -102,7 +71,6 @@ fn container(root: &Path, name: &str) -> PathBuf {
     found.pop().unwrap()
 }
 
-/// Every file under `dir`, as paths relative to it, sorted.
 fn tree(dir: &Path) -> Vec<String> {
     fn walk(dir: &Path, base: &Path, out: &mut Vec<String>) {
         for entry in std::fs::read_dir(dir).unwrap() {
@@ -125,7 +93,6 @@ fn tree(dir: &Path) -> Vec<String> {
     out
 }
 
-/// The `[package] name` a cargo manifest declares.
 fn package_name(manifest: &Path) -> String {
     let body = read(manifest);
     let value: toml::Value = toml::from_str(&body)
@@ -136,10 +103,6 @@ fn package_name(manifest: &Path) -> String {
         .to_string()
 }
 
-/// The dep line the CLI printed, stripped of the `ui::info` decoration.
-///
-/// Found by the TOML key rather than by position: an added log line must not
-/// silently re-point this at something else.
 fn printed_dep_line(output: &str) -> String {
     let hits: Vec<&str> = output
         .lines()
@@ -159,15 +122,6 @@ fn printed_dep_line(output: &str) -> String {
 
 const PLACEMENT: &str = "\n[placement]\nrust_package = \"generated/core\"\n";
 
-// ===========================================================================
-// Scenario 1 — absence is the opt-out
-// ===========================================================================
-
-/// **Scenario 1.** With no `[placement]` table, `generate all --force` writes no
-/// cargo package anywhere in the user's tree.
-///
-/// The cache assertions are the other half and are not decoration: "nothing was
-/// written" must not be satisfiable by generation having silently done nothing.
 #[test]
 fn scenario_1_absence_of_the_table_emits_no_package() {
     let tmp = project("s1", "\"rust\", \"api\"", "");
@@ -187,24 +141,12 @@ fn scenario_1_absence_of_the_table_emits_no_package() {
         "an opted-out project got a core/ directory"
     );
 
-    // Generation really ran, and the cache package is unaffected by the feature.
     let cache = container(root, "s1");
     assert!(cache.join("core/Cargo.toml").is_file());
     assert!(cache.join("core/src/lib.rs").is_file());
     assert!(root.join("generated/database.rs").is_file());
 }
 
-// ===========================================================================
-// Scenario 2 — the knob emits a complete package
-// ===========================================================================
-
-/// **Scenario 2.** The knob emits `Cargo.toml` + `src/lib.rs`, the manifest
-/// parses as TOML and declares `edition = "2024"`, and the directory holds
-/// **nothing else**.
-///
-/// The exhaustive file list is the load-bearing assertion. "Contains a
-/// Cargo.toml" would pass for a directory that also held a `main.rs`, an
-/// `api.rs`, or a leftover from a previous shape.
 #[test]
 fn scenario_2_the_knob_emits_a_complete_package() {
     let tmp = project("s2", "\"rust\", \"api\"", PLACEMENT);
@@ -223,8 +165,6 @@ fn scenario_2_the_knob_emits_a_complete_package() {
         .unwrap_or_else(|e| panic!("the emitted manifest is not TOML: {e}\n{manifest}"));
     assert_eq!(value["package"]["edition"].as_str(), Some("2024"));
 
-    // The name is the app's `core` package name, cross-checked against the one
-    // the CLI wrote into the cache rather than recomputed here.
     let cache = container(root, "s2");
     assert_eq!(
         package_name(&pkg.join("Cargo.toml")),
@@ -237,28 +177,12 @@ fn scenario_2_the_knob_emits_a_complete_package() {
         "the emitted package is not a `core` package"
     );
 
-    // No `[workspace]` table. Not a preference: a nested package carrying one
-    // that any member path-depends on fails the whole workspace with `multiple
-    // workspace roots found in the same workspace` (#430, closed as not a
-    // defect). A generated package with no `[workspace]` is the correct shape.
     assert!(
         value.get("workspace").is_none(),
         "the emitted package must carry no [workspace] table:\n{manifest}"
     );
 }
 
-// ===========================================================================
-// Scenario 3 — three copies, one value
-// ===========================================================================
-
-/// **Scenario 3.** `generated/core/src/lib.rs`, `generated/database.rs` and the
-/// cache's `core/src/lib.rs` are byte-identical.
-///
-/// Extends #335's scenario 29 from two sinks to three. A byte compare rather
-/// than a substring check for the reason that one records: the defect it guards
-/// was two files that were *mostly* the same and differed only in the durability
-/// semantics two generator invocations baked into them. Any assertion weaker
-/// than "identical" passes while that bug is present.
 #[test]
 fn scenario_3_three_copies_one_value() {
     let tmp = project("s3", "\"rust\", \"api\"", PLACEMENT);
@@ -274,18 +198,6 @@ fn scenario_3_three_copies_one_value() {
     assert_eq!(in_tree, cached, "the in-tree package and the cache disagree");
 }
 
-// ===========================================================================
-// Scenario 4b — the printed line names the package ForgeDB actually wrote
-// ===========================================================================
-
-/// **Scenario 4b.** The printed dep line parses as TOML, its `package` equals
-/// the `[package].name` in the emitted manifest, and its `path` points at the
-/// emitted directory.
-///
-/// **Asserted against the manifest, never against a literal.** A literal is
-/// exactly how gate 1's line came to be wrong: `forgedb_core = { path = … }`
-/// reads perfectly and is a hard cargo error, because cargo matches a path dep's
-/// key against the package's own name.
 #[test]
 fn scenario_4b_the_printed_line_names_the_package_forgedb_wrote() {
     let tmp = project("s4", "\"rust\"", PLACEMENT);
@@ -316,24 +228,13 @@ fn scenario_4b_the_printed_line_names_the_package_forgedb_wrote() {
     );
 }
 
-// ===========================================================================
-// Scenario 6 — the path is schema-relative, not CWD-relative
-// ===========================================================================
-
-/// **Scenario 6.** One root config, two apps in sibling subdirectories, both
-/// generated **from the repo root**: each package lands beside its own schema
-/// and neither overwrites the other.
-///
-/// This is `Governing::output`'s lesson re-applied to the new knob. A shared
-/// value read against the CWD makes every app in a project clobber its siblings,
-/// and it does so silently — the last generate wins and everything still builds.
 #[test]
 fn scenario_6_the_placement_is_schema_relative() {
     let tmp = tempfile::TempDir::new().unwrap();
     let root = tmp.path();
     write(
         &root.join("forgedb.toml"),
-        "[project]\nname = \"s6\"\n\n[generate]\ntargets = [\"rust\"]\n[placement]\nrust_package = \"generated/core\"\n",
+        "[project]\nid = \"s6\"\n\n[generate]\ntargets = [\"rust\"]\n[placement]\nrust_package = \"generated/core\"\n",
     );
     write(&root.join("a/schema.forge"), SCHEMA);
     write(&root.join("b/schema.forge"), SCHEMA);
@@ -366,18 +267,6 @@ fn scenario_6_the_placement_is_schema_relative() {
     );
 }
 
-// ===========================================================================
-// Scenario 7 — a rewritten manifest carries the new pins
-// ===========================================================================
-
-/// **Scenario 7.** A hand-edited manifest and a hand-edited `src/lib.rs` are both
-/// rewritten in full on the next generate.
-///
-/// This is the property the whole design turns on: #290's floor problem does
-/// **not** relocate into user property, because the package is ForgeDB's file
-/// and a CLI upgrade's substrate pin reaches an existing project the same way it
-/// reaches a cache member. A `write_file` (write-once) path here would make a
-/// stale pin survivable, which is the failure this guards.
 #[test]
 fn scenario_7_a_hand_edit_is_rewritten_in_full() {
     let tmp = project("s7", "\"rust\"", PLACEMENT);
@@ -388,8 +277,6 @@ fn scenario_7_a_hand_edit_is_rewritten_in_full() {
     let lib = root.join("generated/core/src/lib.rs");
     let before = read(&manifest);
 
-    // A downgraded substrate pin and a source edit — the two shapes of the same
-    // failure.
     write(
         &manifest,
         &before.replace("forgedb-storage = \"0.3\"", "forgedb-storage = \"0.1\""),
@@ -411,17 +298,6 @@ fn scenario_7_a_hand_edit_is_rewritten_in_full() {
     );
 }
 
-// ===========================================================================
-// Scenario 10 — in-tree carries no server
-// ===========================================================================
-
-/// **Scenario 10.** With `api` declared, the in-tree directory holds
-/// `Cargo.toml` + `src/lib.rs` and no `main.rs`, `api.rs` or `[[bin]]`, while the
-/// cache still holds its `server/` package.
-///
-/// Asserted from both sides on purpose: "in-tree has no server" and "the server
-/// still exists" are different claims, and a change that deleted the server
-/// outright would satisfy only the first.
 #[test]
 fn scenario_10_in_tree_carries_no_server() {
     let tmp = project("s10", "\"rust\", \"api\"", PLACEMENT);
@@ -449,20 +325,6 @@ fn scenario_10_in_tree_carries_no_server() {
     assert!(cache.join("server/src/api.rs").is_file());
 }
 
-// ===========================================================================
-// Scenario 11b — the utoipa pin agrees with the derive, in-tree
-// ===========================================================================
-
-/// **Scenario 11b.** Under `targets = ["all"]`, `generate rust --force` — an
-/// invocation that emits no `api.rs` — writes an in-tree manifest that pins
-/// `utoipa` **iff** its `src/lib.rs` names it.
-///
-/// "In-tree carries no `api.rs`" is about the *package*, not the *pin*. When the
-/// app declares `api`, `GenConfig::web` is true, the `ToSchema` derive is in
-/// `database.rs`, and the manifest must pin utoipa or the consumer's own
-/// `cargo build` fails with `E0432: unresolved import 'utoipa'`. Reading the
-/// decision as "no api.rs means no utoipa" is the obvious wrong turn, and it
-/// produces the failure in the user's build rather than in ours.
 #[test]
 fn scenario_11b_the_in_tree_utoipa_pin_agrees_with_the_derive() {
     for (tag, targets) in [("s11b-all", "\"all\""), ("s11b-rust", "\"rust\"")] {
@@ -481,22 +343,13 @@ fn scenario_11b_the_in_tree_utoipa_pin_agrees_with_the_derive() {
     }
 }
 
-// ===========================================================================
-// Scenario 16a — two apps, two package names
-// ===========================================================================
-
-/// **Scenario 16a.** Two schemas in one project, each placing in its own
-/// directory, emit two packages with **different** `[package] name`s.
-///
-/// One name for two packages is a workspace-wide cargo error, so this is the
-/// cheap half of the property scenario 16b compiles.
 #[test]
 fn scenario_16a_two_apps_emit_two_package_names() {
     let tmp = tempfile::TempDir::new().unwrap();
     let root = tmp.path();
     write(
         &root.join("forgedb.toml"),
-        "[project]\nname = \"s16a\"\n\n[generate]\ntargets = [\"rust\"]\n[placement]\nrust_package = \"generated/core\"\n",
+        "[project]\nid = \"s16a\"\n\n[generate]\ntargets = [\"rust\"]\n[placement]\nrust_package = \"generated/core\"\n",
     );
     write(&root.join("blog/schema.forge"), SCHEMA);
     write(&root.join("shop/schema.forge"), SCHEMA);
@@ -517,42 +370,23 @@ fn scenario_16a_two_apps_emit_two_package_names() {
     );
 }
 
-// ===========================================================================
-// Scenario 9 / 17 — `build` regenerates the package and never compiles it
-// ===========================================================================
-
-/// **Scenario 9.** `forgedb build --plan` plans no cargo invocation naming the
-/// in-tree directory.
-///
-/// Class D has **no delivery step**; this is what keeps that true in code rather
-/// than in prose. The planned set is exactly the cache packages, and the in-tree
-/// package is compiled by the consumer's cargo or by nobody.
-///
-/// **Scenario 17.** The same run leaves the in-tree package current and
-/// byte-identical to the mirror — `build` regenerates before it plans, so a
-/// project with the knob set must not have `build` and `generate` emit different
-/// project states.
 #[test]
 fn scenarios_9_and_17_build_regenerates_the_package_but_never_plans_it() {
     let tmp = project("s9", "\"rust\", \"api\"", PLACEMENT);
     let root = tmp.path();
     ok(&forgedb(root, &["generate", "all", "--force"]), "generate all");
 
-    // Make the in-tree package stale in a way only a regeneration can fix.
     let lib = root.join("generated/core/src/lib.rs");
     write(&lib, "// stale\n");
 
     let out = ok(&forgedb(root, &["build", "--plan"]), "build --plan");
 
-    // Scenario 17: regenerated, and identical to the mirror.
     assert_eq!(
         read(&lib),
         read(&root.join("generated/database.rs")),
         "`build` left the in-tree package stale"
     );
 
-    // Scenario 9: nothing planned names it. Compared on the CANONICAL path, so a
-    // plan printing an absolute path cannot slip past a relative-string check.
     let placement = std::fs::canonicalize(root.join("generated/core")).unwrap();
     let needle = placement.to_string_lossy().to_string();
     let plan_lines: Vec<&str> = out
@@ -571,19 +405,6 @@ fn scenarios_9_and_17_build_regenerates_the_package_but_never_plans_it() {
     }
 }
 
-// ===========================================================================
-// Scenario 8 — `--check` compares and writes nothing
-// ===========================================================================
-
-/// **Scenario 8.** A stale committed in-tree package makes `generate --check`
-/// exit non-zero naming the stale path, and leaves the on-disk bytes
-/// **unchanged**; a current one exits 0, also unchanged.
-///
-/// Both assertions are load-bearing. `--check` is CI's staleness gate for
-/// committed generated source, and the in-tree package IS committed source — so
-/// a check that skipped it would report a clean tree while the package cargo
-/// compiles is a schema behind. And a check that *fixed* the file would be
-/// worse than useless in CI: it would pass on every run and gate nothing.
 #[test]
 fn scenario_8_check_compares_and_writes_nothing() {
     let tmp = project("s8", "\"rust\"", PLACEMENT);
@@ -593,7 +414,6 @@ fn scenario_8_check_compares_and_writes_nothing() {
     let lib = root.join("generated/core/src/lib.rs");
     let manifest = root.join("generated/core/Cargo.toml");
 
-    // Current → exit 0, bytes untouched.
     let before_lib = read(&lib);
     let before_manifest = read(&manifest);
     let out = forgedb(root, &["generate", "all", "--check"]);
@@ -605,7 +425,6 @@ fn scenario_8_check_compares_and_writes_nothing() {
     assert_eq!(read(&lib), before_lib, "--check rewrote the source");
     assert_eq!(read(&manifest), before_manifest, "--check rewrote the manifest");
 
-    // Stale → non-zero, names the path, bytes STILL untouched.
     write(&lib, "// a schema behind\n");
     let out = forgedb(root, &["generate", "all", "--check"]);
     assert!(
@@ -624,8 +443,6 @@ fn scenario_8_check_compares_and_writes_nothing() {
         "--check repaired the file it was supposed to report"
     );
 
-    // A MISSING package is reported too — the fresh-clone case, where the
-    // directory a path dep names does not exist at all.
     std::fs::remove_dir_all(root.join("generated/core")).unwrap();
     let out = forgedb(root, &["generate", "all", "--check"]);
     assert!(
@@ -639,23 +456,8 @@ fn scenario_8_check_compares_and_writes_nothing() {
     );
 }
 
-// ===========================================================================
-// Scenario 12 — a placement inside the build cache is refused
-// ===========================================================================
-
-/// **Scenario 12.** A `rust_package` resolving inside `$FORGEDB_HOME` exits
-/// non-zero naming the cache and why — **and nothing was written**: no in-tree
-/// directory, and the mirror was never written either.
-///
-/// The second half is the [[red-for-the-wrong-reason]] lesson from #345, applied
-/// in advance. Mutating the predicate proves the guard *works*; only the
-/// "nothing was written" assertion can fail when the guard is *not called*, or
-/// is called too late. `cache::assert_not_in_cache` was fully mutation-tested
-/// while having executed zero times.
 #[test]
 fn scenario_12_a_placement_inside_the_cache_is_refused() {
-    // `.home` is this fixture's FORGEDB_HOME (see `forgedb`), so this is a
-    // placement literally inside the build cache.
     let tmp = project(
         "s12",
         "\"rust\"",
@@ -684,8 +486,6 @@ fn scenario_12_a_placement_inside_the_cache_is_refused() {
         "the refusal does not name the key at fault:\n{report}"
     );
 
-    // Nothing was written — this is the half that fails when the guard is not
-    // CALLED, or is called after the emitters have already run.
     assert!(
         !root.join(".home/projects/sneaky").exists(),
         "the refused placement was written anyway"
@@ -697,25 +497,10 @@ fn scenario_12_a_placement_inside_the_cache_is_refused() {
     );
 }
 
-// ===========================================================================
-// The halves that run real cargo (tier 2 — `make test-ignored`)
-// ===========================================================================
-//
-// These build a real consumer workspace against a `[patch.crates-io]` block
-// pointing at this checkout. That proves the emitted package **compiles**; it
-// proves nothing about **registry resolution**, because a patch table is
-// precisely the thing that makes a registry lookup not happen. See this file's
-// module doc.
-
-/// This checkout's root, from the test binary's own manifest dir.
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// The `[patch.crates-io]` block that points every substrate crate at this
-/// checkout. Kept in the same shape as `build_cache_compile_test::patch_substrate`
-/// — the list has to cover the transitive substrate (`storage` is a facade over
-/// `storage-native`/`storage-web`), not just what `core` names directly.
 fn patch_block() -> String {
     let mut body = String::from("\n[patch.crates-io]\n");
     for dir in [
@@ -741,13 +526,6 @@ fn patch_block() -> String {
     body
 }
 
-/// Run cargo in `dir` with an explicit `--target-dir` and `CARGO_TARGET_DIR`
-/// removed.
-///
-/// Both are required, not tidy: an ambient env var — **or** a `[build]
-/// target-dir` in `$CARGO_HOME/config.toml`, which is machine-wide and needs no
-/// env var at all (#292) — would redirect this into the directory the outer
-/// `cargo test` holds a lock on, and the test would hang rather than fail.
 fn cargo(dir: &Path, target_dir: &Path, args: &[&str]) -> Output {
     let compiles = args
         .first()
@@ -763,12 +541,6 @@ fn cargo(dir: &Path, target_dir: &Path, args: &[&str]) -> Output {
         .expect("cargo runs")
 }
 
-/// The `[package] name`s `cargo metadata --no-deps` reports as workspace
-/// members.
-///
-/// Read from cargo's own JSON, never scraped from a path string: a name matched
-/// as a substring of a directory goes silently wrong the moment the naming
-/// scheme changes (#386).
 fn metadata_members(dir: &Path, target_dir: &Path) -> Vec<String> {
     let out = cargo(dir, target_dir, &["metadata", "--no-deps", "--format-version", "1"]);
     assert!(
@@ -788,26 +560,6 @@ fn metadata_members(dir: &Path, target_dir: &Path) -> Vec<String> {
     names
 }
 
-// ---------------------------------------------------------------------------
-// Scenario 5 ★ — the printed line builds, and the database runs
-// ---------------------------------------------------------------------------
-
-/// **Scenario 5 (★).** In a real cargo workspace outside this checkout, pasting
-/// the printed dep line **verbatim** into a crate's `[dependencies]` makes the
-/// generated package a workspace member although `members` was never edited,
-/// `cargo build` succeeds, and a `main` that opens a `Database`, inserts a row
-/// and reads it back runs and exits 0.
-///
-/// This is the scenario the whole feature reduces to, and no string-level test
-/// can reach any part of it: the two halves this bug class produces — a manifest
-/// and a source file — are each individually well-formed and fail only when they
-/// disagree.
-///
-/// The consumer here is the workspace **root package**, with a second member
-/// beside it. That shape is deliberate and is the one place the printed line is
-/// paste-able unchanged: `path` is written relative to the directory `generate`
-/// ran in, so a consumer crate in a *subdirectory* must re-base it. The CLI says
-/// so when it prints the line.
 #[test]
 #[ignore = "compiles a real consumer workspace; run with --ignored"]
 fn scenario_5_the_printed_line_builds_and_the_database_runs() {
@@ -820,16 +572,12 @@ fn scenario_5_the_printed_line_builds_and_the_database_runs() {
     );
     write(
         &ws.join("forgedb.toml"),
-        "[project]\nname = \"s5\"\n\n[generate]\ntargets = [\"rust\"]\n[placement]\nrust_package = \"generated/core\"\n",
+        "[project]\nid = \"s5\"\n\n[generate]\ntargets = [\"rust\"]\n[placement]\nrust_package = \"generated/core\"\n",
     );
 
     let out = ok(&forgedb(ws, &["generate", "all", "--force"]), "generate all");
     let dep_line = printed_dep_line(&out);
 
-    // A workspace whose root is also a package, plus one unrelated member. The
-    // `members` array names only `helper` — the generated package joins because
-    // it is a path dependency inside the workspace directory, and that is the
-    // mechanism the whole design rests on.
     write(
         &ws.join("Cargo.toml"),
         &format!(
@@ -872,7 +620,6 @@ fn main() {
 
     let target_dir = tmp.path().join(".cargo-target");
 
-    // The generated package is a member although `members` names only `helper`.
     let members = metadata_members(ws, &target_dir);
     let core = package_name(&ws.join("generated/core/Cargo.toml"));
     assert!(
@@ -881,9 +628,6 @@ fn main() {
     );
     assert!(members.contains(&"consumer".to_string()));
     assert!(members.contains(&"helper".to_string()));
-    // Scoped to the `members` ARRAY, read back through TOML — the manifest DOES
-    // name the core package, in the dep line, and that is the point. A whole-file
-    // `contains` would be satisfied by the very thing under test.
     let root_manifest: toml::Value =
         toml::from_str(&read(&ws.join("Cargo.toml"))).expect("the consumer root parses");
     let listed: Vec<&str> = root_manifest["workspace"]["members"]
@@ -905,8 +649,6 @@ fn main() {
         String::from_utf8_lossy(&build.stderr)
     );
 
-    // `build`, then RUN. A crate that compiles and cannot open a database is
-    // exactly the failure a compile-only check reports as green.
     let run = cargo(ws, &target_dir, &["run", "-p", "consumer"]);
     assert!(
         run.status.success(),
@@ -921,19 +663,6 @@ fn main() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Scenario 11c — the narrowing invocation's package compiles
-// ---------------------------------------------------------------------------
-
-/// **Scenario 11c.** The in-tree package produced by `generate rust --force`
-/// under `targets = ["all"]` **compiles**.
-///
-/// This is the invocation that narrows: it emits no `api.rs`, but the app
-/// declares `api`, so `GenConfig::web` is true and the source carries the
-/// `ToSchema` derives. A manifest computed from "did this command emit an api"
-/// would omit the utoipa pin and the crate would fail with
-/// `error[E0432]: unresolved import 'utoipa'` — in the user's own build.
-/// 11b asserts the pairing as strings; only this one compiles it.
 #[test]
 #[ignore = "compiles a generated package; run with --ignored"]
 fn scenario_11c_the_narrowing_invocations_package_compiles() {
@@ -943,7 +672,7 @@ fn scenario_11c_the_narrowing_invocations_package_compiles() {
     write(&ws.join("schema.forge"), SCHEMA);
     write(
         &ws.join("forgedb.toml"),
-        "[project]\nname = \"s11c\"\n\n[generate]\ntargets = [\"all\"]\n[placement]\nrust_package = \"generated/core\"\n",
+        "[project]\nid = \"s11c\"\n\n[generate]\ntargets = [\"all\"]\n[placement]\nrust_package = \"generated/core\"\n",
     );
 
     let out = ok(&forgedb(ws, &["generate", "rust", "--force"]), "generate rust");
@@ -968,18 +697,6 @@ fn scenario_11c_the_narrowing_invocations_package_compiles() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Scenario 16b — two apps, one consumer workspace
-// ---------------------------------------------------------------------------
-
-/// **Scenario 16b.** A real workspace depending on two ForgeDB apps: `cargo
-/// metadata` lists both generated packages as members and `cargo build`
-/// succeeds.
-///
-/// Each app is consumed by its own member crate. That is not incidental — the
-/// printed dep line uses the key `forgedb_core` for every app, so a **single**
-/// crate depending on two ForgeDB apps must rename one of the two keys itself.
-/// One member per app is the shape that needs no such edit.
 #[test]
 #[ignore = "compiles a real consumer workspace; run with --ignored"]
 fn scenario_16b_two_apps_build_in_one_workspace() {
@@ -988,7 +705,7 @@ fn scenario_16b_two_apps_build_in_one_workspace() {
 
     write(
         &ws.join("forgedb.toml"),
-        "[project]\nname = \"s16b\"\n\n[generate]\ntargets = [\"rust\"]\n[placement]\nrust_package = \"core\"\n",
+        "[project]\nid = \"s16b\"\n\n[generate]\ntargets = [\"rust\"]\n[placement]\nrust_package = \"core\"\n",
     );
 
     let mut dep_lines = Vec::new();
@@ -1015,9 +732,6 @@ fn scenario_16b_two_apps_build_in_one_workspace() {
         ),
     );
     for (app, line) in ["blog", "shop"].iter().zip(&dep_lines) {
-        // Each member sits one level below the directory `generate` ran in, so
-        // the printed path is re-based here — the same edit a real consumer
-        // makes, and the reason the CLI says what the path is relative to.
         let rebased = line.replace(
             &format!("path = \"{app}/core\""),
             "path = \"../core\"",

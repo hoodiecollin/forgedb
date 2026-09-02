@@ -1,19 +1,3 @@
-// ForgeDB Language Server — reusable library surface.
-//
-// Editor features (diagnostics, completion, hover, goto-definition, rename) are
-// driven by the REAL ForgeDB compiler. Buffers are parsed with
-// `forgedb_parser::Parser::parse_recover` — a resilient partial parse that yields
-// a best-effort AST plus every diagnostic the compiler would emit — so what the
-// editor shows matches `forgedb validate` exactly. There is no private grammar here.
-//
-// The whole server (the tower-lsp event loop and its `Backend`) lives in this
-// library so it can be embedded by the `forgedb-lsp` binary that ships alongside
-// the `forgedb` CLI (epic #173: one dist app, `forgedb-lsp` gated behind the
-// non-default `lsp` feature of the root crate). The building blocks are also
-// exercised directly: the CLI↔LSP diagnostic-parity fixture (#173,
-// `tests/lsp_cli_parity.rs` in the root crate) imports `to_lsp_diagnostics` and
-// asserts it stays in lockstep with `forgedb validate` over `examples/*`.
-
 pub mod completion;
 pub mod diagnostics;
 pub mod hover;
@@ -30,12 +14,6 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use crate::{completion::get_completions, hover::get_hover_info};
 
-/// Run the ForgeDB language server over stdio until the client disconnects.
-///
-/// Owns its own multi-threaded Tokio runtime so the caller (the `forgedb-lsp`
-/// binary) stays a plain synchronous `fn main` — the async LSP stack never
-/// leaks into the root `forgedb` crate's default build. Blocks until the LSP
-/// session ends.
 pub fn run() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -73,18 +51,14 @@ impl Backend {
 
     async fn update_document(&self, uri: Url, content: String, version: i32) {
         let (parsed, mut lsp_diagnostics) = match Parser::new(&content) {
-            // Resilient parse: partial AST + all compiler diagnostics.
             Ok(mut parser) => {
                 let parsed = parser.parse_recover();
                 let diags = diagnostics::to_lsp_diagnostics(&parsed.diagnostics, &content);
                 (parsed, diags)
             }
-            // Lexer errors are fatal (no token stream to recover from). Surface the
-            // message as a single diagnostic and keep an empty schema.
             Err(message) => (empty_parsed(), vec![lexer_error_diagnostic(&message)]),
         };
 
-        // Sort by position so the editor's problem list is stable.
         lsp_diagnostics.sort_by_key(|d| (d.range.start.line, d.range.start.character));
 
         let doc = Document { content, parsed };
@@ -147,9 +121,6 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
 
-        // Under FULL sync the spec sends exactly one element, but take `.last()`
-        // so that if multiple incremental-style changes are ever batched we apply
-        // the most-recent one rather than an earlier intermediate state.
         if let Some(change) = params.content_changes.into_iter().last() {
             self.update_document(uri, change.text, version).await;
         }
@@ -197,7 +168,6 @@ impl LanguageServer for Backend {
         let position = params.text_document_position_params.position;
 
         let docs = self.documents.read().await;
-        // A word under the cursor can name a model, a struct, or an enum.
         if let Some(doc) = docs.get(&uri.to_string())
             && let Some(word) = get_word_at_position(&doc.content, position)
             && let Some(def_pos) = find_definition(&doc.parsed.schema, &word)
@@ -242,7 +212,6 @@ impl LanguageServer for Backend {
     }
 }
 
-/// An empty [`ParsedSchema`] for the fatal-lexer-error path (no tokens to walk).
 fn empty_parsed() -> ParsedSchema {
     ParsedSchema {
         schema: Schema {
@@ -254,8 +223,6 @@ fn empty_parsed() -> ParsedSchema {
     }
 }
 
-/// Convert a compiler [`forgedb_validation::Position`] (1-based line/column) into an
-/// LSP [`Position`] (0-based line/character).
 fn to_lsp_position(pos: forgedb_validation::Position) -> Position {
     Position {
         line: pos.line.saturating_sub(1) as u32,
@@ -263,7 +230,6 @@ fn to_lsp_position(pos: forgedb_validation::Position) -> Position {
     }
 }
 
-/// Resolve a name to the position of its model / struct / enum definition.
 fn find_definition(schema: &Schema, name: &str) -> Option<Position> {
     let pos = schema
         .models
@@ -287,13 +253,6 @@ fn find_definition(schema: &Schema, name: &str) -> Option<Position> {
     Some(to_lsp_position(pos))
 }
 
-/// Turn a fatal lexer error string (which embeds "line N, column M") into a
-/// diagnostic anchored at that position, falling back to the document start.
-///
-/// The hardcoded `ERROR` below is correct and must stay: a lexer failure leaves no
-/// token stream to recover from, so it is fatal by construction and can never be a
-/// warning. Severity is only variable on the `parse_recover` path (#237), which
-/// maps it via [`diagnostics::to_lsp_severity`].
 fn lexer_error_diagnostic(message: &str) -> Diagnostic {
     let start = parse_line_column(message)
         .map(|(l, c)| Position {
@@ -317,7 +276,6 @@ fn lexer_error_diagnostic(message: &str) -> Diagnostic {
     }
 }
 
-/// Extract the first `line N` / `column M` pair from a lexer error message.
 fn parse_line_column(message: &str) -> Option<(usize, usize)> {
     let after = |marker: &str| -> Option<usize> {
         let idx = message.find(marker)? + marker.len();
@@ -367,10 +325,6 @@ fn find_all_references(content: &str, old_name: &str, new_name: &str) -> Vec<Tex
     let lines: Vec<&str> = content.lines().collect();
 
     for (line_idx, line) in lines.iter().enumerate() {
-        // `search_from` is a *byte* offset into `line`. `str::find` returns byte
-        // offsets, so all arithmetic here is byte-based. We convert to char counts
-        // only when building LSP `Position` values (UTF-16 units; for ASCII schema
-        // names char count == byte count == UTF-16 unit count).
         let mut search_from: usize = 0;
 
         while search_from <= line.len() {
@@ -423,7 +377,6 @@ mod tests {
         Parser::new(src).unwrap().parse_recover().schema
     }
 
-    /// goto_definition finds a model definition and returns a 0-based position.
     #[test]
     fn find_model_definition_returns_zero_based_position() {
         let schema = parse("User {\n  id: +uuid\n}\n");
@@ -431,14 +384,12 @@ mod tests {
         assert_eq!(pos.line, 0);
     }
 
-    /// goto_definition returns None for an unknown name.
     #[test]
     fn find_definition_unknown_returns_none() {
         let schema = parse("User {\n  id: +uuid\n}\n");
         assert!(find_definition(&schema, "Post").is_none());
     }
 
-    /// goto_definition resolves struct definitions.
     #[test]
     fn find_struct_definition_returns_position() {
         let schema = parse("struct Address {\n  street: string\n}\n");
@@ -446,7 +397,6 @@ mod tests {
         assert_eq!(pos.line, 0);
     }
 
-    /// goto_definition resolves enum definitions (new in the compiler re-point).
     #[test]
     fn find_enum_definition_returns_position() {
         let schema = parse("enum Status {\n  Active\n  Inactive\n}\n");
@@ -454,7 +404,6 @@ mod tests {
         assert_eq!(pos.line, 0);
     }
 
-    /// 1-based compiler positions convert to 0-based LSP positions.
     #[test]
     fn position_conversion_is_zero_based() {
         let p = to_lsp_position(forgedb_validation::Position { line: 3, column: 5 });
@@ -462,7 +411,6 @@ mod tests {
         assert_eq!(p.character, 4);
     }
 
-    /// Lexer error messages yield a diagnostic anchored at the reported position.
     #[test]
     fn lexer_error_is_positioned() {
         let d = lexer_error_diagnostic("Unexpected character '#' at line 2, column 4");
@@ -471,7 +419,6 @@ mod tests {
         assert_eq!(d.severity, Some(DiagnosticSeverity::ERROR));
     }
 
-    /// rename collects word-boundary references across the buffer.
     #[test]
     fn rename_finds_word_boundary_references() {
         let content = "User {\n  id: +uuid\n}\n\nPost {\n  author: *User\n}\n";

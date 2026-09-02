@@ -16,13 +16,6 @@ const styles: Record<CalloutType, CalloutStyle> = {
   success: { icon: CircleCheck, cls: "border-ok/30 bg-ok/10", iconCls: "text-ok" },
 };
 
-// Widened past `CalloutType` on purpose. Every real call site is in an `.mdx`
-// content file, where props are plain JSX attributes that TypeScript never sees
-// — so `string` is the honest type of what actually arrives, and narrowing it
-// here would only buy false confidence. An unrecognized name (`type="info"`,
-// shipped in modifiers.mdx) used to destructure `undefined` and crash the whole
-// prerender, taking the production deploy down over a one-word content typo.
-// A docs typo must degrade, not fail the build.
 const lookup = styles as Record<string, CalloutStyle | undefined>;
 
 export function Callout({

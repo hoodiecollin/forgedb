@@ -1,45 +1,3 @@
-//! # forgedb-backup
-//!
-//! Lock-free **snapshot backup & restore** for a ForgeDB database *directory*,
-//! treated as structured-but-opaque storage. A class-1 **substrate** crate: it
-//! understands the on-disk *layout* (per-model `manifest.json`, fixed/variable
-//! columns, tombstones, junction dirs) and **never** the `.forge` *schema*. It
-//! moves opaque file bytes; it does not know any model's fields, relations, or
-//! directives.
-//!
-//! ## Why it is lock-free
-//!
-//! ForgeDB's storage is **append-only under a row-count anchor**. Each
-//! model/junction directory's [`Manifest`] names a `row_anchor` — the file
-//! whose length counts committed rows (`tombstones.bin` at 1 byte/row for a
-//! model; `fixed/right.bin` at 16 bytes/row for an M2M junction), appended
-//! *last* per write. Reading that length gives a committed watermark `N`;
-//! every column's committed byte length is a pure function of `N` and the
-//! column layout. Concurrent writers only append *past* those lengths, so the
-//! copied prefixes never change under the reader — a crash-consistent snapshot
-//! with **no lock, no MVCC, no WAL**. A half-finished multi-column write (a
-//! torn row: columns appended but the anchor not yet advanced) is naturally
-//! excluded, because `N` comes from the last-appended anchor file.
-//!
-//! ## Archive format (`FORGEBK1`)
-//!
-//! ```text
-//! magic:      8 bytes  b"FORGEBK1"
-//! header_len: u32 LE
-//! header:     header_len bytes of JSON ([`ArchiveHeader`])
-//! payload:    each file's committed prefix, concatenated in header.files order
-//! ```
-//!
-//! The header is versioned (`container_version`) and records each model dir's
-//! `schema_version` / `engine_version` / `compaction_epoch` / `row_count`, so a
-//! restore can refuse incompatible bytes instead of silently materializing them.
-//!
-//! ## Scope (first milestone, #57)
-//!
-//! Full snapshot create/restore over a local path, no WAL replay, no
-//! incrementals, no cloud targets, no compression. `compaction_epoch` is
-//! captured so later incrementals can reject a base taken in a different epoch.
-
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -53,128 +11,69 @@ pub use error::BackupError;
 
 pub type Result<T> = std::result::Result<T, BackupError>;
 
-/// Magic bytes at the head of every archive.
 const MAGIC: &[u8; 8] = b"FORGEBK1";
-/// Archive container format version (distinct from a dir's `schema_version`
-/// and from ForgeDB's `engine_version`).
 const CONTAINER_VERSION: u32 = 1;
 
-/// `#[serde(default)]` for the two version counters on a [`ModelMeta`] read out
-/// of an archive written before they were named as they are now.
 fn one() -> u32 {
     1
 }
-/// Bytes per (offset, length) pair in a variable column's offsets file.
 const OFFSET_PAIR_BYTES: u64 = 16;
-/// The durable replication broker log (#82), a root-level file (not a model dir,
-/// so `model_dirs` skips it). Its end offset is the PITR `base_offset` (#77).
 const REPLICATION_LOG: &str = "_replication.log";
 
-/// One file's committed prefix, recorded in the archive header. `path` is
-/// relative to the data directory root (e.g. `post/tombstones.bin`).
-///
-/// For a **full** archive `base_len == 0` and the payload carries the whole
-/// `[0, len)` prefix. For an **incremental** archive the payload carries only
-/// the appended tail `[base_len, len)`; restore concatenates that tail onto the
-/// `base_len` bytes the chain's prior members already materialized.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
     pub path: String,
-    /// Committed byte length of this file at snapshot time (the final length
-    /// after this archive is applied).
     pub len: u64,
-    /// Bytes assumed already present from earlier chain members. `0` for a full
-    /// archive; the base's committed length for an incremental. The payload
-    /// holds exactly `len - base_len` bytes.
     #[serde(default)]
     pub base_len: u64,
 }
 
-/// Per-directory snapshot metadata (a model or an M2M junction).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelMeta {
-    /// Directory name relative to the data dir (e.g. `post`, `post_tag_link`).
     pub dir: String,
-    /// The app's schema-migration serial, copied from the dir's manifest.
-    ///
-    /// **On-disk key stays `format_version`** and the Rust name follows the
-    /// manifest's (#254). Before that change this field copied the manifest's
-    /// *vestigial* constant `1` while the real serial rode under the other name,
-    /// so `forgedb backup` reported `1` for every dir; it now reports the truth.
     #[serde(rename = "format_version", default = "one")]
     pub schema_version: u32,
-    /// ForgeDB's engine byte-format generation (#254), copied from the manifest.
-    /// Defaults to the baseline for an archive written before the field existed.
     #[serde(default = "one")]
     pub engine_version: u32,
     pub compaction_epoch: u64,
-    /// Committed row count at snapshot time (`len(anchor) / bytes_per_row`).
     pub row_count: usize,
 }
 
-/// Records the base an incremental was cut against, so a restore can validate
-/// the chain before materializing incompatible bytes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BaseRef {
-    /// The full archive that anchors this chain (0-based `sequence == 0`).
     pub chain_id: String,
-    /// This archive's position in the chain (`0` = base, `1..` = deltas).
     pub sequence: u32,
-    /// Per-dir base row_count this delta was computed against — restore checks
-    /// the running dir length matches before appending the tail.
     pub base_row_counts: BTreeMap<String, usize>,
 }
 
-/// The archive header: everything a restore needs to rebuild the tree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchiveHeader {
     pub container_version: u32,
     pub models: Vec<ModelMeta>,
-    /// Files in payload order. Restore reads each file's payload bytes in turn
-    /// (`len` for a full archive, `len - base_len` for an incremental).
     pub files: Vec<FileEntry>,
-    /// A stable identifier for the chain this archive belongs to. A full base
-    /// mints a fresh id; each incremental copies its base's id.
     #[serde(default)]
     pub chain_id: String,
-    /// `0` for a full base, `1..` for successive incrementals in the chain.
     #[serde(default)]
     pub sequence: u32,
-    /// Present iff this is an incremental (`sequence > 0`): the base it deltas.
     #[serde(default)]
     pub base: Option<BaseRef>,
-    /// Point-in-time-recovery watermark (#77): the durable-replication-broker
-    /// (`_replication.log`, #82) end offset at snapshot time — the highest offset
-    /// whose change is already durably present in this archive's committed column
-    /// bytes (the generated mutation records to the broker only *after* the column
-    /// commit, so any frame `<= base_offset` is a subset of these bytes).
-    ///
-    /// A follower recovers to a later point by restoring this base then replaying
-    /// broker frames `(base_offset .. target]` through the generated `apply_frame`
-    /// (#110). `0` when there is no broker log at snapshot time (the `new()`
-    /// standalone path, or a data dir that never ran under `open_at`). Layout-blind:
-    /// read from the log's frame headers, never from a decoded row.
     #[serde(default)]
     pub base_offset: u64,
 }
 
 impl ArchiveHeader {
-    /// Whether this archive is an incremental delta (vs a full base).
     pub fn is_incremental(&self) -> bool {
         self.sequence > 0
     }
 }
 
-/// Result of a successful [`create`].
 #[derive(Debug, Clone)]
 pub struct BackupSummary {
     pub archive_path: PathBuf,
     pub models: Vec<ModelMeta>,
-    /// Total committed payload bytes (excludes the header).
     pub total_bytes: u64,
 }
 
-/// Result of a successful [`restore`].
 #[derive(Debug, Clone)]
 pub struct RestoreSummary {
     pub out_dir: PathBuf,
@@ -182,7 +81,6 @@ pub struct RestoreSummary {
     pub total_bytes: u64,
 }
 
-/// Fall back to this anchor for a legacy manifest that predates `row_anchor`.
 fn default_anchor() -> RowAnchor {
     RowAnchor {
         relative_path: "tombstones.bin".to_string(),
@@ -190,9 +88,6 @@ fn default_anchor() -> RowAnchor {
     }
 }
 
-/// Derive a variable column's offsets file path from its data file path, per
-/// the storage-layout convention (`variable/string_data_N.bin` →
-/// `variable/string_offsets_N.bin`). Substrate layout knowledge, not schema.
 fn offsets_path_for(data_relative_path: &str) -> String {
     data_relative_path.replacen("_data_", "_offsets_", 1)
 }
@@ -201,9 +96,6 @@ fn file_len(path: &Path) -> u64 {
     fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
-/// Committed length of a variable column's data file for `n` rows: the end of
-/// the `n`-th record = `offset[n-1] + length[n-1]`, read from the offsets file.
-/// Returns 0 for `n == 0`.
 fn variable_data_committed_len(offsets_path: &Path, n: usize) -> Result<u64> {
     if n == 0 {
         return Ok(0);
@@ -223,8 +115,6 @@ fn variable_data_committed_len(offsets_path: &Path, n: usize) -> Result<u64> {
     Ok(offset + length)
 }
 
-/// Plan the committed file set for one model/junction directory. Reads only the
-/// directory's `manifest.json` (layout) and stats — never the schema.
 fn plan_dir(data_dir: &Path, dir_name: &str) -> Result<(ModelMeta, Vec<FileEntry>)> {
     let dir = data_dir.join(dir_name);
     let manifest_path = dir.join("manifest.json");
@@ -244,14 +134,11 @@ fn plan_dir(data_dir: &Path, dir_name: &str) -> Result<(ModelMeta, Vec<FileEntry
     let anchor_abs = dir.join(&anchor.relative_path);
     let n = (file_len(&anchor_abs) / anchor.bytes_per_row as u64) as usize;
 
-    // Dedupe by path: a junction's `right.bin` is both a column and the anchor.
     let mut files: BTreeMap<String, u64> = BTreeMap::new();
     let rel = |p: &str| format!("{dir_name}/{p}");
 
-    // The manifest itself travels verbatim so the restored dir is self-describing.
     files.insert(rel("manifest.json"), file_len(&manifest_path));
 
-    // The anchor file's committed prefix.
     files.insert(rel(&anchor.relative_path), n as u64 * anchor.bytes_per_row as u64);
 
     for col in &manifest.columns {
@@ -287,18 +174,6 @@ fn plan_dir(data_dir: &Path, dir_name: &str) -> Result<(ModelMeta, Vec<FileEntry
     Ok((meta, entries))
 }
 
-/// Read the highest offset present in the durable replication log (#82) at
-/// `data_dir/_replication.log`, torn-tail-safe. Returns `0` when the log is
-/// absent or empty. **Layout-blind**, not schema-decoding: it walks the log's
-/// self-describing frame framing (`[4: total_len LE][payload][4: crc]`, the
-/// `forgedb-changefeed::durable` on-disk format) and reads only the length
-/// prefix + the leading 8-byte offset of each frame — never a model, a kind, or
-/// a row byte. This is the PITR `base_offset` watermark (#77).
-///
-/// It deliberately mirrors the broker's frame walk WITHOUT depending on
-/// `forgedb-changefeed` (backup stays a class-1 storage-layout substrate). If
-/// the frame framing ever changes, both must move together — the offset is the
-/// leading 8 bytes of every payload by construction (see `PersistedEvent::to_frame`).
 fn read_broker_end_offset(data_dir: &Path) -> Result<u64> {
     let log_path = data_dir.join(REPLICATION_LOG);
     let buf = match fs::read(&log_path) {
@@ -312,9 +187,8 @@ fn read_broker_end_offset(data_dir: &Path) -> Result<u64> {
     while pos + 4 <= buf.len() {
         let total_len =
             u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-        // A frame is `[4 len][payload (>= 8 for the offset) + 4 crc]`.
         if total_len < 4 + 8 || pos + 4 + total_len > buf.len() {
-            break; // torn / incomplete tail — stop at the valid prefix
+            break;
         }
         let payload_start = pos + 4;
         let offset = u64::from_le_bytes(
@@ -328,8 +202,6 @@ fn read_broker_end_offset(data_dir: &Path) -> Result<u64> {
     Ok(max_offset)
 }
 
-/// Enumerate the model/junction directories in a data dir (immediate
-/// subdirectories, skipping dotfiles), sorted for deterministic archives.
 fn model_dirs(data_dir: &Path) -> Result<Vec<String>> {
     let mut dirs = Vec::new();
     for entry in fs::read_dir(data_dir)? {
@@ -348,11 +220,6 @@ fn model_dirs(data_dir: &Path) -> Result<Vec<String>> {
     Ok(dirs)
 }
 
-/// Create a lock-free full-snapshot archive of `data_dir` at `archive_path`.
-///
-/// Safe to run while a generated app is appending: each file is copied only up
-/// to its committed length (derived from the row-count anchor), so concurrent
-/// appends past that point are excluded and no torn row is captured.
 pub fn create(data_dir: &Path, archive_path: &Path) -> Result<BackupSummary> {
     if !data_dir.is_dir() {
         return Err(BackupError::Layout(format!(
@@ -360,13 +227,6 @@ pub fn create(data_dir: &Path, archive_path: &Path) -> Result<BackupSummary> {
         )));
     }
 
-    // Capture the PITR watermark (#77) BEFORE planning columns, so it is a lower
-    // bound on the committed state: any broker frame at or below `base_offset`
-    // records a mutation whose columns were committed before the broker record
-    // (the generated mutation order), hence already in the bytes we copy. A
-    // concurrent write past this point only *adds* to the columns — never
-    // invalidates a frame `<= base_offset` — so the base stays a superset of
-    // everything through `base_offset`.
     let base_offset = read_broker_end_offset(data_dir)?;
 
     let mut models = Vec::new();
@@ -388,7 +248,6 @@ pub fn create(data_dir: &Path, archive_path: &Path) -> Result<BackupSummary> {
     };
     let total_bytes = write_archive(archive_path, &header, data_dir)?;
 
-    // Loud fail if compaction ran during the copy (see `changed_epoch`).
     if let Some((dir, before, after)) = changed_epoch(data_dir, &models) {
         let _ = fs::remove_file(archive_path);
         return Err(BackupError::Layout(format!(
@@ -403,19 +262,6 @@ pub fn create(data_dir: &Path, archive_path: &Path) -> Result<BackupSummary> {
     })
 }
 
-/// Create an **incremental** archive of `data_dir` against `base_archive`.
-///
-/// The delta ships only each file's byte tail appended since the base's
-/// per-column committed length — cheap because within one compaction epoch the
-/// columns are strictly append-only, so bytes below the base watermark are
-/// immutable.
-///
-/// **Epoch guard (chain validity):** a compaction renumbers rows and bumps each
-/// dir's `compaction_epoch`, invalidating a byte-tail delta computed against a
-/// pre-compaction base. So this refuses (with a clear message) if any current
-/// dir's epoch differs from the base's epoch for that dir — the caller must take
-/// a fresh full base instead. It also refuses if the current committed length is
-/// *shorter* than the base (rows vanished ⇒ not a clean append).
 pub fn create_incremental(
     data_dir: &Path,
     base_archive: &Path,
@@ -428,12 +274,8 @@ pub fn create_incremental(
     }
     let base = read_header(base_archive)?;
 
-    // This incremental's own PITR watermark (#77): captured before planning, same
-    // superset argument as `create`. It supersedes the full base's `base_offset`
-    // once this delta is applied — recovery replays frames `(base_offset .. target]`.
     let base_offset = read_broker_end_offset(data_dir)?;
 
-    // Index the base's per-dir metadata + per-file committed length.
     let base_epoch: BTreeMap<&str, u64> = base
         .models
         .iter()
@@ -449,7 +291,6 @@ pub fn create_incremental(
     for dir_name in model_dirs(data_dir)? {
         let (meta, entries) = plan_dir(data_dir, &dir_name)?;
 
-        // Epoch guard: the chain is valid only within one compaction epoch.
         if let Some(&be) = base_epoch.get(dir_name.as_str())
             && be != meta.compaction_epoch
         {
@@ -458,8 +299,6 @@ pub fn create_incremental(
                 meta.compaction_epoch
             )));
         }
-        // A dir present now but absent from the base is a brand-new dir: its
-        // whole prefix ships (base_len 0). A dir shrinking is not a clean append.
         if let Some(&br) = base_rows.get(dir_name.as_str())
             && meta.row_count < br
         {
@@ -517,8 +356,6 @@ pub fn create_incremental(
     })
 }
 
-/// Mint a chain identifier from the wall clock + process id. Opaque; only used
-/// to group archives of one chain, never parsed.
 fn new_chain_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
@@ -528,9 +365,6 @@ fn new_chain_id() -> String {
     format!("{:032x}-{:x}", nanos, std::process::id())
 }
 
-/// Write an archive (full or incremental) to `archive_path` via temp + rename.
-/// The payload holds each file's `[base_len, len)` tail (`base_len == 0` ⇒ the
-/// whole prefix). Returns the total payload bytes written.
 fn write_archive(archive_path: &Path, header: &ArchiveHeader, data_dir: &Path) -> Result<u64> {
     let header_bytes = serde_json::to_vec(header)?;
 
@@ -567,16 +401,10 @@ fn write_archive(archive_path: &Path, header: &ArchiveHeader, data_dir: &Path) -
     Ok(total_bytes)
 }
 
-/// Restore a single full archive into `out_dir`. Materializes into a temp
-/// sibling dir then atomically renames into place — a partial restore never
-/// clobbers `out_dir`. Refuses an incremental (needs the chain — use
-/// [`restore_chain`]) and an existing non-empty `out_dir` unless `overwrite`.
 pub fn restore(archive_path: &Path, out_dir: &Path, overwrite: bool) -> Result<RestoreSummary> {
     restore_chain(std::slice::from_ref(&archive_path.to_path_buf()), out_dir, overwrite)
 }
 
-/// Open an archive, validate its magic + container version, and return the
-/// header plus a reader positioned at the start of the payload.
 fn open_archive(archive_path: &Path) -> Result<(ArchiveHeader, BufReader<File>)> {
     let mut reader = BufReader::new(File::open(archive_path)?);
     let mut magic = [0u8; 8];
@@ -601,14 +429,6 @@ fn open_archive(archive_path: &Path) -> Result<(ArchiveHeader, BufReader<File>)>
     Ok((header, reader))
 }
 
-/// Restore an **ordered chain** (a full base followed by 0+ incrementals in
-/// `sequence` order) into `out_dir`. The base materializes each file's full
-/// prefix; each incremental *appends* its payload tail onto the running file,
-/// validating that the file's current length equals the delta's `base_len`
-/// (else the chain is out of order / mismatched). Atomic temp + rename.
-///
-/// Validates: exactly one base (`sequence == 0`) first, then contiguous
-/// `sequence` values sharing one `chain_id`.
 pub fn restore_chain(
     archives: &[PathBuf],
     out_dir: &Path,
@@ -618,7 +438,6 @@ pub fn restore_chain(
         return Err(BackupError::Format("no archives given to restore".to_string()));
     }
 
-    // Read all headers up front to validate the chain before touching disk.
     let headers: Vec<ArchiveHeader> = archives
         .iter()
         .map(|p| read_header(p))
@@ -670,7 +489,6 @@ pub fn restore_chain(
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent)?;
             }
-            // Validate the running file length matches the delta's assumed base.
             let current_len = fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
             if entry.base_len != current_len {
                 return Err(BackupError::Format(format!(
@@ -679,7 +497,6 @@ pub fn restore_chain(
                 )));
             }
             let want = entry.len - entry.base_len;
-            // base_len == 0 truncates+creates; base_len > 0 appends the tail.
             let mut out = BufWriter::new(
                 fs::OpenOptions::new()
                     .create(true)
@@ -700,11 +517,8 @@ pub fn restore_chain(
         }
     }
 
-    // The last header's models describe the final restored state.
     let final_models = headers.last().unwrap().models.clone();
 
-    // Swap into place atomically. Remove the prior dir only after the temp tree
-    // is fully materialized.
     if out_dir.exists() {
         fs::remove_dir_all(out_dir)?;
     } else if let Some(parent) = out_dir.parent()
@@ -721,7 +535,6 @@ pub fn restore_chain(
     })
 }
 
-/// Read the header of an archive without materializing it — for `verify`/`list`.
 pub fn read_header(archive_path: &Path) -> Result<ArchiveHeader> {
     let mut reader = BufReader::new(File::open(archive_path)?);
     let mut magic = [0u8; 8];
@@ -739,14 +552,8 @@ pub fn read_header(archive_path: &Path) -> Result<ArchiveHeader> {
     Ok(serde_json::from_slice(&header_bytes)?)
 }
 
-/// Copy the byte range `[start, end)` of `src` into `out`; returns bytes copied
-/// (less than `end - start` only if the source is shorter than expected). A
-/// full archive passes `start == 0`; an incremental passes `start == base_len`
-/// to ship only the appended tail.
 fn copy_range(src: &Path, start: u64, end: u64, out: &mut impl Write) -> Result<u64> {
     if end <= start {
-        // Nothing appended for this file in this archive (or a 0-row column with
-        // no file on disk yet).
         return Ok(0);
     }
     let mut f = File::open(src)?;
@@ -757,16 +564,12 @@ fn copy_range(src: &Path, start: u64, end: u64, out: &mut impl Write) -> Result<
     Ok(io::copy(&mut limited, out)?)
 }
 
-/// Append a suffix to a path's final component (`foo` + `.tmp` → `foo.tmp`).
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(suffix);
     PathBuf::from(s)
 }
 
-/// Re-read each dir's current `compaction_epoch` and return the first one that
-/// differs from the epoch captured at plan time — the signal that compaction
-/// rewrote files under the copy. `(dir, before, after)`; `None` if all stable.
 fn changed_epoch(data_dir: &Path, models: &[ModelMeta]) -> Option<(String, u64, u64)> {
     for meta in models {
         let manifest_path = data_dir.join(&meta.dir).join("manifest.json");
@@ -818,10 +621,8 @@ mod tests {
             row_count: 0,
         }];
 
-        // Stable epoch → no change detected.
         assert!(changed_epoch(data, &models).is_none());
 
-        // Simulate compaction bumping the epoch after plan time.
         write_manifest(&data.join("user"), 5);
         let hit = changed_epoch(data, &models).expect("epoch change must be detected");
         assert_eq!(hit, ("user".to_string(), 4, 5));

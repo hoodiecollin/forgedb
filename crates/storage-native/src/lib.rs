@@ -1,141 +1,3 @@
-//! ForgeDB Storage Engine
-//!
-//! High-performance columnar storage engine for ForgeDB with positional I/O reads,
-//! WAL integration, and tombstone-based deletion tracking.
-//!
-//! # Overview
-//!
-//! `forgedb-storage` is the core storage engine for ForgeDB, implementing a columnar storage
-//! architecture optimized for both read and write performance. The crate provides:
-//!
-//! - **Columnar storage format** - Fixed-size and variable-length columns stored separately
-//! - **Positional I/O reads** - Concurrent-safe reads via `pread(2)`-style positional I/O
-//!   (`FileExt::read_exact_at`) that avoids touching the shared file cursor; multiple `&self`
-//!   readers on the same column can execute concurrently without synchronisation
-//! - **Seek-based writes** - Append methods seek to end-of-file before writing, taking `&mut self`
-//!   for exclusive ownership during the seek + write sequence
-//! - **WAL integration** - Write-Ahead Log support for ACID properties and crash recovery
-//! - **Tombstone tracking** - Efficient soft-delete mechanism without data movement
-//! - **Type-safe API** - Strong typing for columns and database operations
-//!
-//! # Architecture
-//!
-//! ## Columnar Storage Format
-//!
-//! The storage engine uses a columnar layout where each column is stored in separate files:
-//!
-//! ```text
-//! data/
-//! ├── manifest.json              # Database metadata
-//! ├── tombstones.bin            # Deletion bitmap
-//! ├── fixed/
-//! │   └── u64_0.bin            # Fixed-size column (8 bytes per row)
-//! └── variable/
-//!     ├── string_data_0.bin    # Variable-length data
-//!     └── string_offsets_0.bin # (offset, length) pairs
-//! ```
-//!
-//! ## Fixed-Size vs Variable-Length Columns
-//!
-//! **Fixed-Size Columns** (u64, i64, f64, uuid):
-//! - Storage: `fixed/{type}_{index}.bin`
-//! - Layout: Sequential values with no overhead
-//! - Access: O(1) random access via `offset = index * value_size`
-//!
-//! **Variable-Length Columns** (strings):
-//! - Data file: `variable/string_data_{index}.bin` (append-only)
-//! - Offsets file: `variable/string_offsets_{index}.bin` (offset, length pairs)
-//! - Access: O(1) random access (read offset pair, then read string)
-//!
-//! ## Tombstone Bitmap
-//!
-//! Deletions are tracked using a tombstone bitmap:
-//! - Storage: `tombstones.bin` (1 byte per row)
-//! - Format: 0 = active, 1 = deleted
-//! - Benefits: No data movement, fast deletes, preserves row IDs
-//!
-//! # Examples
-//!
-//! ## Describing a model's physical layout (`Manifest`)
-//!
-//! Generated code owns the directory layout and drives the column types directly;
-//! the schema-blind [`Manifest`] records the physical layout (read by backup /
-//! the inspector), persisted next to the column files.
-//!
-//! ```rust,no_run
-//! use forgedb_storage_native::{Manifest, ColumnMetadata, ColumnType};
-//! use std::path::PathBuf;
-//!
-//! let manifest = Manifest {
-//!     schema_version: 1,
-//!     engine_version: 1,
-//!     row_count: 42,
-//!     columns: vec![
-//!         ColumnMetadata { name: "id".to_string(), column_type: ColumnType::U64, column_index: 0, ..Default::default() },
-//!         ColumnMetadata { name: "email".to_string(), column_type: ColumnType::String, column_index: 1, ..Default::default() },
-//!     ],
-//!     wal_enabled: false,
-//!     last_checkpoint: 0,
-//!     compaction_epoch: 0,
-//!     row_anchor: None,
-//!     auto_sequences: Default::default(),
-//! };
-//! manifest.save_to(&PathBuf::from("./mydb/manifest.json"))?;
-//! let reopened = Manifest::load_from(&PathBuf::from("./mydb/manifest.json"))?;
-//! assert_eq!(reopened.row_count, 42);
-//! # Ok::<(), std::io::Error>(())
-//! ```
-//!
-//! ## Working with Columns
-//!
-//! ```rust,no_run
-//! use forgedb_storage_native::FixedColumn;
-//! use std::path::PathBuf;
-//!
-//! // Fixed-size column
-//! let mut id_column = FixedColumn::new(PathBuf::from("./data/fixed/u64_0.bin"), 8)?;
-//! id_column.append_u64(1001)?;
-//! let id = id_column.read_u64(0)?;  // &self — concurrent reads are safe
-//! assert_eq!(id, 1001);
-//! id_column.flush()?;  // explicit fsync before a checkpoint or close
-//! # Ok::<(), std::io::Error>(())
-//! ```
-//!
-//! # Durability Model
-//!
-//! Column files (`FixedColumn`, `VariableColumn`, `Tombstones`) **do not fsync on every append**.
-//! Appended bytes are visible to subsequent reads via the OS page cache, but a crash before an
-//! explicit [`FixedColumn::flush`] / [`VariableColumn::flush`] / [`Tombstones::flush`] call can
-//! lose the most recent appends from those files.
-//!
-//! The **WAL is the crash-durability boundary**: all mutations should be recorded in the WAL
-//! (via [`WalManager`]) before being applied to the column files. On recovery, the WAL is replayed
-//! into the columnar materialization. Call `flush()` at commit / checkpoint boundaries to durably
-//! persist the column files.
-//!
-//! # Public API
-//!
-//! ## Core Types
-//!
-//! - [`Manifest`] - Physical-layout metadata stored in manifest.json
-//! - [`FixedColumn`] - Storage for fixed-size column data
-//! - [`VariableColumn`] - Storage for variable-length column data
-//! - [`Tombstones`] - Deletion tracking bitmap
-//!
-//! ## WAL Re-exports
-//!
-//! Types from [`forgedb-wal`](../forgedb_wal) for convenience:
-//! - [`FsyncPolicy`] - Controls when WAL is fsynced to disk
-//! - [`WalEntry`] - A framed opaque-bytes entry (model tag + `Raw` payload)
-//! - [`WalManager`] - High-level WAL interface
-//! - [`WalOperation`] - The `Raw { payload }` operation variant
-//!
-//! # Related Crates
-//!
-//! - [`forgedb-wal`](../forgedb_wal) - Write-Ahead Log for durability
-//! - [`forgedb-compaction`](../forgedb_compaction) - Background compaction for space reclamation
-
-// WAL re-exports (schema-agnostic substrate surface only)
 pub use forgedb_wal::{FsyncPolicy, WalEntry, WalManager, WalOperation};
 
 mod dir_lock;
@@ -146,21 +8,9 @@ use std::io::{self, IoSlice, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
-/// Push a file's dirty page-cache pages to the storage device **without** a
-/// device-cache barrier (#153 — single-barrier checkpoint).
-///
-/// On macOS, `File::sync_all`/`sync_data` both map to `fcntl(F_FULLFSYNC)` — an
-/// expensive device barrier (~3.5 ms). `libc::fsync` is the *cheap* flush
-/// (~27 µs) that only pushes the file's data into the drive's (volatile) write
-/// cache; a single [`device_barrier`] afterward flushes that whole cache to
-/// permanent media, covering **every** file `fsync`ed this way on the same
-/// device. So a checkpoint of N columns costs N cheap fsyncs + ONE barrier
-/// instead of N barriers. On non-macOS, `sync_data` (fdatasync) is the cheapest
-/// available durable flush.
 #[cfg(target_os = "macos")]
 fn fsync_to_drive(file: &File) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
-    // SAFETY: `file` is a live, open descriptor for the duration of the call.
     if unsafe { libc::fsync(file.as_raw_fd()) } == -1 {
         return Err(io::Error::last_os_error());
     }
@@ -172,15 +22,9 @@ fn fsync_to_drive(file: &File) -> io::Result<()> {
     file.sync_data()
 }
 
-/// Issue ONE device-cache barrier (#153). On macOS `fcntl(F_FULLFSYNC)` tells
-/// the drive to flush its entire write cache to permanent media — which makes
-/// durable every file previously handed to [`fsync_to_drive`] on the same
-/// device, so a checkpoint needs only one of these. On non-macOS, `sync_all` is
-/// the barrier.
 #[cfg(target_os = "macos")]
 fn device_barrier(file: &File) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
-    // SAFETY: `file` is a live, open descriptor for the duration of the call.
     if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } == -1 {
         return Err(io::Error::last_os_error());
     }
@@ -192,56 +36,18 @@ fn device_barrier(file: &File) -> io::Result<()> {
     file.sync_all()
 }
 
-/// Default schema serial for manifests written before the field existed.
-/// Old on-disk manifests deserialize as v1 (the original layout), not v0.
 fn default_schema_version() -> u32 {
     1
 }
 
-/// Default engine generation for every manifest written before #254 added the
-/// field: generation 1, the baseline. This is what makes the counter additive
-/// rather than a second format break.
 fn default_engine_version() -> u32 {
     1
 }
 
-/// Manifest stores metadata about the database
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Manifest {
-    /// The **app's** schema-migration serial: how many migrations from its own
-    /// `migrations/` lineage have been applied. Derived by
-    /// `MigrationLineage::current_schema_version`, baked into generated code as
-    /// `EXPECTED_SCHEMA_VERSION`, and compared by the generated `open()` guard,
-    /// which refuses a dir whose schema is not the one this binary was generated
-    /// from (#74 Phase 1). Lineage-sourced, never hand-edited.
-    ///
-    /// **The on-disk key stays `format_version` (#254).** Only the Rust name
-    /// changed, because the old one described the engine rather than the app.
-    /// A *different* vestigial `schema_version` key — hardcoded to `1` at every
-    /// write site, never incremented, never compared — used to occupy this name
-    /// on disk; it is deleted, and serde's unknown-key tolerance is what lets a
-    /// manifest still carrying it deserialize. Reading the wrong one of those two
-    /// is not a subtle bug: it would compare the open-guard against a constant.
     #[serde(rename = "format_version", default = "default_schema_version")]
     pub schema_version: u32,
-    /// ForgeDB's own **engine byte-format generation** (#254) — owned by the
-    /// released version line, not by the app. It covers both value
-    /// reinterpretation and physical layout, which is why it is not
-    /// `layout_version`.
-    ///
-    /// Orthogonal to `schema_version` above: a schema mismatch means *the app's
-    /// schema changed* and is fixed by the app's migration bin; an engine
-    /// mismatch means *ForgeDB changed* and is fixed by `forgedb migrate engine`.
-    /// Conflating them would send a user to regenerate a schema that is correct.
-    ///
-    /// Generations are assigned at merge order, not at design time — two format
-    /// changes in one cycle would otherwise both claim the same number and
-    /// whichever landed second would silently redefine the other's meaning.
-    ///
-    /// | gen | change |
-    /// |---|---|
-    /// | 1 | baseline — everything written before this field existed |
-    /// | 2 | timestamp values are microseconds, not seconds (#254) |
     #[serde(default = "default_engine_version")]
     pub engine_version: u32,
     pub row_count: usize,
@@ -250,72 +56,27 @@ pub struct Manifest {
     pub wal_enabled: bool,
     #[serde(default)]
     pub last_checkpoint: u64,
-    /// Generation counter bumped on every compaction. A byte-watermark
-    /// incremental backup (#57) is valid only within one epoch — compaction
-    /// rewrites files and shifts offsets, so crossing an epoch forces a fresh
-    /// full backup. Additive (`#[serde(default)]`) for on-disk back-compat.
     #[serde(default)]
     pub compaction_epoch: u64,
-    /// On-disk layout format version, so a schema-blind reader (backup #57,
-    /// inspector #63) can refuse mismatched bytes instead of misreading them.
-    /// Which file's length authoritatively counts committed rows, and how many
-    /// bytes it spends per row. For a model this is `tombstones.bin` (1 byte/row,
-    /// appended last per insert); for an M2M junction it is `fixed/right.bin`
-    /// (16 bytes/row, appended last per link). A schema-blind reader derives the
-    /// committed row count as `len(anchor) / bytes_per_row` — the live watermark,
-    /// independent of the (possibly stale) `row_count` field above. `None` on
-    /// legacy manifests ⇒ fall back to `tombstones.bin`.
     #[serde(default)]
     pub row_anchor: Option<RowAnchor>,
-    /// Per-field allocation high-water marks, as an **opaque** `name -> highest
-    /// value handed out` map (#187).
-    ///
-    /// The substrate neither parses these keys nor branches on them: it stores
-    /// and returns strings and integers. Which fields appear, what the numbers
-    /// mean, and every read and write of them belong to generated code — the
-    /// same class of layout metadata as `compaction_epoch`.
-    ///
-    /// It exists because a rescan alone cannot survive compaction: compaction
-    /// physically drops dead rows, so a post-compaction reopen derives a *lower*
-    /// maximum than was actually issued and hands the same value out twice. The
-    /// contract is a **floor, not a source of truth** — a reader takes
-    /// `max(persisted, scanned)`, so a crash that loses the tip falls back to the
-    /// scan, which is always safe. That is what buys durability without an fsync
-    /// per allocation.
-    ///
-    /// `BTreeMap` (not `HashMap`) so the serialized JSON is byte-stable across
-    /// writes. Additive (`#[serde(default)]`) for on-disk back-compat.
     #[serde(default)]
     pub auto_sequences: std::collections::BTreeMap<String, u64>,
 }
 
-/// Physical descriptor of the file whose length counts committed rows.
-/// Layout fact only — names a file and a per-row byte stride, never a schema
-/// semantic. See [`Manifest::row_anchor`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RowAnchor {
-    /// Anchor file path relative to the model/junction directory.
     pub relative_path: String,
-    /// Bytes the anchor file spends per committed row (`1` for tombstones,
-    /// `16` for a junction's uuid `right` column).
     pub bytes_per_row: usize,
 }
 
 impl Manifest {
-    /// Load a manifest from an explicit path (e.g. a per-model
-    /// `<model>/manifest.json`). Used by
-    /// schema-blind ops tooling — `forgedb-backup` (#57), the inspector (#63) —
-    /// that reads layout metadata for one model directory.
     pub fn load_from(path: &std::path::Path) -> io::Result<Manifest> {
         let content = fs::read_to_string(path)?;
         serde_json::from_str(&content)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
-    /// Atomically write this manifest to `path` via temp-file + `fsync` +
-    /// `rename`. A crash mid-write leaves the intact previous manifest rather
-    /// than a truncated/garbage one that would fail to parse on the next open.
-    /// The temp file is `<path>.tmp`.
     pub fn save_to(&self, path: &std::path::Path) -> io::Result<()> {
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -341,9 +102,6 @@ impl Manifest {
     }
 }
 
-/// Whether a column is fixed-width (positional I/O) or variable-length
-/// (offset-indexed data file). Physical-layout fact only — never a schema
-/// semantic. Lets a schema-blind reader bound each file without guessing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ColumnKind {
     #[default]
@@ -356,19 +114,10 @@ pub struct ColumnMetadata {
     pub name: String,
     pub column_type: ColumnType,
     pub column_index: usize,
-    /// Bytes per row for a fixed column; `0` for a variable column (its width
-    /// lives in the offsets file). Lets backup compute a fixed column's exact
-    /// committed length as `row_count * value_size` without guessing.
     #[serde(default)]
     pub value_size: usize,
-    /// Fixed vs. variable — selects how a reader bounds the column's files.
     #[serde(default)]
     pub kind: ColumnKind,
-    /// Column file path relative to the model directory (e.g.
-    /// `fixed/u32_0.bin` or `variable/string_data_1.bin`). For a variable
-    /// column this is the data file; the offsets file is the same path with
-    /// `_data.bin` → `_offsets.bin` (the storage-layout convention `stats.rs`
-    /// already relies on).
     #[serde(default)]
     pub relative_path: String,
 }
@@ -385,103 +134,36 @@ pub enum ColumnType {
     Uuid,
     Timestamp,
     String,
-    /// Fixed-size byte array (for char(N), structs, fixed arrays)
     FixedBytes(usize),
 }
 
-/// A read snapshot: an immutable row-count watermark captured at a point in time.
-///
-/// This is the substrate primitive behind lock-free snapshot-isolated reads
-/// (see the `mvcc-concurrency` proposal, Direction A). Because the storage
-/// engine is **append-only** — rows are only ever appended, never moved or
-/// mutated in place — a row's *position* is stable for its whole lifetime.
-/// So a single integer, the row count at capture time, fully defines a
-/// consistent view: exactly the rows whose index is below the watermark were
-/// committed when the snapshot was taken, and every one of them is still at the
-/// same index now.
-///
-/// A `Snapshot` carries **no** per-row version metadata and no reference to any
-/// column data — it is a bare `usize`. Readers pass it to `*_at` accessors,
-/// which clamp their scan to `visible(index)`. Rows appended after capture have
-/// `index >= watermark` and are therefore invisible, so concurrent writers
-/// cannot make a reader observe a torn or partial row.
-///
-/// It is schema-agnostic substrate: it knows nothing about any `.forge` model,
-/// only about row positions. Generated code composes per-model watermarks into
-/// its own snapshot struct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Snapshot {
     watermark: usize,
 }
 
 impl Snapshot {
-    /// Capture a snapshot at the given committed row count.
     pub fn new(row_count: usize) -> Self {
         Self {
             watermark: row_count,
         }
     }
 
-    /// The captured row count. Rows at index `0..watermark` are visible.
     pub fn watermark(&self) -> usize {
         self.watermark
     }
 
-    /// Whether the row at `index` was committed as of this snapshot.
     pub fn visible(&self, index: usize) -> bool {
         index < self.watermark
     }
 }
 
-/// Fixed-size column storage backed by a seek-based file.
-///
-/// # Durability
-///
-/// Append methods write to the OS page cache but do **not** call `fsync` per append.
-/// Data written by `append_*` is immediately readable (via `read_*`) on the same or
-/// any other file descriptor to the same file, but a crash before [`flush`](FixedColumn::flush)
-/// may lose the most recent appends. Call `flush()` at commit boundaries or before
-/// advancing the WAL checkpoint.
-/// The backing of one columnar export batch — the substrate half of the
-/// language bindings' Arrow / columnar-export path.
-///
-/// A columnar export hands the caller (generated FFI glue) a single contiguous,
-/// stable-pointer byte buffer for one column at one live-row selection. This
-/// type owns that buffer through *whichever* of the two production paths
-/// produced it, behind an identical `as_ptr()` / `len()` surface so the consumer
-/// (e.g. an Arrow `ArrowArray`) is **alias-or-gather transparent**:
-///
-/// - [`ColumnExport::Mapped`] — a **zero-copy `mmap` alias** of the column
-///   file's dense prefix, taken when the live selection is exactly the
-///   contiguous prefix `[0, n)` (no updates, no tombstones). No bytes are
-///   copied; the pointer aliases the page cache directly. Because numeric
-///   columns are stored little-endian (`to_le_bytes`), the mapped prefix *is* a
-///   valid Arrow primitive buffer as-is.
-/// - [`ColumnExport::Owned`] — a gathered contiguous copy (`FixedColumn::gather`),
-///   the fallback whenever the selection is not an aliasable dense prefix
-///   (update-heavy or tombstoned tables), or is empty.
-///
-/// # Safety / aliasing invariant (`Mapped`)
-///
-/// The mapped prefix aliases live file pages, so it relies on the same
-/// single-writer, append-only discipline the reader handles already assume:
-/// prefix rows `[0, n)` are committed and immutable (appends only ever extend
-/// past `n`, never rewrite mapped bytes), and a compaction/rollback that would
-/// renumber or truncate below `n` does not run while an export is outstanding
-/// (exports are synchronous reads taken on the single writer). Under that
-/// discipline the alias observes a stable snapshot.
 pub enum ColumnExport {
-    /// A gathered / copied contiguous buffer.
     Owned(Vec<u8>),
-    /// A zero-copy read-only `mmap` alias of the column file's dense prefix.
     Mapped(memmap2::Mmap),
 }
 
 impl ColumnExport {
-    /// Pointer to the first byte of the exported buffer. Stable across moving
-    /// the `ColumnExport` (both a `Vec`'s heap allocation and an `Mmap`'s mapped
-    /// address are independent of where the owner struct itself lives), so the
-    /// FFI layer can capture it, then move `self` into an owner box.
     #[must_use]
     pub fn as_ptr(&self) -> *const u8 {
         match self {
@@ -490,7 +172,6 @@ impl ColumnExport {
         }
     }
 
-    /// Total exported byte length (`live_rows * value_size`).
     #[must_use]
     pub fn len(&self) -> usize {
         match self {
@@ -504,7 +185,6 @@ impl ColumnExport {
         self.len() == 0
     }
 
-    /// The exported bytes as a slice.
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
         match self {
@@ -514,24 +194,12 @@ impl ColumnExport {
     }
 }
 
-/// An in-memory bulk-loaded selection of a [`FixedColumn`]'s rows (#168).
-///
-/// Produced by [`FixedColumn::gather_buffered`], it holds one column's selected
-/// rows as a single contiguous buffer (a zero-copy `mmap` alias of the dense
-/// prefix, or a gathered copy) and exposes the **same** positional
-/// `read_*` accessors as [`FixedColumn`], addressed by **slot** (`0..n` over the
-/// selection order) rather than physical row index.  Decoding one column of a
-/// scan from this buffer costs no syscalls; it lets the generated column scan
-/// decode with the identical per-field logic it uses for per-row reads.
-///
-/// Errors mirror [`FixedColumn`]: an out-of-range slot returns `InvalidInput`.
 pub struct BufferedFixedColumn {
     buf: ColumnExport,
     value_size: usize,
 }
 
 impl BufferedFixedColumn {
-    /// Number of buffered slots (`indices.len()` from the gather).
     #[must_use]
     pub fn len(&self) -> usize {
         self.buf.len() / self.value_size
@@ -542,7 +210,6 @@ impl BufferedFixedColumn {
         self.len() == 0
     }
 
-    /// The `value_size`-wide bytes at `slot`, or `InvalidInput` if out of range.
     fn slot_bytes(&self, slot: usize) -> io::Result<&[u8]> {
         let start = slot * self.value_size;
         let end = start + self.value_size;
@@ -591,72 +258,30 @@ impl BufferedFixedColumn {
         Ok(i64::from_le_bytes(b[..8].try_into().unwrap()))
     }
 
-    /// The whole `value_size`-wide value at `slot` (for char(N) / struct /
-    /// fixed-array / nullable / optional-FK columns decoded via `read_unaligned`).
     pub fn read_bytes(&self, slot: usize) -> io::Result<Vec<u8>> {
         Ok(self.slot_bytes(slot)?.to_vec())
     }
 
-    /// The whole `value_size`-wide slot at `slot`, **borrowed** (#238).
-    ///
-    /// The zero-copy counterpart of [`Self::read_bytes`], which is exactly this
-    /// plus a `.to_vec()`; both stay, because a caller that wants an owned buffer
-    /// should not have to write the copy itself.
-    ///
-    /// Borrowing is sound here and nowhere else on the fixed path: this type owns
-    /// its bytes (a gathered `Vec` or an `Mmap` alias of the dense prefix), so the
-    /// `&self` lifetime is the buffer's. [`FixedColumn`] and [`FixedColumnReader`]
-    /// read through the file on every access and have nothing to lend — the same
-    /// split that put [`BufferedVariableColumn::read_str`] on the buffered tier
-    /// only (#224).
     pub fn read_slice(&self, slot: usize) -> io::Result<&[u8]> {
         self.slot_bytes(slot)
     }
 
-    /// The whole `value_size`-wide slot at `slot` as UTF-8, **borrowed** (#238).
-    ///
-    /// For a column where the slot *is* the value and carries no framing:
-    /// `string(N!)` (#238 res 6 — exactly N ASCII characters, therefore exactly N
-    /// bytes, therefore no length prefix), and any other fixed UTF-8 payload.
-    ///
-    /// It deliberately does **not** understand a length prefix. Which slots carry
-    /// one, and how wide it is, is #238's per-declaration layout choice; teaching
-    /// it to a schema-agnostic crate would move generated knowledge into the
-    /// substrate. Prefixed slots read through [`Self::read_slice`] and decode in
-    /// generated code.
-    ///
-    /// # Errors
-    ///
-    /// `InvalidInput` if the slot is out of range; `InvalidData` if the slot's
-    /// bytes are not valid UTF-8 — same contract as
-    /// [`BufferedVariableColumn::read_str`].
     pub fn read_str(&self, slot: usize) -> io::Result<&str> {
         std::str::from_utf8(self.slot_bytes(slot)?)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 }
 
-/// Selection size at or above which [`FixedColumn::gather`] maps the spanned
-/// region once and copies out of memory, instead of issuing one `read_exact_at`
-/// per index (#221).
-///
-/// Below this a handful of `pread`s beats a mapping's setup + teardown; above
-/// it the per-row syscall loop dominates completely — a 22-column scan of
-/// 10 000 live rows was 220 000 syscalls (~112 ms) before #221. Deliberately
-/// conservative rather than tuned: the point is to leave tiny gathers exactly
-/// as they were while removing the per-row syscall from bulk scans.
 const GATHER_MMAP_MIN_ROWS: usize = 8;
 
 pub struct FixedColumn {
     file: File,
     row_count: usize,
-    value_size: usize, // bytes per value
+    value_size: usize,
 }
 
 impl FixedColumn {
     pub fn new(path: PathBuf, value_size: usize) -> io::Result<Self> {
-        // A zero value_size would divide-by-zero when deriving row_count below,
-        // and makes every offset computation meaningless.
         if value_size == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -664,7 +289,6 @@ impl FixedColumn {
             ));
         }
 
-        // Create parent directory if needed
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -853,7 +477,6 @@ impl FixedColumn {
         Ok(i64::from_le_bytes(buf))
     }
 
-    /// Append arbitrary bytes for complex fixed-size types (char arrays, structs, fixed arrays)
     pub fn append_bytes(&mut self, value: &[u8]) -> io::Result<()> {
         if value.len() != self.value_size {
             return Err(io::Error::new(
@@ -868,7 +491,6 @@ impl FixedColumn {
         Ok(())
     }
 
-    /// Read arbitrary bytes for complex fixed-size types (char arrays, structs, fixed arrays)
     pub fn read_bytes(&self, index: usize) -> io::Result<Vec<u8>> {
         if index >= self.row_count {
             return Err(io::Error::new(
@@ -883,50 +505,11 @@ impl FixedColumn {
         Ok(buf)
     }
 
-    /// Copy the physical rows at `indices` into one contiguous owned buffer, in
-    /// the order given (`indices.len() * value_size` bytes).
-    ///
-    /// This is the class-1 columnar-read primitive behind the language bindings'
-    /// Arrow / columnar-export **gather** path — the fallback taken whenever the
-    /// live selection is *not* an aliasable dense prefix (update-heavy or
-    /// tombstoned tables) and a contiguous copy of exactly the live rows is
-    /// needed. It is schema-agnostic: `indices` are opaque physical row
-    /// positions the caller computed (generated code derives the live set from
-    /// `id_to_row` + tombstone liveness, exactly as `all()` / `all_at()` do
-    /// today); `gather` never reads a field name, type, or schema.
-    ///
-    /// # Performance (#221)
-    ///
-    /// For a selection of at least [`GATHER_MMAP_MIN_ROWS`] rows this maps the
-    /// spanned region `[min(indices), max(indices)]` **once** and copies out of
-    /// that mapping in contiguous runs, rather than issuing one `read_exact_at`
-    /// per index. Live selections under append-only churn are long runs broken
-    /// by the holes superseded rows leave behind, so runs are typically far
-    /// longer than one row and the copy collapses to a handful of `memcpy`s.
-    ///
-    /// The mapping is held only for the duration of the call and the returned
-    /// buffer is owned, so this relies on a strictly weaker form of the
-    /// aliasing invariant documented on [`ColumnExport`]: the spanned rows are
-    /// committed (`< row_count`, so within the file's length) and no concurrent
-    /// truncation runs, which the single-writer discipline already guarantees.
-    ///
-    /// Known-unmeasured case: a *sparse* selection spanning a very large file
-    /// faults in one page per isolated row, reading more bytes than the
-    /// per-row path would. It still trades syscalls for faults plus readahead,
-    /// and real live sets stay dense (amplification is bounded by the generated
-    /// compaction ceiling), but it has not been benchmarked.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err(InvalidInput)` if any index is `>= self.len()`.
     pub fn gather(&self, indices: &[usize]) -> io::Result<Vec<u8>> {
         if indices.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Bounds-check the whole selection up front: the mapped path spans
-        // `min..=max`, so an out-of-range index has to be rejected before the
-        // span is computed (and `gather` is all-or-nothing either way).
         let mut lo = usize::MAX;
         let mut hi = 0usize;
         for &index in indices {
@@ -945,8 +528,6 @@ impl FixedColumn {
         if indices.len() >= GATHER_MMAP_MIN_ROWS {
             let offset = (lo * self.value_size) as u64;
             let map_len = (hi + 1 - lo) * self.value_size;
-            // A failed mapping is not fatal — the per-row loop below produces
-            // byte-identical output — so fall through instead of propagating.
             let mapped = unsafe {
                 memmap2::MmapOptions::new()
                     .offset(offset)
@@ -957,7 +538,6 @@ impl FixedColumn {
                 let src = &mmap[..];
                 let mut slot = 0usize;
                 while slot < indices.len() {
-                    // Extend the run while the selection stays consecutive.
                     let start = slot;
                     while slot + 1 < indices.len() && indices[slot + 1] == indices[slot] + 1 {
                         slot += 1;
@@ -981,34 +561,12 @@ impl FixedColumn {
         Ok(out)
     }
 
-    /// Export the physical rows at `indices` as a [`ColumnExport`], taking the
-    /// **zero-copy `mmap` alias** fast path when `indices` is the contiguous
-    /// dense prefix `[0, n)` and falling back to [`gather`](Self::gather)
-    /// (an owned copy) otherwise. The returned buffer is identical bytes either
-    /// way (`indices.len() * value_size`), so the FFI / Arrow consumer is
-    /// alias-or-gather transparent.
-    ///
-    /// This is the class-1 columnar-read primitive the language bindings' Arrow
-    /// export links: `indices` are opaque physical row positions the caller
-    /// (generated code) computed from the live set; `export` reads no field
-    /// name, type, or schema — it only inspects the indices' shape to decide
-    /// whether they alias a prefix.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err(InvalidInput)` if any index is `>= self.len()`, or an I/O
-    /// error if the `mmap` of the aliasable prefix fails.
     pub fn export(&self, indices: &[usize]) -> io::Result<ColumnExport> {
         let n = indices.len();
-        // A dense prefix is `indices == [0, 1, ..., n-1]`, entirely within the
-        // committed rows. Empty selections take the trivial owned path.
         let is_dense_prefix =
             n > 0 && n <= self.row_count && indices.iter().enumerate().all(|(i, &x)| x == i);
 
         if is_dense_prefix {
-            // Alias exactly the first `n * value_size` bytes of the column file
-            // — no copy. Safe under the single-writer/append-only invariant
-            // documented on `ColumnExport`.
             let map_len = n * self.value_size;
             let mmap = unsafe { memmap2::MmapOptions::new().len(map_len).map(&self.file)? };
             return Ok(ColumnExport::Mapped(mmap));
@@ -1017,24 +575,6 @@ impl FixedColumn {
         Ok(ColumnExport::Owned(self.gather(indices)?))
     }
 
-    /// Bulk-load the physical rows at `indices` into an in-memory
-    /// [`BufferedFixedColumn`] whose positional `read_*(slot)` accessors read
-    /// from memory instead of the file (#168 column scan).
-    ///
-    /// This is the class-1 read primitive behind the generated column-pruned
-    /// sequential scan: a scan over `n` rows pays **one** bulk read per column
-    /// (a zero-copy `mmap` alias when `indices` is the dense prefix `[0, n)` — the
-    /// common append-only case — or a single gathered copy otherwise) rather than
-    /// `n` per-row `read_exact_at` syscalls.  `indices` are opaque physical row
-    /// positions the caller (generated code) computed from the live set; the
-    /// returned buffer's `read_*` methods take a **slot** `0..indices.len()`
-    /// indexing into that selection, in the given order.  Reads no field name,
-    /// type, or schema.
-    ///
-    /// # Errors
-    ///
-    /// Propagates [`export`](Self::export)'s errors (out-of-bounds index or a
-    /// failed `mmap`).
     pub fn gather_buffered(&self, indices: &[usize]) -> io::Result<BufferedFixedColumn> {
         Ok(BufferedFixedColumn {
             buf: self.export(indices)?,
@@ -1042,26 +582,14 @@ impl FixedColumn {
         })
     }
 
-    /// Flush all pending writes to disk (fsync).
-    ///
-    /// This is the explicit durability checkpoint: after `flush()` returns `Ok(())`,
-    /// all previous appends are guaranteed to survive a crash. Call this at transaction
-    /// commit boundaries or before advancing the WAL checkpoint.
     pub fn flush(&mut self) -> io::Result<()> {
         self.file.sync_all()
     }
 
-    /// Push this column's data to the drive cache **without** a device barrier
-    /// (#153).  Pair with a single [`FixedColumn::barrier`] (on any column of the
-    /// same device) to make a whole checkpoint's columns durable with ONE
-    /// barrier instead of N.  See [`fsync_to_drive`].
     pub fn sync_to_drive(&self) -> io::Result<()> {
         fsync_to_drive(&self.file)
     }
 
-    /// Issue the single device-cache barrier for a checkpoint (#153): flushes the
-    /// drive's write cache to permanent media, making durable every column
-    /// previously `sync_to_drive`d on the same device.  See [`device_barrier`].
     pub fn barrier(&self) -> io::Result<()> {
         device_barrier(&self.file)
     }
@@ -1076,33 +604,11 @@ impl FixedColumn {
         self.row_count == 0
     }
 
-    /// Refresh the in-memory `row_count` from the on-disk file length (#84).
-    ///
-    /// Reads `read_exact_at` the file positionally, bounded by `row_count`.  For
-    /// the Tier 3 multi-process writer path a *peer* process may have appended
-    /// values since this handle opened; `sync_from_disk` re-derives `row_count`
-    /// from the shared file so the peer's committed rows become readable (paired
-    /// with `Tombstones::sync_from_disk` and `VariableColumn::sync_from_disk`).
-    /// A no-op for the single-writer path, which maintains `row_count` in memory.
     pub fn sync_from_disk(&mut self) -> io::Result<()> {
         self.row_count = self.file.metadata()?.len() as usize / self.value_size;
         Ok(())
     }
 
-    /// Truncate the column to hold exactly `rows` rows, discarding everything
-    /// after that point.
-    ///
-    /// This is the crash-recovery primitive: after replaying a WAL, generated
-    /// code calls `truncate_to_rows` on every column to realign them back to the
-    /// last consistent row watermark before resuming appends.  Any partial
-    /// trailing value left by a torn write is physically removed so the next
-    /// `append_*` lands at exactly row `rows`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err(InvalidInput)` if `rows > self.len()` — truncation cannot
-    /// extend a column.  All other errors come from the underlying `set_len`
-    /// syscall.
     pub fn truncate_to_rows(&mut self, rows: usize) -> io::Result<()> {
         if rows > self.row_count {
             return Err(io::Error::new(
@@ -1115,11 +621,6 @@ impl FixedColumn {
         Ok(())
     }
 
-    /// Open a read-only, positionally-reading view over this column's file
-    /// (#56 Direction B).  The returned [`FixedColumnReader`] shares the file
-    /// via an independent (`try_clone`d) descriptor, so a single `&mut self`
-    /// writer can keep appending while many `&self` readers read concurrently
-    /// without a lock.  See [`FixedColumnReader`] for the full model.
     pub fn reader(&self) -> io::Result<FixedColumnReader> {
         Ok(FixedColumnReader {
             file: self.file.try_clone()?,
@@ -1128,24 +629,9 @@ impl FixedColumn {
     }
 }
 
-/// An in-memory bulk-loaded selection of a [`VariableColumn`]'s rows (#168).
-///
-/// Produced by [`VariableColumn::gather_buffered`]; holds the column's data
-/// bytes plus each selected slot's `(absolute offset, length)` so `read_string`
-/// slices from memory without a syscall.  The variable-column peer of
-/// [`BufferedFixedColumn`]: same `read_string` name as [`VariableColumn`],
-/// addressed by **slot** (`0..n` over the selection order).
 pub struct BufferedVariableColumn {
-    /// The spanned data region — a lazily-paged `mmap` alias when it is large
-    /// enough to be worth mapping, an owned copy otherwise (#222).
     data: ColumnExport,
-    /// File offset `data` starts at, so the absolute offsets in `slots` can be
-    /// rebased onto it. Zero when the whole region is buffered, and zero on the
-    /// sparse path (#228), where `data` is packed and `slots` already index into it.
     base: u64,
-    // (offset, byte length) per slot, in selection order. The offset is absolute in
-    // the data FILE on the spanned path and relative to `data` on the packed sparse
-    // path — `base` is what reconciles them, so `read_str` needs no branch.
     slots: Vec<(u64, u64)>,
 }
 
@@ -1160,26 +646,10 @@ impl BufferedVariableColumn {
         self.slots.is_empty()
     }
 
-    /// The slot's value **borrowed from the buffered span** — no allocation, no
-    /// copy (#224).
-    ///
-    /// #222 made the span an `mmap` alias of the data region, so a scan already
-    /// holds every live string's bytes; this is the read that stops copying them
-    /// back out. The borrow is tied to `&self` and the mapping is owned by `self`,
-    /// so the compiler guarantees the `&str` cannot outlive the pages it points at
-    /// — a *tighter* constraint than the type already operates under, not a new
-    /// aliasing exposure.
-    ///
-    /// UTF-8 is validated on every read (cheap next to the allocation it replaces)
-    /// so an on-disk corruption surfaces as [`io::ErrorKind::InvalidData`] rather
-    /// than as an unchecked `&str`.
     pub fn read_str(&self, slot: usize) -> io::Result<&str> {
         let &(offset, length) = self.slots.get(slot).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "Slot out of bounds")
         })?;
-        // Slots carry absolute file offsets; `base` is where the buffered span
-        // starts. Touching a mapped page here is what pulls it in — dead versions
-        // between live rows are never addressed, so they are never read.
         let start = offset.saturating_sub(self.base) as usize;
         let end = start + length as usize;
         let bytes = self.data.as_slice().get(start..end).ok_or_else(|| {
@@ -1188,50 +658,13 @@ impl BufferedVariableColumn {
         std::str::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
-    /// The slot's value as an owned `String`. Kept for callers that genuinely need
-    /// ownership; it is [`read_str`](Self::read_str) plus the copy, so there is one
-    /// decode path and the two can never disagree.
     pub fn read_string(&self, slot: usize) -> io::Result<String> {
         self.read_str(slot).map(str::to_owned)
     }
 }
 
-/// Variable-length column storage (for strings).
-///
-/// Stores data in an append-only data file plus a separate offset index file.
-///
-/// # Durability
-///
-/// Append methods write to the OS page cache but do **not** call `fsync` per append.
-/// Call [`flush`](VariableColumn::flush) at commit boundaries to guarantee durability.
-/// Spanned-data-region size at or above which [`VariableColumn::gather_buffered`]
-/// maps rather than reads (#222).
-///
-/// Below this the span is small enough that a single bounded read costs less than a
-/// mapping's setup and teardown; above it, mapping is what keeps dead versions inside
-/// the span from being paid for — untouched pages are never faulted in. Conservative
-/// rather than tuned; the shape of the win does not depend on the exact crossover.
 const VAR_MMAP_MIN_BYTES: usize = 64 * 1024;
 
-/// Selection sparsity at which [`VariableColumn::gather_buffered`] reads each
-/// offsets entry on its own instead of the whole spanned slice (#228).
-///
-/// The spanned read is one syscall for `span_rows * 16` bytes; the per-index read
-/// is `n` syscalls of 16 bytes. The former wins while the selection is dense, and
-/// loses badly once it is not: a two-row selection at opposite ends of a 20 000-row
-/// column read 320 KB of offsets per column to use 32 bytes of it.
-///
-/// That shape is not hypothetical — it is what an index-pushdown candidate set
-/// looks like. Since #228 unified the pushdown arm on the buffered scan, a handful
-/// of scattered candidates reach here directly, and before this branch existed the
-/// pushdown measured **5x slower** than the per-row positional decode it replaced.
-///
-/// The crossover is where `n` syscalls cost what the spanned read costs, which on
-/// a warm page cache lands near `span_rows ≈ 190n`. `128` sits just under that:
-/// conservative toward the spanned read (better locality, and it is the path the
-/// dense common case takes), while still catching every sparse case by a wide
-/// margin. The exact value is not load-bearing — the two costs differ by orders of
-/// magnitude on either side of it, not by a few percent.
 const SPARSE_OFFSETS_SPAN_FACTOR: usize = 128;
 
 pub struct VariableColumn {
@@ -1243,7 +676,6 @@ pub struct VariableColumn {
 
 impl VariableColumn {
     pub fn new(data_path: PathBuf, offsets_path: PathBuf) -> io::Result<Self> {
-        // Create parent directories
         if let Some(parent) = data_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -1263,7 +695,7 @@ impl VariableColumn {
             .open(&offsets_path)?;
 
         let current_data_offset = data_file.metadata()?.len();
-        let row_count = offsets_file.metadata()?.len() as usize / 16; // 16 bytes per (offset, length)
+        let row_count = offsets_file.metadata()?.len() as usize / 16;
 
         Ok(VariableColumn {
             data_file,
@@ -1277,11 +709,9 @@ impl VariableColumn {
         let bytes = value.as_bytes();
         let length = bytes.len() as u64;
 
-        // Write data to data file
         self.data_file.seek(SeekFrom::End(0))?;
         self.data_file.write_all(bytes)?;
 
-        // Write (offset, length) to offsets file
         self.offsets_file.seek(SeekFrom::End(0))?;
         self.offsets_file
             .write_all(&self.current_data_offset.to_le_bytes())?;
@@ -1293,28 +723,6 @@ impl VariableColumn {
         Ok(())
     }
 
-    /// Append a single tag byte followed by `value`'s bytes, as one row (#231).
-    ///
-    /// Exactly equivalent to `append_string(&format!("{tag_char}{value}"))` for any
-    /// `tag` that is a valid single-byte UTF-8 scalar, but without materializing
-    /// the concatenation: the tag and the value are written from their own slices
-    /// in one vectored write, so a tagged append costs no allocation and no copy
-    /// of the value.
-    ///
-    /// This is the write-side sibling of [`BufferedVariableColumn::read_str`]
-    /// (#224) and it is schema-agnostic in exactly the same way — it knows nothing
-    /// about what the tag *means*. Generated code uses it for the 1-byte presence
-    /// tag on nullable `string`/`json` columns (`0x00` = None, `0x01` = Some), but
-    /// the column stores opaque bytes either way.
-    ///
-    /// # Note on UTF-8
-    ///
-    /// The stored row is only valid UTF-8 — and so only readable by
-    /// [`read_string`](VariableColumn::read_string) — when `tag < 0x80`. Tags at or
-    /// above `0x80` produce a leading continuation/lead byte with nothing to
-    /// complete it. The column itself is byte-oriented and will store them
-    /// faithfully; it is the caller's job to keep tags in the ASCII range if the
-    /// row must round-trip as a `String`.
     pub fn append_tagged(&mut self, tag: u8, value: &str) -> io::Result<()> {
         let bytes = value.as_bytes();
         let length = bytes.len() as u64 + 1;
@@ -1334,8 +742,6 @@ impl VariableColumn {
             IoSlice::advance_slices(&mut slices, written);
         }
 
-        // One 16-byte write rather than two, matching the (offset, length) pair
-        // layout `append_string` produces.
         let mut entry = [0u8; 16];
         entry[..8].copy_from_slice(&self.current_data_offset.to_le_bytes());
         entry[8..].copy_from_slice(&length.to_le_bytes());
@@ -1356,7 +762,6 @@ impl VariableColumn {
             ));
         }
 
-        // Read offset and length from offsets file using positional I/O
         let offsets_pos = (index * 16) as u64;
         let mut offset_buf = [0u8; 8];
         let mut length_buf = [0u8; 8];
@@ -1367,57 +772,12 @@ impl VariableColumn {
         let offset = u64::from_le_bytes(offset_buf);
         let length = u64::from_le_bytes(length_buf);
 
-        // Read data from data file using positional I/O
         let mut data = vec![0u8; length as usize];
         self.data_file.read_exact_at(&mut data, offset)?;
 
         String::from_utf8(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
-    /// Bulk-load the rows at `indices` into an in-memory
-    /// [`BufferedVariableColumn`] whose `read_string(slot)` reads from memory
-    /// (#168 column scan).
-    ///
-    /// Reads only the **spanned** slice of the offsets index and maps only the
-    /// **spanned** data region, so a scan over `n` variable rows pays one bounded
-    /// read plus one mapping rather than `3n` per-row `read_exact_at` syscalls
-    /// (offset + length + data). `indices` are opaque physical row positions;
-    /// reads no schema.
-    ///
-    /// # Performance (#222)
-    ///
-    /// This used to read the **entire** committed offsets index and the **entire**
-    /// data region into owned buffers on every call, ignoring `indices` — dead
-    /// versions included. That made a scan cost `~A x live_bytes`, a slope in
-    /// amplification rather than the fixed columns' step, and it was measured as
-    /// exactly that: at 2 000 live rows the narrow scan went 563 µs -> 5.8 ms
-    /// across A = 1 -> 16, doubling with each doubling of A.
-    ///
-    /// Both reads are now bounded to `[min(indices), max(indices)]`. Append order
-    /// makes data offsets monotonic in row index, so that row span maps to one
-    /// contiguous byte span. The data span is **mapped** rather than read when it
-    /// is large enough to be worth it, which is what removes the slope: dead
-    /// versions inside the span cost address space, not I/O, because only pages
-    /// actually addressed by `read_string` are ever faulted in.
-    ///
-    /// The residual cost is page granularity — a live row drags in its whole page,
-    /// including any dead bytes sharing it — so the win depends on how clustered
-    /// the live set is. Append-only helps here: an updated row is re-appended at
-    /// the tail, so churn tends to concentrate live rows rather than scatter them.
-    ///
-    /// # Sparse selections (#228)
-    ///
-    /// Bounding to the span is the wrong trade when the selection is a handful of
-    /// rows scattered across the column — the offsets read is then almost entirely
-    /// rows nobody asked for. Below [`SPARSE_OFFSETS_SPAN_FACTOR`] density the
-    /// offsets are read per index instead. This mirrors what
-    /// [`FixedColumn::gather`] already does via `GATHER_MMAP_MIN_ROWS`; the data
-    /// region still maps by span, which costs address space rather than I/O.
-    ///
-    /// # Errors
-    ///
-    /// `InvalidInput` if any index is `>= self.len()`; other errors come from the
-    /// underlying reads.
     pub fn gather_buffered(&self, indices: &[usize]) -> io::Result<BufferedVariableColumn> {
         if indices.is_empty() {
             return Ok(BufferedVariableColumn {
@@ -1427,7 +787,6 @@ impl VariableColumn {
             });
         }
 
-        // Bounds-check the whole selection first, and take the row span.
         let mut lo = usize::MAX;
         let mut hi = 0usize;
         for &index in indices {
@@ -1441,16 +800,10 @@ impl VariableColumn {
             hi = hi.max(index);
         }
 
-        // A few rows scattered across the column: bounding to the span would read
-        // almost entirely rows nobody asked for, and map a data region orders of
-        // magnitude larger than the bytes wanted.  Gather them individually
-        // instead (#228 — see `SPARSE_OFFSETS_SPAN_FACTOR`).
         if hi + 1 - lo > indices.len().saturating_mul(SPARSE_OFFSETS_SPAN_FACTOR) {
             return self.gather_sparse(indices);
         }
 
-        // Only the spanned slice of the offsets index (16 bytes/row), not all
-        // `row_count` rows.
         let mut offsets = vec![0u8; (hi + 1 - lo) * 16];
         self.offsets_file
             .read_exact_at(&mut offsets, (lo * 16) as u64)?;
@@ -1467,7 +820,6 @@ impl VariableColumn {
             slots.push((offset, length));
         }
 
-        // Every selected row empty (or a zero-length span) — nothing to map.
         if data_hi <= data_lo {
             return Ok(BufferedVariableColumn {
                 data: ColumnExport::Owned(Vec::new()),
@@ -1478,8 +830,6 @@ impl VariableColumn {
 
         let span = (data_hi - data_lo) as usize;
         let data = if span >= VAR_MMAP_MIN_BYTES {
-            // A failed mapping is not fatal — the bounded read below yields the
-            // same bytes — so fall through rather than propagate.
             let mapped = unsafe {
                 memmap2::MmapOptions::new()
                     .offset(data_lo)
@@ -1503,27 +853,6 @@ impl VariableColumn {
         Ok(BufferedVariableColumn { data, base: data_lo, slots })
     }
 
-    /// The sparse-selection arm of [`gather_buffered`](Self::gather_buffered)
-    /// (#228): read each selected row's offsets entry and bytes individually, into
-    /// one **packed** buffer holding only the rows asked for.
-    ///
-    /// The spanned arm is the right shape when the selection covers most of its
-    /// span — one bounded offsets read, and a data region whose dead versions cost
-    /// address space rather than I/O because only addressed pages fault in. It is
-    /// the wrong shape when a handful of rows are scattered across the whole
-    /// column: the offsets read is then almost all rows nobody wants, and the
-    /// mapping's setup and teardown are paid in full to reach a few hundred bytes.
-    ///
-    /// That case is not hypothetical — it is what an index-pushdown candidate set
-    /// looks like, and since #228 those reach here directly instead of being
-    /// decoded per row. Measured on a 20 000-row column, two rows at opposite ends
-    /// cost 5x the per-row positional decode this replaced; packing them brings it
-    /// back to parity, while every denser selection keeps the spanned arm's win.
-    ///
-    /// The packed buffer means `slots` here hold **offsets into `data`**, not
-    /// absolute file offsets, with `base` 0 — the one place that distinction
-    /// exists. `read_str` computes `offset - base` either way, so it needs no
-    /// branch and cannot tell the two apart.
     fn gather_sparse(&self, indices: &[usize]) -> io::Result<BufferedVariableColumn> {
         let mut slots = Vec::with_capacity(indices.len());
         let mut data: Vec<u8> = Vec::new();
@@ -1547,24 +876,16 @@ impl VariableColumn {
         })
     }
 
-    /// Flush all pending writes to disk (fsync both data and offsets files).
-    ///
-    /// After `flush()` returns `Ok(())`, all previous appends are guaranteed to
-    /// survive a crash. Call at commit boundaries or before advancing the WAL checkpoint.
     pub fn flush(&mut self) -> io::Result<()> {
         self.data_file.sync_all()?;
         self.offsets_file.sync_all()
     }
 
-    /// Push both backing files to the drive cache without a device barrier
-    /// (#153).  Pair with one [`VariableColumn::barrier`] per checkpoint.
     pub fn sync_to_drive(&self) -> io::Result<()> {
         fsync_to_drive(&self.data_file)?;
         fsync_to_drive(&self.offsets_file)
     }
 
-    /// Issue the single device-cache barrier for a checkpoint (#153).  Barriers
-    /// are device-wide, so one call on the data file covers the offsets file too.
     pub fn barrier(&self) -> io::Result<()> {
         device_barrier(&self.data_file)
     }
@@ -1579,31 +900,12 @@ impl VariableColumn {
         self.row_count == 0
     }
 
-    /// Refresh the in-memory counters from the on-disk file lengths (#84).
-    ///
-    /// Re-derives `row_count` from the offsets file (16 bytes/row) and
-    /// `current_data_offset` from the data file, so a *peer* process's appended
-    /// rows (Tier 3 multi-process writer path) become readable through this
-    /// handle.  Paired with `FixedColumn::sync_from_disk` /
-    /// `Tombstones::sync_from_disk`.  A no-op for the single-writer path.
     pub fn sync_from_disk(&mut self) -> io::Result<()> {
         self.row_count = self.offsets_file.metadata()?.len() as usize / 16;
         self.current_data_offset = self.data_file.metadata()?.len();
         Ok(())
     }
 
-    /// Truncate the column to hold exactly `rows` rows, discarding everything
-    /// after that point.
-    ///
-    /// The data file is cut at the byte immediately after the last byte of row
-    /// `rows - 1` (read from the offsets entry for that row).  The offsets file
-    /// is cut to `rows * 16` bytes.  Both in-memory counters are updated so the
-    /// next `append_string` lands at exactly row `rows`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err(InvalidInput)` if `rows > self.len()`.  All other errors
-    /// come from underlying I/O or `set_len` syscalls.
     pub fn truncate_to_rows(&mut self, rows: usize) -> io::Result<()> {
         if rows > self.row_count {
             return Err(io::Error::new(
@@ -1615,7 +917,6 @@ impl VariableColumn {
         let data_len: u64 = if rows == 0 {
             0
         } else {
-            // Positionally read the (offset, length) pair for row `rows - 1`.
             let offsets_pos = ((rows - 1) * 16) as u64;
             let mut offset_buf = [0u8; 8];
             let mut length_buf = [0u8; 8];
@@ -1635,11 +936,6 @@ impl VariableColumn {
         Ok(())
     }
 
-    /// Open a read-only, positionally-reading view over this column's data +
-    /// offsets files (#56 Direction B).  The returned [`VariableColumnReader`]
-    /// shares both files via independent (`try_clone`d) descriptors, so a single
-    /// `&mut self` writer can keep appending while many `&self` readers read
-    /// concurrently without a lock.  See [`FixedColumnReader`] for the model.
     pub fn reader(&self) -> io::Result<VariableColumnReader> {
         Ok(VariableColumnReader {
             data_file: self.data_file.try_clone()?,
@@ -1648,12 +944,6 @@ impl VariableColumn {
     }
 }
 
-/// Tombstone bitmap for tracking deleted records.
-///
-/// # Durability
-///
-/// Append methods write to the OS page cache but do **not** call `fsync` per append.
-/// Call [`flush`](Tombstones::flush) at commit boundaries to guarantee durability.
 pub struct Tombstones {
     file: File,
     count: usize,
@@ -1697,12 +987,6 @@ impl Tombstones {
         Ok(buf[0] != 0)
     }
 
-    /// Return the subset of `rows` that are **not** tombstoned, preserving order
-    /// (#168 scan filter).  Reads the whole tombstone column **once** rather than
-    /// a per-row [`is_deleted`](Self::is_deleted) syscall — the bulk liveness
-    /// filter a column scan applies to its live-row selection.  A row index past
-    /// the committed count is treated as not-live (dropped), matching
-    /// `is_deleted(..).unwrap_or(true)`.
     pub fn live_indices(&self, rows: &[usize]) -> io::Result<Vec<usize>> {
         let mut bytes = vec![0u8; self.count];
         if !bytes.is_empty() {
@@ -1715,20 +999,14 @@ impl Tombstones {
             .collect())
     }
 
-    /// Flush all pending writes to disk (fsync).
-    ///
-    /// After `flush()` returns `Ok(())`, all previous appends are guaranteed to
-    /// survive a crash. Call at commit boundaries or before advancing the WAL checkpoint.
     pub fn flush(&mut self) -> io::Result<()> {
         self.file.sync_all()
     }
 
-    /// Push the tombstone column to the drive cache without a barrier (#153).
     pub fn sync_to_drive(&self) -> io::Result<()> {
         fsync_to_drive(&self.file)
     }
 
-    /// Issue the single device-cache barrier for a checkpoint (#153).
     pub fn barrier(&self) -> io::Result<()> {
         device_barrier(&self.file)
     }
@@ -1743,13 +1021,6 @@ impl Tombstones {
         self.count == 0
     }
 
-    /// Truncate the tombstone bitmap to hold exactly `rows` rows, discarding
-    /// everything after that point.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err(InvalidInput)` if `rows > self.len()`.  All other errors
-    /// come from the underlying `set_len` syscall.
     pub fn truncate_to_rows(&mut self, rows: usize) -> io::Result<()> {
         if rows > self.count {
             return Err(io::Error::new(
@@ -1762,25 +1033,11 @@ impl Tombstones {
         Ok(())
     }
 
-    /// Re-read the on-disk tombstone count from the file metadata and update the
-    /// cached `count`.
-    ///
-    /// Normally `count` is maintained in memory by `append`/`truncate_to_rows`, so
-    /// this is a no-op for the single-writer path.  For the Tier 3 multi-process
-    /// writer path (#84) a peer process may have appended tombstone bytes since this
-    /// writer opened the file; calling `sync_from_disk` before `len()` lets the
-    /// writer see the peer's committed rows without reopening the storage.
-    ///
-    /// # Errors
-    ///
-    /// Propagates any error from `file.metadata()`.
     pub fn sync_from_disk(&mut self) -> io::Result<()> {
         self.count = self.file.metadata()?.len() as usize;
         Ok(())
     }
 
-    /// Open a read-only, positionally-reading view over this tombstone file
-    /// (#56 Direction B).  See [`FixedColumn::reader`] for the concurrency model.
     pub fn reader(&self) -> io::Result<TombstonesReader> {
         Ok(TombstonesReader {
             file: self.file.try_clone()?,
@@ -1788,13 +1045,6 @@ impl Tombstones {
     }
 }
 
-/// Map a positional read that ran past end-of-file back to the same
-/// out-of-bounds error the cached-count writer columns return (#56 Direction B).
-///
-/// A [`FixedColumnReader`] / [`VariableColumnReader`] / [`TombstonesReader`]
-/// derives length live rather than caching a row count, so an index beyond the
-/// committed prefix surfaces as `UnexpectedEof` from `read_exact_at`; normalize
-/// it to `InvalidInput` for parity with the writer's explicit bound check.
 fn map_out_of_bounds(e: io::Error) -> io::Error {
     if e.kind() == io::ErrorKind::UnexpectedEof {
         io::Error::new(io::ErrorKind::InvalidInput, "Index out of bounds")
@@ -1803,28 +1053,6 @@ fn map_out_of_bounds(e: io::Error) -> io::Error {
     }
 }
 
-/// Read-only, positional view over a [`FixedColumn`]'s backing file
-/// (#56 Direction B — single writer, many concurrent readers).
-///
-/// Created by [`FixedColumn::reader`]; holds an independent file descriptor
-/// (`try_clone`) to the **same** file as the writer.  A single `&mut self`
-/// writer can keep appending while any number of `&self` readers positionally
-/// read the committed prefix concurrently, with no lock:
-///
-/// - Reads use `read_exact_at` (positional `pread`) — they never touch a shared
-///   file cursor, so they are safe against a concurrent seek-based append and
-///   against each other across threads.
-/// - The engine is append-only: bytes at an already-committed offset never move,
-///   so a reader observing an offset below the writer's committed length reads
-///   stable bytes (POSIX page-cache coherence makes the writer's not-yet-fsync'd
-///   appends visible through this independent fd).
-/// - Length is derived **live** on every access (never a cached count), so a
-///   reader created before an append still sees rows the writer commits
-///   afterward — once the caller's watermark admits them.
-///
-/// Callers clamp reads to a captured watermark (the row-count anchor); because
-/// the anchor column is appended last per row, a row within the watermark has
-/// all its columns fully written, so a reader never observes a torn row.
 pub struct FixedColumnReader {
     file: File,
     value_size: usize,
@@ -1917,8 +1145,6 @@ impl FixedColumnReader {
     }
 }
 
-/// Read-only, positional view over a [`VariableColumn`]'s data + offsets files
-/// (#56 Direction B).  See [`FixedColumnReader`] for the concurrency model.
 pub struct VariableColumnReader {
     data_file: File,
     offsets_file: File,
@@ -1959,8 +1185,6 @@ impl VariableColumnReader {
     }
 }
 
-/// Read-only, positional view over a [`Tombstones`] file (#56 Direction B).
-/// See [`FixedColumnReader`] for the concurrency model.
 pub struct TombstonesReader {
     file: File,
 }

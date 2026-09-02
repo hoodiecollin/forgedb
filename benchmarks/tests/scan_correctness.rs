@@ -1,18 +1,3 @@
-//! #168 correctness: the generated bulk-buffered narrow scan must return exactly
-//! the same live records — with byte-identical decoded values — as the
-//! authoritative per-id read path (`all()` / `get()`), under insert + update +
-//! delete churn and across a string (variable) column plus fixed columns.
-//!
-//! Since #228 that scan is a **scope**, `__with_scan(sel, keep, f)`, handing `f` a
-//! `Vec<PostScanRef<'_>>` that borrows the column buffers; the owned `__scan_all()`
-//! this test was written against no longer exists. The values compared are the
-//! same, so the guard is unchanged — the refs are just copied out inside the scope.
-//!
-//! The scan drops the per-row tombstone check (it pre-filters the live set via
-//! one bulk `Tombstones::live_indices`) and decodes from bulk-loaded column
-//! buffers instead of per-row reads — this guards that neither shortcut changes
-//! the result versus the trusted decoder.
-
 use forgedb_benchmarks::forgedb_generated::{Database, Post, User};
 use forgedb_types::Timestamp;
 use std::collections::BTreeMap;
@@ -31,7 +16,7 @@ fn user(i: u128) -> User {
 fn post(i: u128, author: Uuid) -> Post {
     Post {
         id: Uuid::from_u128(0xB000_0000_0000_0000_0000_0000_0000_0000 + i),
-        title: format!("title \u{2713} {i}"), // includes a multibyte char
+        title: format!("title \u{2713} {i}"),
         views: (i as u64) * 7,
         published: i % 2 == 0,
         author,
@@ -40,8 +25,6 @@ fn post(i: u128, author: Uuid) -> Post {
     }
 }
 
-/// Ground truth: the live scan fields keyed by id, built from the per-id read
-/// path (`all()` returns full records via `get`, which honors tombstones).
 fn ground_truth(db: &Database) -> BTreeMap<Uuid, (String, u64, bool, i64)> {
     db.post
         .all()
@@ -50,9 +33,6 @@ fn ground_truth(db: &Database) -> BTreeMap<Uuid, (String, u64, bool, i64)> {
         .collect()
 }
 
-/// The same map, but decoded through the bulk-buffered scan scope `__with_scan()`.
-/// `keep` is `|_| true` (no filter) and the map is built INSIDE the scope, because a
-/// `PostScanRef` borrows the scan's column buffers and cannot outlive it.
 fn from_scan(db: &Database) -> BTreeMap<Uuid, (String, u64, bool, i64)> {
     db.post.__with_scan(
         None,
@@ -70,8 +50,6 @@ fn from_scan(db: &Database) -> BTreeMap<Uuid, (String, u64, bool, i64)> {
     )
 }
 
-/// The projected (views, published) columns keyed by id, from the per-id read
-/// path — ground truth for the column-pruned `all_agg()` scan.
 fn ground_truth_agg(db: &Database) -> BTreeMap<Uuid, (u64, bool)> {
     db.post
         .all()
@@ -80,10 +58,6 @@ fn ground_truth_agg(db: &Database) -> BTreeMap<Uuid, (u64, bool)> {
         .collect()
 }
 
-/// The same, but decoded through the projected buffered scan `all_agg()` (#113 +
-/// #168 column-pruning): it bulk-loads ONLY the `views`/`published` columns and
-/// never touches `title`, so this guards that the pruned decode is value-identical
-/// to the full read path under the same churn.
 fn from_agg_scan(db: &Database) -> BTreeMap<Uuid, (u64, bool)> {
     db.post
         .all_agg()
@@ -101,7 +75,6 @@ fn buffered_scan_matches_per_row_reads_under_churn() {
     let author_id = author.id;
     db.user.insert(author).expect("insert user");
 
-    // Insert 500 posts.
     let mut ids = Vec::new();
     for i in 0..500u128 {
         let p = post(i, author_id);
@@ -112,8 +85,6 @@ fn buffered_scan_matches_per_row_reads_under_churn() {
     assert_eq!(from_scan(&db).len(), 500);
     assert_eq!(ground_truth_agg(&db), from_agg_scan(&db), "projected agg scan after inserts");
 
-    // Update every 3rd post (superseding-version append → the old physical row
-    // is superseded; the scan must decode the NEW values, not the stale row).
     for (i, id) in ids.iter().enumerate() {
         if i % 3 == 0 {
             let mut p = post(i as u128, author_id);
@@ -126,8 +97,6 @@ fn buffered_scan_matches_per_row_reads_under_churn() {
     assert_eq!(ground_truth(&db), from_scan(&db), "after updates");
     assert_eq!(ground_truth_agg(&db), from_agg_scan(&db), "projected agg scan after updates");
 
-    // Delete every 5th post (tombstoned superseding version → id_to_row still
-    // points at the tombstoned row; live_indices must exclude it).
     let mut deleted = 0;
     for (i, id) in ids.iter().enumerate() {
         if i % 5 == 0 {
@@ -141,9 +110,6 @@ fn buffered_scan_matches_per_row_reads_under_churn() {
     let gt_agg = ground_truth_agg(&db);
     assert_eq!(gt_agg, from_agg_scan(&db), "projected agg scan after deletes");
 
-    // Reopen (rebuilds id_to_row/tombstones from disk) and re-verify — the scan
-    // over a reopened dir (columns faulted from files, non-dense live set after
-    // churn) still matches.
     drop(db);
     let db = Database::open_at(dir.path().to_path_buf());
     assert_eq!(gt, from_scan(&db), "after reopen");

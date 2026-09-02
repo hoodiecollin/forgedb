@@ -16,11 +16,9 @@ fn test_new_pagination() {
 
 #[test]
 fn test_new_pagination_clamps_limit() {
-    // Too high
     let p = Pagination::new(2000, 0);
     assert_eq!(p.limit, MAX_LIMIT);
 
-    // Too low
     let p = Pagination::new(0, 0);
     assert_eq!(p.limit, 1);
 }

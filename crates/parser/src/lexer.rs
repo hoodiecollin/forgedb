@@ -1,20 +1,15 @@
-// Re-export Position from validation crate for consistency
 pub use forgedb_validation::Position;
 
-/// Token with position information
 #[derive(Debug, Clone, PartialEq)]
 pub struct TokenWithPos {
     pub token: Token,
     pub position: Position,
 }
 
-/// Token types for the schema language
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
-    // Identifiers and literals
     Ident(String),
 
-    // Types
     TypeU32,
     TypeU64,
     TypeI32,
@@ -24,60 +19,36 @@ pub enum Token {
     TypeString,
     TypeUuid,
     TypeTimestamp,
-    TypeJson,    // json - variable-length column typed serde_json::Value
-    TypeDecimal, // decimal - fixed 16-byte column typed rust_decimal::Decimal
-    /// The deprecated spelling of `bytes(N)` (#233).
-    ///
-    /// There is deliberately **no** `TypeBytes` counterpart: `bytes` is a
-    /// *contextual* keyword, lexed as an ordinary [`Token::Ident`] and recognized
-    /// as the type only in type position followed by `(` (see
-    /// `Parser::at_bytes_type`). `char` stays a reserved word because it always
-    /// was one. Both spellings produce `FieldType::Bytes(N)` — identical AST,
-    /// identical generated Rust (`[u8; N]`), identical column layout and wire form.
-    TypeCharDeprecated, // char(N)
+    TypeJson,
+    TypeDecimal,
+    TypeCharDeprecated,
 
-    // Keywords
-    KwStruct, // struct
-    KwEnum,   // enum
+    KwStruct,
+    KwEnum,
 
-    // Symbols
-    Plus,        // +
-    Ampersand,   // &
-    Caret,       // ^
-    Colon,       // :
-    LBrace,      // {
-    RBrace,      // }
-    LBracket,    // [
-    RBracket,    // ]
-    Asterisk,    // *
-    Question,    // ?
-    /// `!` — the *exactly N* marker inside an inline string width, `string(26!)`
-    /// (#238 res 2). Claimed by that one production and nothing else, so a `!`
-    /// anywhere else is a positioned parse error rather than a skipped character.
-    ///
-    /// New in #238. `!` had no lexer arm before, so no existing schema can
-    /// contain one — the token is purely additive.
-    Bang,        // !
-    At,          // @
-    LParen,      // (
-    RParen,      // )
-    Comma,       // ,
-    Semicolon,   // ;
-    Slash,       // /
-    Gt,          // >  (exclusive lower bound, `@min(>0)` — #239)
-    Lt,          // <  (exclusive upper bound, `@max(<1)` — #239)
-    Number(i64), // Integral numeric literal (may be negative — #239)
-    /// Fractional numeric literal, carried as its **verbatim source lexeme**
-    /// (e.g. `"0.01"`, `"-273.15"`) — #239.
-    ///
-    /// Deliberately not parsed here. Converting to `f64` at lex time would round
-    /// the value before anything knows the target type, which is inherent for an
-    /// `f64` field but defeats the entire point of `decimal`. The lexeme is
-    /// exact, so codegen can pick the conversion once the field type is known.
+    Plus,
+    Ampersand,
+    Caret,
+    Colon,
+    LBrace,
+    RBrace,
+    LBracket,
+    RBracket,
+    Asterisk,
+    Question,
+    Bang,
+    At,
+    LParen,
+    RParen,
+    Comma,
+    Semicolon,
+    Slash,
+    Gt,
+    Lt,
+    Number(i64),
     Fractional(String),
-    Str(String), // String literal: "..." (directive arguments, e.g. @pattern("^[a-z]+$"))
+    Str(String),
 
-    // Whitespace and EOF
     Newline,
     Eof,
 }
@@ -87,9 +58,6 @@ pub struct Lexer {
     position: usize,
     pub line: usize,
     pub column: usize,
-    /// Start position of the most recently produced token, recorded *after*
-    /// leading whitespace/comments are skipped so positions point at the token
-    /// itself (not the preceding indentation).
     token_start: Position,
 }
 
@@ -112,10 +80,6 @@ impl Lexer {
         }
     }
 
-    /// The character after the cursor, without consuming anything.
-    ///
-    /// Needed for the two numeric lookaheads (#239): `-` only starts a number
-    /// when a digit follows, and `.` only continues one when a digit follows.
     fn peek_char(&self) -> Option<char> {
         self.input.get(self.position + 1).copied()
     }
@@ -145,12 +109,10 @@ impl Lexer {
     fn skip_whitespace_with_flag(&mut self) -> bool {
         let start_pos = self.position;
         self.skip_whitespace();
-        // Return true if we skipped any whitespace, or if we're at the start of a line
         self.position > start_pos || self.column == 1
     }
 
     fn skip_comment(&mut self) {
-        // Skip until end of line
         while let Some(ch) = self.current_char() {
             if ch == '\n' {
                 break;
@@ -172,19 +134,6 @@ impl Lexer {
         ident
     }
 
-    /// Read a numeric literal, returning [`Token::Number`] for an integral one and
-    /// [`Token::Fractional`] for one carrying a decimal point.
-    ///
-    /// Accepts an optional leading `-` (#239 gap 4: `celsius: i32 @min(-273)`
-    /// previously failed at the lexer, so a signed field could carry only a
-    /// non-negative bound).
-    ///
-    /// A fractional literal keeps its **verbatim lexeme** rather than being parsed.
-    /// The old body built exactly this string and then discarded it on
-    /// `parse::<i64>()`; that parse was the single lossy step. Deferring the
-    /// conversion to codegen — where the target type is known — is what lets a
-    /// `decimal` bound stay exact while an `f64` bound rounds only into its own
-    /// domain. See [`Token::Fractional`].
     fn read_number(&mut self) -> Result<Token, String> {
         let mut lexeme = String::new();
         if self.current_char() == Some('-') {
@@ -199,8 +148,6 @@ impl Lexer {
                 break;
             }
         }
-        // A '.' belongs to the number only when a digit follows it, so a trailing
-        // dot is left for whatever grammar owns it rather than swallowed here.
         if self.current_char() == Some('.')
             && self.peek_char().is_some_and(|c| c.is_ascii_digit())
         {
@@ -224,13 +171,10 @@ impl Lexer {
         })
     }
 
-    /// Read a double-quoted string literal, consuming the opening and closing quotes.
-    /// Supports the escapes `\"`, `\\`, `\n`, `\t`, `\r`. Called with the cursor on the
-    /// opening `"`.
     fn read_string(&mut self) -> Result<String, String> {
         let start_line = self.line;
         let start_column = self.column;
-        self.advance(); // consume opening quote
+        self.advance();
 
         let mut value = String::new();
         loop {
@@ -242,7 +186,7 @@ impl Lexer {
                     ));
                 }
                 Some('"') => {
-                    self.advance(); // consume closing quote
+                    self.advance();
                     return Ok(value);
                 }
                 Some('\\') => {
@@ -284,8 +228,6 @@ impl Lexer {
 
     pub fn next_token(&mut self) -> Result<Token, String> {
         let had_whitespace = self.skip_whitespace_with_flag();
-        // Record the token's true start (after skipping indentation/whitespace);
-        // comment recursion re-enters here and overwrites this with the real token.
         self.token_start = Position {
             line: self.line,
             column: self.column,
@@ -299,15 +241,11 @@ impl Lexer {
             }
             Some('/') => {
                 self.advance();
-                // Only treat // as a comment if there was preceding whitespace or we're at line start
-                // This allows tsx://path to work while preserving // comments
                 if self.current_char() == Some('/') && had_whitespace {
                     self.advance();
                     self.skip_comment();
-                    // After comment, get next token
                     self.next_token()
                 } else {
-                    // Single slash token (for component paths like tsx://path)
                     Ok(Token::Slash)
                 }
             }
@@ -387,12 +325,7 @@ impl Lexer {
                 self.advance();
                 Ok(Token::Lt)
             }
-            // `-` starts a number only when a digit follows; otherwise it stays an
-            // unexpected character, so a stray dash still fails loudly.
             Some('-') if self.peek_char().is_some_and(|c| c.is_ascii_digit()) => self.read_number(),
-            // `is_ascii_digit`, not `is_numeric`: the latter accepts Unicode digits
-            // like `٣`, which then fail in `parse::<i64>()` with a confusing
-            // "out of range" rather than an unexpected-character error.
             Some(ch) if ch.is_ascii_digit() => self.read_number(),
             Some(ch) if ch.is_alphabetic() || ch == '_' => {
                 let ident = self.read_identifier();
@@ -408,8 +341,6 @@ impl Lexer {
                     "timestamp" => Token::TypeTimestamp,
                     "json" => Token::TypeJson,
                     "decimal" => Token::TypeDecimal,
-                    // NOTE: "bytes" is deliberately absent — it is a contextual
-                    // keyword and lexes as `Token::Ident` (#233).
                     "char" => Token::TypeCharDeprecated,
                     "struct" => Token::KwStruct,
                     "enum" => Token::KwEnum,
@@ -477,7 +408,6 @@ mod tests {
 
     #[test]
     fn lexes_string_with_regex_metacharacters() {
-        // A regex that could never be a bare identifier — the whole point of the feature.
         assert_eq!(
             tokens("\"^[a-z]+$\""),
             vec![Token::Str("^[a-z]+$".to_string()), Token::Eof]
@@ -499,7 +429,6 @@ mod tests {
 
     #[test]
     fn string_literal_in_directive_context() {
-        // @pattern("^[0-9]+$")
         assert_eq!(
             tokens("@pattern(\"^[0-9]+$\")"),
             vec![
@@ -533,7 +462,6 @@ mod tests {
 
     #[test]
     fn double_slash_comment_still_works_after_string_support() {
-        // Guards the tsx://path vs // comment disambiguation is unaffected.
         assert_eq!(tokens("u32 // trailing comment"), vec![Token::TypeU32, Token::Eof]);
     }
 }

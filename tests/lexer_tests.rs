@@ -55,7 +55,7 @@ fn test_identifier() {
 
 #[test]
 fn test_multiline_schema() {
-    let input = "User\n{\nid\n:\n+ u64\n}"; // Space after + for TypeU64
+    let input = "User\n{\nid\n:\n+ u64\n}";
     let mut lexer = Lexer::new(input);
     let tokens = lexer.tokenize().unwrap();
     assert_eq!(
@@ -80,7 +80,7 @@ fn test_multiline_schema() {
 
 #[test]
 fn test_consecutive_symbols() {
-    let mut lexer = Lexer::new("+& u64"); // Space before u64 for TypeU64
+    let mut lexer = Lexer::new("+& u64");
     let tokens = lexer.tokenize().unwrap();
     assert_eq!(
         tokens,
@@ -90,7 +90,7 @@ fn test_consecutive_symbols() {
 
 #[test]
 fn test_mixed_whitespace() {
-    let mut lexer = Lexer::new("User\t{\n  id:\t+ u64\r\n}"); // Space after + for TypeU64
+    let mut lexer = Lexer::new("User\t{\n  id:\t+ u64\r\n}");
     let tokens = lexer.tokenize().unwrap();
     assert_eq!(
         tokens,
