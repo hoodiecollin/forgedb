@@ -157,8 +157,15 @@ comment-check:
 	@$(BUN) scripts/strip-comments.ts --check
 
 test:
+	$(MAKE) goguard
 	cargo test --workspace --no-fail-fast
 	cargo build --workspace --examples
+
+goguard:
+	cd tools/goguard && go build -o ../../target/goguard/goguard .
+
+goguard-check:
+	cd tools/goguard && gofmt -l . && go vet ./... && go test ./...
 
 test-ignored:
 	cargo test --workspace --no-fail-fast -- --ignored \

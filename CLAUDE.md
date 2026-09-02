@@ -48,6 +48,13 @@ rather than a generic runtime that interprets schemas? If either fails → rejec
 - `Cargo.lock` **is committed** (this is a CLI/binary workspace).
 - JS/TS tooling (vscode extension, inspector app, generated TS SDK): use **Bun**, not npm/node.
   TypeScript only, never plain JS.
+- **Go is REQUIRED to run the test suite** (#388). `tools/goguard` is a stdlib-only helper that
+  parses generated Go through `go/parser`, so the identity red line is asserted on an AST rather
+  than on five substrings a rename walks past. It is built on demand by `make test`. **A missing
+  toolchain is a hard test failure, never a skip** — a guard that skips reports green because it
+  never evaluated. `crates/source-guard` is the Rust half; it is `publish = false`, is the 19th
+  `crates/*` entry, and is deliberately excluded from the release ledger because it ships
+  nowhere.
 
 ## Build, test, run
 
@@ -510,7 +517,7 @@ gh issue list --label release-gate --state open      # any row ⇒ blocked
 ```
 
 **The release-gate issue MUST carry a versioned-asset ledger (§5.2).** Its body holds a table of
-**every** independently versioned asset in this repo — all 18 `crates/*` plus the root `forgedb`
+**every** independently versioned asset in this repo — all 18 *publishable* `crates/*` plus the root `forgedb`
 crate plus `apps/vscode-forgedb` — each row defaulting to **"no change"**, created when the
 milestone opens. **When a change touches one of those, set its row in the same pass that lands the
 change.** Deciding "does this need a bump?" with the change in front of you is reliable;

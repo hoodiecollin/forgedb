@@ -69,6 +69,41 @@ macro_rules! body_queries {
                 self.block.stmts.iter().position(pred)
             }
 
+            pub fn param_type(&self, name: &str) -> Option<String> {
+                self.sig.inputs.iter().find_map(|arg| match arg {
+                    syn::FnArg::Typed(pt) => match &*pt.pat {
+                        syn::Pat::Ident(id) if id.ident == name => {
+                            Some(crate::scope::render_type(&pt.ty))
+                        }
+                        _ => None,
+                    },
+                    syn::FnArg::Receiver(_) => None,
+                })
+            }
+
+            pub fn param_names(&self) -> Vec<String> {
+                self.sig
+                    .inputs
+                    .iter()
+                    .filter_map(|arg| match arg {
+                        syn::FnArg::Typed(pt) => match &*pt.pat {
+                            syn::Pat::Ident(id) => Some(id.ident.to_string()),
+                            _ => None,
+                        },
+                        syn::FnArg::Receiver(_) => Some("self".to_string()),
+                    })
+                    .collect()
+            }
+
+            pub fn body_text_because(&self, why: &str) -> String {
+                debug_assert!(
+                    !why.trim().is_empty(),
+                    "body_text_because needs a real reason, not an empty string"
+                );
+                use quote::ToTokens;
+                self.block.to_token_stream().to_string()
+            }
+
             pub fn origin(&self) -> &str {
                 &self.origin
             }
@@ -206,6 +241,24 @@ impl RustSource {
         }
     }
 
+    pub fn methods_named(&self, name: &str) -> Result<Vec<(String, MethodScope<'_>)>, ScopeError> {
+        let hits = self.methods_matching(|_, m| m.sig.ident == name);
+        if hits.is_empty() {
+            return Err(self.scope_error(format!("method `{name}`"), self.method_names()));
+        }
+        Ok(hits
+            .into_iter()
+            .map(|(owner, m)| {
+                let scope = MethodScope {
+                    sig: &m.sig,
+                    block: &m.block,
+                    origin: format!("{}::{owner}::{name}", self.origin()),
+                };
+                (owner, scope)
+            })
+            .collect())
+    }
+
     pub fn method_in(&self, ty: &str, name: &str) -> Result<MethodScope<'_>, ScopeError> {
         let hits = self.methods_matching(|imp, m| imp == ty && m.sig.ident == name);
 
@@ -255,6 +308,44 @@ impl RustSource {
         }
     }
 
+    pub fn struct_literal_field_inits(&self, name: &str) -> Result<Vec<String>, ScopeError> {
+        use quote::ToTokens;
+
+        struct Collect<'n> {
+            name: &'n str,
+            hits: Vec<String>,
+            seen: Vec<String>,
+        }
+        impl<'ast, 'n> syn::visit::Visit<'ast> for Collect<'n> {
+            fn visit_field_value(&mut self, node: &'ast syn::FieldValue) {
+                if let syn::Member::Named(id) = &node.member {
+                    self.seen.push(id.to_string());
+                    if id == self.name {
+                        self.hits
+                            .push(node.expr.to_token_stream().to_string().replace(" :: ", "::"));
+                    }
+                }
+                syn::visit::visit_field_value(self, node);
+            }
+        }
+
+        let mut c = Collect {
+            name,
+            hits: Vec::new(),
+            seen: Vec::new(),
+        };
+        syn::visit::visit_file(&mut c, self.ast());
+
+        if c.hits.is_empty() {
+            c.seen.sort();
+            c.seen.dedup();
+            return Err(self.scope_error(format!("struct-literal field `{name}`"), c.seen));
+        }
+        c.hits.sort();
+        c.hits.dedup();
+        Ok(c.hits)
+    }
+
     pub fn field_type(&self, struct_name: &str, field: &str) -> Result<String, ScopeError> {
         let s = self.struct_named(struct_name)?;
         let names: Vec<String> = s
@@ -297,7 +388,7 @@ impl RustSource {
     }
 }
 
-fn render_type(ty: &syn::Type) -> String {
+pub(crate) fn render_type(ty: &syn::Type) -> String {
     use quote::ToTokens;
     ty.to_token_stream()
         .to_string()

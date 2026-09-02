@@ -541,26 +541,32 @@ User {
     assert!(!db_code.contains("fn __rows_by_region("),
         "#160 C: a composite-only field is not a single-field pushdown");
 
-    let scan = &db_code[db_code.find("pub fn __with_scan<R>").unwrap()..];
-    let scan = &scan[..scan.find("fn __rows_by_").unwrap_or(scan.len())];
-    let scan_flat: String = scan.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(scan.contains("struct __UserScanBufs"),
+    let scan_src = RustSource::generated("database.rs", db_code.clone());
+    let scan_scope = scan_src
+        .method_named("__with_scan")
+        .expect("#168: the buffered scan scope is emitted");
+    let scan_flat = scan_scope.body_text_because(
+        "#168 asserts emitted SHAPE (a local struct decl, two storage type paths, a match \
+         arm); expressing those structurally is the next slice of #388, and the scope is \
+         already structural so it can no longer widen",
+    );
+    assert!(scan_flat.contains("struct __UserScanBufs"),
         "#168: local buffered-column holder emitted");
-    assert!(scan.contains(".gather_buffered(&__rows)"),
+    assert!(scan_scope.calls("gather_buffered"),
         "#168: each scan column is bulk-loaded once");
-    assert!(scan.contains("forgedb_storage::BufferedFixedColumn"),
+    assert!(scan_flat.contains("forgedb_storage :: BufferedFixedColumn"),
         "#168: fixed scan columns use the buffered fixed reader");
-    assert!(scan.contains("forgedb_storage::BufferedVariableColumn"),
+    assert!(scan_flat.contains("forgedb_storage :: BufferedVariableColumn"),
         "#168: string scan columns use the buffered variable reader");
-    assert!(scan_flat.contains("self.tombstones .live_indices(&__all)"),
-        "#168: deleted rows excluded by one bulk tombstone read.\nGot: {scan_flat}");
-    assert!(scan.contains("__all.sort_unstable()"),
+    assert!(scan_scope.calls("live_indices"),
+        "#168: deleted rows excluded by one bulk tombstone read");
+    assert!(scan_scope.calls("sort_unstable"),
         "#168: live rows iterated in physical (ascending) order");
-    assert!(scan_flat.contains("Some(mut __c) => { __c.sort_unstable(); __c }"),
+    assert!(scan_flat.contains("Some (mut __c) => { __c . sort_unstable () ; __c }"),
         "#228: a pushdown selection is sorted for span locality.\nGot: {scan_flat}");
-    assert!(scan.contains("for __slot in 0..__n"),
+    assert!(scan_flat.contains("for __slot in 0 .. __n"),
         "#168: buffered decode iterates slots");
-    assert!(scan.contains("f(&mut __refs)"),
+    assert!(scan_flat.contains("f (& mut __refs)"),
         "#228: the scope hands the borrowed views to the caller's callback");
 }
 
@@ -589,24 +595,31 @@ Metric {
     assert!(db_code.contains("pub fn find_by_price_range"), "#169: decimal range method");
     assert!(db_code.contains("pub fn find_by_at_range"), "#169: timestamp range method");
     assert!(db_code.contains("price_ordered"), "#169: decimal ordered index");
-    let price_range = &db_code[db_code.find("fn find_by_price_range").unwrap()..];
-    let price_range = &price_range[..price_range.find("__out\n").unwrap_or(price_range.len().min(1200))];
-    assert!(price_range.contains("normalize"),
-        "#169: decimal range bounds normalized to match the stored key");
+    let db_src = RustSource::generated("database.rs", db_code.clone());
+    assert!(
+        db_src
+            .method_named("find_by_price_range")
+            .expect("#169: decimal range method")
+            .calls("normalize"),
+        "#169: decimal range bounds normalized to match the stored key"
+    );
 
     assert!(db_code.contains("views_index"), "#169: hash index kept alongside (parallel, not replace)");
     assert!(db_code.contains("pub fn find_by_views"), "#169: exact-match probe still emitted");
 
     assert!(db_code.contains("ratio_ordered"), "#242: f64 gets an ordered index");
     assert!(db_code.contains("pub fn find_by_ratio_range"), "#242: f64 range method");
-    let ratio_range = &db_code[db_code.find("fn find_by_ratio_range").unwrap()..];
-    let ratio_range = &ratio_range[..ratio_range.find("__out\n").unwrap_or(ratio_range.len().min(1200))];
-    assert!(
-        ratio_range.contains("min : Option < f64 >") || ratio_range.contains("min: Option<f64>"),
-        "#242: the caller passes an f64 bound, never the encoded u64: {ratio_range}"
+    let ratio_range = db_src
+        .method_named("find_by_ratio_range")
+        .expect("#242: f64 range method");
+    assert_eq!(
+        ratio_range.param_type("min").as_deref(),
+        Some("Option<f64>"),
+        "#242: the caller passes an f64 bound, never the encoded u64; params: {:?}",
+        ratio_range.param_names()
     );
     assert!(
-        ratio_range.contains("__forgedb_f64_key"),
+        ratio_range.calls("__forgedb_f64_key"),
         "#242: the bound is encoded on the way in, so it is comparable to the stored key"
     );
 
@@ -5078,50 +5091,33 @@ Post {
         "transaction machinery must never match on a decoded field"
     );
 
-    fn bodies_of<'a>(code: &'a str, decl: &str) -> Vec<&'a str> {
-        let mut out = Vec::new();
-        let mut from = 0usize;
-        while let Some(rel) = code[from..].find(decl) {
-            let start = from + rel;
-            let tail = &code[start..];
-            let end = tail[1..]
-                .find("\n    pub fn ")
-                .map(|i| i + 1)
-                .unwrap_or_else(|| {
-                    panic!("#170: no following `pub fn` bounds `{decl}` at byte {start}")
-                });
-            out.push(&tail[..end]);
-            from = start + 1;
-        }
-        assert!(!out.is_empty(), "#170: `{decl}` is not emitted at all");
-        out
-    }
+    let wal_src = RustSource::generated("database.rs", code.clone());
 
-    let stage_bodies = bodies_of(&code, "fn __stage_append");
-    assert_eq!(
-        stage_bodies.len(),
-        2,
-        "#170: one __stage_append per model (User, Post)"
-    );
-    for (i, stage_body) in stage_bodies.iter().enumerate() {
+    let stages = wal_src
+        .methods_named("__stage_append")
+        .expect("#170: the staged-append path is emitted");
+    assert_eq!(stages.len(), 2, "one staged-append per model");
+    for (owner, stage) in &stages {
         assert!(
-            stage_body.contains(".write_buffered("),
-            "#170: __stage_append #{i} uses the buffered (no-fsync) WAL append"
+            stage.calls("write_buffered"),
+            "#170: {owner}::__stage_append uses the buffered (no-fsync) WAL append"
         );
         assert_eq!(
-            stage_body.matches(".write(&forgedb_wal::WalEntry").count(),
+            stage.call_count("write"),
             0,
-            "#170: __stage_append #{i} does NOT per-record fsync (no plain wal.write)"
+            "#170: {owner}::__stage_append does NOT per-record fsync (no plain wal.write)"
         );
     }
 
-    let insert_bodies = bodies_of(&code, "pub fn insert(");
-    assert_eq!(insert_bodies.len(), 2, "#170: one insert per model (User, Post)");
-    for (i, insert_body) in insert_bodies.iter().enumerate() {
+    let inserts = wal_src
+        .methods_named("insert")
+        .expect("#170: the committed insert path is emitted");
+    assert_eq!(inserts.len(), 2, "one insert per model");
+    for (owner, insert) in &inserts {
         assert_eq!(
-            insert_body.matches(".write(&forgedb_wal::WalEntry").count(),
+            insert.call_count("write"),
             1,
-            "#170: insert #{i} still fsyncs per op — exactly one WAL write, inside its own body"
+            "#170: {owner}::insert still fsyncs per op: exactly one plain WAL write, in its own body"
         );
     }
 }
@@ -5996,9 +5992,25 @@ fn test_go_generation_binding() {
     assert!(GoGenerator::go_mod_scaffold("forgedb", true).contains("arrow-go/v18"), "go.mod pins arrow-go when needed");
     assert!(!GoGenerator::go_mod_scaffold("forgedb", false).contains("arrow-go"), "no arrow dep when unneeded");
 
-    for forbidden in ["forgedb_query", "switch model", "predicate", "QueryBuilder", "reflect."] {
-        assert!(!code.contains(forbidden), "must not emit generic query surface: {forbidden}");
-    }
+    let go = forgedb_source_guard::go_facts(&code);
+    assert!(
+        !go.imports("reflect"),
+        "identity red line: generated Go must not import `reflect` — runtime type          inspection is a generic query surface. Aliases do not hide it; imports seen: {:?}",
+        go.import_paths
+    );
+    assert!(
+        !go.dispatches_generically(),
+        "identity red line: generated Go must not route on a model NAME at runtime — the \
+         whole point is that per-model code is GENERATED, so there is nothing to look up. \
+         Integer status switches from the cgo wrappers are legitimate and deliberately not \
+         counted here. string-literal switch tags: {:?}, type switches: {}",
+        go.string_switch_tags, go.type_switches
+    );
+    assert!(
+        go.decl_count > 0 && !go.func_names.is_empty(),
+        "the Go parse must have seen real declarations, got {} decls / {:?}",
+        go.decl_count, go.func_names
+    );
 }
 
 fn go_c_symbols(go_code: &str) -> Vec<String> {
@@ -7269,19 +7281,29 @@ Small {
 }
 
 fn db_for(src: &str) -> String {
-    let mut parser = forgedb_parser::Parser::new(src).unwrap();
-    let schema = parser.parse().unwrap();
-    RustGenerator::generate(&schema).unwrap().code
+    forgedb_source_guard::cached_source(&format!("db:{src}"), || {
+        let mut parser = forgedb_parser::Parser::new(src).unwrap();
+        let schema = parser.parse().unwrap();
+        RustGenerator::generate(&schema).unwrap().code
+    }).to_string()
 }
 
 fn column_init(code: &str, field: &str) -> String {
-    let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
-    let needle = format!("{field}_col: FixedColumn::new(");
-    let at = flat.find(&needle).unwrap_or_else(|| {
-        panic!("no FixedColumn init for `{field}` — it did not get a fixed column at all")
-    });
-    let tail = &flat[at..];
-    tail[..tail.find(") .expect").unwrap_or(tail.len().min(200))].to_string()
+    let inits = RustSource::generated("database.rs", code.to_string())
+        .struct_literal_field_inits(&format!("{field}_col"))
+        .unwrap_or_else(|e| panic!("no column initializer for `{field}`: {e}"));
+
+    let fixed: Vec<&String> = inits
+        .iter()
+        .filter(|i| i.starts_with("FixedColumn::new"))
+        .collect();
+    assert_eq!(
+        fixed.len(),
+        1,
+        "`{field}` must have exactly one FixedColumn::new stride; got {fixed:?} \
+         (all initializers: {inits:?})"
+    );
+    fixed[0].clone()
 }
 
 #[test]
@@ -8150,15 +8172,19 @@ fn test_rust_generation_open_guard_has_two_distinct_arms() {
 }
 
 fn api_for(src: &str) -> String {
-    let mut parser = forgedb_parser::Parser::new(src).unwrap();
-    let schema = parser.parse().unwrap();
-    ApiGenerator::generate(&schema).unwrap().code
+    forgedb_source_guard::cached_source(&format!("api:{src}"), || {
+        let mut parser = forgedb_parser::Parser::new(src).unwrap();
+        let schema = parser.parse().unwrap();
+        ApiGenerator::generate(&schema).unwrap().code
+    }).to_string()
 }
 
 fn wasm_for(src: &str) -> String {
-    let mut parser = forgedb_parser::Parser::new(src).unwrap();
-    let schema = parser.parse().unwrap();
-    WasmGenerator::generate(&schema).unwrap().code
+    forgedb_source_guard::cached_source(&format!("wasm:{src}"), || {
+        let mut parser = forgedb_parser::Parser::new(src).unwrap();
+        let schema = parser.parse().unwrap();
+        WasmGenerator::generate(&schema).unwrap().code
+    }).to_string()
 }
 
 fn flat(code: &str) -> String {

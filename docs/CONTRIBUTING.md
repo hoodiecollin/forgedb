@@ -155,6 +155,10 @@ See [Pull Request Process](#pull-request-process) below for detailed guidelines.
 **Required:**
 - Rust 1.96 — pinned in `rust-toolchain.toml`; rustup honours it automatically ([rustup.rs](https://rustup.rs/)).
   The workspace is edition 2024, which requires ≥ 1.85; 1.70 cannot build it.
+- **Go** ([go.dev/dl](https://go.dev/dl/)) — required to run the test suite, not optional.
+  `tools/goguard` parses generated Go through `go/parser` so the identity red line is checked
+  against an AST rather than five substrings. A missing toolchain **fails** the Go guards; it
+  never skips them, because a guard that skips reports green without having evaluated.
 - Git
 
 **Optional but recommended:**
