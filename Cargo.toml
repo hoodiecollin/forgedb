@@ -19,6 +19,7 @@ members = [
     "crates/txn",
     "crates/coordinator",
     "crates/lsp-server",
+    "crates/source-guard",
 ]
 
 exclude = ["apps/inspector/src-tauri"]
@@ -96,6 +97,8 @@ tempfile = "3.8"
 toml = "0.8"
 home = "0.5"
 regex = "1.12"
+
+forgedb-source-guard = { path = "crates/source-guard" }
 
 [profile.dist]
 inherits = "release"

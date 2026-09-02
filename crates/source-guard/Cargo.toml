@@ -1,0 +1,10 @@
+[package]
+name = "forgedb-source-guard"
+version = "0.0.0"
+edition.workspace = true
+description = "Test-only: assert properties of Rust source through its AST, so a guard cannot pass vacuously."
+
+publish = false
+
+[dependencies]
+syn = { version = "2.0", features = ["full", "parsing", "printing", "extra-traits", "visit"] }

@@ -24,3 +24,4 @@ prettyplease = "0.2"
 [dev-dependencies]
 insta = "1.40"
 toml = "0.8"
+forgedb-source-guard = { path = "../source-guard" }
