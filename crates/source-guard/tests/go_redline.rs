@@ -155,3 +155,53 @@ func (c *Client) GetAccount(id string) error {
     assert!(f.declared_types.iter().any(|t| t == "Client"));
     assert!(f.imports("net/http"));
 }
+
+#[test]
+fn a_missing_go_toolchain_is_fatal_not_skipped() {
+    const RELAY: &str = "SOURCE_GUARD_GO_ABSENT_CHILD";
+
+    if std::env::var_os(RELAY).is_some() {
+        go_facts("package main\n");
+        return;
+    }
+
+    let empty = std::env::temp_dir().join(format!("sg-no-go-{}", std::process::id()));
+    std::fs::create_dir_all(&empty).expect("scratch dir");
+
+    let out = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+        .args([
+            "--exact",
+            "a_missing_go_toolchain_is_fatal_not_skipped",
+            "--nocapture",
+        ])
+        .env(RELAY, "1")
+        .env("PATH", &empty)
+        .output()
+        .expect("re-run this test binary with an empty PATH");
+
+    let _ = std::fs::remove_dir_all(&empty);
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        !out.status.success(),
+        "with no `go` on PATH the child must FAIL. It exited {:?} instead, which is the \
+         skip-shaped outcome design D6 forbids: a guard that cannot evaluate must never \
+         report green.\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        out.status.code()
+    );
+
+    assert!(
+        stderr.contains("cannot run `go`"),
+        "the child failed, but not by the path under test — so this test would keep passing \
+         if the toolchain check were deleted. Expected the `cannot run \\`go\\`` panic.\
+         \nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    assert!(
+        !stdout.contains("test result: ok"),
+        "the child reported a passing run, which means it SKIPPED rather than failed\
+         \nstdout:\n{stdout}"
+    );
+}

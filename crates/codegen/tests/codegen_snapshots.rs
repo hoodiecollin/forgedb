@@ -7281,9 +7281,11 @@ Small {
 }
 
 fn db_for(src: &str) -> String {
-    let mut parser = forgedb_parser::Parser::new(src).unwrap();
-    let schema = parser.parse().unwrap();
-    RustGenerator::generate(&schema).unwrap().code
+    forgedb_source_guard::cached_source(&format!("db:{src}"), || {
+        let mut parser = forgedb_parser::Parser::new(src).unwrap();
+        let schema = parser.parse().unwrap();
+        RustGenerator::generate(&schema).unwrap().code
+    }).to_string()
 }
 
 fn column_init(code: &str, field: &str) -> String {
@@ -8170,15 +8172,19 @@ fn test_rust_generation_open_guard_has_two_distinct_arms() {
 }
 
 fn api_for(src: &str) -> String {
-    let mut parser = forgedb_parser::Parser::new(src).unwrap();
-    let schema = parser.parse().unwrap();
-    ApiGenerator::generate(&schema).unwrap().code
+    forgedb_source_guard::cached_source(&format!("api:{src}"), || {
+        let mut parser = forgedb_parser::Parser::new(src).unwrap();
+        let schema = parser.parse().unwrap();
+        ApiGenerator::generate(&schema).unwrap().code
+    }).to_string()
 }
 
 fn wasm_for(src: &str) -> String {
-    let mut parser = forgedb_parser::Parser::new(src).unwrap();
-    let schema = parser.parse().unwrap();
-    WasmGenerator::generate(&schema).unwrap().code
+    forgedb_source_guard::cached_source(&format!("wasm:{src}"), || {
+        let mut parser = forgedb_parser::Parser::new(src).unwrap();
+        let schema = parser.parse().unwrap();
+        WasmGenerator::generate(&schema).unwrap().code
+    }).to_string()
 }
 
 fn flat(code: &str) -> String {
