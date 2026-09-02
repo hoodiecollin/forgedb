@@ -602,6 +602,7 @@ dependencies = [
 name = "forgedb-source-guard"
 version = "0.0.0"
 dependencies = [
+ "quote",
  "syn",
 ]
 

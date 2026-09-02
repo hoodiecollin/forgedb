@@ -1,3 +1,4 @@
+use forgedb_source_guard::RustSource;
 use forgedb_codegen::{
     ApiGenerator, FfiGenerator, GenConfig, GoGenerator, GoSdkGenerator, HopPlan, ModelOp,
     NapiGenerator, OpenApiGenerator, PyO3Generator, PythonSdkGenerator, RustGenerator,
@@ -7371,12 +7372,14 @@ fn test_rust_generation_string_n_scan_borrows_the_slot() {
         "`string(32)` borrows the slot rather than copying it"
     );
 
-    let scan = &code[code.find("pub fn __with_scan").expect("the scan scope is emitted")..];
-    let scan: String = scan.split_whitespace().collect::<Vec<_>>().join(" ");
-    let scan = &scan[..scan.find("pub fn ").map(|i| i + 7).unwrap_or(scan.len())];
-    assert!(
-        !scan.contains("read_bytes"),
-        "a per-row `Vec` on the scan path is the one outcome #238 exists to avoid: {scan}"
+    let scan_src = RustSource::generated("database.rs", code.clone());
+    let scan = scan_src
+        .method_named("__with_scan")
+        .expect("the scan scope is emitted");
+    assert_eq!(
+        scan.call_count("read_bytes"),
+        0,
+        "a per-row `Vec` on the scan path is the one outcome #238 exists to avoid"
     );
 }
 
