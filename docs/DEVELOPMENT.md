@@ -42,6 +42,21 @@ generator-identity red line is asserted structurally instead of by substring mat
 builds it. If Go is absent the Go guards **fail loudly** rather than skipping — a skipped guard
 reports green because it never ran, which is the failure class those guards exist to remove.
 
+**Semantic code search (recommended — see the *Code search* section of CLAUDE.md):**
+```bash
+# Language server for Rust, pinned to the same toolchain as the build.
+# Deliberately NOT a rust-toolchain.toml component: CI installs no toolchain
+# explicitly, so a component there is downloaded by every job for a tool no job runs.
+rustup component add rust-analyzer --toolchain 1.96
+
+brew install ast-grep gopls jq          # structural search, Go LSP, hook dependency
+curl -LsSf https://astral.sh/uv/install.sh | sh   # uv — Serena is distributed through it
+```
+
+Serena starts from `.mcp.json` when the session opens; `/mcp` should list it. Skipping
+`rust-analyzer` does not error — Serena simply returns nothing for Rust, which is why it sits
+here with the other prerequisites rather than being discovered later.
+
 **Git:**
 ```bash
 # Verify git installation
