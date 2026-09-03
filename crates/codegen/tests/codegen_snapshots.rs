@@ -165,7 +165,7 @@ fn test_rust_generation_auto_generate_synthesis() {
         structs: vec![],
         enums: vec![],
     };
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(code.contains("#[serde(default)]"), "uuid auto field needs #[serde(default)]");
     assert!(
@@ -239,7 +239,7 @@ fn test_api_generation_has_all_crud_operations() {
 #[test]
 fn test_api_generation_has_update_delete_endpoints() {
     let schema = simple_user_schema();
-    let code = ApiGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("ApiGenerator", &schema, || ApiGenerator::generate(&schema).unwrap().code);
 
     assert!(code.contains("async fn update_user"));
     assert!(code.contains("async fn delete_user"));
@@ -253,7 +253,7 @@ fn test_api_generation_has_update_delete_endpoints() {
 #[test]
 fn test_rust_generation_root_threading() {
     let schema = multi_model_schema();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(code.contains("pub fn new_at(root: &std::path::Path)"));
     assert!(code.contains("pub fn new()"));
@@ -269,7 +269,7 @@ fn test_rust_generation_root_threading() {
 #[test]
 fn test_api_generation_tenant_auth_router() {
     let schema = multi_model_schema();
-    let code = ApiGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("ApiGenerator", &schema, || ApiGenerator::generate(&schema).unwrap().code);
 
     assert!(code.contains("pub fn create_router("));
     assert!(code.contains("pub fn create_router_with_auth("));
@@ -281,7 +281,7 @@ fn test_api_generation_tenant_auth_router() {
 #[test]
 fn test_api_generation_cors_surface_is_additive() {
     let schema = multi_model_schema();
-    let code = ApiGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("ApiGenerator", &schema, || ApiGenerator::generate(&schema).unwrap().code);
 
     assert!(code.contains("pub fn create_router("), "create_router keeps its arity");
     assert!(
@@ -298,7 +298,7 @@ fn test_api_generation_cors_surface_is_additive() {
 #[test]
 fn test_api_generation_cors_allows_only_what_is_served() {
     let schema = multi_model_schema();
-    let code = ApiGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("ApiGenerator", &schema, || ApiGenerator::generate(&schema).unwrap().code);
 
     for m in ["Method::GET", "Method::POST", "Method::PUT", "Method::DELETE"] {
         assert!(code.contains(m), "CORS must allow {m}");
@@ -319,7 +319,7 @@ fn test_api_generation_cors_allows_only_what_is_served() {
 #[test]
 fn test_api_generation_cors_layer_is_conditional() {
     let schema = multi_model_schema();
-    let code = ApiGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("ApiGenerator", &schema, || ApiGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("match cors"),
@@ -340,7 +340,7 @@ fn test_api_generation_cors_layer_is_conditional() {
 #[test]
 fn test_api_generation_ws_handlers_check_origin() {
     let schema = multi_model_schema();
-    let code = ApiGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("ApiGenerator", &schema, || ApiGenerator::generate(&schema).unwrap().code);
 
     let extensions = code.matches("Extension<AllowedOrigins>").count();
     assert!(
@@ -362,7 +362,7 @@ fn test_api_generation_ws_handlers_check_origin() {
 #[test]
 fn test_api_generation_observability_endpoints() {
     let schema = multi_model_schema();
-    let code = ApiGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("ApiGenerator", &schema, || ApiGenerator::generate(&schema).unwrap().code);
 
     assert!(code.contains("async fn __health("));
     assert!(code.contains("async fn __ready("));
@@ -380,7 +380,7 @@ fn test_api_generation_observability_endpoints() {
 fn test_api_generation_pagination_knobs() {
     let schema = multi_model_schema();
 
-    let d = ApiGenerator::generate(&schema).unwrap().code;
+    let d = memoized_code("ApiGenerator", &schema, || ApiGenerator::generate(&schema).unwrap().code);
     assert!(
         d.contains("const PAGE_DEFAULT_LIMIT: usize = 50"),
         "default page default limit is 50 (#141)"
@@ -418,7 +418,7 @@ fn test_api_generation_pagination_knobs() {
 fn test_api_generation_metrics_toggle() {
     let schema = multi_model_schema();
 
-    let d = ApiGenerator::generate(&schema).unwrap().code;
+    let d = memoized_code("ApiGenerator", &schema, || ApiGenerator::generate(&schema).unwrap().code);
     assert!(d.contains("async fn __metrics("), "default emits __metrics (#151)");
     assert!(d.contains("\"/metrics\""), "default wires the /metrics route (#151)");
 
@@ -436,7 +436,7 @@ fn test_api_generation_metrics_toggle() {
 #[test]
 fn test_api_generation_snapshot_reads() {
     let schema = multi_model_schema();
-    let code = ApiGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("ApiGenerator", &schema, || ApiGenerator::generate(&schema).unwrap().code);
 
     assert!(code.contains("all_at(&forgedb_storage::Snapshot::new(__w))"));
     assert!(code.contains("get_at(&forgedb_storage::Snapshot::new(__w)"));
@@ -469,8 +469,8 @@ User {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let db_code = RustGenerator::generate(&schema).unwrap().code;
-    let api_code = ApiGenerator::generate(&schema).unwrap().code;
+    let db_code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
+    let api_code = memoized_code("ApiGenerator", &schema, || ApiGenerator::generate(&schema).unwrap().code);
 
     assert!(db_code.contains("pub struct UserScanRef<'a>"), "#160/#224: narrow scan view emitted");
     assert!(!db_code.contains("UserScanRow"),
@@ -585,7 +585,7 @@ Metric {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let db_code = RustGenerator::generate(&schema).unwrap().code;
+    let db_code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(db_code.contains("views_ordered"), "#169: u64 gets an ordered index");
     assert!(db_code.contains("BTreeMap<u64, std :: collections :: BTreeSet")
@@ -1375,7 +1375,7 @@ Widget {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("let n = db.tombstones.len();"),
@@ -1414,7 +1414,7 @@ User {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
     let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
 
     assert!(
@@ -1458,7 +1458,7 @@ User {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
     let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
 
     assert!(code.contains("pub struct UserCard"), "projection struct emitted");
@@ -1520,7 +1520,7 @@ Event {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
     let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
 
     assert!(
@@ -1580,7 +1580,7 @@ Tag {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("db.write_manifest(root);"),
@@ -1641,7 +1641,7 @@ Post {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("Manifest :: load_from") || code.contains("Manifest::load_from"),
@@ -1705,7 +1705,7 @@ Tag {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("fn read_at(&self, row_index: usize) -> Option<Post>"),
@@ -1805,7 +1805,7 @@ Counter {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("pub fn update(&mut self, id: Uuid, record: Post) -> Result<bool, ValidationError>"),
@@ -1856,7 +1856,7 @@ User {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("wal: forgedb_wal::WalManager"),
@@ -1930,7 +1930,7 @@ Tag {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("const WAL_CHECKPOINT_INTERVAL: u64"),
@@ -2007,7 +2007,7 @@ Tag {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("const EXPECTED_SCHEMA_VERSION: u32 = 1"),
@@ -2054,7 +2054,7 @@ User {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("let __schema_version = forgedb_storage::Manifest::load_from(&__manifest_abs)")
@@ -2084,7 +2084,7 @@ User {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("email_index: std::sync::Arc<"),
@@ -2147,7 +2147,7 @@ Post {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(code.contains("handle_index"), "#102: nullable ^field is indexed");
     assert!(
@@ -2220,7 +2220,7 @@ User {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("status_index: std::sync::Arc<"),
@@ -2271,7 +2271,7 @@ User {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("id_versions: std::sync::Arc<HashMap<Uuid, Vec<usize>>>"),
@@ -2312,7 +2312,7 @@ Post {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(code.contains("pub enum ValidationError"), "ValidationError type emitted");
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
@@ -2361,7 +2361,7 @@ Product {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
     let flat = code.replace([' ', '\n'], "");
 
     assert!(
@@ -2420,7 +2420,7 @@ Product {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
     let flat = code.replace([' ', '\n'], "");
 
     assert!(
@@ -2483,7 +2483,7 @@ Post {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("ReferencedByChildren { model: &'static str, field: &'static str }"),
@@ -2539,7 +2539,7 @@ Comment {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(code.contains("const MAX_CASCADE_DEPTH: u32"), "cascade depth bound emitted");
     assert!(
@@ -2575,7 +2575,7 @@ Post {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("let __children = self.post.find_by_author(Some(id));"),
@@ -2635,7 +2635,7 @@ Tag {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("tombstones: Tombstones,"),
@@ -2677,7 +2677,7 @@ Account {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
     let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
 
     assert!(
@@ -2717,7 +2717,7 @@ Gadget {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("const COMPACTION_DEAD_THRESHOLD: u64"),
@@ -2822,7 +2822,7 @@ User {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("pub fn __reindex_delta(&mut self, from: usize)"),
@@ -2889,7 +2889,7 @@ Widget {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("let __anchor = self.tombstones.len();"),
@@ -2937,7 +2937,7 @@ User {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = ApiGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("ApiGenerator", &schema, || ApiGenerator::generate(&schema).unwrap().code);
 
     assert!(!code.contains(r#"json!({ "data": [] })"#), "list stub is gone");
     assert!(
@@ -2980,7 +2980,7 @@ Post {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = ApiGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("ApiGenerator", &schema, || ApiGenerator::generate(&schema).unwrap().code);
     let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
 
     assert!(
@@ -3055,7 +3055,7 @@ Tag {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("changefeed: Option<forgedb_changefeed::ChangeFeed>")
@@ -3206,7 +3206,7 @@ Author {
 
     let flatten = |code: &str| -> String { code.chars().filter(|c| !c.is_whitespace()).collect() };
 
-    let default_code = RustGenerator::generate(&schema).unwrap().code;
+    let default_code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
     let d = flatten(&default_code);
     assert!(
         !d.contains("DurableBroker::open("),
@@ -3356,7 +3356,7 @@ User {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
     assert!(
@@ -3408,7 +3408,7 @@ Tag {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
     assert!(flat.contains("pubenumApplyError"), "must emit an ApplyError type");
@@ -3482,7 +3482,7 @@ Tag {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
     assert!(
@@ -3535,7 +3535,7 @@ Tag {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = WasmGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("WasmGenerator", &schema, || WasmGenerator::generate(&schema).unwrap().code);
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
     assert!(flat.contains("#[wasm_bindgen]"), "must annotate for wasm-bindgen");
@@ -3598,7 +3598,7 @@ Tag {
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
 
-    let replica = WasmGenerator::generate(&schema).unwrap().code;
+    let replica = memoized_code("WasmGenerator", &schema, || WasmGenerator::generate(&schema).unwrap().code);
     let client = WasmGenerator::generate_client(&schema).unwrap().code;
     let worker = WasmGenerator::worker_bootstrap();
 
@@ -3691,7 +3691,7 @@ Post {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = FfiGenerator::generate(&schema, SYM).unwrap().code;
+    let code = memoized_code_with("FfiGenerator", &[SYM], &schema, || FfiGenerator::generate(&schema, SYM).unwrap().code);
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
     assert!(
@@ -3763,7 +3763,7 @@ Reading {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = FfiGenerator::generate(&schema, SYM).unwrap().code;
+    let code = memoized_code_with("FfiGenerator", &[SYM], &schema, || FfiGenerator::generate(&schema, SYM).unwrap().code);
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
     for model in ["user", "post", "reading"] {
@@ -3829,7 +3829,7 @@ Tag {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = FfiGenerator::generate(&schema, SYM).unwrap().code;
+    let code = memoized_code_with("FfiGenerator", &[SYM], &schema, || FfiGenerator::generate(&schema, SYM).unwrap().code);
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
     assert!(flat.contains(&format!("fn{SYM}post_author(")), "forward-FK getter post_author");
@@ -3885,7 +3885,7 @@ Reading {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = FfiGenerator::generate(&schema, SYM).unwrap().code;
+    let code = memoized_code_with("FfiGenerator", &[SYM], &schema, || FfiGenerator::generate(&schema, SYM).unwrap().code);
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
     assert!(flat.contains(&format!("fn{SYM}set_completion_callback(")), "async completion-callback registration");
@@ -3947,7 +3947,7 @@ Post {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = FfiGenerator::generate(&schema, SYM).unwrap().code;
+    let code = memoized_code_with("FfiGenerator", &[SYM], &schema, || FfiGenerator::generate(&schema, SYM).unwrap().code);
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
     assert!(flat.contains("structArrowSchema"), "the Arrow schema struct is defined");
@@ -4036,7 +4036,7 @@ Reading {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = PyO3Generator::generate(&schema).unwrap().code;
+    let code = memoized_code("PyO3Generator", &schema, || PyO3Generator::generate(&schema).unwrap().code);
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
     for model in ["User", "Post", "Reading"] {
@@ -4187,7 +4187,7 @@ Reading {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = NapiGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("NapiGenerator", &schema, || NapiGenerator::generate(&schema).unwrap().code);
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
     assert!(
@@ -4348,7 +4348,7 @@ User {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = ApiGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("ApiGenerator", &schema, || ApiGenerator::generate(&schema).unwrap().code);
     let norm = code.replace(" :: ", "::").replace(" . ", ".");
 
     assert!(
@@ -4417,7 +4417,7 @@ User {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = ApiGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("ApiGenerator", &schema, || ApiGenerator::generate(&schema).unwrap().code);
 
     assert!(code.contains("WebSocketUpgrade"), "ws upgrade imported");
     assert!(
@@ -4475,7 +4475,7 @@ Tag {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(code.contains("pub struct PostStorageReader"), "per-model reader struct");
     assert!(
@@ -4565,7 +4565,7 @@ Counter {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(code.contains("pub enum PostLiveDelta"), "per-model live-delta enum");
     assert!(
@@ -4598,7 +4598,7 @@ User {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = ApiGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("ApiGenerator", &schema, || ApiGenerator::generate(&schema).unwrap().code);
 
     assert!(code.contains("/live-query/"), "per-model /live-query route registered");
     assert!(
@@ -4674,7 +4674,7 @@ Widget {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = ApiGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("ApiGenerator", &schema, || ApiGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("want.parse::<f64>()"),
@@ -4749,7 +4749,7 @@ fn test_openapi_generation_fk_schema() {
 #[test]
 fn test_openapi_generation_is_valid_document() {
     let schema = fk_schema();
-    let code = OpenApiGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("OpenApiGenerator", &schema, || OpenApiGenerator::generate(&schema).unwrap().code);
     let spec: serde_json::Value = serde_json::from_str(&code).expect("output is valid JSON");
 
     assert_eq!(spec["openapi"], "3.1.0");
@@ -4794,7 +4794,7 @@ fn test_openapi_generation_is_valid_document() {
 #[test]
 fn test_openapi_generation_skips_virtual_fields() {
     let schema = component_schema();
-    let code = OpenApiGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("OpenApiGenerator", &schema, || OpenApiGenerator::generate(&schema).unwrap().code);
     let spec: serde_json::Value = serde_json::from_str(&code).unwrap();
 
     let schemas = spec["components"]["schemas"].as_object().unwrap();
@@ -4870,7 +4870,7 @@ Product {
         "the decimal index key normalizes away scale (1.0 == 1.00)"
     );
 
-    let api = ApiGenerator::generate(&schema).unwrap().code;
+    let api = memoized_code("ApiGenerator", &schema, || ApiGenerator::generate(&schema).unwrap().code);
     assert!(
         api.contains("\"price\" => rows.sort_by(|a, b| a.price.cmp(&b.price))"),
         "decimal sorts via Ord::cmp, not partial_cmp"
@@ -4958,13 +4958,13 @@ Order {
         "enum probe takes the enum type"
     );
 
-    let api = ApiGenerator::generate(&schema).unwrap().code;
+    let api = memoized_code("ApiGenerator", &schema, || ApiGenerator::generate(&schema).unwrap().code);
     assert!(
         api.contains("\"status\" => rows.sort_by(|a, b| a.status.cmp(&b.status))"),
         "enum sorts via Ord::cmp"
     );
 
-    let ts = TypeScriptGenerator::generate(&schema).unwrap().code;
+    let ts = memoized_code("TypeScriptGenerator", &schema, || TypeScriptGenerator::generate(&schema).unwrap().code);
     assert!(
         ts.contains("export type OrderStatus = \"Pending\" | \"Paid\" | \"Shipped\";"),
         "TS emits a string-union alias for the enum"
@@ -4974,7 +4974,7 @@ Order {
         "TS field is typed as the enum union"
     );
 
-    let oa = OpenApiGenerator::generate(&schema).unwrap().code;
+    let oa = memoized_code("OpenApiGenerator", &schema, || OpenApiGenerator::generate(&schema).unwrap().code);
     let oa_json: serde_json::Value = serde_json::from_str(&oa).unwrap();
     let enum_schema = &oa_json["components"]["schemas"]["OrderStatus"];
     assert_eq!(enum_schema["type"], "string", "OpenAPI enum is a string");
@@ -5004,7 +5004,7 @@ Post {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("pub fn transaction<T>(")
@@ -5134,7 +5134,7 @@ User {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     let flat_decl: String = code.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
@@ -5184,7 +5184,7 @@ Gadget {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     for model in ["Widget", "Gadget"] {
         let claim = format!("staged_unique_keys.insert(({model:?}, \"code\"");
@@ -5244,7 +5244,7 @@ Event {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         mentions_ident(&code, "created_at_index"),
@@ -5281,7 +5281,7 @@ Gadget {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         !mentions_ident(&code, "id_index"),
@@ -5313,7 +5313,7 @@ Event {
     let emit = |src: &str| {
         let mut parser = forgedb_parser::Parser::new(src).unwrap();
         let schema = parser.parse().unwrap();
-        RustGenerator::generate(&schema).unwrap().code
+        memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code)
     };
 
     assert!(
@@ -5341,7 +5341,7 @@ Post {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("_txn_journal: Option<forgedb_wal::WalManager>"),
@@ -5393,7 +5393,7 @@ User {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("in_transaction: bool")
@@ -5446,7 +5446,7 @@ Post {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
     assert!(
@@ -5548,7 +5548,7 @@ User {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("if self.in_transaction {") && code.contains("self.compact_deferred = true;"),
@@ -5572,7 +5572,7 @@ User {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("pub struct CoordinatedDatabase"),
@@ -5684,7 +5684,7 @@ Ticket {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     let reconnects = code.matches("__coord.reconnect()").count();
     assert_eq!(
@@ -5897,7 +5897,7 @@ Reading {
 #[test]
 fn test_go_generation_binding() {
     let schema = go_binding_schema();
-    let code = GoGenerator::generate(&schema, SYM, FP).unwrap().code;
+    let code = memoized_code_with("GoGenerator", &[SYM, FP], &schema, || GoGenerator::generate(&schema, SYM, FP).unwrap().code);
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
     assert!(code.contains("package forgedb"), "emits a Go package");
@@ -6034,7 +6034,7 @@ fn go_c_symbols(go_code: &str) -> Vec<String> {
 #[test]
 fn test_go_calls_match_ffi_symbols() {
     let schema = go_binding_schema();
-    let mut go_code = GoGenerator::generate(&schema, SYM, FP).unwrap().code;
+    let mut go_code = memoized_code_with("GoGenerator", &[SYM, FP], &schema, || GoGenerator::generate(&schema, SYM, FP).unwrap().code);
     go_code.push_str(&GoGenerator::generate_async_bridge(SYM).code);
     if let Some(arrow) = GoGenerator::generate_arrow(&schema, SYM) {
         go_code.push_str(&arrow.code);
@@ -6158,8 +6158,8 @@ Writer {
 fn test_two_apps_export_disjoint_ffi_symbols() {
     let schema = colliding_post_schema();
 
-    let a = FfiGenerator::generate(&schema, SYM).unwrap().code;
-    let b = FfiGenerator::generate(&schema, SYM_B).unwrap().code;
+    let a = memoized_code_with("FfiGenerator", &[SYM], &schema, || FfiGenerator::generate(&schema, SYM).unwrap().code);
+    let b = memoized_code_with("FfiGenerator", &[SYM_B], &schema, || FfiGenerator::generate(&schema, SYM_B).unwrap().code);
 
     let sa = exported_c_symbols(&a);
     let sb = exported_c_symbols(&b);
@@ -6194,12 +6194,12 @@ fn test_two_apps_export_disjoint_ffi_symbols() {
     }
 
     let go_a = {
-        let mut s = GoGenerator::generate(&schema, SYM, FP).unwrap().code;
+        let mut s = memoized_code_with("GoGenerator", &[SYM, FP], &schema, || GoGenerator::generate(&schema, SYM, FP).unwrap().code);
         s.push_str(&GoGenerator::generate_async_bridge(SYM).code);
         s
     };
     let go_b = {
-        let mut s = GoGenerator::generate(&schema, SYM_B, FP).unwrap().code;
+        let mut s = memoized_code_with("GoGenerator", &[SYM_B, FP], &schema, || GoGenerator::generate(&schema, SYM_B, FP).unwrap().code);
         s.push_str(&GoGenerator::generate_async_bridge(SYM_B).code);
         s
     };
@@ -6265,7 +6265,7 @@ fn test_ffi_cache_package_manifest() {
         "the unwind floor belongs on the driver's invocation, not in a member manifest:\n{manifest}"
     );
 
-    let code = FfiGenerator::generate(&colliding_post_schema(), SYM).unwrap().code;
+    let code = memoized_code_with("FfiGenerator", &[SYM], &colliding_post_schema(), || FfiGenerator::generate(&colliding_post_schema(), SYM).unwrap().code);
     assert!(
         code.contains("use forgedb_core as database"),
         "the source reaches the database through the fixed alias:\n{}",
@@ -6317,7 +6317,7 @@ fn sdk_parity_schema() -> Schema {
 #[test]
 fn test_rust_sdk_generation_snapshot() {
     let schema = sdk_parity_schema();
-    let code = RustSdkGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustSdkGenerator", &schema, || RustSdkGenerator::generate(&schema).unwrap().code);
 
     assert!(code.contains("pub enum Role {"), "enum type missing");
     assert!(code.contains("pub struct Account {"), "model struct missing");
@@ -6353,7 +6353,7 @@ fn test_rust_sdk_generation_snapshot() {
 #[test]
 fn test_go_sdk_generation_snapshot() {
     let schema = sdk_parity_schema();
-    let code = GoSdkGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("GoSdkGenerator", &schema, || GoSdkGenerator::generate(&schema).unwrap().code);
 
     assert!(code.contains("type Role string"), "string-typed enum missing");
     assert!(code.contains("RoleAdmin Role = \"Admin\""), "enum const missing");
@@ -6388,7 +6388,7 @@ fn test_go_sdk_generation_snapshot() {
 #[test]
 fn test_python_sdk_generation_snapshot() {
     let schema = sdk_parity_schema();
-    let code = PythonSdkGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("PythonSdkGenerator", &schema, || PythonSdkGenerator::generate(&schema).unwrap().code);
 
     assert!(code.contains("class Role(str, Enum):"), "str Enum missing");
     assert!(code.contains("class Account:"), "model dataclass missing");
@@ -6433,7 +6433,7 @@ User {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
     let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
 
     assert!(
@@ -6498,7 +6498,7 @@ User {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = ApiGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("ApiGenerator", &schema, || ApiGenerator::generate(&schema).unwrap().code);
     let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
 
     assert!(code.contains("fn __user_scan_matches("), "scan filter emitted");
@@ -6567,7 +6567,7 @@ Owner {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
     assert!(
@@ -6663,7 +6663,7 @@ Doc {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
     assert!(
@@ -6739,7 +6739,7 @@ Doc {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
     for module in ["mod__forgedb_big_bytes", "mod__forgedb_big_array"] {
@@ -6808,7 +6808,7 @@ Doc {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         !code.contains("__forgedb_big_bytes") && !code.contains("__forgedb_big_array"),
@@ -6829,7 +6829,7 @@ Reading {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         !code.contains("__forgedb_f64_key"),
@@ -6850,7 +6850,7 @@ Sample {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("fn __forgedb_f64_key"),
@@ -6893,18 +6893,18 @@ Thing {
     );
 
     assert_eq!(
-        RustGenerator::generate(&dep_schema).unwrap().code,
-        RustGenerator::generate(&can_schema).unwrap().code,
+        memoized_code("RustGenerator", &dep_schema, || RustGenerator::generate(&dep_schema).unwrap().code),
+        memoized_code("RustGenerator", &can_schema, || RustGenerator::generate(&can_schema).unwrap().code),
         "database.rs"
     );
     assert_eq!(
-        ApiGenerator::generate(&dep_schema).unwrap().code,
-        ApiGenerator::generate(&can_schema).unwrap().code,
+        memoized_code("ApiGenerator", &dep_schema, || ApiGenerator::generate(&dep_schema).unwrap().code),
+        memoized_code("ApiGenerator", &can_schema, || ApiGenerator::generate(&can_schema).unwrap().code),
         "api.rs"
     );
     assert_eq!(
-        TypeScriptGenerator::generate(&dep_schema).unwrap().code,
-        TypeScriptGenerator::generate(&can_schema).unwrap().code,
+        memoized_code("TypeScriptGenerator", &dep_schema, || TypeScriptGenerator::generate(&dep_schema).unwrap().code),
+        memoized_code("TypeScriptGenerator", &can_schema, || TypeScriptGenerator::generate(&can_schema).unwrap().code),
         "types.ts"
     );
 }
@@ -6928,7 +6928,7 @@ Link {
         .unwrap()
         .parse()
         .unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     let link = extract_struct(&code, "pub struct LinkScanRef<'a>");
     assert!(
@@ -6992,7 +6992,7 @@ Collide {
     .unwrap()
     .parse()
     .unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
     let view = extract_struct(&code, "pub struct CollideScanRef<'a>");
 
     assert!(
@@ -7016,7 +7016,7 @@ Ticket {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         mentions_ident(&code, "__autoseq_id"),
@@ -7041,7 +7041,7 @@ Invoice {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         mentions_ident(&code, "__autoseq_number"),
@@ -7077,7 +7077,7 @@ Ticket {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     let reader = extract_struct(&code, "pub struct TicketStorageReader");
     assert!(
@@ -7101,7 +7101,7 @@ Ticket {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     let compact = extract_fn(&code, "pub fn compact");
     let write = compact
@@ -7133,7 +7133,7 @@ Ticket {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("staged_sequence_keys"),
@@ -7165,7 +7165,7 @@ fn test_rust_generation_conflict_visible_autos_emit_no_sequence_claim() {
     ] {
         let mut parser = forgedb_parser::Parser::new(src).unwrap();
         let schema = parser.parse().unwrap();
-        let code = RustGenerator::generate(&schema).unwrap().code;
+        let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
         assert!(
             !code.contains("staged_sequence_keys"),
@@ -7191,7 +7191,7 @@ Event {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         !code.contains("__autoseq_"),
@@ -7223,7 +7223,7 @@ Ticket {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
@@ -7248,7 +7248,7 @@ Ticket {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     let model = extract_struct(&code, "pub struct Ticket");
     assert!(
@@ -7268,7 +7268,7 @@ Small {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         mentions_ident(&code, "SequenceExhausted"),
@@ -7284,7 +7284,7 @@ fn db_for(src: &str) -> String {
     forgedb_source_guard::cached_source(&format!("db:{src}"), || {
         let mut parser = forgedb_parser::Parser::new(src).unwrap();
         let schema = parser.parse().unwrap();
-        RustGenerator::generate(&schema).unwrap().code
+        memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code)
     }).to_string()
 }
 
@@ -7484,8 +7484,8 @@ fn test_api_generation_string_n_is_filterable_and_indexed_as_a_string() {
     let src = "Doc {\n  id: +uuid\n  sku: ^string(32)\n}\n";
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let db_code = RustGenerator::generate(&schema).unwrap().code;
-    let api_code = ApiGenerator::generate(&schema).unwrap().code;
+    let db_code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
+    let api_code = memoized_code("ApiGenerator", &schema, || ApiGenerator::generate(&schema).unwrap().code);
 
     assert!(db_code.contains("sku_index"), "an `^string(N)` field is indexed");
     assert!(
@@ -7509,10 +7509,10 @@ fn test_generation_string_n_is_a_string_on_every_wire() {
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
 
-    let ts = TypeScriptGenerator::generate(&schema).unwrap().code;
+    let ts = memoized_code("TypeScriptGenerator", &schema, || TypeScriptGenerator::generate(&schema).unwrap().code);
     assert!(ts.contains("sku: string"), "TS: a string\n{ts}");
 
-    let openapi = OpenApiGenerator::generate(&schema).unwrap().code;
+    let openapi = memoized_code("OpenApiGenerator", &schema, || OpenApiGenerator::generate(&schema).unwrap().code);
     let spec: serde_json::Value = serde_json::from_str(&openapi).unwrap();
     let props = &spec["components"]["schemas"]["Doc"]["properties"];
     assert_eq!(props["sku"]["type"], "string");
@@ -7522,10 +7522,10 @@ fn test_generation_string_n_is_a_string_on_every_wire() {
     assert_eq!(props["key"]["maxLength"], 26);
 
     for (label, code) in [
-        ("rust-sdk", RustSdkGenerator::generate(&schema).unwrap().code),
-        ("python-sdk", PythonSdkGenerator::generate(&schema).unwrap().code),
-        ("go-sdk", GoSdkGenerator::generate(&schema).unwrap().code),
-        ("go", GoGenerator::generate(&schema, SYM, FP).unwrap().code),
+        ("rust-sdk", memoized_code("RustSdkGenerator", &schema, || RustSdkGenerator::generate(&schema).unwrap().code)),
+        ("python-sdk", memoized_code("PythonSdkGenerator", &schema, || PythonSdkGenerator::generate(&schema).unwrap().code)),
+        ("go-sdk", memoized_code("GoSdkGenerator", &schema, || GoSdkGenerator::generate(&schema).unwrap().code)),
+        ("go", memoized_code_with("GoGenerator", &[SYM, FP], &schema, || GoGenerator::generate(&schema, SYM, FP).unwrap().code)),
     ] {
         assert!(
             !code.contains("StringN") && !code.contains("string_n"),
@@ -7566,7 +7566,7 @@ Comment {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(code.contains("pub post: Uuid"), "FK record field stays `Uuid`");
     assert!(
@@ -7589,7 +7589,7 @@ Comment {
 fn test_rust_generation_fk_follows_a_u64_key() {
     let mut parser = forgedb_parser::Parser::new(U64_PARENT_SRC).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("pub post: u64"),
@@ -7619,7 +7619,7 @@ fn test_rust_generation_fk_follows_a_u64_key() {
 fn test_rust_generation_u64_key_gets_the_whole_relation_surface() {
     let mut parser = forgedb_parser::Parser::new(U64_PARENT_SRC).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("pub fn comment_post(&self, record: &Comment) -> Option<Post>"),
@@ -7647,7 +7647,7 @@ fn test_rust_generation_u64_key_gets_the_whole_relation_surface() {
 fn test_rust_generation_non_uuid_parent_delete_is_referentially_checked() {
     let mut parser = forgedb_parser::Parser::new(U64_PARENT_SRC).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("pub fn delete_post(&mut self, id: u64)"),
@@ -7686,7 +7686,7 @@ Draft {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
     assert!(
@@ -7707,7 +7707,7 @@ Draft {
 fn test_rust_generation_delete_doc_does_not_deny_a_referencing_model() {
     let mut parser = forgedb_parser::Parser::new(U64_PARENT_SRC).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         !code.contains("no model references it via a foreign key"),
@@ -7744,7 +7744,7 @@ Line {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(code.contains("pub id: Uuid"), "the FK identity resolves to Uuid");
     assert!(
@@ -7765,7 +7765,7 @@ Line {
 fn test_api_generation_openapi_fk_follows_the_target_key() {
     let mut parser = forgedb_parser::Parser::new(U64_PARENT_SRC).unwrap();
     let schema = parser.parse().unwrap();
-    let doc = OpenApiGenerator::generate(&schema).unwrap().code;
+    let doc = memoized_code("OpenApiGenerator", &schema, || OpenApiGenerator::generate(&schema).unwrap().code);
     let spec: serde_json::Value = serde_json::from_str(&doc).unwrap();
 
     let post = &spec["components"]["schemas"]["Comment"]["properties"]["post"];
@@ -7781,19 +7781,19 @@ fn test_sdk_generation_fk_follows_the_target_key() {
     let mut parser = forgedb_parser::Parser::new(U64_PARENT_SRC).unwrap();
     let schema = parser.parse().unwrap();
 
-    let rust = RustSdkGenerator::generate(&schema).unwrap().code;
+    let rust = memoized_code("RustSdkGenerator", &schema, || RustSdkGenerator::generate(&schema).unwrap().code);
     assert!(
         rust.contains("pub post: u64"),
         "rust-sdk types the FK as the target key:\n{rust}"
     );
 
-    let python = PythonSdkGenerator::generate(&schema).unwrap().code;
+    let python = memoized_code("PythonSdkGenerator", &schema, || PythonSdkGenerator::generate(&schema).unwrap().code);
     assert!(
         python.contains("post: int"),
         "python-sdk types the FK as the target key:\n{python}"
     );
 
-    let go = GoSdkGenerator::generate(&schema).unwrap().code;
+    let go = memoized_code("GoSdkGenerator", &schema, || GoSdkGenerator::generate(&schema).unwrap().code);
     assert!(
         go.contains("Post uint64"),
         "go-sdk types the FK as the target key:\n{go}"
@@ -7805,7 +7805,7 @@ fn test_bindings_fk_type_equals_the_targets_own_id_type() {
     let mut parser = forgedb_parser::Parser::new(U64_PARENT_SRC).unwrap();
     let schema = parser.parse().unwrap();
 
-    let go = GoGenerator::generate(&schema, SYM, FP).unwrap().code;
+    let go = memoized_code_with("GoGenerator", &[SYM, FP], &schema, || GoGenerator::generate(&schema, SYM, FP).unwrap().code);
     let field_type = |decl: &str, name: &str| {
         let body = &go[go.find(decl).unwrap_or_else(|| panic!("`{decl}` in the Go binding"))..];
         body.lines()
@@ -7821,12 +7821,12 @@ fn test_bindings_fk_type_equals_the_targets_own_id_type() {
         "the Go FK field and the target's own id field must have one type"
     );
 
-    let napi = NapiGenerator::generate(&schema).unwrap().code;
+    let napi = memoized_code("NapiGenerator", &schema, || NapiGenerator::generate(&schema).unwrap().code);
     assert!(
         !napi.contains("record.post.to_string()"),
         "napi stringifies a u64 FK while `Post.id` surfaces as a number"
     );
-    let pyo3 = PyO3Generator::generate(&schema).unwrap().code;
+    let pyo3 = memoized_code("PyO3Generator", &schema, || PyO3Generator::generate(&schema).unwrap().code);
     assert!(
         !pyo3.contains("record.post.to_string()"),
         "pyo3 stringifies a u64 FK while `Post.id` surfaces as a number"
@@ -7851,7 +7851,7 @@ Course {
 fn test_rust_generation_junction_admits_a_mixed_key_pair() {
     let mut parser = forgedb_parser::Parser::new(MIXED_M2M_SRC).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
     assert!(code.contains("pub struct CourseStudentLink"), "the junction exists at all");
@@ -7878,7 +7878,7 @@ fn test_rust_generation_junction_admits_a_mixed_key_pair() {
 fn test_rust_generation_junction_round_trip_is_key_typed() {
     let mut parser = forgedb_parser::Parser::new(MIXED_M2M_SRC).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
     assert!(
@@ -7913,7 +7913,7 @@ fn test_rust_generation_junction_round_trip_is_key_typed() {
 fn test_rust_generation_junction_replay_frame_is_the_endpoint_widths() {
     let mut parser = forgedb_parser::Parser::new(MIXED_M2M_SRC).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
     assert!(
@@ -7955,7 +7955,7 @@ Sample {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(
         code.contains("pub tick: Timestamp"),
@@ -8015,7 +8015,7 @@ Tag {
         forgedb_parser::validate_schema(&schema).is_empty(),
         "a timestamp-keyed model is a legal junction endpoint"
     );
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
 
     assert!(code.contains("pub struct TagTickLink"), "the junction is generated");
     assert!(
@@ -8143,7 +8143,7 @@ fn test_engine_generation_refuses_an_unknown_hop() {
 #[test]
 fn test_rust_generation_open_guard_has_two_distinct_arms() {
     let schema = engine_hop_schema();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    let code = memoized_code("RustGenerator", &schema, || RustGenerator::generate(&schema).unwrap().code);
     let flat: String = code
         .chars()
         .filter(|c| !c.is_whitespace() && *c != '\\')
@@ -8175,7 +8175,7 @@ fn api_for(src: &str) -> String {
     forgedb_source_guard::cached_source(&format!("api:{src}"), || {
         let mut parser = forgedb_parser::Parser::new(src).unwrap();
         let schema = parser.parse().unwrap();
-        ApiGenerator::generate(&schema).unwrap().code
+        memoized_code("ApiGenerator", &schema, || ApiGenerator::generate(&schema).unwrap().code)
     }).to_string()
 }
 
@@ -8183,8 +8183,27 @@ fn wasm_for(src: &str) -> String {
     forgedb_source_guard::cached_source(&format!("wasm:{src}"), || {
         let mut parser = forgedb_parser::Parser::new(src).unwrap();
         let schema = parser.parse().unwrap();
-        WasmGenerator::generate(&schema).unwrap().code
+        memoized_code("WasmGenerator", &schema, || WasmGenerator::generate(&schema).unwrap().code)
     }).to_string()
+}
+
+fn memoized_code(
+    generator: &str,
+    schema: &forgedb_parser::Schema,
+    generate: impl FnOnce() -> String,
+) -> String {
+    forgedb_source_guard::cached_source(&format!("{generator}\u{1}{schema:?}"), generate)
+        .to_string()
+}
+
+fn memoized_code_with(
+    generator: &str,
+    extra: &[&str],
+    schema: &forgedb_parser::Schema,
+    generate: impl FnOnce() -> String,
+) -> String {
+    let key = format!("{generator}\u{1}{}\u{1}{schema:?}", extra.join("\u{2}"));
+    forgedb_source_guard::cached_source(&key, generate).to_string()
 }
 
 fn flat(code: &str) -> String {
@@ -8808,7 +8827,7 @@ Post {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let api = ApiGenerator::generate(&schema).unwrap().code;
+    let api = memoized_code("ApiGenerator", &schema, || ApiGenerator::generate(&schema).unwrap().code);
     let f: String = api.split_whitespace().collect::<Vec<_>>().join(" ");
 
     assert!(
@@ -8850,7 +8869,7 @@ Post {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let api = ApiGenerator::generate(&schema).unwrap().code;
+    let api = memoized_code("ApiGenerator", &schema, || ApiGenerator::generate(&schema).unwrap().code);
     let f = flat(&api);
 
     assert!(
@@ -8914,7 +8933,7 @@ Gauge {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let api = ApiGenerator::generate(&schema).unwrap().code;
+    let api = memoized_code("ApiGenerator", &schema, || ApiGenerator::generate(&schema).unwrap().code);
     let f = flat(&api);
 
     for field in ["limit", "offset", "sort", "order"] {
@@ -8947,7 +8966,7 @@ Link {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let api = ApiGenerator::generate(&schema).unwrap().code;
+    let api = memoized_code("ApiGenerator", &schema, || ApiGenerator::generate(&schema).unwrap().code);
     let f = flat(&api);
 
     assert!(
