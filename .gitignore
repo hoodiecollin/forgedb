@@ -57,3 +57,5 @@ apps/vscode-forgedb/*.vsix
 # insta writes .snap.new beside the accepted snapshot when one differs; it is a
 # working file consumed by `cargo insta accept`, never a tracked artifact.
 *.snap.new
+
+/.serena/cache/
