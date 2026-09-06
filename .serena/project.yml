@@ -1,0 +1,19 @@
+languages:
+  - rust
+  - typescript
+  - go
+
+ignored_paths:
+  - scratchpad/
+  - target/
+  - node_modules/
+  - .worktrees/
+  - apps/inspector/src-tauri/target/
+
+ls_specific_settings:
+  rust:
+    initializationOptions:
+      cargo:
+        allFeatures: true
+        buildScripts:
+          enable: true
