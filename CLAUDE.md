@@ -748,7 +748,7 @@ before reporting a symbol missing. Feature-gated code is covered — `.serena/pr
 
 **Two things this does NOT reach, and neither is a bug to file:**
 
-- **`quote!` bodies.** `crates/codegen/src` is ~21k lines with ~938 `quote!` invocations. A
+- **`quote!` bodies.** `crates/codegen/src` is ~21k lines with **934** `quote!` invocations (counted with `ast-grep`, not grep). A
   `quote!` body with interpolation does not re-parse as Rust — you drop to token trees — so
   *"what does the generator emit for X"* is not answerable by `find_symbol` or `ast-grep`. Read the
   generator, or read a snapshot. Searching it as text is legitimate.
