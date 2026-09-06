@@ -719,6 +719,47 @@ of truth.
    tokens; do it anyway, because the cost is bounded and paid once while planning against a stale
    claim is unbounded and discovered late.
 
+## Code search
+
+Symbol lookup goes through the **`serena`** MCP server, not text search.
+
+| Question | Tool |
+|---|---|
+| Where is `X` defined? | `find_symbol` |
+| What references `X`? | `find_referencing_symbols` |
+| What is in this file? | `get_symbols_overview` |
+| Structural pattern | `ast-grep run -p '<pattern>' -l rust\|ts\|tsx\|go` |
+| Symbol-level edit | `replace_symbol_body` (no line-number drift) |
+
+A `PreToolUse` hook refuses `Grep` when the pattern is **identifier-shaped**
+(`^[A-Za-z_][A-Za-z0-9_.:]*$`) and the search is not scoped to a non-code glob or directory.
+Anything with spaces, quotes or regex metacharacters passes through. Text search is still the right
+tool for string literals, error copy, config keys, `Cargo.toml` version lines and
+`.pm-playbook/backlog/` — scope those to a non-code glob.
+
+**An empty result is not proof of absence.** `rust-analyzer` resolves ONE build configuration and
+the host target, so on a native host every item under `#[cfg(target_arch = "wasm32")]` is invisible:
+5 sites across `crates/storage/src/lib.rs` (the facade's web re-export), `crates/wal/src/lib.rs`
+(the in-memory `WalManager`) and `crates/storage-web/src/lib.rs`. Small, but it is exactly the
+substrate seam. `cfg(unix)` and `cfg(not(target_arch = "wasm32"))` are *active* on macOS and Linux
+and are visible. Cross-check with **`ast-grep`**, which parses every file regardless of `cfg`,
+before reporting a symbol missing. Feature-gated code is covered — `.serena/project.yml` sets
+`cargo.allFeatures: true`, verified against `cargo check --workspace --all-features`.
+
+**Two things this does NOT reach, and neither is a bug to file:**
+
+- **`quote!` bodies.** `crates/codegen/src` is ~21k lines with ~938 `quote!` invocations. A
+  `quote!` body with interpolation does not re-parse as Rust — you drop to token trees — so
+  *"what does the generator emit for X"* is not answerable by `find_symbol` or `ast-grep`. Read the
+  generator, or read a snapshot. Searching it as text is legitimate.
+- **Non-root cargo workspaces.** Serena is scoped to the root workspace. `benchmarks/` and
+  `apps/inspector/src-tauri/` are separate workspaces and are not indexed; `scratchpad/` is
+  gitignored and deliberately excluded.
+
+Prerequisites are in [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md). `rust-analyzer` is a **local**
+install, deliberately not a `rust-toolchain.toml` component — CI installs no toolchain explicitly,
+so a component there would be downloaded by every job for a tool no job runs.
+
 ## Conventions
 
 - **ForgeDB's own source carries NO comments (#488).** Not doc comments (`///`, `//!`,
