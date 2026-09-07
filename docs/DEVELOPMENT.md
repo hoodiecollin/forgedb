@@ -46,6 +46,32 @@ Serena starts from `.mcp.json` when the session opens; `/mcp` should list it. Sk
 `rust-analyzer` does not error — Serena simply returns nothing for Rust, which is why it sits
 here with the other prerequisites rather than being discovered later.
 
+**Then trust the checkout, or half the committed config is discarded.** Serena applies
+`ls_specific_settings` from `.serena/project.yml` — which is where `cargo.allFeatures: true` and
+`cargo.buildScripts.enable: true` live — only when the project path is trusted. Trust is declared
+in `~/.serena/serena_config.yml`, which is machine-global and untracked, so it does not arrive with
+a clone. Add the path to your checkout:
+
+```yaml
+trusted_project_path_patterns:
+- /absolute/path/to/forgedb
+- /absolute/path/to/forgedb/**
+```
+
+The `/**` line covers worktrees under `.worktrees/`. Restart the session afterwards — Serena reads
+this once at startup.
+
+Untrusted is the quiet failure, not a loud one: Serena logs
+
+```
+Project path <path> is not trusted, ignoring LS-specific settings from project configuration.
+```
+
+to `~/.serena/logs/` and otherwise behaves normally. Feature-gated code then resolves as if the
+feature were off — `find_symbol` still finds the symbol, while `find_referencing_symbols` reports
+zero callers for it. Verify with `crates/auth/src/lib.rs`: `JwksHttpCache` sits behind the
+non-default `jwks-http` feature and has three references, so zero means the settings were dropped.
+
 **Git:**
 ```bash
 # Verify git installation
