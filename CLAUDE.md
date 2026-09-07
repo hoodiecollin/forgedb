@@ -730,14 +730,28 @@ Anything with spaces, quotes or regex metacharacters passes through. Text search
 tool for string literals, error copy, config keys, `Cargo.toml` version lines and
 `.pm-playbook/backlog/` — scope those to a non-code glob.
 
-**An empty result is not proof of absence.** `rust-analyzer` resolves ONE build configuration and
-the host target, so on a native host every item under `#[cfg(target_arch = "wasm32")]` is invisible:
-5 sites across `crates/storage/src/lib.rs` (the facade's web re-export), `crates/wal/src/lib.rs`
-(the in-memory `WalManager`) and `crates/storage-web/src/lib.rs`. Small, but it is exactly the
-substrate seam. `cfg(unix)` and `cfg(not(target_arch = "wasm32"))` are *active* on macOS and Linux
-and are visible. Cross-check with **`ast-grep`**, which parses every file regardless of `cfg`,
-before reporting a symbol missing. Feature-gated code is covered — `.serena/project.yml` sets
-`cargo.allFeatures: true`, verified against `cargo check --workspace --all-features`.
+**An empty result is not proof of absence — and a non-empty one can still be partial.**
+`rust-analyzer` resolves ONE build configuration and the host target, but the two tool families
+degrade differently under it, and the second is the dangerous one:
+
+- `find_symbol` / `get_symbols_overview` read a **syntactic** index and DO see items the host
+  build excludes. All 5 `#[cfg(target_arch = "wasm32")]` sites resolve on a macOS host — the
+  `WalManager` at `crates/wal/src/lib.rs:112`, `storage-web`'s `persist` module, and `OpfsSource`
+  inside it.
+- `find_referencing_symbols` needs **semantic** resolution and finds nothing in code the active
+  `cfg` excludes. It reports **zero callers rather than an error**, so a `cfg`-gated symbol reads
+  as dead. Measured in `crates/auth/src/lib.rs`: `StaticKey` resolves 3 references; `JwksHttpCache`
+  — same file, behind the non-default `jwks-http` feature — resolves none while having 3.
+
+So the failure to plan for is not "the symbol is missing", it is "the symbol is found and its
+callers are not". Cross-check with **`ast-grep`**, which parses every file regardless of `cfg`,
+before concluding either that a symbol is absent or that nothing calls it.
+
+**`cargo.allFeatures: true` in `.serena/project.yml` applies only if the project path matches
+`trusted_project_path_patterns` in `~/.serena/serena_config.yml`** — machine-global and untracked,
+so it does not travel with a clone. Untrusted, Serena discards every `ls_specific_settings` entry
+and says so only in its log, and feature-gated code then resolves as though the feature were off.
+`docs/DEVELOPMENT.md` has the setup step; `tests/semantic_search_test.rs` guards the repo half.
 
 **Two things this does NOT reach, and neither is a bug to file:**
 
