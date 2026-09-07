@@ -1,14 +1,9 @@
-languages:
-  - rust
-  - typescript
-  - go
-
 ignored_paths:
-  - scratchpad/
-  - target/
-  - node_modules/
-  - .worktrees/
-  - apps/inspector/src-tauri/target/
+- scratchpad/
+- target/
+- node_modules/
+- .worktrees/
+- apps/inspector/src-tauri/target/
 
 ls_specific_settings:
   rust:
@@ -17,3 +12,46 @@ ls_specific_settings:
         allFeatures: true
         buildScripts:
           enable: true
+
+language_servers:
+- rust
+- typescript
+- go
+
+default_modes:
+
+added_modes:
+
+excluded_tools: []
+
+included_optional_tools: []
+
+fixed_tools: []
+
+symbol_info_budget:
+
+language_backend:
+
+line_ending:
+
+read_only_memory_patterns: []
+
+ignored_memory_patterns: []
+
+ls_workspace_folders:
+- .
+
+ls_additional_workspace_folders: []
+
+read_only: false
+
+ignore_all_files_in_gitignore: true
+
+initial_prompt: ''
+
+encoding: utf-8
+
+activation_command:
+
+activation_command_timeout: 180.0
+project_name: forgedb
