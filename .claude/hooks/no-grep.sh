@@ -32,13 +32,12 @@ an import, a comment, or a same-named symbol in another module.
   File structure ........ serena: get_symbols_overview
   Structural pattern .... ast-grep run -p '<pattern>' -l rust|ts|tsx|go
 
-An EMPTY result from serena is not proof of absence. rust-analyzer resolves ONE build
-configuration and the host target. On a native host that hides every item under
-#[cfg(target_arch = "wasm32")] — 5 sites across crates/storage/src/lib.rs (the facade's
-web re-export), crates/wal/src/lib.rs (the in-memory WalManager) and
-crates/storage-web/src/lib.rs. Small, but it is the substrate seam, so a miss there is
-load-bearing. Cross-check with ast-grep, which parses every file regardless of cfg,
-before reporting a symbol missing.
+An EMPTY result from serena is not proof of absence, and a non-empty one can still be
+partial. find_symbol reads a syntactic index and DOES see cfg-excluded items, but
+find_referencing_symbols needs semantic resolution and reports ZERO CALLERS rather than
+an error for anything the host build's cfg excludes — so a cfg-gated or feature-gated
+symbol reads as dead code. Cross-check with ast-grep, which parses every file regardless
+of cfg, before concluding a symbol is absent OR that nothing calls it.
 
 Text search is still right for things with no AST node — string literals, error copy,
 config keys, Cargo.toml version lines, .pm-playbook/backlog/. Scope those to a non-code

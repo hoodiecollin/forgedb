@@ -58,4 +58,4 @@ apps/vscode-forgedb/*.vsix
 # working file consumed by `cargo insta accept`, never a tracked artifact.
 *.snap.new
 
-/.serena/cache/
+/.serena/memories/
