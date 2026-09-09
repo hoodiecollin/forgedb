@@ -34,3 +34,6 @@ jobs:
 
       - name: No comments in ForgeDB's own source
         run: make comment-check
+
+      - name: Branch-hygiene guard scenarios
+        run: make branch-hygiene-test

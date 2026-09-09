@@ -620,7 +620,13 @@ of truth.
      branch, so a PR merged into `develop` leaves its issue open however the body is written.
    - **The release sequence is ordered, and the order is the whole point:** publish the substrate
      → **then** merge `develop` → `main` → **then** tag. Publishing after the merge reopens the
-     window the branch exists to close.
+     window the branch exists to close. **The merge itself is a PR headed by a throwaway
+     `release/vX.Y.Z`, never by `develop`** — `delete_branch_on_merge` deletes the head branch, and
+     `develop`'s `deletion` rule is bypassed by the admin role that performs every release merge,
+     so it cannot stop the one event that deletes it (#487, 2/2 releases; the second went five days
+     unnoticed). The forward merge back uses a `sync/*` head for the same reason.
+     `.github/workflows/branch-hygiene.yml` enforces both directions and asserts `develop` still
+     exists after every push to `main`.
    - **The outside-repo reclose is a check on `main`, not on `develop`** — required on the
      integration branch it would sit red for an entire cycle and stop being read.
      `.github/workflows/substrate-reclose.yml`.
