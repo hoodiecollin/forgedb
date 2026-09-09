@@ -452,8 +452,9 @@ current one. Chores, CI fixes and typo PRs close no issue and pass silently, and
 correctly so: work with no issue cannot be next-cycle work, because next-cycle
 work is *defined* by carrying that milestone.
 
-The `Cycle scope` workflow enforces this on PRs to `develop`. Most work here
-merges locally, so run the same check yourself before merging a branch back:
+The `Cycle scope` workflow enforces this on PRs to `develop`, which is how core
+work lands (#390), so CI sees it. Run the same check yourself for anything that
+still lands directly:
 
 ```bash
 make cycle-scope ISSUE=245        # the issue(s) your branch closes
