@@ -501,7 +501,7 @@ fn the_nightly_checks_out_develop_explicitly() {
 
 #[test]
 fn the_workflows_this_file_guards_still_exist() {
-    for f in ["test.yml", "nightly-ignored.yml", "substrate-reclose.yml"] {
+    for f in ["test.yml", "nightly-ignored.yml", "substrate-reclose.yml", "branch-hygiene.yml"] {
         let p = repo_root().join(".github/workflows").join(f);
         assert!(
             Path::new(&p).exists(),
@@ -880,4 +880,80 @@ fn no_reclose_workflow_passes_a_tombstoned_cli_flag() {
             }
         }
     }
+}
+
+#[test]
+fn the_branch_hygiene_guard_runs_on_both_merge_directions() {
+    let on = trigger_block("branch-hygiene.yml");
+
+    assert!(
+        on.contains("pull_request"),
+        "branch-hygiene.yml must run on pull_request, or the head-branch rule is advice \
+         nobody is checked against. Got: {on}"
+    );
+    assert!(
+        on.contains("main") && on.contains("develop"),
+        "the guard must cover PRs into BOTH `main` and `develop`. Only `main` catches the \
+         release merge and misses the forward merge, whose head would be `main` — deleting \
+         the default branch, which is worse than #487's original symptom. Got: {on}"
+    );
+    assert!(
+        on.contains("push"),
+        "branch-hygiene.yml must also run on push, which is how the develop-existence check \
+         fires at the release merge. Got: {on}"
+    );
+}
+
+#[test]
+fn the_head_guard_invokes_the_script_rather_than_reimplementing_it() {
+    let cmd = run_command("branch-hygiene.yml", "Head branch must be disposable");
+
+    assert!(
+        cmd.contains("scripts/check-branch-hygiene.ts"),
+        "the step must call the script. A second copy of the rule written inline in YAML is \
+         untestable and drifts from the one the scenarios cover, so the guard would pass \
+         while the real rule changed underneath it. Got: {cmd}"
+    );
+    assert!(
+        cmd.contains("pr-head"),
+        "the step must call the `pr-head` subcommand specifically; `branch-exists` exits zero \
+         for a branch that is present and would report green on every PR. Got: {cmd}"
+    );
+}
+
+#[test]
+fn the_existence_check_fires_at_the_merge_and_not_at_the_tag() {
+    let cmd = run_command("branch-hygiene.yml", "develop survived the merge");
+
+    assert!(
+        cmd.contains("branch-exists") && cmd.contains("develop"),
+        "the step must assert `develop` exists by name. Got: {cmd}"
+    );
+
+    let on = trigger_block("branch-hygiene.yml");
+    assert!(
+        !on.contains("tags"),
+        "this check must NOT be tag-triggered. Workflows firing on the same event are \
+         independent, so a tag-triggered check cannot block a tag-triggered release — it \
+         would report after the fact. `push` to main fires at the release merge, which is \
+         when the branch actually disappears. Got: {on}"
+    );
+}
+
+#[test]
+fn the_branch_hygiene_scenarios_have_a_place_where_they_can_fail() {
+    let recipe = make_recipe("branch-hygiene-test");
+    assert!(
+        recipe.contains("check-branch-hygiene.test.ts"),
+        "`make branch-hygiene-test` must run the scenario file. A target that runs something \
+         else reports green while the guard's own rules go uncovered. Got: {recipe}"
+    );
+
+    let cmd = run_command("test.yml", "Branch-hygiene guard scenarios");
+    assert!(
+        cmd.contains("make branch-hygiene-test"),
+        "test.yml must run the scenarios, or they are enforced by memory. The scenarios run \
+         under bun, which test.yml installs only AFTER `make test` — so this step has to sit \
+         with the other bun steps, not with the cargo ones. Got: {cmd}"
+    );
 }
