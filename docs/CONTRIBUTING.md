@@ -426,6 +426,24 @@ Releases go **publish the substrate → merge `develop` into `main` → tag**, i
 order. The `Substrate reclose` workflow runs on `main` and proves the first step
 actually happened.
 
+**That merge is never a PR headed by `develop`.** `delete_branch_on_merge` is
+true, so GitHub deletes the head branch — and the `deletion` rule protecting
+`develop` is bypassed by the admin role that performs every release merge, which
+makes it unenforceable against the one event that deletes the branch (#487). It
+fired on both releases so far; the second left `develop` missing for five days,
+unnoticed, because a `git fetch` without `--prune` keeps serving a stale
+`origin/develop` that reads normally. Cut a disposable head:
+
+```bash
+git push origin origin/develop:refs/heads/release/v0.6.0
+gh pr create --base main --head release/v0.6.0 --title "Release v0.6.0"
+```
+
+The same applies in reverse: the forward merge back into `develop` goes through a
+throwaway `sync/*` branch, never a PR headed by `main`. The `Branch hygiene`
+workflow enforces both directions, and checks that `develop` still exists after
+every push to `main`.
+
 ### There is exactly one `develop`
 
 No `v0.5-develop` alongside a `v0.4-develop`. The branch name never contains a
