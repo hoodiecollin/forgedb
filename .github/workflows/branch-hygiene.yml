@@ -1,0 +1,41 @@
+name: Branch hygiene
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  pr-head-is-disposable:
+    name: pr-head-is-disposable
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Typecheck repo tooling
+        run: make scripts-typecheck
+
+      - name: Head branch must be disposable
+        env:
+          BASE: ${{ github.base_ref }}
+          HEAD: ${{ github.head_ref }}
+        run: bun scripts/check-branch-hygiene.ts pr-head "$BASE" "$HEAD"
+
+  develop-exists:
+    name: develop-exists
+    if: github.event_name == 'push'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: develop survived the merge
+        run: bun scripts/check-branch-hygiene.ts branch-exists develop
