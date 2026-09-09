@@ -238,6 +238,14 @@ else
 	@echo "usage: make cycle-scope ISSUE=<n[,n...]>   (or PR=<n>)"; exit 2
 endif
 
+.PHONY: branch-hygiene-test branch-hygiene
+
+branch-hygiene-test:
+	@$(BUN) test scripts/check-branch-hygiene.test.ts
+
+branch-hygiene:
+	@$(BUN) scripts/check-branch-hygiene.ts branch-exists $(or $(NAME),develop)
+
 .PHONY: experiment-261
 
 experiment-261:
