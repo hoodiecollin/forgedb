@@ -95,9 +95,26 @@ if [ "$tool" = "Bash" ]; then
   redirect_into_code='>>?[[:space:]]*[^[:space:]>]*\.(rs|ts|tsx|js|mjs|cjs|go)([^A-Za-z0-9_]|$)'
 
   segments=$(awk '{
-    gsub(/[|][|]/, "\n"); gsub(/&&/, "\n"); gsub(/;/, "\n")
-    gsub(/[$][(]/, "\n"); gsub(/[(]/, "\n"); gsub(/[|]/, "\n@PIPE@ ")
-    print }' <<<"$cmd")
+    s = $0; out = ""; n = length(s); sq = 0; dq = 0; i = 1
+    while (i <= n) {
+      c = substr(s, i, 1); nx = substr(s, i + 1, 1)
+      if (sq) { out = out c; if (c == "\047") sq = 0; i++; continue }
+      if (dq) {
+        if (c == "\\") { out = out c nx; i += 2; continue }
+        out = out c; if (c == "\"") dq = 0; i++; continue
+      }
+      if (c == "\047") { sq = 1; out = out c; i++; continue }
+      if (c == "\"") { dq = 1; out = out c; i++; continue }
+      if (c == "\\") { out = out c nx; i += 2; continue }
+      if (c == "|" && nx == "|") { out = out "\n"; i += 2; continue }
+      if (c == "&" && nx == "&") { out = out "\n"; i += 2; continue }
+      if (c == ";") { out = out "\n"; i++; continue }
+      if (c == "$" && nx == "(") { out = out "\n"; i += 2; continue }
+      if (c == "(") { out = out "\n"; i++; continue }
+      if (c == "|") { out = out "\n@PIPE@ "; i++; continue }
+      out = out c; i++
+    }
+    print out }' <<<"$cmd")
 
   while IFS= read -r seg; do
     piped=0
