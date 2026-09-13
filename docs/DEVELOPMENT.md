@@ -306,7 +306,7 @@ make test
 make clippy
 
 # TIER 2 — the ~20 tests that each generate and compile a crate. #[ignore]d out of
-# tier 1; run nightly by CI. Minutes, not seconds. Run it when you touch codegen, the
+# tier 1; CI runs it only on manual dispatch while #449 is open. Minutes, not seconds. Run it when you touch codegen, the
 # build cache, or the generated API.
 make test-ignored
 

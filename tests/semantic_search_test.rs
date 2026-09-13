@@ -342,6 +342,8 @@ fn shell_edits_of_source_files_are_refused() {
         "sed -i '' 's/foo/bar/' crates/parser/src/ast.rs",
         "sed -i.bak 's/foo/bar/' src/main.rs",
         "perl -pi -e 's/foo/bar/' tools/goguard/main.go",
+        "perl -pi -e 's/Value::F64\\(12\\.5\\)\\.is_numeric/Value::F64(3.14).is_numeric/' crates/types/tests/doc_examples.rs",
+        "sed -i '' 's/(\"tests\\/snapshot_order_test.rs\", 1)/(\"tests\\/snapshot_order_test.rs\", 2)/' tests/negated_contains_ratchet_test.rs",
         "cat > src/new.rs <<'EOF'\nfn main() {}\nEOF",
         "echo 'pub fn x() {}' >> crates/types/src/lib.rs",
         "printf 'x' | tee src/project.rs",
@@ -369,6 +371,9 @@ fn shell_search_scoped_to_non_code_or_piped_output_still_works() {
         "grep -rn 'name:' .github/workflows/",
         "ast-grep run -p 'fn $F($$$)' -l rust",
         "grep -n allFeatures ~/.serena/serena_config.yml",
+        "grep -l -E 'decimal|json|timestamp\\(us\\)' examples/*.forge",
+        "grep -c '\\.lines()' /tmp/v060check/lines-sites.txt",
+        "cargo test 2>&1 | grep -E 'test result|panicked at (crates|tests)'",
     ] {
         assert_eq!(
             run_hook(&bash_payload(command)),
