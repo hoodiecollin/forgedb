@@ -775,6 +775,21 @@ Text search is still the right tool for string literals, error copy, config keys
 lines and `.pm-playbook/backlog/` — scope those to a non-code glob. Both matchers are guarded by
 `tests/semantic_search_test.rs`, which runs the hook against a table of payloads.
 
+**The same rule holds for TESTS that assert a property of source (#388, #515).** A guard over
+Rust asks `forgedb_source_guard::RustSource` (scoping: `fn_named` / `method_named` / `struct_named`;
+body: `calls` / `field_read_count` / `stmt_index_of` / the match queries; file-wide: `file_call_count`,
+`file_calls_path_with_str_arg`, `file_field_read_count`, `ident_count`, `uses`, `derives` /
+`any_derive` / `attr_count` / `fns_with_attr`, `const_u64`, `string_literals`, `or_expressions_joining`;
+`walk` for a directory), over Go asks `go_facts` (imports, string switches, exported symbols, struct
+field types), over a manifest asks the `toml` crate through `tests/common`. Every visitor descends
+into macro bodies, because `assert!` is where most such sites live and `syn` does not enter a macro
+on its own. Two ratchets keep the class from growing back, both AST-derived and both **equalities**:
+`tests/line_scan_ratchet_test.rs` names every remaining `.lines()` call site with its reason (process
+output, a `.gitignore`, workflow YAML, a failure-message excerpt), and
+`tests/negated_contains_ratchet_test.rs` holds the per-file count of `!x.contains(..)` so it can only
+be lowered. A text extractor counted 52 of the 59 line scans; the AST saw the seven inside `assert!`
+bodies — which is the reason the ratchets parse rather than grep.
+
 **An empty result is not proof of absence — and a non-empty one can still be partial.**
 `rust-analyzer` resolves ONE build configuration and the host target, but the two tool families
 degrade differently under it, and the second is the dangerous one:
