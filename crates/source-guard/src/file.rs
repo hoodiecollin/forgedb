@@ -477,6 +477,91 @@ impl RustSource {
     }
 }
 
+struct SiteWalker<'n> {
+    method: &'n str,
+    stack: Vec<String>,
+    hits: std::collections::BTreeMap<String, usize>,
+}
+
+impl<'n> SiteWalker<'n> {
+    fn record(&mut self) {
+        let key = self.stack.last().cloned().unwrap_or_else(|| "<file>".to_string());
+        *self.hits.entry(key).or_insert(0) += 1;
+    }
+}
+
+impl<'ast, 'n> Visit<'ast> for SiteWalker<'n> {
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        self.stack.push(node.sig.ident.to_string());
+        syn::visit::visit_item_fn(self, node);
+        self.stack.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        self.stack.push(node.sig.ident.to_string());
+        syn::visit::visit_impl_item_fn(self, node);
+        self.stack.pop();
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        if node.method == self.method {
+            self.record();
+        }
+        syn::visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        for e in macro_exprs(node) {
+            let mut inner = SiteWalker {
+                method: self.method,
+                stack: self.stack.clone(),
+                hits: std::collections::BTreeMap::new(),
+            };
+            inner.visit_expr(&e);
+            for (k, v) in inner.hits {
+                *self.hits.entry(k).or_insert(0) += v;
+            }
+        }
+    }
+}
+
+fn strip_parens(e: &syn::Expr) -> &syn::Expr {
+    match e {
+        syn::Expr::Paren(p) => strip_parens(&p.expr),
+        other => other,
+    }
+}
+
+impl RustSource {
+    pub fn method_call_sites(&self, method: &str) -> std::collections::BTreeMap<String, usize> {
+        let mut w = SiteWalker {
+            method,
+            stack: Vec::new(),
+            hits: std::collections::BTreeMap::new(),
+        };
+        w.visit_file(self.ast());
+        w.hits
+    }
+
+    pub fn negated_method_call_count(&self, method: &str) -> usize {
+        let mut n = 0;
+        walk_exprs(
+            self.ast(),
+            |e| {
+                if let syn::Expr::Unary(u) = e
+                    && matches!(u.op, syn::UnOp::Not(_))
+                    && let syn::Expr::MethodCall(m) = strip_parens(&u.expr)
+                    && m.method == method
+                {
+                    n += 1;
+                }
+            },
+            |_| {},
+        );
+        n
+    }
+}
+
 impl<'a> FnScope<'a> {
     pub fn match_has_wildcard_arm(&self) -> bool {
         block_match_facts(self.block).0
