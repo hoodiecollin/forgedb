@@ -414,13 +414,13 @@ fn test_fixed_column_f64() {
     let path = temp_dir.join("test_f64.bin");
     let mut col = FixedColumn::new(path, 8).unwrap();
 
-    col.append_f64(3.14159).unwrap();
-    col.append_f64(-2.71828).unwrap();
-    col.append_f64(1.41421).unwrap();
+    col.append_f64(12.5).unwrap();
+    col.append_f64(-0.75).unwrap();
+    col.append_f64(1024.125).unwrap();
 
-    assert!((col.read_f64(0).unwrap() - 3.14159).abs() < 0.00001);
-    assert!((col.read_f64(1).unwrap() - (-2.71828)).abs() < 0.00001);
-    assert!((col.read_f64(2).unwrap() - 1.41421).abs() < 0.00001);
+    assert!((col.read_f64(0).unwrap() - 12.5).abs() < 0.00001);
+    assert!((col.read_f64(1).unwrap() - (-0.75)).abs() < 0.00001);
+    assert!((col.read_f64(2).unwrap() - 1024.125).abs() < 0.00001);
     assert_eq!(col.len(), 3);
 
     fs::remove_dir_all(&temp_dir).unwrap();

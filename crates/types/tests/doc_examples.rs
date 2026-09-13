@@ -73,7 +73,7 @@ fn value_is_numeric() {
     assert!(Value::U32(10).is_numeric());
     assert!(Value::U64(u64::MAX).is_numeric());
     assert!(Value::I32(42).is_numeric());
-    assert!(Value::F64(3.14).is_numeric());
+    assert!(Value::F64(12.5).is_numeric());
     assert!(!Value::String("hello".to_string()).is_numeric());
 }
 

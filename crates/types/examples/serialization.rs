@@ -32,7 +32,7 @@ fn main() {
     println!("Timestamp Value:\n{}\n", json);
 
     println!("--- Roundtrip Test ---");
-    let original = Value::F64(3.14159);
+    let original = Value::F64(12.5);
     let json = serde_json::to_string(&original).unwrap();
     let deserialized: Value = serde_json::from_str(&json).unwrap();
     println!("Original: {:?}", original);
