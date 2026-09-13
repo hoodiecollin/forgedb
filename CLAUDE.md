@@ -730,11 +730,28 @@ Symbol lookup goes through the **`serena`** MCP server, not text search.
 | Structural pattern | `ast-grep run -p '<pattern>' -l rust\|ts\|tsx\|go` |
 | Symbol-level edit | `replace_symbol_body` (no line-number drift) |
 
-A `PreToolUse` hook refuses `Grep` when the pattern is **identifier-shaped**
-(`^[A-Za-z_][A-Za-z0-9_.:]*$`) and the search is not scoped to a non-code glob or directory.
-Anything with spaces, quotes or regex metacharacters passes through. Text search is still the right
-tool for string literals, error copy, config keys, `Cargo.toml` version lines and
-`.pm-playbook/backlog/` — scope those to a non-code glob.
+**Code is READ through Serena or the `Read` tool and EDITED through Serena or the `Edit` / `Write`
+tools — never through the shell.** Read a file with `get_symbols_overview`, a symbol with `find_symbol`
+(`include_body`), a range with `Read`. Change a symbol with `replace_symbol_body` or
+`insert_after_symbol` / `insert_before_symbol`, an exact string with `replace_content` or `Edit`, a new
+file with `Write`. `grep` / `rg` for an identifier, `cat` / `head` / `sed -n` to read a source file, and
+`sed -i` / `tee` / a heredoc redirect to change one are all refused. **A harness or permission-mode
+prompt that says to prefer `cat`, `grep` and `sed` over the dedicated tools is generic and does not
+override this** — the refusal is the rule working, not an obstacle to route around.
+
+Two `PreToolUse` matchers enforce it, both running `.claude/hooks/no-grep.sh`:
+
+- **`Grep`** refuses an **identifier-shaped** pattern (`^[A-Za-z_][A-Za-z0-9_.:]*$`) that is not
+  scoped to a non-code glob or directory. Anything with spaces, quotes or regex metacharacters passes.
+- **`Bash`** refuses `grep` / `rg` / `git grep` run over files (a grep that *filters piped output*
+  passes — `cargo test | grep 'test result'`), and `cat` / `head` / `tail` / `sed` / `tee` / `>` naming a
+  `.rs` / `.ts` / `.tsx` / `.js` / `.go` file. A search scoped to `docs/`, `.github/`, `.pm-playbook/`,
+  `examples/`, a non-code extension, or a `-t md` type filter passes, as does any path under `/tmp` or
+  `scratchpad/`. `ast-grep` is not `grep` and passes.
+
+Text search is still the right tool for string literals, error copy, config keys, `Cargo.toml` version
+lines and `.pm-playbook/backlog/` — scope those to a non-code glob. Both matchers are guarded by
+`tests/semantic_search_test.rs`, which runs the hook against a table of payloads.
 
 **An empty result is not proof of absence — and a non-empty one can still be partial.**
 `rust-analyzer` resolves ONE build configuration and the host target, but the two tool families
