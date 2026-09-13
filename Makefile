@@ -151,7 +151,7 @@ extension-package:
 	cd $(EXTENSION) && $(BUN) install && $(BUN) run package
 	@echo "Packaged: $(EXTENSION)/forgedb-*.vsix"
 
-.PHONY: test test-ignored comment-check
+.PHONY: test test-ignored comment-check clippy
 
 comment-check:
 	@$(BUN) scripts/strip-comments.ts --check
@@ -160,6 +160,9 @@ test:
 	$(MAKE) goguard
 	cargo test --workspace --no-fail-fast
 	cargo build --workspace --examples
+
+clippy:
+	cargo clippy --workspace --all-targets
 
 goguard:
 	cd tools/goguard && go build -o ../../target/goguard/goguard .
