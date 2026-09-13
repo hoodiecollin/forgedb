@@ -83,12 +83,23 @@ Example: `cargo run -- generate all --output ./generated`.
 | 2 — ignored suite | `make test-ignored` | `.github/workflows/nightly-ignored.yml`, nightly against `develop`; files an issue on failure |
 
 `make test` is exactly `cargo test --workspace --no-fail-fast` + `cargo build --workspace
---examples`; the workflow invokes the target rather than repeating it, so there is one
-definition. `tests/ci_gate_test.rs` guards the properties that would otherwise break
-*silently* — the tier-2 command staying workspace-level rather than degrading into a list of
-test binaries (that form covers 13 of the 20 ignored tests and looks complete), the `--skip`
-still matching exactly the one test that belongs on the `main` surface, and the examples build
-still being there.
+--examples`, and the same workflow then runs `make clippy` (`cargo clippy --workspace
+--all-targets`, deny-level lints fail it, warnings do not — #293); the workflow invokes the
+targets rather than repeating them, so there is one definition of each. `tests/ci_gate_test.rs`
+guards the properties that would otherwise break *silently* — the tier-2 command staying
+workspace-level rather than degrading into a list of test binaries (that form covers 13 of the
+20 ignored tests and looks complete), the `--skip` still matching exactly the one test that
+belongs on the `main` surface, the examples build still being there, the clippy target still
+covering every target, and the tier-1 codegen compile check (below) still being non-ignored.
+
+**Tier 1 compiles generated code once (#293).** `tests/codegen_compiles_test.rs` generates a
+multi-model schema into a fresh cache, patches every `forgedb-*` dep to the checkout, and
+`cargo check`s the emitted `core` + `server` packages under `target/codegen-check`. A second
+test corrupts the generated `lib.rs` and asserts the check fails, so the first is proven to be
+looking at the package it names on every run. The four wrappers, the wasm replica and the
+transformer stay in tier 2 and in the reclose on `main` — the reclose builds the CLI from the
+checkout but resolves substrate from crates.io, which is why it cannot run on `develop`
+mid-cycle, and why a tier-1 check against the in-tree substrate was needed at all.
 
 **A build-only check does NOT substitute for running tier 2.** `cargo test --no-run --
 --ignored` reports **green on a broken tree** (verified, #384): `#[ignore]` is a runtime
@@ -111,10 +122,12 @@ cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
 - **Compile the examples.** `--lib --bins --tests` and `--doc` both EXCLUDE examples, which
   silently broke twice; `cargo build --workspace --examples` is part of the baseline.
 - **Codegen caveat (load-bearing):** the `crates/codegen` insta snapshot tests only compare
-  generated code as *strings* — they do NOT compile it. When changing generators, generate
-  for a real multi-model schema and `cargo check` the emitted Rust (`database.rs` +
-  `api.rs`) in a throwaway crate; snapshot pass ≠ output compiles. This discipline caught
-  3 real codegen bugs during Phase 3b.
+  generated code as *strings* — they do NOT compile it; snapshot pass ≠ output compiles. This
+  discipline caught 3 real codegen bugs during Phase 3b and 4 more since. Tier 1 now compiles
+  the generated `core` + `server` for one multi-model schema (above), so a PR cannot merge
+  with output rustc rejects — but that schema is one schema. When a generator change touches a
+  type or directive that schema does not use, generate for one that does and `cargo check` it,
+  or run the tier-2 scenario that covers it.
 
 **The exact pass count is intentionally NOT pinned here** — it changes every time a guard is
 added and has been a chronic drift source (this doc has claimed 531 / 521 / 498 / 434 / … over
@@ -677,9 +690,11 @@ of truth.
    (Portable form: `ai-pm-playbook` PLAYBOOK §5.3, rules PM008/PM009.)
 
 3. **Codegen is compile-tested, not just snapshot-tested.** The `insta` snapshots compare
-   generated code as *strings* — a snapshot pass does **not** mean the output compiles. When you
-   change a generator, generate for a real multi-model schema and `cargo check` the emitted crate
-   (`database.rs` + `api.rs`). Also `cargo build --workspace --examples` — the default test flags
+   generated code as *strings* — a snapshot pass does **not** mean the output compiles. Tier 1
+   compiles the generated `core` + `server` for one multi-model schema on every PR (#293,
+   `tests/codegen_compiles_test.rs`); when a generator change touches a type or directive that
+   schema does not use, generate for one that does and `cargo check` it, or run the tier-2
+   scenario that covers it. Also `cargo build --workspace --examples` — the default test flags
    exclude examples. (Both disciplines have caught real bugs; see *Build, test, run*.)
 
 4. **Ground truth over sources of truth.** Code + git history + runtime/DB state are ground truth;

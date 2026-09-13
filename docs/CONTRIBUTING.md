@@ -630,7 +630,7 @@ Closes #123
 
 | Check | Runs on | Blocks? |
 |---|---|---|
-| **`test suite`** — tier 1 (`make test`) | PRs into `develop`/`main`, and pushes to both | **Yes**, on PRs |
+| **`test suite`** — tier 1 (`make test`, then `make clippy`) | PRs into `develop`/`main`, and pushes to both | **Yes**, on PRs |
 | Cycle-scope gate | PRs into `develop` | Yes |
 | Substrate outside-repo reclose | `main` | Yes |
 | Reclose under a foreign cargo workspace root | `main` | Yes |
@@ -642,11 +642,19 @@ Run tier 1 yourself before opening a PR — it is the same command CI runs:
 
 ```bash
 make test          # cargo test --workspace --no-fail-fast + cargo build --workspace --examples
+make clippy        # cargo clippy --workspace --all-targets; deny-level lints fail, warnings do not
 ```
 
 The examples build is not optional: `--lib`, `--bins`, `--tests` **and** `--doc` all
 exclude examples, so no test flag covers them, and their omission has silently broken
 the tree twice.
+
+Tier 1 includes one compile of generated code: `tests/codegen_compiles_test.rs` generates a
+multi-model schema, patches every `forgedb-*` dependency to the checkout, and `cargo check`s
+the emitted `core` and `server` packages. The insta snapshots compare generated code as
+strings, so this is the first place a codegen change meets rustc on a PR into `develop`.
+The four wrappers, the wasm replica and the transformer are still compiled only in tier 2
+and in the reclose on `main`.
 
 The slow tier is the ~20 tests that each generate and compile a crate. They are
 `#[ignore]`d out of tier 1 and run nightly, but run them yourself when you touch codegen,
