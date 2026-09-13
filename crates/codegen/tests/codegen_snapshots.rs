@@ -6129,10 +6129,10 @@ fn symbol_stems(
 }
 
 fn go_exported_symbols(go_code: &str) -> std::collections::BTreeSet<String> {
-    go_code
-        .lines()
-        .filter_map(|l| l.trim().strip_prefix("//export "))
-        .map(|s| s.trim().to_string())
+    forgedb_source_guard::go_facts(go_code)
+        .exported()
+        .iter()
+        .cloned()
         .collect()
 }
 
@@ -7806,16 +7806,15 @@ fn test_bindings_fk_type_equals_the_targets_own_id_type() {
     let schema = parser.parse().unwrap();
 
     let go = memoized_code_with("GoGenerator", &[SYM, FP], &schema, || GoGenerator::generate(&schema, SYM, FP).unwrap().code);
+    let facts = forgedb_source_guard::go_facts(&go);
     let field_type = |decl: &str, name: &str| {
-        let body = &go[go.find(decl).unwrap_or_else(|| panic!("`{decl}` in the Go binding"))..];
-        body.lines()
-            .take_while(|l| !l.starts_with('}'))
-            .find(|l| l.trim_start().starts_with(&format!("{name} ")))
-            .map(|l| l.split_whitespace().nth(1).unwrap().to_string())
-            .unwrap_or_else(|| panic!("field `{name}` in `{decl}`"))
+        facts
+            .field_type(decl, name)
+            .unwrap_or_else(|| panic!("field `{name}` in Go struct `{decl}`: {:?}", facts.struct_fields.keys()))
+            .to_string()
     };
-    let post_id = field_type("type Post struct {", "Id");
-    let comment_fk = field_type("type Comment struct {", "Post");
+    let post_id = field_type("Post", "Id");
+    let comment_fk = field_type("Comment", "Post");
     assert_eq!(
         comment_fk, post_id,
         "the Go FK field and the target's own id field must have one type"
