@@ -1,7 +1,8 @@
 // wholesale-orders: Northwind trading company — customers, employees, products, orders
 // Adapted from Northwind (PostgreSQL port)
 // Source: https://github.com/pthom/northwind_psql (MIT License)
-// Money fields stored as i64 cents. discount is f64 [0,1] fraction.
+// Money fields stored as i64 cents. discount is a `decimal` fraction in [0, 1]:
+// it multiplies into a price, and a binary float cannot hold 0.1 exactly.
 
 Category {
   id: +uuid
@@ -125,7 +126,7 @@ OrderDetail {
   product: *Product
   unit_price: i64 @min(0)
   quantity: i32 @min(1)
-  discount: f64 @min(0) @max(1)
+  discount: decimal @min(0) @max(1)
   created_at: +timestamp
 
   @index(order, product)

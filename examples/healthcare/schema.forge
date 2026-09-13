@@ -2,6 +2,14 @@
 // departments, appointments, prescriptions, diagnoses.
 // Provenance: Synthetic (modeled after the standard healthcare design pattern)
 
+// Vitals taken at an appointment: three fixed-width numbers that belong
+// together, so an embedded struct rather than three columns or a model.
+struct Vitals {
+  systolic: u32
+  diastolic: u32
+  heart_rate: u32
+}
+
 Department {
   id: +uuid
   name: &string @length(1, 100)
@@ -44,6 +52,8 @@ Appointment {
   scheduled_at: timestamp
   status: string @length(1, 20)
   notes: string?
+  // not every visit records them
+  vitals: Vitals?
   diagnoses: [Diagnosis]
   created_at: +timestamp
   @index(provider, scheduled_at)

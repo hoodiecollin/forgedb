@@ -13,7 +13,7 @@ through prescribing and diagnosis documentation.
 | `Department` | Organizational unit; one-to-many `Provider` |
 | `Provider` | Doctor, nurse, or technician (role via `kind` string); belongs to a `Department` |
 | `Patient` | Demographics and contact info; root for clinical records |
-| `Appointment` | Scheduled encounter between a `Patient` and a `Provider` |
+| `Appointment` | Scheduled encounter between a `Patient` and a `Provider`; carries optional `vitals: Vitals?` |
 | `Prescription` | Drug order authored by a `Provider` for a `Patient` |
 | `Diagnosis` | ICD-style code record attached to an `Appointment` |
 
@@ -32,4 +32,5 @@ Key relationships:
 - `[Model]` one-to-many virtual back-references
 - Composite `@index(provider, scheduled_at)` and `@index(patient, scheduled_at)` on `Appointment` — the key query pattern for provider schedules and patient history
 - `@min(N)` and `@length(N, M)` constraints documenting domain rules
-- Provider role modeled as a `string` field (`kind`) with `@length` constraint rather than an enum type (ForgeDB has no enum type)
+- `struct Vitals { systolic, diastolic, heart_rate }` embedded as `Appointment.vitals: Vitals?` — three fixed-width numbers that belong together, optional because not every visit records them. A struct may hold only fixed-size scalars, which is exactly what vitals are
+- Provider role modeled as a `string` field (`kind`) with `@length` constraint. A declared `enum` would also fit (see `food-delivery`'s `OrderStatus`); the string is kept here to show the other idiom

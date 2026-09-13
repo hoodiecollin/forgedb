@@ -22,8 +22,10 @@ The CLI reads `schema.forge` from the current directory:
 (cd examples/music-store && forgedb generate all --output ./out)   # emit Rust/TS/API/stubs
 ```
 
-Every schema here passes `validate --strict` **and** `generate all` (the `openapi` target
-is skipped by design — see the root CLAUDE.md).
+Every schema here passes `validate --strict` **and** `generate all`, and CI holds both:
+`tests/lsp_cli_parity.rs` validates the corpus, and `tests/example_corpus_test.rs`
+generates every schema and asserts the corpus shows every showcased type (`decimal`,
+`json`, `timestamp(us)`, `bytes(N)`, `string(N)`, `[T; N]`, `struct`, `enum`).
 
 ## Catalog (18 apps)
 
@@ -31,22 +33,22 @@ is skipped by design — see the root CLAUDE.md).
 |---|---|---|---|
 | `hr-directory` | Adapted — Oracle HR (UPL) | 7 | Geo hierarchy, employee self-ref, mutual FK cycle, temporal job history — the small "intro" example |
 | `music-store` | Adapted — Chinook (MIT) | 10 | M2M playlists, `InvoiceLine` join-with-payload, self-ref `reports_to`, `@soft_delete`, money as `i64` cents |
-| `wholesale-orders` | Adapted — Northwind (MIT port) | 8 | `OrderDetail` join w/ discount, self-ref employees, multi-FK orders, composite indexes |
+| `wholesale-orders` | Adapted — Northwind (MIT port) | 8 | `OrderDetail` join w/ `decimal` discount fraction, self-ref employees, multi-FK orders, composite indexes |
 | `dvd-rental` | Adapted — Sakila/Pagila (BSD) | 13 | Two M2M on one model, dual FK to same model, store↔staff mutual cycle, geo chain (most complex) |
 | `code-hosting` | Adapted — Gitea (MIT) | 11 | Fork lineage self-ref, PR head/base dual FK, org/team RBAC joins, issue↔label M2M |
 | `publishing-membership` | Adapted — Ghost (MIT) | 7 | `@fulltext`, three M2M pairs, subscription billing join, ISO currency as `string @length(3, 3)` |
 | `social-graph` | Inspired — Mastodon (AGPL) | 7 | Reply-thread self-ref, follow/block join models (dual FK to `Account`), notifications |
 | `student-information-system` | Synthetic (teaching SIS) | 7 | Textbook M2M-with-payload (`Enrollment` grade), section/term/course FKs, GPA constraints |
-| `healthcare` | Synthetic | 6 | Appointments, role-as-string providers, prescriptions/diagnoses, composite scheduling index |
+| `healthcare` | Synthetic | 6 + struct | Appointments with an optional `struct Vitals`, role-as-string providers, prescriptions/diagnoses, composite scheduling index |
 | `hotel-reservations` | Synthetic | 6 | RoomType template vs Room inventory, date-range availability, `i64` money |
 | `food-delivery` | Synthetic | 8 | `struct GeoPoint` (required + optional), `OrderItem` join, timestamped status-event audit log |
-| `banking-ledger` | Synthetic | 6 | Double-entry transactions, `Transfer` dual FK to `Account`, joint-account M2M, `string` currency codes |
+| `banking-ledger` | Synthetic | 6 | Money as `decimal` (exact, where the rest of the corpus uses `i64` cents), `Transaction` keyed by its posting instant `id: +timestamp(us)`, `Transfer` dual FK to `Account`, joint-account M2M, `string` currency codes |
 | `airline-reservations` | Synthetic | 7 | Flight dual FK to `Airport`, unique-seat composite index (seat lock), IATA codes as `string(3!)` (inline fixed-width) |
 | `blog-cms` | Synthetic | 5 | **Correct snake_case component refs** (`tsx://`/`jsx://`/`api://`), self-ref comments/categories, `@fulltext`, `@soft_delete` |
 | `project-management` | Synthetic | 8 | Org→Team→Project→Issue hierarchy, sub-issue self-ref, label M2M, dual composite indexes |
-| `saas-multitenant` | Synthetic | 7 | Per-tenant `*Organization` scoping, `Membership` RBAC join, API keys, audit log |
+| `saas-multitenant` | Synthetic | 7 | Per-tenant `*Organization` scoping, `Membership` RBAC join, API keys, audit log with a `json?` diff, `json` permission sets |
 | `ecommerce-store` | Synthetic | 9 | Product variants, `CartItem`/`OrderItem` joins, money as `i64` minor units, SKU/order-number natural keys |
-| `iot-sensors` | Synthetic | 3 + struct | `+u64` high-volume PK (not auto-incremented yet, [#187](https://github.com/hoodiecollin/forgedb/issues/187)), fixed array `[f64; 3]`, `struct Calibration`, append-heavy telemetry |
+| `iot-sensors` | Synthetic | 3 + struct | `+u64` allocated PK for append-heavy telemetry, `+timestamp(us)` reading stamp, fixed array `[f64; 3]`, `struct Calibration` |
 
 ## Provenance & licensing
 
@@ -55,14 +57,12 @@ copy no SQL/DDL, triggers, or code. Each app README names the source, URL, and l
 (MIT, BSD, UPL, AGPL — AGPL/GPL sources are used as design inspiration only). Synthetic
 examples are original, modeled after standard patterns for their domain.
 
-## Behavioral caveat
+## Two money idioms, on purpose
 
-These schemas all **parse, generate, and compile** — including nullable variable-length
-strings (`string?`), inline `struct` definitions, integer PKs (`id: +u64`), and
-string-literal directive arguments (`@pattern("regex")`, `@default("text")`), which earlier
-revisions did not support. One behavioral caveat remains:
-
-- **Integer `+u32`/`+u64` keys are not auto-incremented yet.** The `+` modifier synthesizes
-  `+uuid` (a random UUID) and `+timestamp` (the current time) on create, but an integer auto
-  key is currently a marker only — a create must supply the id. `iot-sensors` uses `id: +u64`.
-  Tracked in [#187](https://github.com/hoodiecollin/forgedb/issues/187).
+Twelve schemas store money as `i64` minor units (cents), and `banking-ledger` stores it as
+`decimal`. Both are correct; the corpus shows both so a reader can see the trade. Integer
+minor units are compact and fast and fit a store whose amounts are always whole cents.
+`decimal` is exact fixed-point with a scale, which is what a ledger needs when interest,
+exchange rates or split allocations produce fractions of a cent that must sum exactly.
+`f64` is used for neither: a binary float cannot hold `0.1`, which is why
+`wholesale-orders` stores its discount fraction as `decimal` too.

@@ -13,7 +13,7 @@ A high-volume IoT telemetry platform for connected sensor devices.
 | Model | Key fields | Relations |
 |-------|-----------|-----------|
 | `Device` | `serial_number ^&string`, `calibration Calibration?` | many `SensorReading`, `Alert` |
-| `SensorReading` | `id +u64`, `reading [f64; 3]`, `recorded_at +timestamp` | `*Device`; composite `@index(device, recorded_at)` |
+| `SensorReading` | `id +u64`, `reading [f64; 3]`, `recorded_at +timestamp(us)` | `*Device`; composite `@index(device, recorded_at)` |
 | `Alert` | `severity`, `message`, `raised_at +timestamp`, `resolved_at?` | `*Device` |
 
 **Struct:**
@@ -29,7 +29,8 @@ Used as an optional embedded value type on `Device.calibration`.
 
 ## Grammar features showcased
 
-- **`+u64` primary key** on `SensorReading` — a compact integer PK for high-volume append-only tables (avoids UUID entropy overhead at scale). Note: `+u64` currently *marks* the key but is **not** auto-incremented yet — the caller supplies the id ([#187](https://github.com/hoodiecollin/forgedb/issues/187)); `+uuid`/`+timestamp` are auto-generated today.
+- **`+u64` primary key** on `SensorReading` — a compact integer PK for high-volume append-only tables (avoids UUID entropy overhead at scale). An integer auto key is allocated from a per-field counter that survives reopen and is conflict-checked across processes (#187); `0` is the allocate sentinel, so a create never supplies it
+- **`+timestamp(us)`** on `SensorReading.recorded_at` — a stamp at microsecond precision. Storage is always microseconds; the declared unit is the floor a written value is rounded to, and a kilohertz sensor would see its samples merged by the millisecond default
 - **Fixed array `[f64; 3]`** on `SensorReading.reading` — three-axis (x, y, z) sensor sample in a single typed field
 - **`struct Calibration`** — fixed-size embedded value type (f64 fields only, no strings); used as `calibration: Calibration?` (nullable struct) on `Device`
 - **Composite `@index(device, recorded_at)`** using a FK relation field name — validated by the parser against declared field names
