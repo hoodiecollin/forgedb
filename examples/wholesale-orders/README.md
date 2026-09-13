@@ -20,13 +20,13 @@ A wholesale trading company: customers place orders for products supplied by ven
 | `Employee` | Staff member; self-referencing `reports_to: ?Employee` org hierarchy |
 | `Product` | Catalog item; `unit_price` as i64 cents; optional supplier and category |
 | `Order` | Purchase order; links customer, employee, shipper; `freight` as i64 cents |
-| `OrderDetail` | Explicit join model (Order ↔ Product with payload) — quantity, snapshot unit_price, discount fraction |
+| `OrderDetail` | Explicit join model (Order ↔ Product with payload) — quantity, snapshot unit_price, `decimal` discount fraction |
 
 ## Key Relationships
 
 - **Employee self-ref:** `reports_to: ?Employee` with reverse collection `subordinates: [Employee]`
 - **Product catalog:** Product references optional Supplier and Category
-- **Order ↔ OrderDetail ↔ Product:** `OrderDetail` is an explicit join model carrying `unit_price` (snapshot at order time), `quantity i32`, and `discount f64 [0,1]` — NOT a pure M2M because the link carries data
+- **Order ↔ OrderDetail ↔ Product:** `OrderDetail` is an explicit join model carrying `unit_price` (snapshot at order time), `quantity i32`, and `discount decimal [0,1]` — NOT a pure M2M because the link carries data
 - **Order header:** links optional Customer, Employee, and Shipper; `order_date: +timestamp` auto-set on create
 - **Natural key:** `Customer.customer_code: ^&string @length(5, 5)` captures Northwind's 5-char CHAR customer ID
 - **Composite indexes:** `@index(customer, order_date)`, `@index(employee, order_date)` on Order; `@index(order, product)` on OrderDetail
@@ -39,8 +39,8 @@ A wholesale trading company: customers place orders for products supplied by ven
 - Self-referencing optional FK (`reports_to`/`subordinates` on Employee)
 - `^&` combined unique+indexed modifier on natural key (`Customer.customer_code`)
 - `+uuid` primary keys, `+timestamp` for auto-dated `order_date`
-- `i64` for money (unit_price, freight — stored as cents); `f64` for fractional discount
-- `@min`/`@max` on numeric fields (discount bounded [0,1])
+- `i64` for money (unit_price, freight — stored as cents); `decimal` for the fractional discount, because it multiplies into a price and a binary float cannot hold `0.1` exactly
+- `@min`/`@max` on numeric fields (discount bounded [0,1]; both directives accept `decimal`)
 - `@length` on string fields, `@url` on home_page
 - `@default(0)` on inventory counters, `@default(0)` on freight
 - Multiple composite model-level indexes `@index(a, b)` per model
