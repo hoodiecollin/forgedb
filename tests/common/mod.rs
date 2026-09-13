@@ -34,6 +34,50 @@ fn dep(name: &str) -> String {
     format!("{name} = {{ path = {:?} }}\n", path.to_string_lossy())
 }
 
+pub fn manifest(text: &str) -> toml::Value {
+    toml::from_str(text).unwrap_or_else(|e| panic!("manifest is not valid TOML: {e}\n{text}"))
+}
+
+pub fn manifest_dep_keys(text: &str) -> std::collections::BTreeSet<String> {
+    fn collect(table: &toml::Table, out: &mut std::collections::BTreeSet<String>) {
+        for (key, value) in table {
+            if let Some(inner) = value.as_table() {
+                if key.ends_with("dependencies") {
+                    out.extend(inner.keys().cloned());
+                } else {
+                    collect(inner, out);
+                }
+            }
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    if let Some(table) = manifest(text).as_table() {
+        collect(table, &mut out);
+    }
+    out
+}
+
+pub fn manifest_str(text: &str, path: &[&str]) -> Option<String> {
+    let mut cur = manifest(text);
+    for key in path {
+        cur = cur.get(key)?.clone();
+    }
+    cur.as_str().map(str::to_string)
+}
+
+pub fn manifest_str_array(text: &str, path: &[&str]) -> Vec<String> {
+    let mut cur = manifest(text);
+    for key in path {
+        match cur.get(key) {
+            Some(v) => cur = v.clone(),
+            None => return Vec::new(),
+        }
+    }
+    cur.as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
 pub fn write(path: &Path, contents: &str) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).unwrap();

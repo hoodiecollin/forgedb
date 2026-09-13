@@ -508,17 +508,14 @@ fn the_replica_member_builds_for_wasm32() {
         fx.container().file_name().unwrap().to_string_lossy()
     );
     let members = read(&fx.project_root().join("Cargo.toml"));
-    let pkg = members
-        .lines()
-        .find(|l| l.contains("/wasm\""))
-        .unwrap_or_else(|| panic!("no wasm member in the root manifest:\n{members}"));
-    assert!(pkg.contains("wasm"), "sanity: {pkg}");
+    let listed = common::manifest_str_array(&members, &["workspace", "members"]);
+    assert!(
+        listed.iter().any(|m| m.ends_with("/wasm")),
+        "no wasm member in the root manifest's [workspace].members: {listed:?}\n{members}"
+    );
 
     let manifest = read(&fx.container().join("wasm/Cargo.toml"));
-    let pkg_name = manifest
-        .lines()
-        .find_map(|l| l.strip_prefix("name = "))
-        .map(|v| v.trim().trim_matches('"').to_string())
+    let pkg_name = common::manifest_str(&manifest, &["package", "name"])
         .expect("the wasm manifest declares a package name");
     assert!(
         pkg_name.ends_with("-wasm"),

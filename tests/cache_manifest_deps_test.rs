@@ -2,6 +2,8 @@ use forgedb::commands::generate::CORE_SUBSTRATE_REEXPORTS;
 use forgedb_codegen::{ApiGenerator, GenConfig, ServerPackage};
 use std::collections::BTreeSet;
 
+mod common;
+
 const SCHEMA: &str = r#"
 enum Status { Draft, Published, Archived }
 
@@ -94,25 +96,10 @@ fn crate_roots(source: &str) -> BTreeSet<String> {
 }
 
 fn manifest_deps(manifest: &str) -> BTreeSet<String> {
-    let mut deps = BTreeSet::new();
-    let mut in_deps = false;
-    for line in manifest.lines() {
-        let t = line.trim();
-        if t.starts_with('[') {
-            in_deps = t.contains("dependencies]");
-            continue;
-        }
-        if !in_deps || t.starts_with('#') || t.is_empty() {
-            continue;
-        }
-        if let Some((key, _)) = t.split_once('=') {
-            let key = key.trim().trim_matches('"');
-            if !key.is_empty() {
-                deps.insert(key.replace('-', "_"));
-            }
-        }
-    }
-    deps
+    common::manifest_dep_keys(manifest)
+        .into_iter()
+        .map(|k| k.replace('-', "_"))
+        .collect()
 }
 
 fn reexported() -> BTreeSet<String> {

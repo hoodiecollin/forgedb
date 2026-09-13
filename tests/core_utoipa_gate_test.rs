@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod common;
+
 const SCHEMA: &str = r#"
 User {
   id: +uuid
@@ -119,9 +121,7 @@ impl Fixture {
 }
 
 fn pins_utoipa(manifest: &str) -> bool {
-    manifest
-        .lines()
-        .any(|l| l.trim_start().starts_with("utoipa ") || l.trim_start().starts_with("utoipa="))
+    common::manifest_dep_keys(manifest).contains("utoipa")
 }
 
 fn imports_utoipa(source: &str) -> bool {

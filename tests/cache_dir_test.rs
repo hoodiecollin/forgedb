@@ -3,6 +3,8 @@ use std::sync::{Mutex, MutexGuard};
 
 use forgedb::cache;
 
+mod common;
+
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct EnvGuard {
@@ -338,30 +340,7 @@ fn default_members_of(project: &Path) -> Vec<String> {
 fn array_of(project: &Path, key: &str) -> Vec<String> {
     let src = std::fs::read_to_string(project.join("Cargo.toml"))
         .unwrap_or_else(|e| panic!("no workspace root at {}: {e}", project.display()));
-
-    let mut out = Vec::new();
-    let mut inside = false;
-    for line in src.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with(&format!("{key} = [")) {
-            if trimmed.ends_with("[]") {
-                return out;
-            }
-            inside = true;
-            continue;
-        }
-        if inside {
-            if trimmed == "]" {
-                break;
-            }
-            if let Some(rest) = trimmed.strip_prefix('"')
-                && let Some(name) = rest.split('"').next()
-            {
-                out.push(name.to_string());
-            }
-        }
-    }
-    out
+    common::manifest_str_array(&src, &["workspace", key])
 }
 
 fn containers_of(project: &Path) -> Vec<String> {
