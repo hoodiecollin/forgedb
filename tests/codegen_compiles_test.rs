@@ -5,13 +5,11 @@ use forgedb::naming::PackageKind;
 mod common;
 use common::cache::Fixture;
 
-const CONFIG: &str = r#"[project]
-id = "codegen-compiles"
-isolated = true
-
-[generate]
-targets = ["rust", "api"]
-"#;
+fn config(id: &str) -> String {
+    format!(
+        "[project]\nid = \"{id}\"\nisolated = true\n\n[generate]\ntargets = [\"rust\", \"api\"]\n"
+    )
+}
 
 const SCHEMA: &str = r#"
 enum Status { Draft, Published, Archived }
@@ -38,24 +36,25 @@ Post {
 }
 "#;
 
-fn target_dir() -> PathBuf {
+fn target_dir(lane: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
         .join("codegen-check")
+        .join(lane)
 }
 
-fn check_core_and_server(fx: &Fixture) -> std::process::Output {
+fn check_core_and_server(fx: &Fixture, lane: &str) -> std::process::Output {
     let core = fx.package_name(&PackageKind::Core);
     let server = fx.package_name(&PackageKind::Server);
-    fx.cargo_in(&target_dir(), &["check", "-p", &core, "-p", &server])
+    fx.cargo_in(&target_dir(lane), &["check", "-p", &core, "-p", &server])
 }
 
 #[test]
 fn the_generated_core_and_server_type_check_against_the_checkout() {
-    let fx = Fixture::generate(CONFIG, &[("schema.forge", SCHEMA)]);
+    let fx = Fixture::generate(&config("codegen-compiles"), &[("schema.forge", SCHEMA)]);
     fx.patch_substrate();
 
-    let out = check_core_and_server(&fx);
+    let out = check_core_and_server(&fx, "positive");
     assert!(
         out.status.success(),
         "the generated core and server packages do not type-check against the in-tree \
@@ -67,14 +66,14 @@ fn the_generated_core_and_server_type_check_against_the_checkout() {
 
 #[test]
 fn the_check_fails_when_the_emitted_core_does_not_compile() {
-    let fx = Fixture::generate(CONFIG, &[("schema.forge", SCHEMA)]);
+    let fx = Fixture::generate(&config("codegen-mutation"), &[("schema.forge", SCHEMA)]);
     fx.patch_substrate();
 
     let lib = fx.container().join("core").join("src").join("lib.rs");
     assert!(lib.is_file(), "no generated core at {}", lib.display());
     std::fs::write(&lib, "pub fn broken( {}\n").unwrap();
 
-    let out = check_core_and_server(&fx);
+    let out = check_core_and_server(&fx, "mutation");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         !out.status.success(),
