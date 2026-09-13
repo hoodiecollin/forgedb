@@ -52,15 +52,10 @@ fn baked_fsync(generated_dir: &Path) -> Option<String> {
 
 fn baked_schema_version(generated_dir: &Path) -> Option<u32> {
     let src = fs::read_to_string(generated_dir.join("database.rs")).ok()?;
-    let line = src
-        .lines()
-        .find(|l| l.contains("const EXPECTED_SCHEMA_VERSION"))?;
-    let rhs = line.rsplit('=').next()?.trim();
-    rhs.chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .parse()
+    forgedb_source_guard::RustSource::generated("database.rs", src)
+        .const_u64("EXPECTED_SCHEMA_VERSION")
         .ok()
+        .and_then(|v| u32::try_from(v).ok())
 }
 
 fn baked(generated_dir: &Path) -> Option<(String, u32)> {

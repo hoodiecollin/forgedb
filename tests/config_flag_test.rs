@@ -54,17 +54,9 @@ fn build_cmd(root: &Path, output: &str) {
 fn baked_interval(generated_dir: &Path) -> u64 {
     let src = fs::read_to_string(generated_dir.join("database.rs"))
         .expect("generated database.rs should exist");
-    let line = src
-        .lines()
-        .find(|l| l.contains("const WAL_CHECKPOINT_INTERVAL"))
-        .unwrap_or_else(|| panic!("no WAL_CHECKPOINT_INTERVAL const in {generated_dir:?}"));
-    line.rsplit('=')
-        .next()
-        .expect("const has a value")
-        .trim()
-        .trim_end_matches(';')
-        .parse()
-        .unwrap_or_else(|_| panic!("unparseable const line: {line}"))
+    forgedb_source_guard::RustSource::generated("database.rs", src)
+        .const_u64("WAL_CHECKPOINT_INTERVAL")
+        .unwrap_or_else(|e| panic!("no WAL_CHECKPOINT_INTERVAL const in {generated_dir:?}: {e}"))
 }
 
 fn baked_fsync(generated_dir: &Path) -> String {

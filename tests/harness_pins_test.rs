@@ -5,11 +5,9 @@ use std::collections::BTreeSet;
 use forgedb_codegen::{CorePackage, GenConfig, ServerPackage};
 
 fn substrate_keys(manifest: &str) -> BTreeSet<String> {
-    manifest
-        .lines()
-        .filter_map(|l| l.split_once('=').map(|(k, _)| k.trim()))
+    common::manifest_dep_keys(manifest)
+        .into_iter()
         .filter(|k| k.starts_with("forgedb-"))
-        .map(str::to_string)
         .collect()
 }
 

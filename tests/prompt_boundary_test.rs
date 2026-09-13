@@ -3,6 +3,8 @@ use std::process::Command;
 
 use forgedb::ask::Askability;
 
+mod common;
+
 const BIN: &str = env!("CARGO_BIN_EXE_forgedb");
 
 const SCHEMA: &str = "Note {\n  id: +uuid\n  body: string\n}\n";
@@ -293,14 +295,12 @@ fn s5_the_language_server_cannot_reach_an_asker() {
         "/crates/lsp-server/Cargo.toml"
     ))
     .expect("the LSP crate's manifest is readable");
-    for line in manifest.lines() {
-        let line = line.trim();
-        assert!(
-            !line.starts_with("forgedb ") && !line.starts_with("forgedb="),
-            "the language server must not depend on the root crate, whose \
-             identity resolution can ask questions: {line}"
-        );
-    }
+    let deps = common::manifest_dep_keys(&manifest);
+    assert!(
+        !deps.contains("forgedb"),
+        "the language server must not depend on the root crate, whose \
+         identity resolution can ask questions: {deps:?}"
+    );
 
     let launcher = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),

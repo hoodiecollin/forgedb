@@ -474,35 +474,28 @@ fn strip_ansi(s: &str) -> String {
 
 #[test]
 fn test_migrate_spawns_no_cargo_of_its_own() {
-    let src = include_str!("../src/commands/migrate/mod.rs");
-    let offenders: Vec<(usize, &str)> = src
-        .lines()
-        .enumerate()
-        .filter(|(_, l)| l.contains("Command::new(\"cargo\")"))
-        .map(|(i, l)| (i + 1, l.trim()))
-        .collect();
-    assert!(
-        offenders.is_empty(),
-        "migrate.rs spawns cargo directly again — route it through \
-         crate::commands::build::driver instead:\n{}",
-        offenders
-            .iter()
-            .map(|(n, l)| format!("  {n}: {l}"))
-            .collect::<Vec<_>>()
-            .join("\n")
+    let src = forgedb_source_guard::RustSource::repo_file(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/commands/migrate/mod.rs"
+    ));
+    let spawns = src.file_calls_path_with_str_arg("Command::new", "cargo");
+    assert_eq!(
+        spawns, 0,
+        "migrate.rs spawns cargo directly again ({spawns} call(s)) — route it through \
+         crate::commands::build::driver instead"
     );
 
     assert!(
-        src.contains("driver::execute(&driver::plan("),
+        src.file_call_count("execute") >= 1 && src.file_call_count("plan") >= 1,
         "migrate.rs no longer builds through driver::plan + driver::execute"
     );
     assert!(
-        src.contains("driver::assert_no_duplicate_artifact_names"),
+        src.file_call_count("assert_no_duplicate_artifact_names") >= 1,
         "migrate.rs no longer runs the pre-build collision guard, so a \
          transform/engine bin-name collision would be a cargo WARNING at exit 0"
     );
     assert!(
-        src.contains("driver::target_directory("),
+        src.file_call_count("target_directory") >= 1,
         "migrate run no longer asks the driver where cargo writes"
     );
 }

@@ -1,24 +1,12 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+use forgedb_source_guard::RustSource;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            rust_files(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
-}
-
-fn substrate_sources() -> Vec<(String, PathBuf)> {
+fn substrate_sources() -> Vec<(String, RustSource)> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(repo_root().join("crates"))
         .expect("read crates/")
@@ -28,25 +16,25 @@ fn substrate_sources() -> Vec<(String, PathBuf)> {
         if krate == "codegen" {
             continue;
         }
-        let mut files = Vec::new();
-        rust_files(&entry.path().join("src"), &mut files);
-        out.extend(files.into_iter().map(|f| (krate.clone(), f)));
+        for src in RustSource::walk(entry.path().join("src"), &[]) {
+            out.push((krate.clone(), src));
+        }
     }
+    assert!(
+        out.len() > 20,
+        "walked only {} substrate source files; the assertions below would hold over nothing",
+        out.len()
+    );
     out
 }
 
 #[test]
 fn no_substrate_crate_reads_auto_sequences() {
     let mut violations = Vec::new();
-    for (krate, file) in substrate_sources() {
-        let src = std::fs::read_to_string(&file).unwrap_or_default();
-        for (i, line) in src.lines().enumerate() {
-            if line.trim_start().starts_with("//") {
-                continue;
-            }
-            if line.contains(".auto_sequences") {
-                violations.push(format!("{krate}: {}:{}", file.display(), i + 1));
-            }
+    for (krate, src) in substrate_sources() {
+        let reads = src.file_field_read_count("auto_sequences");
+        if reads > 0 {
+            violations.push(format!("{krate}: {} ({reads} read(s))", src.origin()));
         }
     }
     assert!(
@@ -67,10 +55,14 @@ fn auto_sequences_is_declared_only_by_the_two_manifest_backends() {
     let crates_dir = repo_root().join("crates");
 
     let mut found = Vec::new();
-    for (_, file) in substrate_sources() {
-        let src = std::fs::read_to_string(&file).unwrap_or_default();
-        if src.lines().any(|l| l.contains("pub auto_sequences")) {
-            found.push(file.strip_prefix(&crates_dir).unwrap().to_path_buf());
+    for (_, src) in substrate_sources() {
+        if !src.structs_declaring_field("auto_sequences").is_empty() {
+            found.push(
+                PathBuf::from(src.origin())
+                    .strip_prefix(&crates_dir)
+                    .expect("a walked file lives under crates/")
+                    .to_path_buf(),
+            );
         }
     }
     found.sort();

@@ -12,11 +12,24 @@ pub struct GoFacts {
     pub declared_types: Vec<String>,
     pub func_names: Vec<String>,
     pub decl_count: usize,
+    pub exported_symbols: Vec<String>,
+    pub struct_fields: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
 }
 
 impl GoFacts {
     pub fn imports(&self, path: &str) -> bool {
         self.import_paths.iter().any(|p| p == path)
+    }
+
+    pub fn exported(&self) -> &[String] {
+        &self.exported_symbols
+    }
+
+    pub fn field_type(&self, struct_name: &str, field: &str) -> Option<&str> {
+        self.struct_fields
+            .get(struct_name)
+            .and_then(|f| f.get(field))
+            .map(String::as_str)
     }
 
     pub fn dispatches_generically(&self) -> bool {

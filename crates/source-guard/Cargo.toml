@@ -7,8 +7,9 @@ description = "Test-only: assert properties of Rust source through its AST, so a
 publish = false
 
 [dependencies]
-syn = { version = "2.0", features = ["full", "parsing", "printing", "extra-traits", "visit"] }
+syn = { version = "2.0", features = ["full", "parsing", "printing", "extra-traits", "visit", "visit-mut"] }
 quote = "1.0"
+proc-macro2 = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 

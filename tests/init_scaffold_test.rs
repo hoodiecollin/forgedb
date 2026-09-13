@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::TempDir;
 
+mod common;
+
 fn forgedb(dir: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_forgedb"))
         .current_dir(dir)
@@ -195,15 +197,12 @@ fn s17_init_mints_a_unique_committed_id() {
     let (_b, two) = scaffold("api");
 
     let read_id = |p: &std::path::Path| -> String {
-        read(&p.join("forgedb.toml"))
-            .lines()
-            .find(|l| l.starts_with("id = "))
-            .unwrap_or_else(|| panic!("no `id` in the scaffolded config of {}", p.display()))
-            .to_string()
+        common::manifest_str(&read(&p.join("forgedb.toml")), &["project", "id"])
+            .unwrap_or_else(|| panic!("no `[project].id` in the scaffolded config of {}", p.display()))
     };
 
     let (a, b) = (read_id(&one), read_id(&two));
-    assert!(a.starts_with("id = \"api-"), "the slug keeps it legible: {a}");
+    assert!(a.starts_with("api-"), "the slug keeps it legible: {a}");
     assert_ne!(a, b, "two scaffolds of the same directory name share an id");
 
     assert!(

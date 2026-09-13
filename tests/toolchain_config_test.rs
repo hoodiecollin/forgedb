@@ -78,22 +78,20 @@ fn a_misspelled_sub_key_is_refused() {
 
 #[test]
 fn the_table_is_spelled_toolchain() {
-    let src: String = include_str!("../src/config.rs")
-        .lines()
-        .map(|l| match l.find("//") {
-            Some(i) => &l[..i],
-            None => l,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        src.contains("pub toolchain: ToolchainConfig,"),
+    let src = forgedb_source_guard::RustSource::repo_file(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/config.rs"
+    ));
+    assert_eq!(
+        src.field_type("ForgeConfig", "toolchain").as_deref(),
+        Ok("ToolchainConfig"),
         "`ForgeConfig::toolchain` was renamed. Under `deny_unknown_fields` every \
          already-released forgedb rejects an unknown table, so this spelling ships \
          once: a rename strands every config that adopted the first name."
     );
-    assert!(
-        !src.contains("pub runtime: ToolchainConfig"),
+    assert_ne!(
+        src.field_type("ForgeConfig", "runtime").as_deref(),
+        Ok("ToolchainConfig"),
         "`[runtime]` already means replication / change-feed capacity / cascade \
          depth; overloading it is what the separate table exists to avoid"
     );

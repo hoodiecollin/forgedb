@@ -30,6 +30,29 @@ impl RustSource {
         }
     }
 
+    pub fn walk(dir: impl AsRef<Path>, skip_dirs: &[&str]) -> Vec<Self> {
+        fn collect(dir: &Path, skip: &[&str], out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if !skip.contains(&name) {
+                        collect(&path, skip, out);
+                    }
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut paths = Vec::new();
+        collect(dir.as_ref(), skip_dirs, &mut paths);
+        paths.sort();
+        paths.into_iter().map(Self::repo_file).collect()
+    }
+
     pub fn ast(&self) -> &syn::File {
         &self.file
     }

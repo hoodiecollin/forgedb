@@ -6129,10 +6129,10 @@ fn symbol_stems(
 }
 
 fn go_exported_symbols(go_code: &str) -> std::collections::BTreeSet<String> {
-    go_code
-        .lines()
-        .filter_map(|l| l.trim().strip_prefix("//export "))
-        .map(|s| s.trim().to_string())
+    forgedb_source_guard::go_facts(go_code)
+        .exported()
+        .iter()
+        .cloned()
         .collect()
 }
 
@@ -6193,19 +6193,20 @@ fn test_two_apps_export_disjoint_ffi_symbols() {
         );
     }
 
-    let go_a = {
-        let mut s = memoized_code_with("GoGenerator", &[SYM, FP], &schema, || GoGenerator::generate(&schema, SYM, FP).unwrap().code);
-        s.push_str(&GoGenerator::generate_async_bridge(SYM).code);
-        s
-    };
-    let go_b = {
-        let mut s = memoized_code_with("GoGenerator", &[SYM_B, FP], &schema, || GoGenerator::generate(&schema, SYM_B, FP).unwrap().code);
-        s.push_str(&GoGenerator::generate_async_bridge(SYM_B).code);
-        s
-    };
+    let main_a = memoized_code_with("GoGenerator", &[SYM, FP], &schema, || GoGenerator::generate(&schema, SYM, FP).unwrap().code);
+    let bridge_a = GoGenerator::generate_async_bridge(SYM).code;
+    let main_b = memoized_code_with("GoGenerator", &[SYM_B, FP], &schema, || GoGenerator::generate(&schema, SYM_B, FP).unwrap().code);
+    let bridge_b = GoGenerator::generate_async_bridge(SYM_B).code;
+    let go_a = format!("{main_a}{bridge_a}");
 
-    let ea = go_exported_symbols(&go_a);
-    let eb = go_exported_symbols(&go_b);
+    let ea: std::collections::BTreeSet<String> = go_exported_symbols(&main_a)
+        .union(&go_exported_symbols(&bridge_a))
+        .cloned()
+        .collect();
+    let eb: std::collections::BTreeSet<String> = go_exported_symbols(&main_b)
+        .union(&go_exported_symbols(&bridge_b))
+        .cloned()
+        .collect();
     assert!(!ea.is_empty(), "the Go package //exports at least the completion callback");
     assert!(
         ea.is_disjoint(&eb),
@@ -7806,16 +7807,15 @@ fn test_bindings_fk_type_equals_the_targets_own_id_type() {
     let schema = parser.parse().unwrap();
 
     let go = memoized_code_with("GoGenerator", &[SYM, FP], &schema, || GoGenerator::generate(&schema, SYM, FP).unwrap().code);
+    let facts = forgedb_source_guard::go_facts(&go);
     let field_type = |decl: &str, name: &str| {
-        let body = &go[go.find(decl).unwrap_or_else(|| panic!("`{decl}` in the Go binding"))..];
-        body.lines()
-            .take_while(|l| !l.starts_with('}'))
-            .find(|l| l.trim_start().starts_with(&format!("{name} ")))
-            .map(|l| l.split_whitespace().nth(1).unwrap().to_string())
-            .unwrap_or_else(|| panic!("field `{name}` in `{decl}`"))
+        facts
+            .field_type(decl, name)
+            .unwrap_or_else(|| panic!("field `{name}` in Go struct `{decl}`: {:?}", facts.struct_fields.keys()))
+            .to_string()
     };
-    let post_id = field_type("type Post struct {", "Id");
-    let comment_fk = field_type("type Comment struct {", "Post");
+    let post_id = field_type("Post", "Id");
+    let comment_fk = field_type("Comment", "Post");
     assert_eq!(
         comment_fk, post_id,
         "the Go FK field and the target's own id field must have one type"
@@ -9011,28 +9011,26 @@ Note {
         .unwrap()
         .code;
 
-    let derives_to_schema = |code: &str| {
-        code.lines()
-            .any(|l| l.contains("#[derive(") && l.contains("ToSchema"))
-    };
-
+    let off_src = RustSource::generated("web_off.rs", off.clone());
     assert!(
-        !off.contains("use utoipa::"),
+        !off_src.uses().contains("utoipa"),
         "the utoipa import survived:\n{off}"
     );
-    assert!(!derives_to_schema(&off), "a ToSchema derive survived");
-    assert!(
-        !off.contains("#[schema("),
+    assert!(!off_src.any_derive("ToSchema"), "a ToSchema derive survived");
+    assert_eq!(
+        off_src.attr_count("schema"),
+        0,
         "a #[schema(..)] attribute survived without its derive"
     );
 
     let on = RustGenerator::generate_with_config(&schema, 1, GenConfig::DEFAULT)
         .unwrap()
         .code;
-    assert!(on.contains("use utoipa::ToSchema"), "the ON path lost its import");
-    assert!(derives_to_schema(&on), "the ON path lost its derive");
+    let on_src = RustSource::generated("web_on.rs", on);
+    assert!(on_src.uses().contains("utoipa"), "the ON path lost its import");
+    assert!(on_src.any_derive("ToSchema"), "the ON path lost its derive");
     assert!(
-        on.contains("#[schema("),
+        on_src.attr_count("schema") > 0,
         "this schema no longer exercises #[schema(..)], so the OFF assertion above is vacuous"
     );
 }
@@ -9082,26 +9080,18 @@ fn answered_transform_crate() -> (String, forgedb_codegen::TransformCrate) {
 }
 
 fn code_only(main: &str) -> String {
-    main.lines()
-        .map(|l| {
-            let l = match l.find("///") {
-                Some(i) => &l[..i],
-                None => l,
-            };
-            match l.find("//") {
-                Some(i) => &l[..i],
-                None => l,
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    RustSource::generated("main.rs", main).tokens_without_docs()
+}
+
+fn dense_of(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 #[test]
 fn test_transform_generation_answers_are_lowered() {
     let (main, _) = answered_transform_crate();
     let code = code_only(&main);
-    let dense: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    let dense = dense_of(&code);
 
     assert!(
         dense.contains(r#"serde_json::from_str("\"untitled\"").unwrap()"#),
@@ -9126,7 +9116,7 @@ fn test_transform_generation_answers_are_lowered() {
         "hop_body_class",
     ] {
         assert!(
-            !code.contains(forbidden),
+            !dense.contains(&dense_of(forbidden)),
             "`{forbidden}` reached the emitted crate. The answer is a COMPILE-TIME \
              input that is lowered; carrying it as data and matching on it is the \
              inversion this guard exists for:\n{code}"
@@ -9142,7 +9132,7 @@ fn test_transform_generation_answers_are_lowered() {
         "descriptor",
     ] {
         assert!(
-            !code.contains(forbidden),
+            !dense.contains(&dense_of(forbidden)),
             "the bridge must never be given a model list or an op table (found \
              {forbidden:?}):\n{code}"
         );
