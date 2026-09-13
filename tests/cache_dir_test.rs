@@ -918,15 +918,13 @@ fn s335_10_no_server_means_no_utoipa_anywhere() {
     let manifest = std::fs::read_to_string(core.join("Cargo.toml")).unwrap();
     assert!(!manifest.contains("utoipa"), "{manifest}");
 
-    let lib = std::fs::read_to_string(core.join("src/lib.rs")).unwrap();
-    assert!(!lib.contains("use utoipa::"), "the utoipa import survived");
-    assert!(
-        !lib.lines().any(|l| l.contains("#[derive(") && l.contains("ToSchema")),
-        "a ToSchema derive survived"
-    );
+    let lib = forgedb_source_guard::RustSource::repo_file(core.join("src/lib.rs"));
+    let uses = lib.uses();
+    assert!(!uses.contains("utoipa"), "the utoipa import survived: {uses:?}");
+    assert!(!lib.any_derive("ToSchema"), "a ToSchema derive survived");
 
-    assert!(lib.contains("pub use forgedb_storage;"), "core lost its re-exports");
-    assert!(lib.contains("pub use forgedb_types;"));
+    assert!(uses.contains("forgedb_storage"), "core lost its re-exports: {uses:?}");
+    assert!(uses.contains("forgedb_types"), "core lost its re-exports: {uses:?}");
 }
 
 #[test]

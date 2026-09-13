@@ -73,6 +73,19 @@ fn identifiers_containing_a_substring_are_counted_in_items_and_macro_bodies() {
 }
 
 #[test]
+fn the_token_rendering_carries_code_and_not_prose() {
+    let planted = RustSource::generated(
+        "planted.rs",
+        "/// Answer lives here in prose only\n// and CopyField here\n#[tokio::main]\nfn run() { let x = Vec::<Step>::new(); let _ = x; }\n",
+    );
+    let code = planted.tokens_without_docs();
+    assert!(!code.contains("Answer"), "a doc comment must not survive: {code}");
+    assert!(!code.contains("CopyField"), "a line comment must not survive: {code}");
+    assert!(code.contains("Step"), "code must survive: {code}");
+    assert!(planted.uses().contains("tokio"), "an attribute path root counts as a use");
+}
+
+#[test]
 fn a_negated_contains_is_counted_and_a_plain_or_bare_assert_is_not() {
     assert_eq!(src().negated_method_call_count("contains"), 3);
     assert_eq!(src().negated_method_call_count("lines"), 0);

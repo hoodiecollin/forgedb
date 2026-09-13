@@ -36,63 +36,8 @@ const LANGUAGE: &[&str] = &[
     "u128", "i8", "i16", "i32", "i64", "i128", "f32", "f64", "bool", "char", "str",
 ];
 
-fn crate_roots(source: &str) -> BTreeSet<String> {
-    let mut found = BTreeSet::new();
-    let mut rest = String::new();
-
-    for line in source.lines() {
-        let trimmed = line.trim_start();
-        if let Some(after) = trimmed.strip_prefix("use ") {
-            let head: String = after
-                .trim_start()
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            if !head.is_empty() {
-                found.insert(head);
-            }
-            if !trimmed.contains(';') {
-                rest.push_str("\n@IMPORT_BLOCK\n");
-            }
-            continue;
-        }
-        if rest.ends_with("@IMPORT_BLOCK\n") && !trimmed.contains(';') {
-            rest.push_str("@IMPORT_BLOCK\n");
-            continue;
-        }
-        if rest.ends_with("@IMPORT_BLOCK\n") {
-            rest.push('\n');
-            continue;
-        }
-        rest.push_str(line);
-        rest.push('\n');
-    }
-
-    let rb = rest.as_bytes();
-    let mut j = 0usize;
-    while j + 1 < rb.len() {
-        if rb[j] == b':' && rb[j + 1] == b':' {
-            let mut k = j;
-            while k > 0 && (rb[k - 1].is_ascii_alphanumeric() || rb[k - 1] == b'_') {
-                k -= 1;
-            }
-            if k < j {
-                let ident = &rest[k..j];
-                let bound_left = k > 0 && matches!(rb[k - 1], b'.' | b':');
-                let looks_like_a_crate = ident
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_lowercase() || c == '_');
-                if !bound_left && looks_like_a_crate {
-                    found.insert(ident.to_string());
-                }
-            }
-            j += 2;
-            continue;
-        }
-        j += 1;
-    }
-    found
+fn crate_roots(where_: &str, source: &str) -> BTreeSet<String> {
+    forgedb_source_guard::RustSource::generated(where_, source).uses()
 }
 
 fn manifest_deps(manifest: &str) -> BTreeSet<String> {
@@ -103,11 +48,15 @@ fn manifest_deps(manifest: &str) -> BTreeSet<String> {
 }
 
 fn reexported() -> BTreeSet<String> {
-    CORE_SUBSTRATE_REEXPORTS
-        .lines()
-        .filter_map(|l| l.trim().strip_prefix("pub use "))
-        .map(|l| l.trim_end_matches(';').trim().to_string())
-        .collect()
+    let roots = forgedb_source_guard::RustSource::generated("reexports.rs", CORE_SUBSTRATE_REEXPORTS).uses();
+    assert!(
+        roots.len() >= 3,
+        "CORE_SUBSTRATE_REEXPORTS yields only {} re-exported crate(s), fewer than the three \
+         it carries today; the snippet has changed shape and the comparison below would run \
+         against almost nothing: {roots:?}",
+        roots.len()
+    );
+    roots
 }
 
 #[test]
@@ -125,7 +74,7 @@ fn the_server_manifest_pins_every_crate_its_source_names() {
 
     let mut missing: Vec<(&str, String)> = Vec::new();
     for (where_, source) in [("server/src/api.rs", &api.code), ("server/src/main.rs", &main)] {
-        for root in crate_roots(source) {
+        for root in crate_roots(where_, source) {
             if LANGUAGE.contains(&root.as_str())
                 || own_modules.contains(&root)
                 || deps.contains(&root)
@@ -179,6 +128,7 @@ fn a_decimal_column_makes_the_server_name_rust_decimal_and_the_manifest_pin_it()
 #[test]
 fn the_extractor_finds_the_roots_it_is_supposed_to() {
     let found = crate_roots(
+        "probe.rs",
         "use axum::{extract::Path, http::StatusCode};\n\
          use std::sync::Arc;\n\
          fn f() { let x = want.parse::<rust_decimal::Decimal>(); serde_json::json!({}); }\n\

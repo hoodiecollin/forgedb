@@ -84,6 +84,42 @@ impl<'ast, 'f> Visit<'ast> for ExprWalker<'f> {
     }
 }
 
+struct AttrPathRoots {
+    out: BTreeSet<String>,
+}
+
+impl<'ast> Visit<'ast> for AttrPathRoots {
+    fn visit_attribute(&mut self, node: &'ast syn::Attribute) {
+        if let Some(root) = path_root_if_crate_like(node.path()) {
+            self.out.insert(root);
+        }
+        syn::visit::visit_attribute(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        if let Some(root) = path_root_if_crate_like(&node.path) {
+            self.out.insert(root);
+        }
+        for e in macro_exprs(node) {
+            let mut inner = AttrPathRoots {
+                out: BTreeSet::new(),
+            };
+            inner.visit_expr(&e);
+            self.out.append(&mut inner.out);
+        }
+    }
+}
+
+struct DocBlanker;
+
+impl syn::visit_mut::VisitMut for DocBlanker {
+    fn visit_attribute_mut(&mut self, node: &mut syn::Attribute) {
+        if node.path().is_ident("doc") {
+            node.meta = syn::parse_quote!(doc = "");
+        }
+    }
+}
+
 fn walk_exprs(
     file: &syn::File,
     mut on_expr: impl FnMut(&syn::Expr),
@@ -356,8 +392,20 @@ impl RustSource {
         );
         out.append(&mut from_exprs);
         out.append(&mut from_types);
+        let mut attrs = AttrPathRoots {
+            out: BTreeSet::new(),
+        };
+        attrs.visit_file(self.ast());
+        out.append(&mut attrs.out);
         out.retain(|r| r != "self" && r != "super" && r != "crate");
         out
+    }
+
+    pub fn tokens_without_docs(&self) -> String {
+        use syn::visit_mut::VisitMut;
+        let mut file: syn::File = (*self.ast()).clone();
+        DocBlanker.visit_file_mut(&mut file);
+        file.to_token_stream().to_string()
     }
 
     fn use_roots_of(tree: &syn::UseTree) -> BTreeSet<String> {

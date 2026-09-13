@@ -108,18 +108,15 @@ fn an_unresolvable_default_is_none_rather_than_a_substituted_zero() {
 }
 
 fn recover_body(code: &str) -> String {
-    let start = code
-        .find("fn recover_from_wal")
-        .expect("generated database.rs must contain `fn recover_from_wal`");
-    let rest = &code[start..];
-    let end = rest
-        .find("\n    }\n")
-        .expect("`recover_from_wal` must have a closing brace");
-    rest[..end]
-        .lines()
-        .map(|l| match l.find("//") {
-            Some(i) => &l[..i],
-            None => l,
+    let src = forgedb_source_guard::RustSource::generated("database.rs", code);
+    src.methods_named("recover_from_wal")
+        .expect("generated database.rs must contain `fn recover_from_wal`")
+        .iter()
+        .map(|(owner, scope)| {
+            format!(
+                "{owner}::recover_from_wal {}",
+                scope.body_text_because("the backfill assertions match on the emitted calls")
+            )
         })
         .collect::<Vec<_>>()
         .join("\n")
