@@ -1,6 +1,8 @@
 // SaaS Multi-Tenant Platform — organization-scoped tenancy with RBAC
 // Showcases: tenant root model, explicit join model (Membership) carrying role,
-// api_key unique hash, invitation lifecycle, immutable audit log.
+// api_key unique hash, invitation lifecycle, immutable audit log, and two
+// `json` columns for data with no fixed shape (a role's permission set, an
+// audit row's before/after diff).
 
 Organization {
   id: +uuid
@@ -41,7 +43,9 @@ Membership {
 Role {
   id: +uuid
   name: &string @length(1, 50)
-  permissions: string
+  // e.g. {"projects": ["read", "write"], "billing": ["read"]}; not indexable,
+  // and it does not need to be — roles are looked up by name
+  permissions: json
   created_at: +timestamp
   org: *Organization
 }
@@ -74,6 +78,8 @@ AuditLog {
   action: string @length(1, 100)
   resource_type: string @length(1, 50)
   resource_id: uuid
+  // {"before": {...}, "after": {...}} for an update; absent for a read or delete
+  changes: json?
   occurred_at: +timestamp
   org: *Organization
   actor: *User
