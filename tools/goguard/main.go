@@ -87,6 +87,12 @@ type Facts struct {
 	DeclaredTypes []string `json:"declared_types"`
 	FuncNames     []string `json:"func_names"`
 	DeclCount     int      `json:"decl_count"`
+	// ExportedSymbols holds the name after every `//export` cgo directive. That directive
+	// is a comment to go/parser, so it is read from the comment groups, not the decls.
+	ExportedSymbols []string `json:"exported_symbols"`
+	// StructFields maps struct name -> field name -> field type as written, so a guard
+	// can compare two declared field types without finding them by line.
+	StructFields map[string]map[string]string `json:"struct_fields"`
 }
 
 func main() {
@@ -115,6 +121,16 @@ func main() {
 		DeclaredTypes:    []string{},
 		FuncNames:        []string{},
 		DeclCount:        len(file.Decls),
+		ExportedSymbols:  []string{},
+		StructFields:     map[string]map[string]string{},
+	}
+
+	for _, group := range file.Comments {
+		for _, c := range group.List {
+			if rest, ok := strings.CutPrefix(c.Text, "//export "); ok {
+				facts.ExportedSymbols = append(facts.ExportedSymbols, strings.TrimSpace(rest))
+			}
+		}
 	}
 
 	for _, imp := range file.Imports {
@@ -139,6 +155,16 @@ func main() {
 			facts.TypeSwitches++
 		case *ast.TypeSpec:
 			facts.DeclaredTypes = append(facts.DeclaredTypes, node.Name.Name)
+			if st, ok := node.Type.(*ast.StructType); ok {
+				fields := map[string]string{}
+				for _, f := range st.Fields.List {
+					ty := exprText(fset, src, f.Type)
+					for _, name := range f.Names {
+						fields[name.Name] = ty
+					}
+				}
+				facts.StructFields[node.Name.Name] = fields
+			}
 		case *ast.FuncDecl:
 			facts.FuncNames = append(facts.FuncNames, node.Name.Name)
 		}
