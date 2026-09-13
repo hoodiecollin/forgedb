@@ -24,7 +24,7 @@ fn main() {
         Value::U64(u64::MAX),
         Value::I32(42),
         Value::I64(1234567890),
-        Value::F64(3.14159),
+        Value::F64(12.5),
         Value::Bool(true),
         Value::String("Hello, ForgeDB!".to_string()),
         Value::Uuid(Uuid::new_v4()),

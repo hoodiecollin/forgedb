@@ -62,7 +62,7 @@ fn test_value_i64() {
 
 #[test]
 fn test_value_f64() {
-    let val = Value::F64(3.14159);
+    let val = Value::F64(12.5);
     assert_eq!(val.type_name(), "f64");
     assert!(val.is_numeric());
 }
@@ -110,8 +110,8 @@ fn test_value_from_i64() {
 
 #[test]
 fn test_value_from_f64() {
-    let val: Value = 3.14159_f64.into();
-    assert_eq!(val, Value::F64(3.14159));
+    let val: Value = 12.5_f64.into();
+    assert_eq!(val, Value::F64(12.5));
 }
 
 #[test]

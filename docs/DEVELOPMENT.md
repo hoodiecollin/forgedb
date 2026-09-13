@@ -295,8 +295,15 @@ forgedb/
 # TIER 1 — the default suite. Exactly what CI runs (.github/workflows/test.yml).
 # --no-fail-fast surfaces ALL results; cargo otherwise halts at the first failing
 # binary. The examples build is separate because --lib/--bins/--tests AND --doc all
-# EXCLUDE examples, so no test flag covers them.
+# EXCLUDE examples, so no test flag covers them. Tier 1 also generates a
+# multi-model schema and `cargo check`s the emitted core + server packages against
+# the in-tree substrate (tests/codegen_compiles_test.rs), so a codegen change meets
+# rustc on the PR gate rather than at the release merge.
 make test
+
+# Clippy over every target (tests and examples included). Deny-level lints fail it;
+# warnings do not. CI runs it as a step of the same required check.
+make clippy
 
 # TIER 2 — the ~20 tests that each generate and compile a crate. #[ignore]d out of
 # tier 1; run nightly by CI. Minutes, not seconds. Run it when you touch codegen, the
@@ -306,6 +313,7 @@ make test-ignored
 # The individual commands, if you need to vary them
 cargo test --workspace --no-fail-fast
 cargo build --workspace --examples
+cargo clippy --workspace --all-targets
 cargo test --workspace -- --nocapture
 ```
 

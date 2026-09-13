@@ -30,6 +30,9 @@ jobs:
       - name: Tier 1 — workspace suite + examples
         run: make test
 
+      - name: Clippy — deny-level lints over every target
+        run: make clippy
+
       - uses: oven-sh/setup-bun@v2
 
       - name: No comments in ForgeDB's own source

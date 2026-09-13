@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod cache;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
