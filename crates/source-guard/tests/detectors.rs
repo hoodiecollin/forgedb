@@ -46,6 +46,33 @@ fn method_call_sites_are_attributed_to_the_enclosing_fn_including_inside_macros(
 }
 
 #[test]
+fn an_or_expression_joining_a_literal_and_an_ident_is_found_in_either_order() {
+    let planted = RustSource::generated(
+        "planted.rs",
+        r#"
+fn a(f: &Field) -> bool { f.name == "id" || f.auto_generate }
+fn b(f: &Field) -> bool { f.auto_generate || f.name == "id" }
+fn c(f: &Field) -> bool { f.name == "id" || f.unique }
+fn d(f: &Field) -> bool { f.name == "other" || f.auto_generate }
+fn e(f: &Field) -> bool { assert!(f.name == "id" || f.auto_generate); true }
+"#,
+    );
+    let hits = planted.or_expressions_joining("id", "auto_generate");
+    assert_eq!(hits.len(), 3, "a, b and the one inside assert!: {hits:?}");
+    assert!(planted.or_expressions_joining("id", "nothing").is_empty());
+}
+
+#[test]
+fn identifiers_containing_a_substring_are_counted_in_items_and_macro_bodies() {
+    let planted = RustSource::generated(
+        "planted.rs",
+        "fn PyInit__forgedb_native() {}\nfn other() { assert!(_forgedb_native_ok()); }\nconst STEM: &str = \"_forgedb_native\";\n",
+    );
+    assert_eq!(planted.idents_containing("_forgedb_native"), 2);
+    assert_eq!(planted.string_literals().iter().filter(|s| s.contains("_forgedb_native")).count(), 1);
+}
+
+#[test]
 fn a_negated_contains_is_counted_and_a_plain_or_bare_assert_is_not() {
     assert_eq!(src().negated_method_call_count("contains"), 3);
     assert_eq!(src().negated_method_call_count("lines"), 0);

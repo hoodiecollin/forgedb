@@ -543,6 +543,60 @@ impl RustSource {
         w.hits
     }
 
+    pub fn or_expressions_joining(&self, lit: &str, ident: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        walk_exprs(
+            self.ast(),
+            |e| {
+                if let syn::Expr::Binary(b) = e
+                    && matches!(b.op, syn::BinOp::Or(_))
+                {
+                    let l = b.left.to_token_stream().to_string();
+                    let r = b.right.to_token_stream().to_string();
+                    let quoted = format!("\"{lit}\"");
+                    let has_lit = |s: &str| s.contains(&quoted);
+                    let has_ident = |s: &str| token_idents(&syn::parse_str(s).unwrap_or_default(), ident) > 0;
+                    if (has_lit(&l) && has_ident(&r)) || (has_lit(&r) && has_ident(&l)) {
+                        out.push(e.to_token_stream().to_string());
+                    }
+                }
+            },
+            |_| {},
+        );
+        out
+    }
+
+    pub fn idents_containing(&self, needle: &str) -> usize {
+        struct W<'n> {
+            needle: &'n str,
+            count: usize,
+        }
+        impl<'ast, 'n> Visit<'ast> for W<'n> {
+            fn visit_ident(&mut self, node: &'ast proc_macro2::Ident) {
+                if node.to_string().contains(self.needle) {
+                    self.count += 1;
+                }
+            }
+            fn visit_macro(&mut self, node: &'ast syn::Macro) {
+                fn scan(tokens: &proc_macro2::TokenStream, needle: &str) -> usize {
+                    let mut n = 0;
+                    for tt in tokens.clone() {
+                        match tt {
+                            proc_macro2::TokenTree::Ident(i) if i.to_string().contains(needle) => n += 1,
+                            proc_macro2::TokenTree::Group(g) => n += scan(&g.stream(), needle),
+                            _ => {}
+                        }
+                    }
+                    n
+                }
+                self.count += scan(&node.tokens, self.needle);
+            }
+        }
+        let mut w = W { needle, count: 0 };
+        w.visit_file(self.ast());
+        w.count
+    }
+
     pub fn negated_method_call_count(&self, method: &str) -> usize {
         let mut n = 0;
         walk_exprs(

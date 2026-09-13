@@ -188,27 +188,14 @@ fn scenario_12_the_extension_stem_has_one_spelling() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
     let mut hits: Vec<String> = Vec::new();
-    let mut stack = vec![root.join("src"), root.join("crates")];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if path.file_name().and_then(|n| n.to_str()) == Some("tests") {
-                    continue;
-                }
-                stack.push(path);
-                continue;
-            }
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            let src = std::fs::read_to_string(&path).unwrap();
-            for (n, line) in src.lines().enumerate() {
-                let code = line.split("//").next().unwrap_or("");
-                if code.contains(&stem) {
-                    hits.push(format!("{}:{}", path.display(), n + 1));
-                }
-            }
+    let mut sources = forgedb_source_guard::RustSource::walk(root.join("src"), &["tests"]);
+    sources.extend(forgedb_source_guard::RustSource::walk(root.join("crates"), &["tests"]));
+    assert!(sources.len() > 50, "walked only {} files", sources.len());
+    for src in &sources {
+        let in_literals = src.string_literals().iter().filter(|s| s.contains(&stem)).count();
+        let in_idents = src.idents_containing(&stem);
+        for _ in 0..(in_literals + in_idents) {
+            hits.push(src.origin().to_string());
         }
     }
 
@@ -299,31 +286,22 @@ fn scenario_9_generated_code_carries_no_version_string_and_no_timestamp() {
 #[test]
 fn scenario_10_the_delivery_table_has_no_wildcard_arm() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/commands/build/deliver.rs");
-    let src = read(&path);
-
-    let start = src
-        .find("pub fn destinations_for(")
-        .unwrap_or_else(|| panic!("no `destinations_for` in {}", path.display()));
-    let end = src[start..]
-        .find("\n}\n")
-        .unwrap_or_else(|| panic!("`destinations_for` in {} is unterminated", path.display()))
-        + start;
-
-    let body: String = src[start..end]
-        .lines()
-        .map(|l| l.split("//").next().unwrap_or(""))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let src = forgedb_source_guard::RustSource::repo_file(&path);
+    let table = src
+        .fn_named("destinations_for")
+        .unwrap_or_else(|e| panic!("no `destinations_for` in {}: {e}", path.display()));
 
     assert!(
-        !body.contains("_ =>") && !body.contains("_ if"),
+        !table.match_has_wildcard_arm(),
         "the delivery table has a wildcard arm, so adding a PackageKind is a \
-         silent non-delivery rather than a compile error:\n{body}"
+         silent non-delivery rather than a compile error:\n{}",
+        table.body_text_because("listing the arms in the failure message")
     );
+    let arms = table.match_arm_paths();
     for kind in ["Napi", "Pyo3", "Ffi", "Core", "Server", "Wasm", "Transform", "Engine"] {
         assert!(
-            body.contains(kind),
-            "`{kind}` has no arm in the delivery table — the match is not total"
+            arms.iter().any(|a| a == kind || a.ends_with(&format!("::{kind}"))),
+            "`{kind}` has no arm in the delivery table — the match is not total: {arms:?}"
         );
     }
 }

@@ -38,22 +38,13 @@ fn make_recipe(target: &str) -> String {
 }
 
 fn ignored_tests() -> BTreeSet<String> {
-    let re = Regex::new(r"#\[ignore[^\]]*\]\s*\n\s*(?:pub\s+)?fn\s+(\w+)").unwrap();
-    let dir = repo_root().join("tests");
     let mut out = BTreeSet::new();
-    for entry in std::fs::read_dir(&dir).expect("tests/ is readable") {
-        let path = entry.expect("readable dir entry").path();
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
-        let src = std::fs::read_to_string(&path).expect("readable test file");
-        for caps in re.captures_iter(&src) {
-            out.insert(caps[1].to_string());
-        }
+    for src in forgedb_source_guard::RustSource::walk(repo_root().join("tests"), &["common"]) {
+        out.extend(src.fns_with_attr("ignore"));
     }
     assert!(
         !out.is_empty(),
-        "found no #[ignore]d tests — the parser has drifted from the source, and every \
+        "found no #[ignore]d tests — the walk has drifted from the source, and every \
          assertion keyed on this set would now pass vacuously"
     );
     out
@@ -218,7 +209,9 @@ fn s337_the_go_reclose_proves_the_init_check_executes() {
          unreachable (#486):\n{body}"
     );
 
-    let scaffold = read("src/templates.rs");
+    let scaffold = forgedb_source_guard::RustSource::repo_file(repo_root().join("src/templates.rs"))
+        .string_literals()
+        .join("\n");
     let defaults: Vec<&str> = scaffold
         .lines()
         .filter_map(|l| {
