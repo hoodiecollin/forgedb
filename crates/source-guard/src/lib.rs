@@ -1,4 +1,5 @@
 mod cache;
+mod file;
 mod go;
 mod order;
 mod scope;

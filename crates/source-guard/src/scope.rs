@@ -26,13 +26,13 @@ pub struct FnScope<'a> {
     pub(crate) item: &'a syn::ItemFn,
     pub(crate) sig: &'a syn::Signature,
     pub(crate) block: &'a syn::Block,
-    origin: String,
+    pub(crate) origin: String,
 }
 
 pub struct MethodScope<'a> {
     pub(crate) sig: &'a syn::Signature,
     pub(crate) block: &'a syn::Block,
-    origin: String,
+    pub(crate) origin: String,
 }
 
 macro_rules! body_queries {
