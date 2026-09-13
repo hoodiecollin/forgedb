@@ -441,6 +441,34 @@ fn tier_one_runs_the_suite_and_builds_the_examples() {
 }
 
 #[test]
+fn tier_one_runs_clippy_over_every_target() {
+    let recipe = make_recipe("clippy");
+
+    assert!(
+        recipe.contains("cargo clippy --workspace --all-targets"),
+        "`make clippy` must lint every target. The deny-level approx_constant errors lived in \
+         tests and examples for weeks while `--workspace` alone reported clean. Got: {recipe}"
+    );
+    assert!(
+        !recipe.contains("-D warnings"),
+        "`make clippy` gates deny-level lints only; warnings-as-errors is a separate decision \
+         with dozens of pre-existing style warnings behind it. Got: {recipe}"
+    );
+
+    let wf = unwrap_continuations(&workflow("test.yml"));
+    assert!(
+        wf.contains("make clippy"),
+        "test.yml must run `make clippy`. A lint that runs only on a developer's machine is \
+         enforced by whether they remembered"
+    );
+    assert!(
+        !wf.contains("cargo clippy"),
+        "test.yml has its own copy of the clippy command alongside the make target; the two \
+         will drift"
+    );
+}
+
+#[test]
 fn the_nightly_invokes_the_aggregate_target_rather_than_its_own_copy() {
     let cmd = run_command("nightly-ignored.yml", "Tier 2 — the ignored suite");
 
