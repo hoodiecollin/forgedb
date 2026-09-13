@@ -469,6 +469,31 @@ fn tier_one_runs_clippy_over_every_target() {
 }
 
 #[test]
+fn the_codegen_compile_check_is_not_ignored() {
+    let rel = "tests/codegen_compiles_test.rs";
+    let src = forgedb_source_guard::RustSource::repo_file(repo_root().join(rel));
+    let ignored = ignored_tests();
+
+    for name in [
+        "the_generated_core_and_server_type_check_against_the_checkout",
+        "the_check_fails_when_the_emitted_core_does_not_compile",
+    ] {
+        src.fn_named(name).unwrap_or_else(|e| {
+            panic!(
+                "{rel} no longer declares `{name}`: {e}. A rename here silently removes the \
+                 only tier-1 compile of the generated database and api"
+            )
+        });
+        assert!(
+            !ignored.contains(name),
+            "`{name}` is #[ignore]d. Tier 2 already compiles generated code nightly and has \
+             been red for weeks without blocking anything; the point of this test is that it \
+             runs on the PR gate"
+        );
+    }
+}
+
+#[test]
 fn the_nightly_invokes_the_aggregate_target_rather_than_its_own_copy() {
     let cmd = run_command("nightly-ignored.yml", "Tier 2 — the ignored suite");
 
