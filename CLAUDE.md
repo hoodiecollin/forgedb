@@ -73,7 +73,7 @@ Example: `cargo run -- generate all --output ./generated`.
 | Tier | Command | Where |
 |---|---|---|
 | 1 — default suite | `make test` | `.github/workflows/test.yml`; required check on PRs into `develop`/`main` |
-| 2 — ignored suite | `make test-ignored` | `.github/workflows/nightly-ignored.yml`, nightly against `develop`; files an issue on failure |
+| 2 — ignored suite | `make test-ignored` | `.github/workflows/nightly-ignored.yml` against `develop`, **manual dispatch only**: the nightly schedule is paused until #449 is fixed for real (#551, #457); files an issue on failure |
 
 `make test` is exactly `cargo test --workspace --no-fail-fast` + `cargo build --workspace
 --examples`; the workflow invokes the target rather than repeating it, so there is one
