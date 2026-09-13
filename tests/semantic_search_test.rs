@@ -269,3 +269,154 @@ fn the_mcp_server_is_declared_and_pinned_to_the_project() {
          args were: {args}"
     );
 }
+
+fn bash_payload(command: &str) -> String {
+    let escaped = command
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n");
+    format!(r#"{{"tool_name":"Bash","tool_input":{{"command":"{escaped}"}}}}"#)
+}
+
+#[test]
+fn the_bash_matcher_is_wired_to_the_same_hook() {
+    let settings = read(".claude/settings.json");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&settings).expect(".claude/settings.json is not valid JSON");
+    let entries = parsed["hooks"]["PreToolUse"]
+        .as_array()
+        .expect("settings.json has no hooks.PreToolUse array");
+    let bash_entry = entries.iter().find(|e| e["matcher"] == "Bash").expect(
+        "no PreToolUse entry matches the Bash tool, so `grep`/`sed` run through the shell bypass \
+         the Grep-tool hook entirely and the Serena rule is enforced on one door of two",
+    );
+    let command = bash_entry["hooks"][0]["command"]
+        .as_str()
+        .expect("the Bash PreToolUse entry has no command");
+    assert!(
+        command.ends_with(".claude/hooks/no-grep.sh"),
+        "settings.json points the Bash matcher at {command}, which is not the committed hook"
+    );
+}
+
+#[test]
+fn shell_search_over_source_files_is_refused() {
+    for command in [
+        "grep -rn CommitSequencer crates/",
+        "grep -rn 'fn identity_field' .",
+        "rg 'fn identity_field' src",
+        "git grep identity_field -- crates",
+        "find crates -name '*.rs' | xargs grep -l Manifest",
+        "cd /x && grep -n Manifest crates/storage/src/lib.rs",
+    ] {
+        assert_eq!(
+            run_hook(&bash_payload(command)),
+            BLOCK,
+            "`{command}` searches source files as text and must route to serena/ast-grep; the \
+             Grep-tool hook never sees a grep run through Bash"
+        );
+    }
+}
+
+#[test]
+fn shell_reads_of_source_files_are_refused() {
+    for command in [
+        "cat src/project.rs",
+        "head -50 crates/codegen/src/rust.rs",
+        "tail -n 20 src/main.rs",
+        "sed -n '10,40p' scripts/strip-comments.ts",
+        "cat apps/website/lib/roadmap-transform.ts | grep isCore",
+    ] {
+        assert_eq!(
+            run_hook(&bash_payload(command)),
+            BLOCK,
+            "`{command}` reads a source file as text; it must go through get_symbols_overview, \
+             find_symbol with include_body, or the Read tool"
+        );
+    }
+}
+
+#[test]
+fn shell_edits_of_source_files_are_refused() {
+    for command in [
+        "sed -i '' 's/foo/bar/' crates/parser/src/ast.rs",
+        "sed -i.bak 's/foo/bar/' src/main.rs",
+        "perl -pi -e 's/foo/bar/' tools/goguard/main.go",
+        "cat > src/new.rs <<'EOF'\nfn main() {}\nEOF",
+        "echo 'pub fn x() {}' >> crates/types/src/lib.rs",
+        "printf 'x' | tee src/project.rs",
+    ] {
+        assert_eq!(
+            run_hook(&bash_payload(command)),
+            BLOCK,
+            "`{command}` changes a source file as text; it must go through replace_symbol_body, \
+             insert_after_symbol, replace_content, or the Edit/Write tools"
+        );
+    }
+}
+
+#[test]
+fn shell_search_scoped_to_non_code_or_piped_output_still_works() {
+    for command in [
+        "cargo test -p forgedb-parser 2>&1 | grep 'test result'",
+        "git log --oneline | rg fix",
+        "ls crates | grep storage",
+        "grep -n '^version' crates/*/Cargo.toml",
+        "grep -rn 'milestone' .pm-playbook/backlog/",
+        "grep -rn 'publish-gap' docs/",
+        "rg -t md Serena docs/",
+        "grep -c hooks .claude/settings.json",
+        "grep -rn 'name:' .github/workflows/",
+        "ast-grep run -p 'fn $F($$$)' -l rust",
+        "grep -n allFeatures ~/.serena/serena_config.yml",
+    ] {
+        assert_eq!(
+            run_hook(&bash_payload(command)),
+            ALLOW,
+            "`{command}` is a search over files with no AST node, or a filter over piped output; \
+             refusing it buys friction with no cover"
+        );
+    }
+}
+
+#[test]
+fn shell_access_to_non_code_and_scratch_files_still_works() {
+    for command in [
+        "cat Cargo.toml",
+        "cat .claude/settings.json",
+        "sed -n '1,20p' docs/ARCHITECTURE.md",
+        "sed -i '' 's/0.5.0/0.6.0/' Cargo.toml",
+        "cat /tmp/probe.ts",
+        "bun /tmp/probe.ts",
+        "cat scratchpad/probe/src/main.rs",
+        "wc -l src/*.rs",
+        "git diff src/project.rs",
+        "cargo build --workspace",
+        "bun scripts/strip-comments.ts --check",
+        "head -c 200 target/debug/forgedb",
+    ] {
+        assert_eq!(
+            run_hook(&bash_payload(command)),
+            ALLOW,
+            "`{command}` touches no tracked source file as text; refusing it would block ordinary \
+             build, diff and scratch work"
+        );
+    }
+}
+
+#[test]
+fn a_malformed_bash_payload_cannot_block_every_command() {
+    for payload in [
+        r#"{"tool_name":"Bash"}"#,
+        r#"{"tool_name":"Bash","tool_input":{}}"#,
+        r#"{"tool_name":"Bash","tool_input":{"command":null}}"#,
+        r#"{"tool_name":"Bash","tool_input":{"command":""}}"#,
+    ] {
+        assert_eq!(
+            run_hook(payload),
+            ALLOW,
+            "a hook that errors on an unexpected Bash payload blocks every shell command in the \
+             session. Payload: {payload:?}"
+        );
+    }
+}
