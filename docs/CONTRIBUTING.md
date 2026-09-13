@@ -636,7 +636,7 @@ Closes #123
 | Reclose under a foreign cargo workspace root | `main` | Yes |
 | `migrate_tests` vs the published substrate | `main` | Yes |
 | Go reclose | `main` | Yes |
-| Nightly ignored suite — tier 2 | schedule, against `develop` | Files an issue |
+| Ignored suite — tier 2 | manual dispatch against `develop` (the nightly schedule is paused until #449 is fixed) | Files an issue |
 
 Run tier 1 yourself before opening a PR — it is the same command CI runs:
 
@@ -657,7 +657,7 @@ The four wrappers, the wasm replica and the transformer are still compiled only 
 and in the reclose on `main`.
 
 The slow tier is the ~20 tests that each generate and compile a crate. They are
-`#[ignore]`d out of tier 1 and run nightly, but run them yourself when you touch codegen,
+`#[ignore]`d out of tier 1 and run only on manual dispatch while #449 is open, so run them yourself when you touch codegen,
 the build cache, or the generated API:
 
 ```bash
