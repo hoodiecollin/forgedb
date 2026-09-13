@@ -1,6 +1,8 @@
 // IoT Sensor Platform — high-volume telemetry with fixed-array readings
 // Showcases: +u64 PK for append-heavy tables, fixed array [f64; 3] for 3-axis
-// sensor samples, embedded struct (Calibration), composite @index on FK + time.
+// sensor samples, embedded struct (Calibration), composite @index on FK + time,
+// and `timestamp(us)` on the reading stamp, because a millisecond floor would
+// merge samples from a kilohertz sensor.
 
 struct Calibration {
   offset: f64
@@ -24,7 +26,7 @@ Device {
 SensorReading {
   id: +u64
   reading: [f64; 3]
-  recorded_at: +timestamp
+  recorded_at: +timestamp(us)
   device: *Device
   @index(device, recorded_at)
 }
