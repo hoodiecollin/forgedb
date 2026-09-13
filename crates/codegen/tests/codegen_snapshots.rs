@@ -6193,19 +6193,20 @@ fn test_two_apps_export_disjoint_ffi_symbols() {
         );
     }
 
-    let go_a = {
-        let mut s = memoized_code_with("GoGenerator", &[SYM, FP], &schema, || GoGenerator::generate(&schema, SYM, FP).unwrap().code);
-        s.push_str(&GoGenerator::generate_async_bridge(SYM).code);
-        s
-    };
-    let go_b = {
-        let mut s = memoized_code_with("GoGenerator", &[SYM_B, FP], &schema, || GoGenerator::generate(&schema, SYM_B, FP).unwrap().code);
-        s.push_str(&GoGenerator::generate_async_bridge(SYM_B).code);
-        s
-    };
+    let main_a = memoized_code_with("GoGenerator", &[SYM, FP], &schema, || GoGenerator::generate(&schema, SYM, FP).unwrap().code);
+    let bridge_a = GoGenerator::generate_async_bridge(SYM).code;
+    let main_b = memoized_code_with("GoGenerator", &[SYM_B, FP], &schema, || GoGenerator::generate(&schema, SYM_B, FP).unwrap().code);
+    let bridge_b = GoGenerator::generate_async_bridge(SYM_B).code;
+    let go_a = format!("{main_a}{bridge_a}");
 
-    let ea = go_exported_symbols(&go_a);
-    let eb = go_exported_symbols(&go_b);
+    let ea: std::collections::BTreeSet<String> = go_exported_symbols(&main_a)
+        .union(&go_exported_symbols(&bridge_a))
+        .cloned()
+        .collect();
+    let eb: std::collections::BTreeSet<String> = go_exported_symbols(&main_b)
+        .union(&go_exported_symbols(&bridge_b))
+        .cloned()
+        .collect();
     assert!(!ea.is_empty(), "the Go package //exports at least the completion callback");
     assert!(
         ea.is_disjoint(&eb),
