@@ -1,8 +1,7 @@
-Register a read snapshot.
+Registers a read snapshot and returns the LSN of the last commit.
 
-Returns the LSN of the last committed transaction (`next_lsn - 1`), which
-is `Lsn(start_lsn)` if nothing has committed yet.  Increments the refcount
-for that LSN so [`gc`] knows it is still needed.
+The returned value is `next_lsn - 1`, so it is `Lsn(start_lsn)` when nothing has committed
+yet. The sequencer increments a reference count for that LSN so [`Self::gc`] keeps every
+conflict entry the snapshot could still collide with.
 
-The caller must pair every `register_snapshot` with exactly one
-[`release_snapshot`] on the same LSN to keep refcounts correct.
+Pair every call with exactly one [`Self::release_snapshot`] on the same LSN.

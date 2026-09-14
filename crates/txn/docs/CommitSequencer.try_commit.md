@@ -1,11 +1,9 @@
-Attempt to commit a transaction's write-set (first-committer-wins, #83).
+Attempts to commit a write-set under first-committer-wins.
 
-For each key in `ws.keys`, checks whether it was last committed at a
-LSN strictly greater than `ws.snapshot_lsn`.  If ANY key conflicts,
-returns [`CommitOutcome::Conflict`] immediately (the caller must discard
-staged writes and retry).  On success, assigns the next monotonic LSN,
-records it for every key in the write-set, and returns
-[`CommitOutcome::Committed`].
+Every key in `ws.keys` is checked against the LSN it was last committed at. If any key's last
+commit is strictly greater than `ws.snapshot_lsn`, the result is [`CommitOutcome::Conflict`]
+naming the first such key, and nothing is recorded: the caller discards its staged writes and
+retries from a fresh snapshot. Otherwise the sequencer assigns the next LSN, records it for
+every key in the write-set, and returns [`CommitOutcome::Committed`].
 
-Pure opaque-key equality + integer compare — no schema, no model name,
-no field awareness.
+The check is opaque-key equality plus an integer compare. Keys are never interpreted.

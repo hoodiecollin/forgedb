@@ -1,1 +1,1 @@
-Return the raw integer value.
+The raw integer value.

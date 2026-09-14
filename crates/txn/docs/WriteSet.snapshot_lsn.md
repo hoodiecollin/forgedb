@@ -1,1 +1,1 @@
-The read snapshot LSN this transaction observed.
+The read snapshot the transaction observed.

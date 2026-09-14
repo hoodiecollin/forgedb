@@ -1,60 +1,26 @@
-MVCC Tier 2 commit sequencer for ForgeDB (#83).
+An in-memory commit sequencer implementing snapshot isolation with first-committer-wins.
 
-This crate is **structurally schema-agnostic**: its public API names only
-rows, opaque byte-keys, and integer LSNs.  No model name, no field, no
-generic predicate, no `Fn`-over-schema.  It is the substrate the generated
-`Database::transaction_retrying` links against — the generated code brings
-the schema knowledge; this crate provides only the ordering oracle.
+The crate is schema-agnostic by construction: its public API names only opaque byte keys
+([`OpaqueKey`]), integer sequence numbers ([`Lsn`]) and a per-transaction [`WriteSet`]. It has
+no model, field or predicate types. The generated database brings the schema knowledge and
+links this crate only as the ordering oracle for its transaction path.
 
-## Design
+## How it works
 
-The [`CommitSequencer`] implements **snapshot isolation with first-committer-wins**
-(SI-FCW): the first transaction to commit a key at a given LSN wins; a later
-transaction whose read snapshot predates that commit conflicts and must retry.
+A transaction registers a read snapshot ([`CommitSequencer::register_snapshot`]), which
+returns the LSN of the last commit at that moment. When it is ready to commit it hands the
+sequencer the set of keys it wrote together with that snapshot LSN
+([`CommitSequencer::try_commit`]). If any key was last committed at an LSN strictly greater
+than the snapshot, another transaction won the race: the outcome is
+[`CommitOutcome::Conflict`] and the caller discards its staged writes and retries. Otherwise
+the sequencer assigns the next LSN, records it against every key in the write-set, and returns
+[`CommitOutcome::Committed`].
 
-Isolation level: **snapshot isolation**.  The disclosed anomaly is write-skew
-(two transactions read overlapping key sets, each writes a disjoint subset;
-both may commit in SI).  Serializable snapshot isolation (SSI) requires
-read-set tracking and is deferred to Tier 3.
+Every registered snapshot is released with [`CommitSequencer::release_snapshot`], and
+[`CommitSequencer::gc`] prunes conflict entries no live snapshot can still conflict with.
 
-## Usage
+## Isolation level
 
-```
-use forgedb_txn::{CommitSequencer, WriteSet, CommitOutcome, Lsn};
-
-// new(0) → commit LSNs start at Lsn(1); sentinel "before any commit" = Lsn(0).
-let mut seq = CommitSequencer::new(0);
-
-// Transaction A takes a snapshot before any commit → snap_a = Lsn(0).
-let snap_a = seq.register_snapshot();
-assert_eq!(snap_a, Lsn(0));
-
-// Transaction B takes a snapshot at the same point → snap_b = Lsn(0).
-let snap_b = seq.register_snapshot();
-
-// A commits key "row:0" → assigned Lsn(1).
-let ws_a = WriteSet {
-    keys: vec![b"row:0".to_vec().into_boxed_slice()],
-    snapshot_lsn: snap_a,
-};
-match seq.try_commit(&ws_a) {
-    CommitOutcome::Committed(lsn) => {
-        println!("A committed at LSN {}", lsn.as_u64());
-        assert_eq!(lsn, Lsn(1));
-    }
-    CommitOutcome::Conflict { .. } => panic!("unexpected conflict"),
-}
-seq.release_snapshot(snap_a);
-
-// B tries to commit the same key with snap_b = Lsn(0).
-// A committed at Lsn(1) > Lsn(0) → conflict.
-let ws_b = WriteSet {
-    keys: vec![b"row:0".to_vec().into_boxed_slice()],
-    snapshot_lsn: snap_b,
-};
-match seq.try_commit(&ws_b) {
-    CommitOutcome::Conflict { .. } => println!("B conflicts, must retry"),
-    CommitOutcome::Committed(_) => panic!("should have conflicted"),
-}
-seq.release_snapshot(snap_b);
-```
+Snapshot isolation. The disclosed anomaly is write skew: two transactions that read
+overlapping keys and write disjoint subsets can both commit. The sequencer tracks write-sets
+only, not read-sets.

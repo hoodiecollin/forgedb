@@ -1,1 +1,1 @@
-The first conflicting opaque key detected.
+The first conflicting key found, in write-set order.

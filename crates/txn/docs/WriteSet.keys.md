@@ -1,1 +1,1 @@
-Every opaque key touched by this transaction's writes.
+Every opaque key the transaction wrote.
