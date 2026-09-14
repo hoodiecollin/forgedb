@@ -1,15 +1,22 @@
+#[doc = include_str!("../docs/entry.WalOperation.md")]
 #[derive(Debug, Clone, PartialEq)]
 pub enum WalOperation {
-    Raw { payload: Vec<u8> },
+    #[doc = include_str!("../docs/entry.WalOperation.Raw.md")]
+    Raw {
+        #[doc = include_str!("../docs/entry.WalOperation.Raw.payload.md")]
+        payload: Vec<u8>,
+    },
 }
 
 impl WalOperation {
+    #[doc = include_str!("../docs/entry.WalOperation.type_byte.md")]
     pub fn type_byte(&self) -> u8 {
         match self {
             WalOperation::Raw { .. } => 0x20,
         }
     }
 
+    #[doc = include_str!("../docs/entry.WalOperation.to_bytes.md")]
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
             WalOperation::Raw { payload } => {
@@ -21,6 +28,7 @@ impl WalOperation {
         }
     }
 
+    #[doc = include_str!("../docs/entry.WalOperation.from_bytes.md")]
     pub fn from_bytes(type_byte: u8, bytes: &[u8]) -> std::io::Result<Self> {
         use std::io::{Error, ErrorKind};
 
@@ -51,13 +59,17 @@ impl WalOperation {
     }
 }
 
+#[doc = include_str!("../docs/entry.WalEntry.md")]
 #[derive(Debug, Clone, PartialEq)]
 pub struct WalEntry {
+    #[doc = include_str!("../docs/entry.WalEntry.model_name.md")]
     pub model_name: String,
+    #[doc = include_str!("../docs/entry.WalEntry.operation.md")]
     pub operation: WalOperation,
 }
 
 impl WalEntry {
+    #[doc = include_str!("../docs/entry.WalEntry.raw.md")]
     pub fn raw(model_name: impl Into<String>, payload: Vec<u8>) -> Self {
         WalEntry {
             model_name: model_name.into(),
@@ -65,6 +77,7 @@ impl WalEntry {
         }
     }
 
+    #[doc = include_str!("../docs/entry.WalEntry.to_bytes.md")]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
 
@@ -87,6 +100,7 @@ impl WalEntry {
         result
     }
 
+    #[doc = include_str!("../docs/entry.WalEntry.from_bytes.md")]
     pub fn from_bytes(bytes: &[u8]) -> std::io::Result<(Self, usize)> {
         use std::io::{Error, ErrorKind};
 
