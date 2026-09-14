@@ -110,10 +110,14 @@ match, which is precisely the bug. Diff against the published artifact instead:
 ```bash
 # for each crate, fetch what is actually on crates.io and diff the source
 curl -sL "https://static.crates.io/crates/$C/$C-$V.crate" | tar xz
-diff -rq "$C-$V/src" "crates/<dir>/src"
+diff -rq "$C-$V/src"  "crates/<dir>/src"
+diff -rq "$C-$V/docs" "crates/<dir>/docs"   # substrate crates: the docs.rs sidecars (#490)
 ```
 
-Every crate that reports a difference needs a publish. (Reconciling the v0.4.0 gap this way found
+Every crate that reports a difference needs a publish. Diff `docs/` as well as `src/` for a
+substrate crate: its docs.rs prose lives in `crates/<dir>/docs/*.md` sidecars that
+`include_str!` pulls in at build time, so a sidecar-only correction changes the published
+artifact while leaving `src/` byte-identical. (Reconciling the v0.4.0 gap this way found
 six drifted crates where a version-number comparison found one.)
 
 ### …but a clean `src/` diff does NOT mean "no publish"

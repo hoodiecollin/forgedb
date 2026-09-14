@@ -825,8 +825,8 @@ so a component there would be downloaded by every job for a tool no job runs.
   `//!`, a `#[doc = "…"]` literal, JSDoc), not inline `//` prose, on any surface — Rust, TS/TSX,
   `Cargo.toml`, the workflows, the Makefile. The rule bans prose in a source file, not the `doc`
   attribute: `#[doc = include_str!("…")]` naming a sidecar file is permitted, because the sentence
-  it points at is not in the file an agent reads. That is how the substrate crates get their
-  docs.rs content back (#490), and the checker's refusal of the literal form lands with it.
+  it points at is not in the file an agent reads. That is how the substrate crates carry their
+  docs.rs content (#490), and `make comment-check` refuses the literal form.
   A comment drifts the moment the code moves, and it sits in
   a coding agent's grep path where a stale line reads as authoritative and steers a whole
   session down a path that looks correct the entire way. Code is read by reading it; when
@@ -862,6 +862,19 @@ so a component there would be downloaded by every job for a tool no job runs.
   `tests/ci_gate_test.rs::the_comment_rule_has_a_place_where_it_can_fail`. `--write`
   fixes a tree in place. It is a real lexer, not a regex, because this repo is a code
   generator whose sources are full of raw strings holding Rust that itself contains `///`.
+
+  **The substrate crates' docs.rs content lives in sidecars (#490).** `crates/<c>/docs/<key>.md`,
+  one file per public attachment point, attached by `#[doc = include_str!("../docs/<key>.md")]`.
+  The key is the item's path within the crate joined with dots: `crate` for the root, `durable`
+  for a `pub mod`, `CommitSequencer.try_commit`, `WriteSet.keys`, `CommitOutcome.Conflict.key`.
+  Adding a public item to one of the 10 host-side substrate crates means adding its sidecar:
+  `make docs-check` (rustdoc's `missing_docs` and broken-link lints with all features, and zero
+  doctests) and `tests/substrate_docs_test.rs` (no literal, every include names its own file,
+  every file claimed exactly once, no executable fence, case-insensitive key uniqueness, floors)
+  fail otherwise. **No runnable examples in a sidecar, as a rule** — every fence is tagged
+  `text`, `toml`, `json`, `sh`, `console`, `forge`, `http` or `yaml`. wasm32-gated items and
+  `forgedb-storage-web` carry no sidecars (#563). The walker behind both guards is
+  `forgedb_source_guard::RustSource::doc_sites`.
 - No time estimates (hours/days/weeks) anywhere — describe scope, not duration.
 - Don't `git commit` without the user's consent (an in-the-moment "commit when done"
   counts as consent for that scope; it doesn't carry to follow-up changes). When you do
