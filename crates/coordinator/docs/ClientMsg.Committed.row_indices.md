@@ -1,1 +1,1 @@
-Physical row indices, one per `(model_tag, opaque_row_bytes)` entry.
+One physical row index per row, parallel to `model_tags` and `opaque_row_bytes`; the coordinator records as many rows as the shortest of the three vectors and ignores any excess.

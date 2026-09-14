@@ -1,1 +1,1 @@
-Opaque turn ID — must be echoed back in `Committed`.
+Identifier of this turn, starting at `1` and increasing by one per grant; it must be echoed in [`ClientMsg::Committed`].

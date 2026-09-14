@@ -1,2 +1,1 @@
-The first conflicting opaque key (for logging/debugging; the client
-MUST NOT interpret it).
+The first write-set key found to conflict, returned verbatim for logging; the client must not interpret it.

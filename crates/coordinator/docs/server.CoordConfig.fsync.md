@@ -1,1 +1,1 @@
-Replication-log fsync policy (#156).
+When the replication log is fsynced; see [`CoordFsync`]. Default [`CoordFsync::Always`].

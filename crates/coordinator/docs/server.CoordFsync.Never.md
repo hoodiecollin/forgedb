@@ -1,2 +1,1 @@
-Never fsync in the commit path — rely on the OS to flush the log. A
-coordinator crash rewinds the replication tail (no client data lost).
+Never flush in the commit path; the OS writes the log back on its own schedule, and a crash can lose the unflushed tail.

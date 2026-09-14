@@ -1,2 +1,1 @@
-Opaque conflict keys (row-id bytes + unique-claim bytes).  The
-coordinator compares them for equality only — never decodes them.
+Opaque conflict keys for the transaction's writes; the coordinator compares them for equality only and never decodes them.

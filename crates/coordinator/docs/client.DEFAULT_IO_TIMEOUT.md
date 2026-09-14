@@ -1,6 +1,3 @@
-Default I/O timeout for individual read/write operations.
+The socket read and write timeout [`CoordinatorClient::connect`] uses: 35 seconds.
 
-This value is **declared to the coordinator** on every `RequestTurn`
-(`client_deadline_ms`), which clamps its grant wait to fit inside it (#274).
-Before #274 the coordinator could not see it, so raising `--turn-timeout` past
-this value silently desynchronized the connection.
+It is also the deadline the client declares on every `RequestTurn`, which the coordinator clamps its grant wait to fit inside; a coordinator that receives no declaration assumes this same value.

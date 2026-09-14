@@ -1,10 +1,5 @@
-Replace the socket, discarding any reply stranded on the old one, and clear
-the poison flag.
+Dial the coordinator again, replace the socket, and clear the poison flag.
 
-Takes `&self` so it works through the `Arc` the generated
-`CoordinatedDatabase` holds — recovery policy stays in generated code,
-beside the `Busy` budget and retry limit that already live there, rather
-than being decided by this substrate.
+The old socket is sent a best-effort `Disconnect` before it is dropped, which discards any reply stranded on it; [`Self::last_known_lsn`] is kept. Takes `&self` so it can be called through the `Arc` a generated writer holds; whether and when to reconnect is the caller's policy.
 
-On failure the flag is **left set**: the stream is still the old,
-desynchronized one.
+If dialing fails the error is returned, the old socket stays in place, and the poison flag stays set.

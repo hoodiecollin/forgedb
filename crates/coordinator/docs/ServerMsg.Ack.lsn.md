@@ -1,1 +1,1 @@
-The LSN assigned to this commit in `_replication.log`.
+The commit LSN, equal to the `reserved_lsn` of the turn's [`ServerMsg::Grant`].

@@ -1,28 +1,17 @@
-MVCC Tier 3 coordinator for ForgeDB (#84).
+MVCC Tier 3 commit coordinator for ForgeDB: a schema-agnostic control plane that serializes commit turns for several writer processes sharing one data directory.
 
-Schema-agnostic control plane: owns the conflict map (via `forgedb-txn`),
-the LSN sequence, the opaque `_replication.log` (via `forgedb-changefeed`),
-and grants serialized exclusive commit turns over a Unix domain socket.
+One coordinator process (`forgedb coordinate <root>`) serves one data directory. It holds the directory's single-writer lock on behalf of every coordinated client, runs the conflict check and LSN sequence through [`forgedb_txn::CommitSequencer`], appends each committed payload to `<root>/_coordinator_replication.log` through [`forgedb_changefeed::durable::DurableBroker`], and hands out exclusive commit turns over a Unix domain socket. The server side is [`server`], the client side generated writers link is [`client`], and the wire protocol is defined at the crate root.
 
-## Architecture
+## Turn protocol
 
-One `forgedb coordinate <root>` process per data directory.  Generated
-writers connect over a Unix socket and follow a three-message turn protocol:
+Every frame is a length-prefixed JSON message ([`encode_msg`] / [`decode_msg`]); [`ClientMsg`] and [`ServerMsg`] are internally tagged by a `type` field holding the variant name. A commit takes three steps:
 
-1. **`RequestTurn`** — client sends its write-set keys + read-snapshot LSN.
-   The coordinator does a conflict check (`CommitSequencer::try_commit`), then
-   either **`Grant { turn_id, reserved_lsn }`** (exclusive turn) or
-   **`Nack { conflict_key }`** (retry required).
+1. The client sends [`ClientMsg::RequestTurn`] with its opaque write-set keys and read-snapshot LSN. The coordinator checks the keys against those committed after that LSN and replies [`ServerMsg::Grant`] (an exclusive turn plus the reserved LSN), [`ServerMsg::Nack`] (a conflict; retry from a fresh snapshot) or [`ServerMsg::Busy`] (another turn stayed outstanding for the whole wait window).
+2. Holding the grant, the client performs its own data-plane write (columns and WAL) and makes it durable.
+3. The client sends [`ClientMsg::Committed`] with the opaque row bytes. The coordinator releases the turn, appends the rows to the replication log, and replies [`ServerMsg::Ack`].
 
-2. *Data-plane write* (by the client, after Grant) — the client writes to
-   the shared column files + WAL on its own, then sends `Committed`.
+At most one turn is outstanding at a time; a turn not committed within the configured timeout is reclaimed.
 
-3. **`Committed`** — client announces durability, hands opaque row bytes to
-   the coordinator, which appends them to `_replication.log` and replies with
-   **`Ack { lsn }`**.  The turn is released; the next queued client may proceed.
+## What the coordinator never does
 
-## Identity red line
-
-The coordinator NEVER writes a column, NEVER decodes `opaque_row_bytes`, and
-NEVER interprets a model name as anything other than an opaque routing tag.
-Every `unsafe` block is forbidden by clippy (`#![forbid(unsafe_code)]`).
+It never opens a column file, never decodes `opaque_row_bytes`, and treats model names as opaque tags. It has no dependency on any `forgedb-storage` crate, and the crate is `#![forbid(unsafe_code)]`.

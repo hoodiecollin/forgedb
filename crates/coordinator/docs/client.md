@@ -1,5 +1,3 @@
-Schema-agnostic client for the Tier 3 coordinator Unix socket.
+Client side of the coordinator socket protocol, linked by generated coordinated writers.
 
-The generated `CoordinatedDatabase` wraps this client; the client itself
-knows nothing about models, fields, or schema — it only speaks the
-coordinator wire protocol.
+[`client::CoordinatorClient`] owns one Unix-socket connection and exposes the two protocol calls a writer needs, [`client::CoordinatorClient::request_turn`] and [`client::CoordinatorClient::committed`]. It knows nothing about models, fields or the schema; every key and row it carries is opaque bytes. Failures surface as [`client::ClientError`].

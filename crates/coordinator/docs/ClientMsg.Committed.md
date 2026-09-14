@@ -1,4 +1,3 @@
-Announce that the data-plane column + WAL write is now durable.
+Report that the granted turn's data-plane write is durable, and hand over the opaque payload for the replication log.
 
-The coordinator appends the opaque payload to `_replication.log` and
-releases the outstanding turn.
+The coordinator releases the turn first (so the next waiting client can be granted), then appends one event per row to `<root>/_coordinator_replication.log` under the configured fsync policy, then replies [`ServerMsg::Ack`]. A `turn_id` that is not the current turn is answered with [`ServerMsg::Error`] and nothing is appended.

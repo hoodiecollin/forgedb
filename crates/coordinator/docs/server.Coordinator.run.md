@@ -1,3 +1,3 @@
-Run the coordinator: bind the Unix socket, accept connections, dispatch
-each to a handler thread.  Blocks until the process is killed or
-`shutdown()` is called.
+Bind the Unix socket and serve connections until the accept loop stops.
+
+Any stale file at the socket path is removed first. Each accepted connection gets its own thread, which reads frames until the client sends `Disconnect`, closes the socket, sends no frame for [`CoordConfig::turn_timeout`] (the per-connection read timeout), or sends a frame the coordinator rejects (oversized or malformed); the last two are logged and the connection dropped. Blocks the calling thread; it returns `Ok(())` only if accept fails after [`Self::shutdown`] has been called, so in practice the process is stopped by a signal.

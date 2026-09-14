@@ -1,1 +1,1 @@
-The committed payload was recorded to the log; the turn is released.
+The `Committed` payload was appended to the replication log and flushed as the [`server::CoordFsync`] policy dictates; the turn itself was released before the append.

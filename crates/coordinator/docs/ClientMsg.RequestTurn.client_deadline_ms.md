@@ -1,14 +1,3 @@
-The client's own I/O deadline, in milliseconds (#274).
+The client's own I/O timeout in milliseconds; the coordinator clamps its grant wait to fit inside it, less [`server::GRANT_REPLY_MARGIN`], so a `Busy` reply is written before the client stops reading.
 
-The coordinator clamps its grant wait to fit inside this, so a `Busy`
-reply always reaches the client before it stops reading.  Without it
-neither side could see the other's deadline and the operator was
-silently responsible for keeping two numbers — `--turn-timeout` and a
-constant compiled into the client — in a relationship nothing checked.
-
-`0` (the `serde` default, i.e. a **pre-#274 client**, which omits the
-field entirely) means "unknown — assume the legacy 35s".  Deliberately
-an additive field rather than a handshake message: the protocol is
-internally-tagged JSON with no version field (#277), so an unknown
-*variant* breaks whichever peer ships second, while an unknown *field*
-is ignored in both directions.
+`0`, the serde default for a client that omits the field, means "unknown" and is treated as 35 seconds. It is an additive field rather than a handshake message because the protocol has no version field: an unknown field is ignored by both peers, an unknown variant is not.

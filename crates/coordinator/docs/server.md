@@ -1,27 +1,16 @@
-Coordinator server — Unix-socket listener that serializes multi-process
-commit turns for Tier 3 MVCC (#84).
+The coordinator server: a Unix-socket listener that serializes commit turns across writer processes.
 
-## What the server owns (schema-agnostic control plane)
+## What the server owns
 
-- The **#89 single-writer `DirLock`** on the data directory, held on behalf
-  of all coordinated clients (Tier 3 mode-switch, spec T3-5): an exclusive
-  advisory `fs2` lock on `<root>/.forgedb.lock` — the *exact same file*
-  `forgedb_storage::DirLock::acquire` locks. Holding it means (a) a second
-  coordinator is refused, and (b) a *standalone* writer (which self-acquires
-  the `DirLock` in `open_at`) is mutually excluded — so "coordinated" and
-  "standalone" modes can never both run. Coordinated clients therefore open
-  **lock-free** (`_lock: None`); their write mutual-exclusion comes from the
-  serialized turn-grant, not the file lock. This is pure filesystem interop
-  on an opaque path — the coordinator gains NO `forgedb-storage*` dependency
-  (T3-8): it never opens a column, it only advisory-locks a known path.
-- A [`CommitSequencer`] seeded from the broker watermark, so LSNs continue
-  monotonically across restarts.
-- A [`DurableBroker`] for `_coordinator_replication.log` — the cross-process
-  durable log that remote read-replica followers resume from.
-- The pending-turn slot (at most one outstanding `Grant` at a time).
+- The data directory's single-writer lock: an exclusive advisory `fs2` lock on `<root>/`[`server::DIR_LOCK_FILENAME`], the same file a standalone generated writer locks when it opens the directory itself. Holding it refuses a second coordinator and excludes a standalone writer, so the two modes cannot run on one directory at once. Coordinated clients open the directory without the lock; their mutual exclusion is the serialized turn. This is a filesystem contract on a fixed filename, not a code dependency: the crate links no `forgedb-storage` crate and never opens a column file.
+- A [`forgedb_txn::CommitSequencer`], seeded from the replication log's watermark so LSNs keep increasing across coordinator restarts.
+- A [`forgedb_changefeed::durable::DurableBroker`] over `<root>/_coordinator_replication.log`, the durable cross-process log the committed row bytes are appended to.
+- The single pending-turn slot: at most one `Grant` is outstanding at a time, and one not committed within [`server::CoordConfig::turn_timeout`] is reclaimed.
 
-## What the server does NOT own (data plane — stays in the writer process)
+## Threading
 
-- Column files (`FixedColumn`, `VariableColumn`, `Tombstones`).
-- The per-model WAL.
-- Any record field or schema knowledge.
+[`server::Coordinator::run`] spawns one thread per connection. Turn state lives under one mutex with a condvar that waiting `RequestTurn` handlers block on; the broker lives under a separate mutex. A `Committed` handler takes the broker lock, releases the turn and wakes the waiters, and only then appends and fsyncs under the broker lock, so a commit's disk barrier never holds the next grant back, while holding the broker lock across the release keeps appends in commit order.
+
+## What the server does not own
+
+Column files, the per-model WAL, and any knowledge of records or schema stay in the writer process.

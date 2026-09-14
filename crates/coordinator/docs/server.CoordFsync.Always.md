@@ -1,1 +1,1 @@
-Fsync the replication log on every commit (max durability; the default).
+Flush after every commit. The default.

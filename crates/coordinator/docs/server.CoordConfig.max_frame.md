@@ -1,2 +1,1 @@
-Maximum protocol frame size the coordinator will decode (#145) — bounds
-per-turn write-set size vs memory. Default [`DEFAULT_MAX_FRAME`] (16 MiB).
+Largest frame payload, in bytes, the coordinator will decode from a client; a larger frame fails the connection. Bounds the memory one write set or committed payload can demand. Default [`crate::DEFAULT_MAX_FRAME`], 16 MiB.

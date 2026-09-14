@@ -1,1 +1,1 @@
-Fsync once per N commits (group commit): amortizes the barrier under load.
+Flush once every `N` commits (group commit), amortizing the barrier under load; `0` behaves as `1`.

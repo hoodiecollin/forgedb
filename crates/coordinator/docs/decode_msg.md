@@ -1,4 +1,3 @@
-Decode one length-framed JSON message from a reader, rejecting frames larger
-than [`DEFAULT_MAX_FRAME`]. Used by the client to decode (small) server
-responses; the coordinator's per-connection decode uses
-[`decode_msg_with_limit`] with its configured cap (#145).
+Read one length-prefixed JSON frame from `reader`, rejecting a payload larger than [`DEFAULT_MAX_FRAME`].
+
+Equivalent to [`decode_msg_with_limit`] with that default. The client uses it for coordinator replies.
