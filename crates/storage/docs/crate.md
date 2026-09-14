@@ -1,30 +1,12 @@
-`forgedb-storage` — the columnar storage **facade**.
+The columnar storage facade: a compile-time re-export of one backend crate, selected by target.
 
-This crate is a thin, target-selecting re-export. It owns no engine code; it
-picks one at compile time and re-exports its entire surface:
+This crate owns no engine code. On host targets (`cfg(not(target_arch = "wasm32"))`) it
+re-exports the whole public surface of [`forgedb-storage-native`](https://docs.rs/forgedb-storage-native),
+the positional file-I/O columnar engine, and that crate's page is where every item below is
+documented. On `wasm32` it re-exports `forgedb-storage-web` instead; that backend is not
+documented here.
 
-- **host targets** (`cfg(not(target_arch = "wasm32"))`) → [`forgedb-storage-native`],
-  the positional file-I/O columnar engine (`pread`-style reads, advisory
-  [`DirLock`], WAL re-exports). This is the historical `forgedb-storage`
-  engine, moved out verbatim — the native public surface is unchanged.
-- **`wasm32`** (the browser read-replica target, #110) → [`forgedb-storage-web`],
-  an in-memory-arena backend with byte-identical positional semantics whose
-  only async boundaries are `hydrate()` (load column blobs from IndexedDB /
-  OPFS on open) and `commit()` (flush dirty arenas back). The per-row column
-  API stays synchronous, so the generated data logic compiles unchanged.
-
-## Why a facade and not a trait
-
-Generated code writes `use forgedb_storage::{FixedColumn, VariableColumn,
-Tombstones};` and calls `FixedColumn::new(PathBuf::from(col_path), size)`
-directly. A `StorageBackend` trait would risk *async-coloring* that per-row
-API (`get()` becoming `async` everywhere) — the native path would pay for the
-browser path and pressure would build toward runtime schema interpretation
-(against the generator-identity red lines). The cfg facade keeps the
-generated surface **byte-identical across targets** with zero codegen
-branches: exactly one backend is linked per build, so their identically-named
-public types never collide.
-
-[`forgedb-storage-native`]: forgedb_storage_native
-[`forgedb-storage-web`]: forgedb_storage_web
-[`DirLock`]: crate::DirLock
+Generated code writes `use forgedb_storage::{FixedColumn, VariableColumn, Tombstones};` and
+calls the backend directly, so it stays byte-identical across targets. Exactly one backend is
+linked per build, which is why the two backends can share their type names without colliding
+and why the facade is a `cfg` re-export rather than a trait.
