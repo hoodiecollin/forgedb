@@ -122,6 +122,16 @@ fn derives_and_attributes_are_read_from_the_ast() {
 }
 
 #[test]
+fn a_struct_fields_attributes_are_read_by_name_and_a_miss_names_the_fields() {
+    let s = src();
+    assert_eq!(s.field_attrs("Author", "email").unwrap(), vec!["schema(value_type = String)"]);
+    assert!(s.field_attrs("Author", "id").unwrap().is_empty());
+    let err = s.field_attrs("Author", "nope").unwrap_err().to_string();
+    assert!(err.contains("email"), "lists the fields present: {err}");
+    assert!(s.field_attrs("Nope", "id").is_err());
+}
+
+#[test]
 fn a_const_is_read_by_name_and_a_miss_names_what_exists() {
     let s = src();
     assert_eq!(s.const_u64("WAL_CHECKPOINT_INTERVAL").unwrap(), 512);

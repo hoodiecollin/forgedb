@@ -97,6 +97,73 @@ fn every_example_generates() {
     );
 }
 
+const WIRE_CONFIG: &str = r#"[project]
+id = "example-corpus-wire"
+isolated = true
+
+[generate]
+targets = ["rust", "api", "openapi"]
+"#;
+
+#[test]
+fn the_openapi_document_and_the_handler_agree_on_every_write_body() {
+    let mut omitted_total = 0usize;
+    let mut undefaulted: Vec<String> = Vec::new();
+
+    for (path, content) in example_schemas() {
+        let label = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let schema = parsed(&label, &content);
+        let fx = Fixture::generate(WIRE_CONFIG, &[("schema.forge", &content)]);
+        let generated = fx.project_dir().join("generated");
+        let database = forgedb_source_guard::RustSource::repo_file(generated.join("database.rs"));
+        let openapi: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(generated.join("openapi.json")).expect("openapi.json emitted"),
+        )
+        .expect("openapi.json parses");
+
+        for model in &schema.models {
+            let documented: Vec<String> = openapi["components"]["schemas"][&model.name]["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{label}: openapi.json has no schema for {}", model.name))
+                .keys()
+                .cloned()
+                .collect();
+            let generated_struct = database.struct_named(&model.name).unwrap_or_else(|e| {
+                panic!("{label}: database.rs has no struct for {}: {e}", model.name)
+            });
+            for field in &generated_struct.fields {
+                let name = field.ident.as_ref().expect("named field").to_string();
+                if documented.contains(&name) {
+                    continue;
+                }
+                omitted_total += 1;
+                let attrs = database.field_attrs(&model.name, &name).expect("field exists");
+                if !attrs.iter().any(|a| a.starts_with("serde") && a.contains("default")) {
+                    undefaulted.push(format!("{label}: {}.{name}", model.name));
+                }
+            }
+        }
+    }
+
+    assert!(
+        omitted_total > 0,
+        "no example model has a field the openapi document omits, so this guard compared \
+         nothing; the corpus has dozens of virtual-relation fields"
+    );
+    assert!(
+        undefaulted.is_empty(),
+        "{} field(s) are absent from the create/replace body openapi.json documents yet \
+         REQUIRED by the generated handler's deserializer, so the documented body is a 422. \
+         The struct field needs #[serde(default)] (#286):\n  {}",
+        undefaulted.len(),
+        undefaulted.join("\n  ")
+    );
+}
+
 #[test]
 fn the_corpus_shows_every_showcased_type() {
     let mut where_seen: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();

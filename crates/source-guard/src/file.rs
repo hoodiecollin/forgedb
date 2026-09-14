@@ -435,6 +435,25 @@ impl RustSource {
         Ok(derive_names(&s.attrs))
     }
 
+    pub fn field_attrs(&self, struct_name: &str, field: &str) -> Result<Vec<String>, ScopeError> {
+        let s = self.struct_named(struct_name)?;
+        let names: Vec<String> = s
+            .fields
+            .iter()
+            .filter_map(|f| f.ident.as_ref().map(|i| i.to_string()))
+            .collect();
+        s.fields
+            .iter()
+            .find(|f| f.ident.as_ref().is_some_and(|i| i == field))
+            .map(|f| {
+                f.attrs
+                    .iter()
+                    .map(|a| a.meta.to_token_stream().to_string().replace(" (", "("))
+                    .collect()
+            })
+            .ok_or_else(|| self.scope_error(format!("field `{struct_name}.{field}`"), names))
+    }
+
     pub fn any_derive(&self, name: &str) -> bool {
         self.ast()
             .items
