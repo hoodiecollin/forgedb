@@ -141,6 +141,7 @@ pub struct User {
     #[serde(default)]
     pub id: Uuid,
     pub name: String,
+    #[serde(default)]
     pub posts: (),
 }
 #[derive(Debug, Clone)]
@@ -1121,6 +1122,7 @@ pub struct Post {
     pub title: String,
     pub author: Uuid,
     pub editor: Option<Uuid>,
+    #[serde(default)]
     pub tags: (),
 }
 #[derive(Debug, Clone)]
@@ -2932,6 +2934,7 @@ pub struct Tag {
     #[serde(default)]
     pub id: Uuid,
     pub label: String,
+    #[serde(default)]
     pub posts: (),
 }
 #[derive(Debug, Clone)]

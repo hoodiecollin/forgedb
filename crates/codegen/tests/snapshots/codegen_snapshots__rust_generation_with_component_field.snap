@@ -141,7 +141,9 @@ pub struct Product {
     #[serde(default)]
     pub id: Uuid,
     pub name: String,
+    #[serde(default)]
     pub reviews: (),
+    #[serde(default)]
     pub card: String,
 }
 #[derive(Debug, Clone)]

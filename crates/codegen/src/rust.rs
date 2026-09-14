@@ -5152,7 +5152,9 @@ impl RustGenerator {
 
         let (schema_attr, serde_attr) = Self::field_wire_attrs(schema, field, is_key);
 
-        let serde_default = if auto_default && field.auto_generate {
+        let serde_default = if Self::is_absent_from_write_body(&field.field_type) {
+            quote! { #[serde(default)] }
+        } else if auto_default && field.auto_generate {
             match &field.field_type {
                 forgedb_parser::FieldType::Uuid
                 | forgedb_parser::FieldType::U32
@@ -5171,6 +5173,15 @@ impl RustGenerator {
         } else {
             quote! { #schema_attr #serde_attr #serde_default pub #field_name: #field_type }
         }
+    }
+
+    fn is_absent_from_write_body(field_type: &forgedb_parser::FieldType) -> bool {
+        use forgedb_parser::{FieldType, RelationType};
+        matches!(
+            field_type,
+            FieldType::Relation(RelationType::OneToMany(_) | RelationType::ManyToMany(_))
+                | FieldType::Component(_)
+        )
     }
 
     fn field_wire_attrs(

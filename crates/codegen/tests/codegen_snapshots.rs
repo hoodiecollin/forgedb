@@ -8679,8 +8679,8 @@ fn test_rust_generation_page_ref_field_order() {
              \"rust_decimal::serde::str\")] pub price: rust_decimal::Decimal, pub \
              tier: Tier, #[schema(value_type = String)] pub made_at: Timestamp, pub \
              checksum: [u8; 4usize], pub scores: [i32; 3usize], pub dims: Dims, pub \
-             owner: Uuid, pub parts: (), pub payload: serde_json::Value, pub serial: \
-             u32, }"
+             owner: Uuid, #[serde(default)] pub parts: (), pub payload: serde_json::Value, \
+             pub serial: u32, }"
         ),
         "and the model's order is what it is being held to: {f}"
     );
