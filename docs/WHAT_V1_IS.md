@@ -108,7 +108,10 @@ deploy path; and a stated [semver policy](./SEMVER.md).
 
 ### API / SDK
 - The REST **create** body is the whole record — you supply auto (`+`) fields
-  (`id`, `created_at`) and virtual relation fields (as `null`). The direct Rust
+  (`id`, `created_at`). Virtual relation fields (`[Model]`, `[..]`) may be omitted
+  or sent as `null`, and a component field may be omitted; the generated
+  `openapi.json` omits both, and the handler accepts exactly the body it documents
+  (#286). A component field still rejects an explicit `null` (#287). The direct Rust
   `db.create_<model>` path auto-generates `+` fields; the REST layer does not
   yet. `create` returns the new id, not the full record.
 - The REST **update** body is likewise the whole record — **`PUT` replaces, and there
