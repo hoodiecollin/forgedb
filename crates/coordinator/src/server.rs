@@ -14,27 +14,35 @@ use thiserror::Error;
 
 use crate::{ClientMsg, ServerMsg, decode_msg_with_limit, encode_msg};
 
+#[doc = include_str!("../docs/server.TURN_TIMEOUT.md")]
 pub const TURN_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[doc = include_str!("../docs/server.GRANT_REPLY_MARGIN.md")]
 pub const GRANT_REPLY_MARGIN: Duration = Duration::from_millis(500);
 
 const LEGACY_CLIENT_DEADLINE: Duration = Duration::from_secs(35);
 
+#[doc = include_str!("../docs/server.DIR_LOCK_FILENAME.md")]
 pub const DIR_LOCK_FILENAME: &str = ".forgedb.lock";
 
+#[doc = include_str!("../docs/server.ServerError.md")]
 #[derive(Debug, Error)]
 pub enum ServerError {
+    #[doc = include_str!("../docs/server.ServerError.Io.md")]
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+    #[doc = include_str!("../docs/server.ServerError.DirAlreadyLocked.md")]
     #[error(
         "data directory is already locked (another coordinator, or a standalone \
          ForgeDB writer, already holds <root>/.forgedb.lock)"
     )]
     DirAlreadyLocked,
+    #[doc = include_str!("../docs/server.ServerError.Shutdown.md")]
     #[error("coordinator is shutting down")]
     Shutdown,
 }
 
+#[doc = include_str!("../docs/server.Result.md")]
 pub type Result<T> = std::result::Result<T, ServerError>;
 
 struct PendingTurn {
@@ -43,18 +51,26 @@ struct PendingTurn {
     granted_at: Instant,
 }
 
+#[doc = include_str!("../docs/server.CoordFsync.md")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CoordFsync {
+    #[doc = include_str!("../docs/server.CoordFsync.Always.md")]
     #[default]
     Always,
+    #[doc = include_str!("../docs/server.CoordFsync.Never.md")]
     Never,
+    #[doc = include_str!("../docs/server.CoordFsync.Periodic.md")]
     Periodic(u64),
 }
 
+#[doc = include_str!("../docs/server.CoordConfig.md")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoordConfig {
+    #[doc = include_str!("../docs/server.CoordConfig.fsync.md")]
     pub fsync: CoordFsync,
+    #[doc = include_str!("../docs/server.CoordConfig.turn_timeout.md")]
     pub turn_timeout: Duration,
+    #[doc = include_str!("../docs/server.CoordConfig.max_frame.md")]
     pub max_frame: usize,
 }
 
@@ -205,6 +221,7 @@ impl CoordState {
     }
 }
 
+#[doc = include_str!("../docs/server.Coordinator.md")]
 pub struct Coordinator {
     root: PathBuf,
     socket_path: PathBuf,
@@ -222,10 +239,12 @@ impl std::fmt::Debug for Coordinator {
 }
 
 impl Coordinator {
+    #[doc = include_str!("../docs/server.Coordinator.open.md")]
     pub fn open(root: &Path, socket_path: &Path) -> Result<Self> {
         Self::open_with_config(root, socket_path, CoordConfig::default())
     }
 
+    #[doc = include_str!("../docs/server.Coordinator.open_with_fsync.md")]
     pub fn open_with_fsync(root: &Path, socket_path: &Path, fsync: CoordFsync) -> Result<Self> {
         Self::open_with_config(
             root,
@@ -237,6 +256,7 @@ impl Coordinator {
         )
     }
 
+    #[doc = include_str!("../docs/server.Coordinator.open_with_config.md")]
     pub fn open_with_config(
         root: &Path,
         socket_path: &Path,
@@ -290,6 +310,7 @@ impl Coordinator {
         })
     }
 
+    #[doc = include_str!("../docs/server.Coordinator.run.md")]
     pub fn run(&self) -> Result<()> {
         let _ = std::fs::remove_file(&self.socket_path);
 
@@ -320,6 +341,7 @@ impl Coordinator {
         Ok(())
     }
 
+    #[doc = include_str!("../docs/server.Coordinator.shutdown.md")]
     pub fn shutdown(&self) {
         let (lock, cvar) = &self.state.coord;
         let mut s = lock.lock().unwrap();
