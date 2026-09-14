@@ -1,1 +1,1 @@
-Check if there's a next page
+`true` when rows remain after this page, that is when [`Self::end`] is below `total_count`.

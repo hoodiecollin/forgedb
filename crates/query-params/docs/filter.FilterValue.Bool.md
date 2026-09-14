@@ -1,1 +1,1 @@
-TODO(#490)
+The literal parameter text `true` or `false`, case-sensitive.

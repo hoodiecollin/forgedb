@@ -1,1 +1,1 @@
-TODO(#490)
+Descending; what `order=desc` or `order=descending` selects.

@@ -1,1 +1,1 @@
-TODO(#490)
+The direction, [`SortOrder::Asc`] unless the `order` parameter said otherwise.

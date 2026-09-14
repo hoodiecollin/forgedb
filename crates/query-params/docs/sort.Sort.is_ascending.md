@@ -1,1 +1,1 @@
-Check if sort is ascending
+Whether [`Self::order`] is [`SortOrder::Asc`].

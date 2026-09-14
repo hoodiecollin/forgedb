@@ -1,1 +1,1 @@
-Create new query params with all fields
+Assembles a `QueryParams` from already-built parts, stored as given with no parsing, clamping or deduplication.

@@ -1,6 +1,3 @@
-Check if this filter matches a number value.
+`true` when the value is a [`FilterValue::Number`] equal to `value` under exact `f64` equality; `false` for any other variant.
 
-Uses exact equality. REST filter params represent discrete user-supplied values
-(e.g. `age=30`), where exact bit-level equality is the correct semantic.
-The previous relative-epsilon comparison was wrong for large magnitudes and
-added false positives for nearby-but-distinct values.
+There is no tolerance: a REST filter is a discrete user-supplied value such as `age=30`, and only the same number matches it. `NaN` never matches.

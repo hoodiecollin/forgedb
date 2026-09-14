@@ -1,1 +1,1 @@
-Check if there is a sort
+Whether [`Self::sort`] is present.

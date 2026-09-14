@@ -1,1 +1,1 @@
-Check if there are any filters
+Whether [`Self::filters`] holds at least one filter.

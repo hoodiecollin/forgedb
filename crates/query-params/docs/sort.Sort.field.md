@@ -1,1 +1,1 @@
-TODO(#490)
+The `sort` parameter value, verbatim and unvalidated.
