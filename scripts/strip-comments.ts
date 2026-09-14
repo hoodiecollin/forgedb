@@ -216,12 +216,13 @@ function embeddedRustCuts(src: string): Cut[] {
         if (/^\s*(pub\s+)?fn\s+\w+\s*[(<]/m.test(body) || /^\s*use\s+[\w:]+\s*(::\{|;)/m.test(body)) {
           let off = p + 1;
           for (const line of body.split("\n")) {
-            if (
+            const comment =
               /^\s*(\/\/\/|\/\/!|\/\/)/.test(line) &&
               !REGRESSION.test(line) &&
               !DIRECTIVE.test(line) &&
-              !GENERATED_MARKER.test(line)
-            ) {
+              !GENERATED_MARKER.test(line);
+            const docLiteral = /^\s*#!?\[\s*doc\s*=\s*(r#*)?"/.test(line);
+            if (comment || docLiteral) {
               cuts.push({ start: off, end: off + line.length, inline: false });
             }
             off += line.length + 1;
@@ -504,6 +505,11 @@ function selfTest(): number {
       '#[doc = include_str!("../docs/f.md")]\nfn f() {}\n',
     ],
     ['let s = r##"#[doc = "x"]"##;\n', "rust", 'let s = r##"#[doc = "x"]"##;\n'],
+    [
+      'const D: &str = r##"use x;\n#[doc = "gone"]\n#[doc = include_str!("k.md")]\nfn main() {}\n"##;\n',
+      "rust",
+      'const D: &str = r##"use x;\n#[doc = include_str!("k.md")]\nfn main() {}\n"##;\n',
+    ],
     ["#[derive(Debug)]\n#[doc(hidden)]\nfn f() {}\n", "rust", "#[derive(Debug)]\n#[doc(hidden)]\nfn f() {}\n"],
     ["/* /* nested */ */\nfn f() {}\n", "rust", "fn f() {}\n"],
     ["foo(/* x */ y);\n", "rust", "foo( y);\n"],
