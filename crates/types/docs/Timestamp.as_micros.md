@@ -1,1 +1,1 @@
-Returns the timestamp as microseconds since the Unix epoch.
+The instant as microseconds since the Unix epoch.

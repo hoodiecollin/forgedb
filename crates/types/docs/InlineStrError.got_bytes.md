@@ -1,1 +1,1 @@
-The length of the offered value, in bytes.
+The length of the offered text, in bytes.

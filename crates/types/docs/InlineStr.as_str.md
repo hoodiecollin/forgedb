@@ -1,4 +1,3 @@
 The text, borrowed.
 
-Infallible: UTF-8 is checked at construction, and construction is the only
-writer of `buf`.
+Infallible: every constructor takes a `&str`, so the used bytes are always valid UTF-8.

@@ -1,5 +1,4 @@
-Why an RFC 3339 string could not be read as a [`Timestamp`].
+The failure of an RFC 3339 parse ([`Timestamp::from_rfc3339`]).
 
-Deliberately opaque: this reaches users through a 400/422 on a REST path
-segment or query parameter, where the useful information is "that is not an
-RFC 3339 instant", not which of fourteen sub-fields was malformed.
+Deliberately carries no detail: the useful message at a request boundary is that the input
+is not an RFC 3339 instant, not which sub-field was malformed.

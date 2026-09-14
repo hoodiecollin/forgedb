@@ -1,1 +1,1 @@
-The byte capacity, as a constant.
+The byte capacity, equal to `BYTES`.

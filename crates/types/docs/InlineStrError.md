@@ -1,4 +1,3 @@
-Why a `&str` did not fit an [`InlineStr`].
+Why a `&str` did not fit an [`InlineStr`]: it was longer than the capacity.
 
-Carries both numbers so the generated 422 can name the bound without
-re-deriving it from the schema.
+Carries both lengths so a caller can report the bound without re-deriving it.

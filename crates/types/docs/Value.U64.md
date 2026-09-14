@@ -1,2 +1,1 @@
-64-bit unsigned integer — stored losslessly; `u64` values above `i64::MAX`
-cannot be represented by the signed `I64` variant without truncation
+A 64-bit unsigned integer, kept distinct from `I64` so values above `i64::MAX` are not truncated.

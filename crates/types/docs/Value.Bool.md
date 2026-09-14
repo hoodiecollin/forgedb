@@ -1,1 +1,1 @@
-Boolean value
+A boolean.

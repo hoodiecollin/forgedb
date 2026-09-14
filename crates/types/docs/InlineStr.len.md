@@ -1,1 +1,1 @@
-Length in **bytes** (matching `str::len`), not in characters.
+The length in bytes, as `str::len` counts it, not in characters.

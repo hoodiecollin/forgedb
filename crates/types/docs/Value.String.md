@@ -1,1 +1,1 @@
-UTF-8 encoded string
+UTF-8 text.

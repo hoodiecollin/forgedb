@@ -1,1 +1,1 @@
-64-bit signed integer
+A 64-bit signed integer.

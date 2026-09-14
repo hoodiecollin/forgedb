@@ -1,6 +1,3 @@
-Returns the current timestamp, in microseconds.
+The current system time, in microseconds.
 
-```rust
-use forgedb_types::Timestamp;
-assert!(Timestamp::now().as_micros() > 1_577_836_800_000_000);
-```
+Saturates at `i64::MAX` if the count does not fit, and yields `0` if the system clock reads earlier than the epoch.

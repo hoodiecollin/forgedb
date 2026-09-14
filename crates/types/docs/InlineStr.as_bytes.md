@@ -1,1 +1,1 @@
-The used bytes, borrowed. Excludes the unused tail.
+The used bytes, borrowed; the unused tail is excluded.

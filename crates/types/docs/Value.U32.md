@@ -1,1 +1,1 @@
-32-bit unsigned integer
+A 32-bit unsigned integer.

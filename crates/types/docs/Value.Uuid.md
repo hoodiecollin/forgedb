@@ -1,1 +1,1 @@
-Universally unique identifier
+A UUID.

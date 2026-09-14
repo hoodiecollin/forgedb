@@ -1,1 +1,1 @@
-An instant (microseconds since the Unix epoch); JSON form is RFC 3339
+An instant; its JSON form is the RFC 3339 string [`Timestamp`] renders.
