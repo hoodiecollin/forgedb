@@ -1,1 +1,1 @@
-TODO(#490)
+The [`ColumnType`] of the stored values.

@@ -1,17 +1,5 @@
-Export the physical rows at `indices` as a [`ColumnExport`], taking the
-**zero-copy `mmap` alias** fast path when `indices` is the contiguous
-dense prefix `[0, n)` and falling back to [`gather`](Self::gather)
-(an owned copy) otherwise. The returned buffer is identical bytes either
-way (`indices.len() * value_size`), so the FFI / Arrow consumer is
-alias-or-gather transparent.
+Export the rows at `indices` as a [`ColumnExport`]: a zero-copy `mmap` alias when `indices` is exactly the dense prefix `0, 1, ..., n - 1` with `0 < n <= len()`, otherwise an owned [`FixedColumn::gather`] copy.
 
-This is the class-1 columnar-read primitive the language bindings' Arrow
-export links: `indices` are opaque physical row positions the caller
-(generated code) computed from the live set; `export` reads no field
-name, type, or schema — it only inspects the indices' shape to decide
-whether they alias a prefix.
+The bytes are identical either way (`indices.len() * value_size`), so the consumer is transparent to which path was taken. The column inspects only the shape of `indices`, never a field name, type or schema. See [`ColumnExport`] for the aliasing invariant a mapped export relies on.
 
-# Errors
-
-Returns `Err(InvalidInput)` if any index is `>= self.len()`, or an I/O
-error if the `mmap` of the aliasable prefix fails.
+Returns `InvalidInput` if any index is `>= len()`, or the I/O error if mapping the prefix fails.

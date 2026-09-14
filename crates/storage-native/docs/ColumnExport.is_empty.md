@@ -1,1 +1,1 @@
-TODO(#490)
+Whether the buffer holds no bytes.

@@ -1,9 +1,3 @@
-On-disk layout format version, so a schema-blind reader (backup #57,
-inspector #63) can refuse mismatched bytes instead of misreading them.
-Which file's length authoritatively counts committed rows, and how many
-bytes it spends per row. For a model this is `tombstones.bin` (1 byte/row,
-appended last per insert); for an M2M junction it is `fixed/right.bin`
-(16 bytes/row, appended last per link). A schema-blind reader derives the
-committed row count as `len(anchor) / bytes_per_row` — the live watermark,
-independent of the (possibly stale) `row_count` field above. `None` on
-legacy manifests ⇒ fall back to `tombstones.bin`.
+Which file's length authoritatively counts committed rows, and how many bytes it spends per row.
+
+A schema-blind reader derives the committed row count as `len(anchor file) / bytes_per_row`, a live watermark independent of the possibly stale [`Manifest::row_count`]. This works because generated code appends the anchor file last for each row, so every row below the watermark has all of its columns fully written. For a model the anchor is `tombstones.bin` (1 byte per row); for a many-to-many junction it is `fixed/right.bin` (16 bytes per row). `None` on manifests written before the field existed; readers then assume `tombstones.bin` at 1 byte per row.

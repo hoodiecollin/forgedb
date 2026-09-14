@@ -1,1 +1,1 @@
-TODO(#490)
+The column's name, as chosen by the writer.

@@ -1,22 +1,5 @@
-Read-only, positional view over a [`FixedColumn`]'s backing file
-(#56 Direction B — single writer, many concurrent readers).
+Read-only, positional view over a [`FixedColumn`]'s file, for many concurrent readers beside a single writer.
 
-Created by [`FixedColumn::reader`]; holds an independent file descriptor
-(`try_clone`) to the **same** file as the writer.  A single `&mut self`
-writer can keep appending while any number of `&self` readers positionally
-read the committed prefix concurrently, with no lock:
+Created by [`FixedColumn::reader`]; holds an independent descriptor (`try_clone`) to the same file. Its reads use `read_exact_at` and never touch a shared file cursor, so they are safe against a concurrent seek-and-append by the writer and against each other across threads. The file is append-only, so bytes at an already-committed offset never change, and the page cache makes the writer's not-yet-fsynced appends visible through this descriptor. The length is derived from the file on every call rather than cached, so a reader created before an append sees rows the writer commits afterward.
 
-- Reads use `read_exact_at` (positional `pread`) — they never touch a shared
-  file cursor, so they are safe against a concurrent seek-based append and
-  against each other across threads.
-- The engine is append-only: bytes at an already-committed offset never move,
-  so a reader observing an offset below the writer's committed length reads
-  stable bytes (POSIX page-cache coherence makes the writer's not-yet-fsync'd
-  appends visible through this independent fd).
-- Length is derived **live** on every access (never a cached count), so a
-  reader created before an append still sees rows the writer commits
-  afterward — once the caller's watermark admits them.
-
-Callers clamp reads to a captured watermark (the row-count anchor); because
-the anchor column is appended last per row, a row within the watermark has
-all its columns fully written, so a reader never observes a torn row.
+There is no cached bound: a read past the end of the file fails with `InvalidInput`. A caller that wants a consistent view clamps its reads to a watermark captured from the file the writer appends last per row (see [`Snapshot`]), so it never observes a row whose other columns are still being written.

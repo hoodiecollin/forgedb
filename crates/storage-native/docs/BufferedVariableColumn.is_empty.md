@@ -1,1 +1,1 @@
-TODO(#490)
+Whether the selection holds no slots.

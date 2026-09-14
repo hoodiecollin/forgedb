@@ -1,7 +1,3 @@
-Truncate the tombstone bitmap to hold exactly `rows` rows, discarding
-everything after that point.
+Truncate the file to exactly `rows` bytes, discarding the flags of every later row.
 
-# Errors
-
-Returns `Err(InvalidInput)` if `rows > self.len()`.  All other errors
-come from the underlying `set_len` syscall.
+Returns `InvalidInput` if `rows > len()`. Other errors come from `set_len`.

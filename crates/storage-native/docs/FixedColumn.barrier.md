@@ -1,3 +1,3 @@
-Issue the single device-cache barrier for a checkpoint (#153): flushes the
-drive's write cache to permanent media, making durable every column
-previously `sync_to_drive`d on the same device.  See [`device_barrier`].
+Force the drive's write cache to permanent media, making durable every file previously pushed with `sync_to_drive` on the same device.
+
+On macOS this is `fcntl(F_FULLFSYNC)`; on other platforms it is `File::sync_all`. One call per checkpoint suffices.

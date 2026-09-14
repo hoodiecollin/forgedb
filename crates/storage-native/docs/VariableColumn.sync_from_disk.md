@@ -1,7 +1,3 @@
-Refresh the in-memory counters from the on-disk file lengths (#84).
+Re-derive the row count from the offsets file's length (16 bytes per row) and the append position from the data file's length.
 
-Re-derives `row_count` from the offsets file (16 bytes/row) and
-`current_data_offset` from the data file, so a *peer* process's appended
-rows (Tier 3 multi-process writer path) become readable through this
-handle.  Paired with `FixedColumn::sync_from_disk` /
-`Tombstones::sync_from_disk`.  A no-op for the single-writer path.
+Both are otherwise maintained in memory by this handle's own appends and truncations, so rows another process appended are invisible until this is called. It reads only file metadata.

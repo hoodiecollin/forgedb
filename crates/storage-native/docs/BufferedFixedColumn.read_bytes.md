@@ -1,2 +1,1 @@
-The whole `value_size`-wide value at `slot` (for char(N) / struct /
-fixed-array / nullable / optional-FK columns decoded via `read_unaligned`).
+The whole `value_size`-wide slot as an owned `Vec<u8>`: [`BufferedFixedColumn::read_slice`] plus a copy. Returns `InvalidInput` if `slot >= len()`.

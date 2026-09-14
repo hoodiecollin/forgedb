@@ -1,1 +1,1 @@
-A gathered / copied contiguous buffer.
+An owned contiguous copy of the selected bytes.

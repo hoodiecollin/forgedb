@@ -1,1 +1,1 @@
-Total exported byte length (`live_rows * value_size`).
+Length of the buffer in bytes.

@@ -1,3 +1,3 @@
-Physical descriptor of the file whose length counts committed rows.
-Layout fact only — names a file and a per-row byte stride, never a schema
-semantic. See [`Manifest::row_anchor`].
+Physical descriptor of the file whose length counts committed rows: a path relative to the model directory and a per-row byte stride.
+
+A layout fact only, never a schema semantic. See [`Manifest::row_anchor`].

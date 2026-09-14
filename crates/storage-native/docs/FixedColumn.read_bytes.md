@@ -1,1 +1,1 @@
-Read arbitrary bytes for complex fixed-size types (char arrays, structs, fixed arrays)
+Read the whole `value_size`-wide row `index` as an owned `Vec<u8>`. Returns `InvalidInput` if `index >= len()`.

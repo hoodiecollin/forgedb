@@ -1,1 +1,1 @@
-Number of buffered slots (`indices.len()` from the gather).
+Number of buffered slots: the length of the `indices` passed to the gather.

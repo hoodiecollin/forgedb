@@ -1,4 +1,3 @@
-Push this column's data to the drive cache **without** a device barrier
-(#153).  Pair with a single [`FixedColumn::barrier`] (on any column of the
-same device) to make a whole checkpoint's columns durable with ONE
-barrier instead of N.  See [`fsync_to_drive`].
+Push the column's dirty pages to the drive without forcing a device-cache barrier.
+
+On macOS this is `fsync(2)`, which hands the data to the drive's cache; on other platforms it is `File::sync_data`. Pair it with a single [`FixedColumn::barrier`] on any file of the same device, so a checkpoint touching many files pays one barrier instead of one per file.

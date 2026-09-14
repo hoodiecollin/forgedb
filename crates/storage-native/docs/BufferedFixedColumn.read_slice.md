@@ -1,12 +1,5 @@
-The whole `value_size`-wide slot at `slot`, **borrowed** (#238).
+The whole `value_size`-wide slot, borrowed from the buffer.
 
-The zero-copy counterpart of [`Self::read_bytes`], which is exactly this
-plus a `.to_vec()`; both stay, because a caller that wants an owned buffer
-should not have to write the copy itself.
+The zero-copy counterpart of [`BufferedFixedColumn::read_bytes`]. Borrowing is possible here because this type owns its bytes; [`FixedColumn`] and [`FixedColumnReader`] read through the file on every access and have nothing to lend. Generated code decodes the wider fixed layouts (raw byte fields, inline structs, fixed arrays, nullable and optional-FK encodings) from this slice.
 
-Borrowing is sound here and nowhere else on the fixed path: this type owns
-its bytes (a gathered `Vec` or an `Mmap` alias of the dense prefix), so the
-`&self` lifetime is the buffer's. [`FixedColumn`] and [`FixedColumnReader`]
-read through the file on every access and have nothing to lend — the same
-split that put [`BufferedVariableColumn::read_str`] on the buffered tier
-only (#224).
+Returns `InvalidInput` if `slot >= len()`.

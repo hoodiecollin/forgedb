@@ -1,3 +1,3 @@
-Whether a column is fixed-width (positional I/O) or variable-length
-(offset-indexed data file). Physical-layout fact only — never a schema
-semantic. Lets a schema-blind reader bound each file without guessing.
+Whether a column is fixed-width (one file, positional I/O) or variable-length (a data file indexed by an offsets file).
+
+A physical-layout fact only, never a schema semantic; it lets a schema-blind reader bound each column's files without guessing.

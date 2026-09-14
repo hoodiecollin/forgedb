@@ -1,1 +1,1 @@
-TODO(#490)
+Whether the file holds no rows.

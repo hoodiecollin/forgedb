@@ -1,136 +1,49 @@
-ForgeDB Storage Engine
+Native columnar storage backend for ForgeDB: positional file I/O over per-column files, a physical-layout manifest, a byte-per-row tombstone file, and an advisory single-writer directory lock.
 
-High-performance columnar storage engine for ForgeDB with positional I/O reads,
-WAL integration, and tombstone-based deletion tracking.
+`forgedb-storage-native` is the engine the `forgedb-storage` facade re-exports on non-`wasm32` targets. It is schema-agnostic substrate: it never reads a `.forge` schema and knows nothing about models or fields. Generated code decides the directory layout, opens each column by path, and drives the typed `append_*` / `read_*` calls directly.
 
-# Overview
+# What the crate provides
 
-`forgedb-storage` is the core storage engine for ForgeDB, implementing a columnar storage
-architecture optimized for both read and write performance. The crate provides:
+- [`FixedColumn`]: one file of fixed-width values, `value_size` bytes per row, addressed as `offset = index * value_size`.
+- [`VariableColumn`]: a data file of concatenated value bytes plus an offsets file holding one little-endian `(offset: u64, length: u64)` pair per row.
+- [`Tombstones`]: one byte per row, `0` live and `1` deleted, so a delete moves no data and row indices stay stable.
+- [`FixedColumnReader`], [`VariableColumnReader`], [`TombstonesReader`]: read-only views over the same files through independent descriptors, for concurrent readers beside a single writer.
+- [`BufferedFixedColumn`], [`BufferedVariableColumn`], [`ColumnExport`]: a row selection loaded into memory (a copy or an `mmap` alias) for column scans and columnar export.
+- [`Manifest`], [`ColumnMetadata`], [`RowAnchor`]: the physical-layout metadata persisted as `manifest.json` beside the column files, so schema-blind tooling (backup, the inspector) can bound every file without the schema.
+- [`Snapshot`]: a row-count watermark that defines a consistent read view over append-only columns.
+- [`DirLock`]: an exclusive advisory lock on a data directory.
 
-- **Columnar storage format** - Fixed-size and variable-length columns stored separately
-- **Positional I/O reads** - Concurrent-safe reads via `pread(2)`-style positional I/O
-  (`FileExt::read_exact_at`) that avoids touching the shared file cursor; multiple `&self`
-  readers on the same column can execute concurrently without synchronisation
-- **Seek-based writes** - Append methods seek to end-of-file before writing, taking `&mut self`
-  for exclusive ownership during the seek + write sequence
-- **WAL integration** - Write-Ahead Log support for ACID properties and crash recovery
-- **Tombstone tracking** - Efficient soft-delete mechanism without data movement
-- **Type-safe API** - Strong typing for columns and database operations
+# I/O model
 
-# Architecture
+Reads are positional (`pread`-style `read_exact_at`) and take `&self`; they never touch the file cursor, so any number of readers can run concurrently on one handle or across cloned handles. Appends take `&mut self`, seek to the end of the file and write, so a column has one writer at a time. Each writer handle tracks its row count in memory; `sync_from_disk` re-derives it from the file when another process may have appended.
 
-## Columnar Storage Format
+All multi-byte values are stored little-endian.
 
-The storage engine uses a columnar layout where each column is stored in separate files:
+# Layout on disk
+
+The crate takes paths; it does not name files. The layout generated code writes for one model looks like this:
 
 ```text
-data/
-├── manifest.json              # Database metadata
-├── tombstones.bin            # Deletion bitmap
+<model>/
+├── manifest.json               physical layout (Manifest)
+├── tombstones.bin              one byte per row, appended last per insert
 ├── fixed/
-│   └── u64_0.bin            # Fixed-size column (8 bytes per row)
+│   └── uuid_0.bin              fixed-width column, value_size bytes per row
 └── variable/
-    ├── string_data_0.bin    # Variable-length data
-    └── string_offsets_0.bin # (offset, length) pairs
+    ├── string_data_1.bin       concatenated value bytes
+    └── string_offsets_1.bin    one (offset, length) pair per row, 16 bytes
 ```
 
-## Fixed-Size vs Variable-Length Columns
+# Durability
 
-**Fixed-Size Columns** (u64, i64, f64, uuid):
-- Storage: `fixed/{type}_{index}.bin`
-- Layout: Sequential values with no overhead
-- Access: O(1) random access via `offset = index * value_size`
+Column files do **not** fsync on every append. Appended bytes are visible to subsequent reads through the page cache, but a crash before an explicit [`FixedColumn::flush`] / [`VariableColumn::flush`] / [`Tombstones::flush`] can lose the most recent appends. The write-ahead log is the crash-durability boundary: record a mutation with [`WalManager`] before applying it to the column files, replay the log on recovery, and call `truncate_to_rows` on every column to realign them to the last consistent row count.
 
-**Variable-Length Columns** (strings):
-- Data file: `variable/string_data_{index}.bin` (append-only)
-- Offsets file: `variable/string_offsets_{index}.bin` (offset, length pairs)
-- Access: O(1) random access (read offset pair, then read string)
+For a checkpoint spanning many files, `sync_to_drive` on each file followed by one `barrier` on any file of the same device makes the whole set durable with a single device-cache flush instead of one per file.
 
-## Tombstone Bitmap
+# Locking
 
-Deletions are tracked using a tombstone bitmap:
-- Storage: `tombstones.bin` (1 byte per row)
-- Format: 0 = active, 1 = deleted
-- Benefits: No data movement, fast deletes, preserves row IDs
+[`DirLock::acquire`] takes an exclusive advisory lock on `<root>/.forgedb.lock`; a second acquire, from this or another process, fails with `WouldBlock`. It prevents two writers from opening one directory by accident; it is not a lease, a registry or a coordinator, and it does not serialize concurrent writers. The `forgedb-coordinator` process locks the same filename, so a coordinator and a standalone writer are mutually exclusive on one directory.
 
-# Examples
+# WAL re-exports
 
-## Describing a model's physical layout (`Manifest`)
-
-Generated code owns the directory layout and drives the column types directly;
-the schema-blind [`Manifest`] records the physical layout (read by backup /
-the inspector), persisted next to the column files.
-
-```rust,no_run
-use forgedb_storage_native::{Manifest, ColumnMetadata, ColumnType};
-use std::path::PathBuf;
-
-let manifest = Manifest {
-    schema_version: 1,
-    engine_version: 1,
-    row_count: 42,
-    columns: vec![
-        ColumnMetadata { name: "id".to_string(), column_type: ColumnType::U64, column_index: 0, ..Default::default() },
-        ColumnMetadata { name: "email".to_string(), column_type: ColumnType::String, column_index: 1, ..Default::default() },
-    ],
-    wal_enabled: false,
-    last_checkpoint: 0,
-    compaction_epoch: 0,
-    row_anchor: None,
-    auto_sequences: Default::default(),
-};
-manifest.save_to(&PathBuf::from("./mydb/manifest.json"))?;
-let reopened = Manifest::load_from(&PathBuf::from("./mydb/manifest.json"))?;
-assert_eq!(reopened.row_count, 42);
-# Ok::<(), std::io::Error>(())
-```
-
-## Working with Columns
-
-```rust,no_run
-use forgedb_storage_native::FixedColumn;
-use std::path::PathBuf;
-
-// Fixed-size column
-let mut id_column = FixedColumn::new(PathBuf::from("./data/fixed/u64_0.bin"), 8)?;
-id_column.append_u64(1001)?;
-let id = id_column.read_u64(0)?;  // &self — concurrent reads are safe
-assert_eq!(id, 1001);
-id_column.flush()?;  // explicit fsync before a checkpoint or close
-# Ok::<(), std::io::Error>(())
-```
-
-# Durability Model
-
-Column files (`FixedColumn`, `VariableColumn`, `Tombstones`) **do not fsync on every append**.
-Appended bytes are visible to subsequent reads via the OS page cache, but a crash before an
-explicit [`FixedColumn::flush`] / [`VariableColumn::flush`] / [`Tombstones::flush`] call can
-lose the most recent appends from those files.
-
-The **WAL is the crash-durability boundary**: all mutations should be recorded in the WAL
-(via [`WalManager`]) before being applied to the column files. On recovery, the WAL is replayed
-into the columnar materialization. Call `flush()` at commit / checkpoint boundaries to durably
-persist the column files.
-
-# Public API
-
-## Core Types
-
-- [`Manifest`] - Physical-layout metadata stored in manifest.json
-- [`FixedColumn`] - Storage for fixed-size column data
-- [`VariableColumn`] - Storage for variable-length column data
-- [`Tombstones`] - Deletion tracking bitmap
-
-## WAL Re-exports
-
-Types from [`forgedb-wal`](../forgedb_wal) for convenience:
-- [`FsyncPolicy`] - Controls when WAL is fsynced to disk
-- [`WalEntry`] - A framed opaque-bytes entry (model tag + `Raw` payload)
-- [`WalManager`] - High-level WAL interface
-- [`WalOperation`] - The `Raw { payload }` operation variant
-
-# Related Crates
-
-- [`forgedb-wal`](../forgedb_wal) - Write-Ahead Log for durability
-- [`forgedb-compaction`](../forgedb_compaction) - Background compaction for space reclamation
+[`FsyncPolicy`], [`WalEntry`], [`WalManager`] and [`WalOperation`] are re-exported from [`forgedb_wal`] so generated code needs a single storage import.

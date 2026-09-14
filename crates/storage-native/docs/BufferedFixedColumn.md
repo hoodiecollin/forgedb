@@ -1,11 +1,5 @@
-An in-memory bulk-loaded selection of a [`FixedColumn`]'s rows (#168).
+An in-memory selection of a [`FixedColumn`]'s rows, produced by [`FixedColumn::gather_buffered`].
 
-Produced by [`FixedColumn::gather_buffered`], it holds one column's selected
-rows as a single contiguous buffer (a zero-copy `mmap` alias of the dense
-prefix, or a gathered copy) and exposes the **same** positional
-`read_*` accessors as [`FixedColumn`], addressed by **slot** (`0..n` over the
-selection order) rather than physical row index.  Decoding one column of a
-scan from this buffer costs no syscalls; it lets the generated column scan
-decode with the identical per-field logic it uses for per-row reads.
+It holds the selected rows as one contiguous buffer (an `mmap` alias when the selection was the dense prefix, a gathered copy otherwise) and exposes the same `read_*` accessors as [`FixedColumn`], addressed by **slot**, `0..len()` in selection order, rather than by physical row index. Decoding a column from it costs no syscalls, so a column scan can use the identical per-field logic it uses for single-row reads.
 
-Errors mirror [`FixedColumn`]: an out-of-range slot returns `InvalidInput`.
+Every accessor returns `InvalidInput` for a slot at or beyond [`BufferedFixedColumn::len`]. The typed accessors decode the leading bytes of the slot and panic if the column's `value_size` is narrower than the type they decode; call the accessor that matches the column's width.

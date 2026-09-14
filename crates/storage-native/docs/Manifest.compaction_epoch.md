@@ -1,4 +1,3 @@
-Generation counter bumped on every compaction. A byte-watermark
-incremental backup (#57) is valid only within one epoch — compaction
-rewrites files and shifts offsets, so crossing an epoch forces a fresh
-full backup. Additive (`#[serde(default)]`) for on-disk back-compat.
+Generation counter the writer increments on every compaction. Missing from the file means `0`.
+
+Compaction rewrites files and shifts offsets, so a byte-watermark incremental backup is valid only within one epoch; the backup tooling compares this value to decide whether a fresh full snapshot is needed.

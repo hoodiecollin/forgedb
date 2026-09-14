@@ -1,1 +1,1 @@
-The exported bytes as a slice.
+The buffer as a byte slice.

@@ -1,12 +1,3 @@
-Try to acquire an exclusive advisory lock on `<root>/.forgedb.lock`,
-creating the file (and any missing parent directories) if needed.
+Take an exclusive advisory lock on `<root>/.forgedb.lock`, creating `root` and the lock file if they are missing.
 
-Returns `Ok(DirLock)` on success.  If another process already holds the
-lock, returns `Err` with `kind() == io::ErrorKind::WouldBlock` so the
-caller can print a clear "another writer already has this data dir open"
-message and exit.
-
-# Errors
-
-- `WouldBlock` — another process already holds the exclusive lock.
-- Any other `io::Error` from creating the directory or opening the file.
+Returns the held [`DirLock`] on success. The attempt does not block: if the lock is already held through any other handle, in this or another process, it fails with `ErrorKind::WouldBlock` and the message "another ForgeDB writer already has this data directory open", so a caller can report it and exit. Any other error comes from creating the directory or opening the file.

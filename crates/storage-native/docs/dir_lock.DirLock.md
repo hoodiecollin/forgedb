@@ -1,39 +1,7 @@
-An advisory exclusive lock on a ForgeDB data directory.
+An exclusive advisory lock on a ForgeDB data directory, held for as long as the value lives.
 
-Holds an open `File` to `<root>/.forgedb.lock` with an OS-level exclusive
-advisory lock (via [`fs2::FileExt::try_lock_exclusive`]).  The lock is
-released automatically when this value is dropped (the `File` closes, which
-the OS uses to release the advisory lock).
+Holds an open `File` on `<root>/.forgedb.lock` with an OS-level exclusive advisory lock taken by `fs2::FileExt::try_lock_exclusive`. Dropping the value closes the file, which releases the lock; the lock file itself is never deleted.
 
-# Acquiring
+It prevents two writers from opening one directory by accident. It is not a lease, a registry or a distributed coordinator, and it does not serialize concurrent writers. The `forgedb-coordinator` process locks the same file, so a coordinator and a standalone writer exclude each other.
 
-```no_run
-use forgedb_storage_native::DirLock;
-use std::path::Path;
-
-let lock = DirLock::acquire(Path::new("./data"))?;
-// lock is held for the lifetime of the value
-drop(lock); // released here
-# Ok::<(), std::io::Error>(())
-```
-
-# Conflicts
-
-If another process already holds the lock, [`acquire`](DirLock::acquire)
-returns `Err` with `kind() == io::ErrorKind::WouldBlock`.  The caller
-should print a human-readable message and exit:
-
-```no_run
-use forgedb_storage_native::DirLock;
-use std::path::Path;
-
-match DirLock::acquire(Path::new("./data")) {
-    Ok(lock) => { /* proceed */ }
-    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-        eprintln!("error: another ForgeDB writer already has this data directory open");
-        std::process::exit(1);
-    }
-    Err(e) => return Err(e),
-}
-# Ok::<(), std::io::Error>(())
-```
+Acquire it with [`DirLock::acquire`]; a directory already locked through any other handle, in this process or another, yields `WouldBlock`.

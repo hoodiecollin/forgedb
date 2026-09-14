@@ -1,18 +1,5 @@
-Per-field allocation high-water marks, as an **opaque** `name -> highest
-value handed out` map (#187).
+Per-field allocation high-water marks: an opaque map from a name to the highest value handed out. Missing from the file means empty.
 
-The substrate neither parses these keys nor branches on them: it stores
-and returns strings and integers. Which fields appear, what the numbers
-mean, and every read and write of them belong to generated code — the
-same class of layout metadata as `compaction_epoch`.
+This crate neither parses the keys nor branches on them; every read and write belongs to generated code, which takes `max(persisted, rescanned)` on reopen. The persisted value is a floor, not the source of truth: it exists because compaction drops dead rows, so a rescan alone could derive a lower maximum than was issued and hand a value out twice, while a crash that loses the tip safely falls back to the scan. That is what buys durability without an fsync per allocation.
 
-It exists because a rescan alone cannot survive compaction: compaction
-physically drops dead rows, so a post-compaction reopen derives a *lower*
-maximum than was actually issued and hands the same value out twice. The
-contract is a **floor, not a source of truth** — a reader takes
-`max(persisted, scanned)`, so a crash that loses the tip falls back to the
-scan, which is always safe. That is what buys durability without an fsync
-per allocation.
-
-`BTreeMap` (not `HashMap`) so the serialized JSON is byte-stable across
-writes. Additive (`#[serde(default)]`) for on-disk back-compat.
+Stored as a `BTreeMap` so the serialized JSON is byte-stable across writes.

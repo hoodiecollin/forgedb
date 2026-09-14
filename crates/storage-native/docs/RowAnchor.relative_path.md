@@ -1,1 +1,1 @@
-Anchor file path relative to the model/junction directory.
+Path of the anchor file, relative to the model or junction directory.
