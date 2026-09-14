@@ -1,1 +1,1 @@
-Column type (fixed or variable)
+Whether the column is fixed-width or variable-length.

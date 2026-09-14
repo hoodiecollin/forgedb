@@ -1,1 +1,1 @@
-Number of deleted rows (tombstones)
+Rows whose tombstone byte is nonzero.

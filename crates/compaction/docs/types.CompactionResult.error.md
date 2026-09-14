@@ -1,1 +1,1 @@
-Error message if failed
+The error message when `success` is `false`; `None` otherwise.

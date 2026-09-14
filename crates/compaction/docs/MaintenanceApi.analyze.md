@@ -1,1 +1,1 @@
-Analyze operation - collect and return statistics
+Alias for [`Self::stats`].

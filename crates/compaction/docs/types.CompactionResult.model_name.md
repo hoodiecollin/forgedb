@@ -1,1 +1,1 @@
-Model name
+The model's directory name.

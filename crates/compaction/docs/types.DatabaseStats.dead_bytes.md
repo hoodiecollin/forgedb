@@ -1,1 +1,1 @@
-Total dead bytes
+Sum of `dead_bytes` over `models`.

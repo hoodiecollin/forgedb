@@ -1,4 +1,5 @@
-Signal the background thread to stop.
+Asks the scheduling thread to exit. Returns immediately.
 
-Does not block; use `Drop` (or explicitly drop this struct) to wait for
-the thread to fully exit.
+The thread notices the request when its current sleep ends, so it may keep running for up
+to `check_interval_secs` plus any pass in progress. Dropping the value joins it.
+[`Self::is_running`] reports `false` as soon as `stop` returns.

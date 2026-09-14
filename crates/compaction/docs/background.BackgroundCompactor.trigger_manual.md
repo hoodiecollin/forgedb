@@ -1,8 +1,7 @@
-Trigger a one-shot manual compaction in a new thread (non-blocking).
+Runs one [`Compactor::compact_needed`] pass on a fresh thread and returns without waiting
+for it.
 
-# C6 fix
-
-The previous implementation checked status then spawned in separate steps,
-creating a TOCTOU race where two concurrent callers could both observe
-`!Running` and both spawn compaction threads.  Now the check and the
-`Running` transition happen inside a single mutex critical section.
+Returns `Err` if the status is already [`CompactionStatus::Running`]; the check and the
+transition to `Running` happen under one lock, so two concurrent callers cannot both spawn.
+Does not require [`Self::start`]. The outcome is visible through [`Self::status`] and
+[`Self::last_results`]; the thread is detached and is not joined on drop.

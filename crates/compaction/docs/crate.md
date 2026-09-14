@@ -1,126 +1,63 @@
-ForgeDB Compaction
+Dead-space reclaim and storage statistics for a ForgeDB data directory.
 
-Database compaction and space reclamation for ForgeDB's columnar storage system.
+`forgedb-compaction` is schema-agnostic substrate: it rewrites the column files under a
+model directory as opaque bytes and reads no `.forge` schema. Which rows are live is the
+caller's decision.
 
-# Overview
+# What generated code links
 
-This crate provides comprehensive database maintenance capabilities for ForgeDB,
-focusing on reclaiming dead space from deleted records, collecting storage statistics,
-and managing background compaction operations.
+A generated database's `Database::compact()` builds a [`Compactor`] over its data directory
+with a default [`CompactionConfig`] and calls [`Compactor::compact_model_keeping`] with the
+physical row indices it wants to keep. That is the only entry point generated code uses.
+[`BackgroundCompactor`], [`MaintenanceApi`] and the tombstone-based
+[`Compactor::compact_model`] are not linked by generated code.
 
-# Architecture
+# Two reclaim primitives
 
-The compaction system consists of three main components:
+- [`Compactor::compact_model_keeping`] keeps exactly the rows the caller names and drops
+  everything else. This is the supported path.
+- [`Compactor::compact_model`] drops the rows whose tombstone byte is set and keeps the
+  rest. It is deprecated: a generated database records a delete as a tombstoned marker row
+  and an update as a newly appended version, so tombstone-driven compaction reclaims nothing
+  from updates and brings deleted rows back. [`Compactor::compact_all`],
+  [`Compactor::compact_needed`], [`BackgroundCompactor`] and the compaction methods of
+  [`MaintenanceApi`] all route through it. The `forgedb compact` and `forgedb vacuum` CLI
+  commands refuse with an error that points at the in-process `Database::compact()`.
 
-- **Compactor**: Core compaction engine that performs space reclamation
-- **BackgroundCompactor**: Manages automated compaction in a background thread
-- **StatsCollector**: Collects storage statistics for analysis and monitoring
+# On-disk layout
 
-## Compaction Process
+Every method takes a data directory and addresses a model by the name of its subdirectory:
 
-1. **Read Current State** - Collect statistics and read tombstone bitmap
-2. **Compact Variable Columns** - Rebuild data files with only active rows
-3. **Compact Fixed Columns** - Remove deleted row slots from fixed-size columns
-4. **Update Tombstones** - Reset tombstone bitmap (no deleted rows after compaction)
-5. **Atomic Replacement** - Safely replace old files with compacted versions
-
-# Examples
-
-## Manual Compaction
-
-```rust,no_run
-use forgedb_compaction::{Compactor, CompactionConfig};
-
-let config = CompactionConfig::default();
-let compactor = Compactor::new("./data", config);
-
-// Compact a specific model
-match compactor.compact_model("User") {
-    Ok(result) => {
-        println!("Reclaimed {} bytes ({:.1}%)",
-            result.bytes_reclaimed,
-            result.reclaim_percentage()
-        );
-    }
-    Err(e) => eprintln!("Compaction failed: {}", e),
-}
+```text
+<data_dir>/<model>/
+  tombstones.bin                  one byte per row; nonzero = deleted; its length is the row count
+  manifest.json                   optional; its row_count is rewritten after a pass
+  fixed/<column>.bin              fixed-width column; row width = file size / row count
+  variable/<column>_data.bin      variable-length column payload
+  variable/<column>_offsets.bin   one little-endian (offset: u64, length: u64) pair per row
+  .last_compaction                unix seconds of the last compaction pass
 ```
 
-## Background Compaction
+A model directory without `tombstones.bin` can be neither compacted nor measured: the row
+count is that file's size.
 
-```rust,no_run
-use forgedb_compaction::{BackgroundCompactor, CompactionConfig};
+# A compaction pass
 
-let config = CompactionConfig {
-    dead_space_threshold: 0.3,  // Compact when 30% dead space
-    auto_compact: true,
-    check_interval_secs: 300,    // Check every 5 minutes
-    max_compaction_time_secs: 600,
-};
+A pass reads the model's statistics, rewrites every column file into a `.bin.tmp` sibling
+holding only the kept rows, renames each temp file over its original, rewrites
+`tombstones.bin` as one zero byte per surviving row, updates `row_count` in
+`manifest.json` when that file exists, writes `.last_compaction`, and re-reads the
+statistics to fill a [`CompactionResult`]. Each rename is atomic but the renames are
+sequential: a crash between two of them leaves those columns at different versions.
 
-let bg_compactor = BackgroundCompactor::new("./data", config);
-bg_compactor.start();
+# Locking
 
-// Your application runs...
+The compactor takes no lock. The caller must ensure nothing else reads or writes the model
+directory during a pass; a generated database runs it under its single-writer lock and
+rebuilds its in-memory row mapping afterwards.
 
-bg_compactor.stop();
-```
+# Statistics
 
-## Statistics Collection
-
-```rust,no_run
-use forgedb_compaction::StatsCollector;
-
-let collector = StatsCollector::new("./data");
-
-// Collect database-wide statistics
-match collector.collect_database_stats() {
-    Ok(stats) => {
-        println!("Total disk usage: {} bytes", stats.total_disk_bytes);
-        println!("Dead space: {:.1}%", stats.dead_space_ratio * 100.0);
-    }
-    Err(e) => eprintln!("Failed to collect stats: {}", e),
-}
-```
-
-# Public API
-
-## Core Types
-
-- [`Compactor`] - Core compaction engine
-- [`BackgroundCompactor`] - Automated background compaction
-- [`StatsCollector`] - Storage statistics collector
-- [`MaintenanceApi`] - High-level API combining compaction and statistics
-
-## Configuration
-
-- [`CompactionConfig`] - Configuration for compaction behavior
-- [`CompactionResult`] - Results and metrics from compaction operations
-- [`DatabaseStats`] - Database-wide storage statistics
-- [`ModelStats`] - Per-model storage statistics
-
-# Compaction Strategies
-
-## Threshold-Based Compaction
-
-Compaction is triggered when dead space ratio exceeds a threshold:
-
-- **High-write workloads**: 0.3-0.5 (30-50%) - Less frequent compaction
-- **High-read workloads**: 0.1-0.2 (10-20%) - More frequent compaction
-- **Balanced workloads**: 0.3 (30%) - Default, good balance
-
-## Performance Impact
-
-- **Disk I/O**: Reads and rewrites all column files for compacted models
-- **CPU**: Minimal - mostly copying data
-- **Memory**: Buffers column data during compaction
-- **Concurrency**: Safe to run during normal database operations
-
-# Related Crates
-
-- [`forgedb-storage`](../forgedb_storage) - Columnar storage engine
-- [`forgedb-types`](../forgedb_types) - Common type definitions
-
-# See Also
-
-- [README](./README.md) for comprehensive documentation and examples
+[`StatsCollector`] produces [`DatabaseStats`], [`ModelStats`] and [`ColumnStats`] from the
+same layout without modifying it. [`ModelStats::needs_compaction`] compares a model's
+dead-space ratio against [`CompactionConfig::dead_space_threshold`].

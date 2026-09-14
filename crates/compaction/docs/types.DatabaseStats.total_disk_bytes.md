@@ -1,1 +1,1 @@
-Total disk usage in bytes
+Sum of `total_disk_bytes` over `models`.

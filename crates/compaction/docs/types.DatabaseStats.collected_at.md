@@ -1,1 +1,1 @@
-Statistics collection time
+When collection began, taken before the directory walk.

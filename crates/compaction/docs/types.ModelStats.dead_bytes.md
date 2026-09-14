@@ -1,1 +1,1 @@
-Total dead bytes
+Sum of every column's `dead_bytes`.

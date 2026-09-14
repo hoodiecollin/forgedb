@@ -1,1 +1,1 @@
-Active rows (excluding deleted)
+Rows whose tombstone byte is zero.

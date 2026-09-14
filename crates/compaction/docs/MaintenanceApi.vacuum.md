@@ -1,1 +1,1 @@
-Vacuum operation - alias for compact (removes dead space)
+Alias for [`Self::compact_all`].

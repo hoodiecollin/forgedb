@@ -1,22 +1,13 @@
-Compact a specific model (tombstone-based, **DEPRECATED** — see #105).
+Compacts a model by dropping every row whose tombstone byte is set. Deprecated; use
+[`Self::compact_model_keeping`].
 
-Unsafe against the #66 generated mutation surface: it reclaims nothing
-from superseding-version updates and RESURRECTS deleted rows (a delete
-tombstones a *marker* row, not the old data row).  Use
-[`Compactor::compact_model_keeping`] — the keep-set primitive the
-generated in-process `Database::compact()` (#92) drives.  Retained (not
-`#[deprecated]`) only to keep the published `forgedb-compaction 0.1.0`
-API stable; the offline `forgedb compact` CLI no longer calls it.
+A generated database records a delete as a tombstoned marker row and an update as a newly
+appended version, so this method reclaims nothing from updates and, by dropping only the
+marker, brings deleted rows back. It is not annotated `#[deprecated]`, so the compiler does
+not warn. [`Self::compact_all`], [`Self::compact_needed`] and [`crate::BackgroundCompactor`]
+still call it.
 
-# Crash safety (C2)
-
-All compacted column files are written as `.tmp` siblings first.  Only
-after every write succeeds are they renamed to their final paths.  The
-manifest `row_count` is updated last so it acts as a logical commit
-record: if the process dies before the manifest rename, the column files
-are already consistent and a re-run is idempotent.
-
-**Residual window**: individual file renames are atomic but not grouped
-— a crash between two column-file renames leaves those columns at
-different post-compaction versions.  Full directory-level atomicity is
-deferred.
+Reads the row count from the size of `tombstones.bin`, marks each row with a nonzero byte
+for removal, and runs the same staged rewrite as [`Self::compact_model_keeping`]. Returns
+`Err` when the model directory or its `tombstones.bin` is missing, or when any read, write
+or rename fails.

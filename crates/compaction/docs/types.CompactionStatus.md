@@ -1,1 +1,1 @@
-Compaction operation status
+State reported by [`crate::BackgroundCompactor::status`].
