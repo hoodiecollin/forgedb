@@ -279,7 +279,8 @@ key; both are breaking, both are in `docs/UPGRADING.md`.
   `ChangeKind::{Inserted,Linked,Updated,Deleted}` (#66).
 - `auth` — verify-only JWT + tenant cross-check substrate (#59). Schema-agnostic axum
   extractor/middleware: verifies an asymmetric JWT (JWKS or static PEM, algorithm-pinned,
-  `exp`/`nbf`/`iss`/`aud`+skew), extracts a configured tenant claim, cross-checks it against the
+  `exp` with skew; `iss`/`aud` only when the claim is present; `nbf` is NOT validated —
+  found by #490's verify pass against jsonwebtoken 9's defaults), extracts a configured tenant claim, cross-checks it against the
   process's tenant → 403, injects an opaque `Principal`. Knows nothing of models/rows/schema — same
   class as `changefeed`.
 - `wal` — write-ahead log. The generated durable write path (#89) links only the **opaque `Raw`**
@@ -320,7 +321,7 @@ key; both are breaking, both are in `docs/UPGRADING.md`.
   The broker is opened `FsyncPolicy::Never` and the coordinator drives the barrier via a configurable
   **`CoordFsync`** (`forgedb coordinate --fsync always|never|periodic` / `FORGEDB_COORDINATOR_FSYNC`, default
   `always`; Option C) — which also fixed a latent N+1-fsyncs-per-commit (per-record + explicit flush) down to
-  ≤1. The `_replication.log` is resumable/secondary (clients fsync their own columns+WAL before `Committed`),
+  ≤1. The coordinator's `_coordinator_replication.log` (the generated server's own broker is `_replication.log`) is resumable/secondary (clients fsync their own columns+WAL before `Committed`),
   so `never`/`periodic` never risk committed client data — only rewind replication on a coordinator crash.
 
 **Internal (compiler internals):** `parser`, `codegen`, `validation`, `migrations`, `backup`, `watcher`,
