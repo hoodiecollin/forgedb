@@ -1,7 +1,6 @@
-Fsync policy determines when a native WAL is flushed to disk.
+Whether an append is followed by an fsync.
 
-Defined at the crate root (not in the native-only `writer` module) because it
-is part of the schema-agnostic substrate surface `forgedb-storage` re-exports
-and generated code names (`FsyncPolicy::Always`) — it must exist on **both**
-the native and the `wasm32` follower target. On `wasm32` there is no file WAL
-(see the in-memory [`WalManager`] below), so the policy is inert there.
+The policy is consulted only by [`WalManager::write`]; there is no background
+timer. [`WalManager::write_buffered`] bypasses it and [`WalManager::flush`] syncs
+regardless of it. An fsync here is `File::sync_all`, so file metadata is synced
+along with the data.

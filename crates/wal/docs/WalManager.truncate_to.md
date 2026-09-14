@@ -1,10 +1,10 @@
-Truncate the WAL to a specific byte `offset`, dropping every byte after it
-(MVCC Tier 1 transaction rollback).
+Roll the file back to `offset` bytes, discarding everything appended after
+that point.
 
-Unlike [`truncate`] (which clears the whole log), this rolls the file back
-to a previously-recorded [`size`] mark, so a committed WAL prefix survives
-and only the aborted transaction's staged records are discarded.
-A no-op if `offset` is already `>=` the current length.
-
-[`truncate`]: WalManager::truncate
-[`size`]: WalManager::size
+Pair it with a [`Self::size`] taken before a batch of appends: the earlier
+records survive and only the batch is dropped, which is how a transaction's
+staged records are rolled back without clearing the log. The shortened file is
+fsynced and the reader is reopened. A no-op when `offset` is at or past the
+current length. An `offset` that does not fall on a record boundary leaves a
+torn record at the tail, which [`Self::replay`] then treats as the end of the
+log.

@@ -1,2 +1,3 @@
-Serialize the operation payload to bytes (excluding the type byte and
-model-name framing, which are written by [`WalEntry::to_bytes`]).
+Encode the operation data: for [`Self::Raw`], a little-endian `u32` payload
+length followed by the payload. Excludes the type byte and model-name framing,
+which [`WalEntry::to_bytes`] writes.

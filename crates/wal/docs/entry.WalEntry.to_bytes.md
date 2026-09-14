@@ -1,4 +1,10 @@
-Serialize the entry to bytes including the CRC32 checksum.
+Encode the entry as one framed record, ready to append.
 
-Wire format (see `lib.rs` for the full layout comment):
-`[4: total_length][1: op_type][2: model_name_len][N: model_name][M: op_data][4: crc32]`
+Layout, all integers little-endian:
+
+```text
+[4: total length][1: type byte][2: model name length][N: model name][M: operation data][4: CRC32]
+```
+
+The leading length counts every byte after itself, checksum included; the
+CRC32 covers the type byte through the operation data.

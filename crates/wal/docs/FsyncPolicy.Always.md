@@ -1,1 +1,2 @@
-Fsync after every write (maximum durability, slower).
+Fsync after every append. Slowest, and the only policy under which a returned
+[`WalManager::write`] means the record is on disk.

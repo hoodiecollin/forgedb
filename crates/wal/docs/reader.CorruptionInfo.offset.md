@@ -1,1 +1,1 @@
-TODO(#490)
+Byte offset in the file at which decoding was attempted and failed.

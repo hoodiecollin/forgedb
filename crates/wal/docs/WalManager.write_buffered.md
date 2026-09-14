@@ -1,3 +1,6 @@
-Append an entry WITHOUT fsyncing (#170 group commit) — durability deferred
-to a later [`flush`](Self::flush). Only for writes gated on a later durable
-marker (MVCC-Tier-1 staged rows). See [`WalWriter::write_buffered`].
+Append `entry` without fsyncing, whatever the fsync policy.
+
+Durability is deferred to a later [`Self::flush`], so a batch of appends pays
+one fsync instead of one per record. A crash before that flush can lose these
+records; use it only for records whose visibility already depends on a later
+durable marker. See [`WalWriter::write_buffered`].

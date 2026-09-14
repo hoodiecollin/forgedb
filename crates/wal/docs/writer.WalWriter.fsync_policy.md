@@ -1,1 +1,1 @@
-Get the current fsync policy
+The policy [`Self::write`] applies, as given to [`Self::new`].

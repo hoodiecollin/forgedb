@@ -1,3 +1,2 @@
-Opaque, schema-agnostic payload. The WAL stores and returns these bytes
-verbatim and never interprets them — the (generated) caller owns the
-encoding. This is the identity-preserving write path.
+Opaque payload bytes, stored and returned verbatim. Type byte `0x20`; encoded
+as a little-endian `u32` length followed by the payload.

@@ -1,6 +1,5 @@
-A complete WAL entry: a model-name routing tag plus an operation.
+One WAL record: a model-name tag plus a [`WalOperation`].
 
-The `model_name` field is an opaque string stored verbatim in the entry
-header. The WAL never interprets it. Generated code uses it to route
-replayed entries back to the correct model; ForgeDB itself never branches
-on it.
+`model_name` is stored verbatim in the record header and never interpreted by
+this crate; the caller uses it to route replayed records. [`Self::to_bytes`] and
+[`Self::from_bytes`] are the on-disk framing, CRC32 included.

@@ -1,1 +1,1 @@
-Returns `true` if the WAL file contains no entries (file length is 0).
+Whether the file is zero bytes long, read from file metadata.
