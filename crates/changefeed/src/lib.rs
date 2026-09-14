@@ -1,16 +1,24 @@
+#![doc = include_str!("../docs/crate.md")]
 use tokio::sync::broadcast;
 
+#[doc = include_str!("../docs/durable.md")]
 pub mod durable;
 
+#[doc = include_str!("../docs/ChangeKind.md")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeKind {
+    #[doc = include_str!("../docs/ChangeKind.Inserted.md")]
     Inserted,
+    #[doc = include_str!("../docs/ChangeKind.Updated.md")]
     Updated,
+    #[doc = include_str!("../docs/ChangeKind.Deleted.md")]
     Deleted,
+    #[doc = include_str!("../docs/ChangeKind.Linked.md")]
     Linked,
 }
 
 impl ChangeKind {
+    #[doc = include_str!("../docs/ChangeKind.to_byte.md")]
     pub fn to_byte(self) -> u8 {
         match self {
             ChangeKind::Inserted => 0,
@@ -20,6 +28,7 @@ impl ChangeKind {
         }
     }
 
+    #[doc = include_str!("../docs/ChangeKind.from_byte.md")]
     pub fn from_byte(byte: u8) -> Option<Self> {
         match byte {
             0 => Some(ChangeKind::Inserted),
@@ -31,24 +40,31 @@ impl ChangeKind {
     }
 }
 
+#[doc = include_str!("../docs/ChangeEvent.md")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChangeEvent {
+    #[doc = include_str!("../docs/ChangeEvent.model.md")]
     pub model: &'static str,
+    #[doc = include_str!("../docs/ChangeEvent.row_index.md")]
     pub row_index: usize,
+    #[doc = include_str!("../docs/ChangeEvent.kind.md")]
     pub kind: ChangeKind,
 }
 
+#[doc = include_str!("../docs/ChangeFeed.md")]
 #[derive(Debug, Clone)]
 pub struct ChangeFeed {
     sender: broadcast::Sender<ChangeEvent>,
 }
 
 impl ChangeFeed {
+    #[doc = include_str!("../docs/ChangeFeed.new.md")]
     pub fn new(capacity: usize) -> Self {
         let (sender, _rx) = broadcast::channel(capacity);
         Self { sender }
     }
 
+    #[doc = include_str!("../docs/ChangeFeed.emit.md")]
     pub fn emit(&self, model: &'static str, row_index: usize, kind: ChangeKind) -> usize {
         self.sender
             .send(ChangeEvent {
@@ -59,10 +75,12 @@ impl ChangeFeed {
             .unwrap_or(0)
     }
 
+    #[doc = include_str!("../docs/ChangeFeed.subscribe.md")]
     pub fn subscribe(&self) -> broadcast::Receiver<ChangeEvent> {
         self.sender.subscribe()
     }
 
+    #[doc = include_str!("../docs/ChangeFeed.subscriber_count.md")]
     pub fn subscriber_count(&self) -> usize {
         self.sender.receiver_count()
     }
