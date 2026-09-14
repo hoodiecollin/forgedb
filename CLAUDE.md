@@ -784,9 +784,13 @@ so a component there would be downloaded by every job for a tool no job runs.
 
 ## Conventions
 
-- **ForgeDB's own source carries NO comments (#488).** Not doc comments (`///`, `//!`,
-  `#[doc]`, JSDoc), not inline `//` prose, on any surface — Rust, TS/TSX, `Cargo.toml`,
-  the workflows, the Makefile. A comment drifts the moment the code moves, and it sits in
+- **ForgeDB's own source carries NO prose (#488, restated by #490).** Not doc comments (`///`,
+  `//!`, a `#[doc = "…"]` literal, JSDoc), not inline `//` prose, on any surface — Rust, TS/TSX,
+  `Cargo.toml`, the workflows, the Makefile. The rule bans prose in a source file, not the `doc`
+  attribute: `#[doc = include_str!("…")]` naming a sidecar file is permitted, because the sentence
+  it points at is not in the file an agent reads. That is how the substrate crates get their
+  docs.rs content back (#490), and the checker's refusal of the literal form lands with it.
+  A comment drifts the moment the code moves, and it sits in
   a coding agent's grep path where a stale line reads as authoritative and steers a whole
   session down a path that looks correct the entire way. Code is read by reading it; when
   a piece of code needs explaining, rename or restructure until it doesn't.
