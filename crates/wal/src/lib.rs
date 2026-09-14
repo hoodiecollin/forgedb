@@ -1,3 +1,4 @@
+#![doc = include_str!("../docs/crate.md")]
 use std::io;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
@@ -16,13 +17,18 @@ pub use reader::{CorruptionInfo, WalReader};
 #[cfg(not(target_arch = "wasm32"))]
 pub use writer::WalWriter;
 
+#[doc = include_str!("../docs/FsyncPolicy.md")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsyncPolicy {
+    #[doc = include_str!("../docs/FsyncPolicy.Always.md")]
     Always,
+    #[doc = include_str!("../docs/FsyncPolicy.Periodic.md")]
     Periodic(std::time::Duration),
+    #[doc = include_str!("../docs/FsyncPolicy.Never.md")]
     Never,
 }
 
+#[doc = include_str!("../docs/WalManager.md")]
 #[cfg(not(target_arch = "wasm32"))]
 pub struct WalManager {
     writer: WalWriter,
@@ -32,6 +38,7 @@ pub struct WalManager {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl WalManager {
+    #[doc = include_str!("../docs/WalManager.open.md")]
     pub fn open<P: AsRef<Path>>(path: P, fsync_policy: FsyncPolicy) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
 
@@ -45,18 +52,22 @@ impl WalManager {
         Ok(WalManager { writer, reader, path })
     }
 
+    #[doc = include_str!("../docs/WalManager.write.md")]
     pub fn write(&mut self, entry: &WalEntry) -> io::Result<()> {
         self.writer.write(entry)
     }
 
+    #[doc = include_str!("../docs/WalManager.write_buffered.md")]
     pub fn write_buffered(&mut self, entry: &WalEntry) -> io::Result<()> {
         self.writer.write_buffered(entry)
     }
 
+    #[doc = include_str!("../docs/WalManager.flush.md")]
     pub fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()
     }
 
+    #[doc = include_str!("../docs/WalManager.replay.md")]
     pub fn replay<F>(&mut self, mut callback: F) -> io::Result<Vec<WalEntry>>
     where
         F: FnMut(&WalEntry) -> io::Result<()>,
@@ -70,18 +81,21 @@ impl WalManager {
         Ok(entries)
     }
 
+    #[doc = include_str!("../docs/WalManager.truncate.md")]
     pub fn truncate(&mut self) -> io::Result<()> {
         self.writer.truncate()?;
         self.reader = WalReader::new(&self.path)?;
         Ok(())
     }
 
+    #[doc = include_str!("../docs/WalManager.truncate_to.md")]
     pub fn truncate_to(&mut self, offset: u64) -> io::Result<()> {
         self.writer.truncate_to(offset)?;
         self.reader = WalReader::new(&self.path)?;
         Ok(())
     }
 
+    #[doc = include_str!("../docs/WalManager.rotate.md")]
     pub fn rotate(&mut self) -> io::Result<PathBuf> {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -99,11 +113,13 @@ impl WalManager {
         Ok(archive_path)
     }
 
+    #[doc = include_str!("../docs/WalManager.is_empty.md")]
     pub fn is_empty(&self) -> io::Result<bool> {
         let metadata = std::fs::metadata(&self.path)?;
         Ok(metadata.len() == 0)
     }
 
+    #[doc = include_str!("../docs/WalManager.size.md")]
     pub fn size(&self) -> io::Result<u64> {
         let metadata = std::fs::metadata(&self.path)?;
         Ok(metadata.len())

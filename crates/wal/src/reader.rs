@@ -4,16 +4,19 @@ use std::path::Path;
 
 use crate::entry::WalEntry;
 
+#[doc = include_str!("../docs/reader.WalReader.md")]
 pub struct WalReader {
     file: File,
 }
 
 impl WalReader {
+    #[doc = include_str!("../docs/reader.WalReader.new.md")]
     pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let file = File::open(path)?;
         Ok(WalReader { file })
     }
 
+    #[doc = include_str!("../docs/reader.WalReader.read_all.md")]
     pub fn read_all(&mut self) -> io::Result<Vec<WalEntry>> {
         self.file.seek(SeekFrom::Start(0))?;
         let mut entries = Vec::new();
@@ -38,6 +41,7 @@ impl WalReader {
         Ok(entries)
     }
 
+    #[doc = include_str!("../docs/reader.WalReader.read_with_validation.md")]
     pub fn read_with_validation(&mut self) -> io::Result<(Vec<WalEntry>, Vec<CorruptionInfo>)> {
         self.file.seek(SeekFrom::Start(0))?;
         let mut entries = Vec::new();
@@ -67,14 +71,17 @@ impl WalReader {
         Ok((entries, corruptions))
     }
 
+    #[doc = include_str!("../docs/reader.WalReader.position.md")]
     pub fn position(&mut self) -> io::Result<u64> {
         self.file.stream_position()
     }
 
+    #[doc = include_str!("../docs/reader.WalReader.seek.md")]
     pub fn seek(&mut self, pos: u64) -> io::Result<u64> {
         self.file.seek(SeekFrom::Start(pos))
     }
 
+    #[doc = include_str!("../docs/reader.WalReader.read_one.md")]
     pub fn read_one(&mut self) -> io::Result<Option<WalEntry>> {
         let mut buffer = vec![0u8; 4];
 
@@ -110,8 +117,11 @@ impl WalReader {
     }
 }
 
+#[doc = include_str!("../docs/reader.CorruptionInfo.md")]
 #[derive(Debug, Clone)]
 pub struct CorruptionInfo {
+    #[doc = include_str!("../docs/reader.CorruptionInfo.offset.md")]
     pub offset: usize,
+    #[doc = include_str!("../docs/reader.CorruptionInfo.error.md")]
     pub error: String,
 }

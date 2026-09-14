@@ -1,50 +1,80 @@
+#![doc = include_str!("../docs/crate.md")]
 #![forbid(unsafe_code)]
 
+#[doc = include_str!("../docs/client.md")]
 pub mod client;
+#[doc = include_str!("../docs/server.md")]
 pub mod server;
 
 use serde::{Deserialize, Serialize};
 
+#[doc = include_str!("../docs/ClientMsg.md")]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMsg {
+    #[doc = include_str!("../docs/ClientMsg.RequestTurn.md")]
     RequestTurn {
+        #[doc = include_str!("../docs/ClientMsg.RequestTurn.write_set_keys.md")]
         write_set_keys: Vec<Vec<u8>>,
+        #[doc = include_str!("../docs/ClientMsg.RequestTurn.snapshot_lsn.md")]
         snapshot_lsn: u64,
+        #[doc = include_str!("../docs/ClientMsg.RequestTurn.client_deadline_ms.md")]
         #[serde(default)]
         client_deadline_ms: u64,
     },
+    #[doc = include_str!("../docs/ClientMsg.Committed.md")]
     Committed {
+        #[doc = include_str!("../docs/ClientMsg.Committed.turn_id.md")]
         turn_id: u64,
+        #[doc = include_str!("../docs/ClientMsg.Committed.model_tags.md")]
         model_tags: Vec<Vec<u8>>,
+        #[doc = include_str!("../docs/ClientMsg.Committed.row_indices.md")]
         row_indices: Vec<u64>,
+        #[doc = include_str!("../docs/ClientMsg.Committed.change_kinds.md")]
         change_kinds: Vec<u8>,
+        #[doc = include_str!("../docs/ClientMsg.Committed.opaque_row_bytes.md")]
         opaque_row_bytes: Vec<Vec<u8>>,
     },
+    #[doc = include_str!("../docs/ClientMsg.Disconnect.md")]
     Disconnect,
 }
 
+#[doc = include_str!("../docs/ServerMsg.md")]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerMsg {
+    #[doc = include_str!("../docs/ServerMsg.Grant.md")]
     Grant {
+        #[doc = include_str!("../docs/ServerMsg.Grant.turn_id.md")]
         turn_id: u64,
+        #[doc = include_str!("../docs/ServerMsg.Grant.reserved_lsn.md")]
         reserved_lsn: u64,
     },
+    #[doc = include_str!("../docs/ServerMsg.Nack.md")]
     Nack {
+        #[doc = include_str!("../docs/ServerMsg.Nack.conflict_key.md")]
         conflict_key: Vec<u8>,
     },
+    #[doc = include_str!("../docs/ServerMsg.Ack.md")]
     Ack {
+        #[doc = include_str!("../docs/ServerMsg.Ack.lsn.md")]
         lsn: u64,
     },
+    #[doc = include_str!("../docs/ServerMsg.Busy.md")]
     Busy,
-    Error { message: String },
+    #[doc = include_str!("../docs/ServerMsg.Error.md")]
+    Error {
+        #[doc = include_str!("../docs/ServerMsg.Error.message.md")]
+        message: String,
+    },
 }
 
 use std::io::{self, Read};
 
+#[doc = include_str!("../docs/DEFAULT_MAX_FRAME.md")]
 pub const DEFAULT_MAX_FRAME: usize = 16 * 1024 * 1024;
 
+#[doc = include_str!("../docs/encode_msg.md")]
 pub fn encode_msg<T: Serialize>(msg: &T) -> io::Result<Vec<u8>> {
     let payload = serde_json::to_vec(msg)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -55,10 +85,12 @@ pub fn encode_msg<T: Serialize>(msg: &T) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
+#[doc = include_str!("../docs/decode_msg.md")]
 pub fn decode_msg<T: for<'de> Deserialize<'de>, R: Read>(reader: &mut R) -> io::Result<T> {
     decode_msg_with_limit(reader, DEFAULT_MAX_FRAME)
 }
 
+#[doc = include_str!("../docs/decode_msg_with_limit.md")]
 pub fn decode_msg_with_limit<T: for<'de> Deserialize<'de>, R: Read>(
     reader: &mut R,
     max_frame: usize,

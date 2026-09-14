@@ -1,3 +1,4 @@
+#![doc = include_str!("../docs/crate.md")]
 use std::collections::HashMap;
 
 use jsonwebtoken::{decode, decode_header, DecodingKey, Validation};
@@ -5,6 +6,7 @@ use serde_json::Value;
 
 pub use jsonwebtoken::Algorithm;
 
+#[doc = include_str!("../docs/parse_algorithm.md")]
 pub fn parse_algorithm(name: &str) -> Option<Algorithm> {
     Some(match name.trim().to_ascii_uppercase().as_str() {
         "RS256" => Algorithm::RS256,
@@ -20,32 +22,56 @@ pub fn parse_algorithm(name: &str) -> Option<Algorithm> {
     })
 }
 
+#[doc = include_str!("../docs/AuthError.md")]
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
+    #[doc = include_str!("../docs/AuthError.MissingToken.md")]
     #[error("missing or malformed Authorization header")]
     MissingToken,
+    #[doc = include_str!("../docs/AuthError.AlgorithmNotAllowed.md")]
     #[error("token algorithm {0:?} is not in the allowlist")]
     AlgorithmNotAllowed(Algorithm),
+    #[doc = include_str!("../docs/AuthError.Invalid.md")]
     #[error("token verification failed: {0}")]
     Invalid(String),
+    #[doc = include_str!("../docs/AuthError.UnknownKey.md")]
     #[error("no verification key for kid {0:?}")]
     UnknownKey(Option<String>),
+    #[doc = include_str!("../docs/AuthError.MissingTenantClaim.md")]
     #[error("tenant claim '{claim}' missing from token")]
-    MissingTenantClaim { claim: String },
+    MissingTenantClaim {
+        #[doc = include_str!("../docs/AuthError.MissingTenantClaim.claim.md")]
+        claim: String,
+    },
+    #[doc = include_str!("../docs/AuthError.MissingRequiredClaim.md")]
     #[error("required claim '{0}' missing from token")]
     MissingRequiredClaim(String),
+    #[doc = include_str!("../docs/AuthError.TenantMismatch.md")]
     #[error(
         "tenant mismatch: token tenant '{token}' is not authorized for this process (serves '{process}')"
     )]
-    TenantMismatch { token: String, process: String },
+    TenantMismatch {
+        #[doc = include_str!("../docs/AuthError.TenantMismatch.token.md")]
+        token: String,
+        #[doc = include_str!("../docs/AuthError.TenantMismatch.process.md")]
+        process: String,
+    },
+    #[doc = include_str!("../docs/AuthError.Key.md")]
     #[error("invalid verification key material: {0}")]
     Key(String),
+    #[doc = include_str!("../docs/AuthError.Fetch.md")]
     #[cfg(feature = "jwks-http")]
     #[error("failed to fetch JWKS from {url}: {reason}")]
-    Fetch { url: String, reason: String },
+    Fetch {
+        #[doc = include_str!("../docs/AuthError.Fetch.url.md")]
+        url: String,
+        #[doc = include_str!("../docs/AuthError.Fetch.reason.md")]
+        reason: String,
+    },
 }
 
 impl AuthError {
+    #[doc = include_str!("../docs/AuthError.status_code.md")]
     pub fn status_code(&self) -> u16 {
         match self {
             AuthError::TenantMismatch { .. } => 403,
@@ -54,20 +80,29 @@ impl AuthError {
     }
 }
 
+#[doc = include_str!("../docs/StaticKey.md")]
 #[derive(Debug, Clone)]
 pub struct StaticKey {
+    #[doc = include_str!("../docs/StaticKey.kid.md")]
     pub kid: Option<String>,
+    #[doc = include_str!("../docs/StaticKey.pem.md")]
     pub pem: String,
+    #[doc = include_str!("../docs/StaticKey.algorithm.md")]
     pub algorithm: Algorithm,
 }
 
+#[doc = include_str!("../docs/KeySource.md")]
 pub enum KeySource {
+    #[doc = include_str!("../docs/KeySource.StaticPem.md")]
     StaticPem(Vec<StaticKey>),
+    #[doc = include_str!("../docs/KeySource.Jwks.md")]
     Jwks(jsonwebtoken::jwk::JwkSet),
+    #[doc = include_str!("../docs/KeySource.JwksHttp.md")]
     #[cfg(feature = "jwks-http")]
     JwksHttp(std::sync::Arc<JwksHttpCache>),
 }
 
+#[doc = include_str!("../docs/JwksHttpCache.md")]
 #[cfg(feature = "jwks-http")]
 pub struct JwksHttpCache {
     url: String,
@@ -99,6 +134,7 @@ impl JwksHttpCache {
 }
 
 impl KeySource {
+    #[doc = include_str!("../docs/KeySource.static_pem.md")]
     pub fn static_pem(kid: Option<String>, pem: impl Into<String>, algorithm: Algorithm) -> Self {
         KeySource::StaticPem(vec![StaticKey {
             kid,
@@ -107,12 +143,14 @@ impl KeySource {
         }])
     }
 
+    #[doc = include_str!("../docs/KeySource.from_jwks_json.md")]
     pub fn from_jwks_json(json: &str) -> Result<Self, AuthError> {
         let set: jsonwebtoken::jwk::JwkSet =
             serde_json::from_str(json).map_err(|e| AuthError::Key(e.to_string()))?;
         Ok(KeySource::Jwks(set))
     }
 
+    #[doc = include_str!("../docs/KeySource.jwks_url.md")]
     #[cfg(feature = "jwks-http")]
     pub fn jwks_url(
         url: impl Into<String>,
@@ -194,13 +232,20 @@ fn build_static_key(k: &StaticKey) -> Result<DecodingKey, AuthError> {
     key.map_err(|e| AuthError::Key(e.to_string()))
 }
 
+#[doc = include_str!("../docs/AuthConfig.md")]
 #[derive(Debug, Clone)]
 pub struct AuthConfig {
+    #[doc = include_str!("../docs/AuthConfig.algorithms.md")]
     pub algorithms: Vec<Algorithm>,
+    #[doc = include_str!("../docs/AuthConfig.issuer.md")]
     pub issuer: Option<String>,
+    #[doc = include_str!("../docs/AuthConfig.audience.md")]
     pub audience: Option<String>,
+    #[doc = include_str!("../docs/AuthConfig.tenant_claim.md")]
     pub tenant_claim: String,
+    #[doc = include_str!("../docs/AuthConfig.leeway_secs.md")]
     pub leeway_secs: u64,
+    #[doc = include_str!("../docs/AuthConfig.required_claims.md")]
     pub required_claims: Vec<String>,
 }
 
@@ -217,14 +262,20 @@ impl Default for AuthConfig {
     }
 }
 
+#[doc = include_str!("../docs/Principal.md")]
 #[derive(Debug, Clone)]
 pub struct Principal {
+    #[doc = include_str!("../docs/Principal.subject.md")]
     pub subject: String,
+    #[doc = include_str!("../docs/Principal.tenant.md")]
     pub tenant: String,
+    #[doc = include_str!("../docs/Principal.roles.md")]
     pub roles: Vec<String>,
+    #[doc = include_str!("../docs/Principal.claims.md")]
     pub claims: HashMap<String, Value>,
 }
 
+#[doc = include_str!("../docs/Authenticator.md")]
 pub struct Authenticator {
     config: AuthConfig,
     keys: KeySource,
@@ -232,6 +283,7 @@ pub struct Authenticator {
 }
 
 impl Authenticator {
+    #[doc = include_str!("../docs/Authenticator.new.md")]
     pub fn new(config: AuthConfig, keys: KeySource, process_tenant: impl Into<String>) -> Self {
         Authenticator {
             config,
@@ -240,10 +292,12 @@ impl Authenticator {
         }
     }
 
+    #[doc = include_str!("../docs/Authenticator.process_tenant.md")]
     pub fn process_tenant(&self) -> &str {
         &self.process_tenant
     }
 
+    #[doc = include_str!("../docs/Authenticator.authenticate.md")]
     pub fn authenticate(&self, token: &str) -> Result<Principal, AuthError> {
         let header = decode_header(token).map_err(|e| AuthError::Invalid(e.to_string()))?;
 
@@ -324,6 +378,7 @@ fn extract_roles(claims: &HashMap<String, Value>) -> Vec<String> {
     Vec::new()
 }
 
+#[doc = include_str!("../docs/axum_mw.md")]
 #[cfg(feature = "axum")]
 pub mod axum_mw {
 
@@ -340,6 +395,7 @@ pub mod axum_mw {
 
     use super::{AuthError, Authenticator};
 
+    #[doc = include_str!("../docs/axum_mw.require_tenant.md")]
     pub async fn require_tenant(
         State(auth): State<Arc<Authenticator>>,
         mut req: Request<Body>,

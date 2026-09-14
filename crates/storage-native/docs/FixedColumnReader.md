@@ -1,0 +1,5 @@
+Read-only, positional view over a [`FixedColumn`]'s file, for many concurrent readers beside a single writer.
+
+Created by [`FixedColumn::reader`]; holds an independent descriptor (`try_clone`) to the same file. Its reads use `read_exact_at` and never touch a shared file cursor, so they are safe against a concurrent seek-and-append by the writer and against each other across threads. The file is append-only, so bytes at an already-committed offset never change, and the page cache makes the writer's not-yet-fsynced appends visible through this descriptor. The length is derived from the file on every call rather than cached, so a reader created before an append sees rows the writer commits afterward.
+
+There is no cached bound: a read past the end of the file fails with `InvalidInput`. A caller that wants a consistent view clamps its reads to a watermark captured from the file the writer appends last per row (see [`Snapshot`]), so it never observes a row whose other columns are still being written.

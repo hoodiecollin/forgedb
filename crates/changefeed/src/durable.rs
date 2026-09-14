@@ -6,26 +6,37 @@ use tokio::sync::broadcast;
 
 use crate::ChangeKind;
 
+#[doc = include_str!("../docs/durable.FsyncPolicy.md")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsyncPolicy {
+    #[doc = include_str!("../docs/durable.FsyncPolicy.Always.md")]
     Always,
+    #[doc = include_str!("../docs/durable.FsyncPolicy.Never.md")]
     Never,
 }
 
+#[doc = include_str!("../docs/durable.PersistedEvent.md")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedEvent {
+    #[doc = include_str!("../docs/durable.PersistedEvent.offset.md")]
     pub offset: u64,
+    #[doc = include_str!("../docs/durable.PersistedEvent.model.md")]
     pub model: String,
+    #[doc = include_str!("../docs/durable.PersistedEvent.row_index.md")]
     pub row_index: u64,
+    #[doc = include_str!("../docs/durable.PersistedEvent.kind.md")]
     pub kind: ChangeKind,
+    #[doc = include_str!("../docs/durable.PersistedEvent.bytes.md")]
     pub bytes: Vec<u8>,
 }
 
 impl PersistedEvent {
+    #[doc = include_str!("../docs/durable.PersistedEvent.to_wire.md")]
     pub fn to_wire(&self) -> Vec<u8> {
         self.to_frame()
     }
 
+    #[doc = include_str!("../docs/durable.PersistedEvent.from_wire.md")]
     pub fn from_wire(buf: &[u8]) -> io::Result<PersistedEvent> {
         match Self::from_frame(buf)? {
             Some((event, _)) => Ok(event),
@@ -129,6 +140,7 @@ impl PersistedEvent {
     }
 }
 
+#[doc = include_str!("../docs/durable.DurableBroker.md")]
 pub struct DurableBroker {
     path: PathBuf,
     file: File,
@@ -139,6 +151,7 @@ pub struct DurableBroker {
 }
 
 impl DurableBroker {
+    #[doc = include_str!("../docs/durable.DurableBroker.open.md")]
     pub fn open<P: AsRef<Path>>(
         path: P,
         fsync: FsyncPolicy,
@@ -177,6 +190,7 @@ impl DurableBroker {
         })
     }
 
+    #[doc = include_str!("../docs/durable.DurableBroker.record.md")]
     pub fn record(
         &mut self,
         model: &str,
@@ -207,18 +221,22 @@ impl DurableBroker {
         Ok(offset)
     }
 
+    #[doc = include_str!("../docs/durable.DurableBroker.flush.md")]
     pub fn flush(&mut self) -> io::Result<()> {
         self.file.sync_all()
     }
 
+    #[doc = include_str!("../docs/durable.DurableBroker.watermark.md")]
     pub fn watermark(&self) -> u64 {
         self.next_offset - 1
     }
 
+    #[doc = include_str!("../docs/durable.DurableBroker.earliest_retained.md")]
     pub fn earliest_retained(&self) -> u64 {
         self.earliest
     }
 
+    #[doc = include_str!("../docs/durable.DurableBroker.read_from.md")]
     pub fn read_from(&self, after: u64, max: usize) -> io::Result<Vec<PersistedEvent>> {
         let mut out = Vec::new();
         if max == 0 {
@@ -246,14 +264,17 @@ impl DurableBroker {
         Ok(out)
     }
 
+    #[doc = include_str!("../docs/durable.DurableBroker.subscribe.md")]
     pub fn subscribe(&self) -> broadcast::Receiver<PersistedEvent> {
         self.sender.subscribe()
     }
 
+    #[doc = include_str!("../docs/durable.DurableBroker.subscriber_count.md")]
     pub fn subscriber_count(&self) -> usize {
         self.sender.receiver_count()
     }
 
+    #[doc = include_str!("../docs/durable.DurableBroker.catch_up_from.md")]
     pub fn catch_up_from(&self, after: u64, max: usize) -> io::Result<CatchUp> {
         let receiver = self.sender.subscribe();
         let boundary = self.watermark();
@@ -265,6 +286,7 @@ impl DurableBroker {
         })
     }
 
+    #[doc = include_str!("../docs/durable.DurableBroker.prune_through.md")]
     pub fn prune_through(&mut self, through: u64) -> io::Result<()> {
         let retained = self.read_from(through, usize::MAX)?;
 
@@ -340,9 +362,13 @@ impl DurableBroker {
     }
 }
 
+#[doc = include_str!("../docs/durable.CatchUp.md")]
 pub struct CatchUp {
+    #[doc = include_str!("../docs/durable.CatchUp.replayed.md")]
     pub replayed: Vec<PersistedEvent>,
+    #[doc = include_str!("../docs/durable.CatchUp.boundary.md")]
     pub boundary: u64,
+    #[doc = include_str!("../docs/durable.CatchUp.receiver.md")]
     pub receiver: broadcast::Receiver<PersistedEvent>,
 }
 

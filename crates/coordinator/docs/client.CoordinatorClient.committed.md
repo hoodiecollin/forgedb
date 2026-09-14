@@ -1,0 +1,3 @@
+Report that the granted turn's data-plane write is durable and hand the coordinator the opaque payload for the replication log.
+
+`turn_id` must be the id from the preceding grant. `model_tags`, `row_indices` and `opaque_row_bytes` are parallel per-row vectors and `change_kinds` holds each row's [`forgedb_changefeed::ChangeKind`] as a byte; all are forwarded without inspection. On `Ack` the returned LSN is stored as [`Self::last_known_lsn`]. A server `Error` (the turn is not the current one) becomes [`ClientError::Protocol`]; an I/O failure becomes [`ClientError::Io`] and poisons the connection.

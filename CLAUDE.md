@@ -279,7 +279,8 @@ key; both are breaking, both are in `docs/UPGRADING.md`.
   `ChangeKind::{Inserted,Linked,Updated,Deleted}` (#66).
 - `auth` — verify-only JWT + tenant cross-check substrate (#59). Schema-agnostic axum
   extractor/middleware: verifies an asymmetric JWT (JWKS or static PEM, algorithm-pinned,
-  `exp`/`nbf`/`iss`/`aud`+skew), extracts a configured tenant claim, cross-checks it against the
+  `exp` with skew; `iss`/`aud` only when the claim is present; `nbf` is NOT validated —
+  found by #490's verify pass against jsonwebtoken 9's defaults), extracts a configured tenant claim, cross-checks it against the
   process's tenant → 403, injects an opaque `Principal`. Knows nothing of models/rows/schema — same
   class as `changefeed`.
 - `wal` — write-ahead log. The generated durable write path (#89) links only the **opaque `Raw`**
@@ -320,7 +321,7 @@ key; both are breaking, both are in `docs/UPGRADING.md`.
   The broker is opened `FsyncPolicy::Never` and the coordinator drives the barrier via a configurable
   **`CoordFsync`** (`forgedb coordinate --fsync always|never|periodic` / `FORGEDB_COORDINATOR_FSYNC`, default
   `always`; Option C) — which also fixed a latent N+1-fsyncs-per-commit (per-record + explicit flush) down to
-  ≤1. The `_replication.log` is resumable/secondary (clients fsync their own columns+WAL before `Committed`),
+  ≤1. The coordinator's `_coordinator_replication.log` (the generated server's own broker is `_replication.log`) is resumable/secondary (clients fsync their own columns+WAL before `Committed`),
   so `never`/`periodic` never risk committed client data — only rewind replication on a coordinator crash.
 
 **Internal (compiler internals):** `parser`, `codegen`, `validation`, `migrations`, `backup`, `watcher`,
@@ -825,8 +826,8 @@ so a component there would be downloaded by every job for a tool no job runs.
   `//!`, a `#[doc = "…"]` literal, JSDoc), not inline `//` prose, on any surface — Rust, TS/TSX,
   `Cargo.toml`, the workflows, the Makefile. The rule bans prose in a source file, not the `doc`
   attribute: `#[doc = include_str!("…")]` naming a sidecar file is permitted, because the sentence
-  it points at is not in the file an agent reads. That is how the substrate crates get their
-  docs.rs content back (#490), and the checker's refusal of the literal form lands with it.
+  it points at is not in the file an agent reads. That is how the substrate crates carry their
+  docs.rs content (#490), and `make comment-check` refuses the literal form.
   A comment drifts the moment the code moves, and it sits in
   a coding agent's grep path where a stale line reads as authoritative and steers a whole
   session down a path that looks correct the entire way. Code is read by reading it; when
@@ -862,6 +863,19 @@ so a component there would be downloaded by every job for a tool no job runs.
   `tests/ci_gate_test.rs::the_comment_rule_has_a_place_where_it_can_fail`. `--write`
   fixes a tree in place. It is a real lexer, not a regex, because this repo is a code
   generator whose sources are full of raw strings holding Rust that itself contains `///`.
+
+  **The substrate crates' docs.rs content lives in sidecars (#490).** `crates/<c>/docs/<key>.md`,
+  one file per public attachment point, attached by `#[doc = include_str!("../docs/<key>.md")]`.
+  The key is the item's path within the crate joined with dots: `crate` for the root, `durable`
+  for a `pub mod`, `CommitSequencer.try_commit`, `WriteSet.keys`, `CommitOutcome.Conflict.key`.
+  Adding a public item to one of the 10 host-side substrate crates means adding its sidecar:
+  `make docs-check` (rustdoc's `missing_docs` and broken-link lints with all features, and zero
+  doctests) and `tests/substrate_docs_test.rs` (no literal, every include names its own file,
+  every file claimed exactly once, no executable fence, case-insensitive key uniqueness, floors)
+  fail otherwise. **No runnable examples in a sidecar, as a rule** — every fence is tagged
+  `text`, `toml`, `json`, `sh`, `console`, `forge`, `http` or `yaml`. wasm32-gated items and
+  `forgedb-storage-web` carry no sidecars (#563). The walker behind both guards is
+  `forgedb_source_guard::RustSource::doc_sites`.
 - No time estimates (hours/days/weeks) anywhere — describe scope, not duration.
 - Don't `git commit` without the user's consent (an in-the-moment "commit when done"
   counts as consent for that scope; it doesn't carry to follow-up changes). When you do

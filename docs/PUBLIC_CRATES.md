@@ -139,6 +139,19 @@ discipline is described in [PUBLISHING.md](./PUBLISHING.md).
 
 ---
 
+## API documentation
+
+Each host-side substrate crate documents every public item on docs.rs
+(`https://docs.rs/<crate>`). The prose is not in the source: ForgeDB's own source carries no
+comments, so each item carries `#[doc = include_str!("../docs/<key>.md")]` and the sidecar
+files live in `crates/<dir>/docs/`, keyed on the item's path (`CommitSequencer.try_commit.md`,
+`WriteSet.keys.md`, `crate.md` for the root). `make docs-check` fails on an undocumented public
+item, a broken intra-doc link, or a doctest, and `tests/substrate_docs_test.rs` reconciles the
+attributes against the files in both directions. Sidecars carry no runnable examples, as a
+rule. `forgedb-storage`'s page documents the facade only and links `forgedb-storage-native`;
+`forgedb-storage-web` and the wasm32 branches carry no sidecars while the browser target is
+deprecated (#563).
+
 ## References
 
 - [ARCHITECTURE.md](./ARCHITECTURE.md) — system architecture and the storage model

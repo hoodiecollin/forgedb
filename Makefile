@@ -151,10 +151,23 @@ extension-package:
 	cd $(EXTENSION) && $(BUN) install && $(BUN) run package
 	@echo "Packaged: $(EXTENSION)/forgedb-*.vsix"
 
-.PHONY: test test-ignored comment-check clippy
+.PHONY: test test-ignored comment-check clippy docs-check
+
+SUBSTRATE_DOC_CRATES := forgedb-types forgedb-storage forgedb-storage-native forgedb-wal \
+  forgedb-changefeed forgedb-auth forgedb-query-params forgedb-compaction forgedb-txn \
+  forgedb-coordinator
 
 comment-check:
+	@$(BUN) scripts/strip-comments.ts --self-test
 	@$(BUN) scripts/strip-comments.ts --check
+
+docs-check:
+	@for c in $(SUBSTRATE_DOC_CRATES); do \
+	  echo "docs-check: $$c"; \
+	  cargo rustdoc -q -p $$c --all-features -- -D missing_docs -D rustdoc::broken_intra_doc_links || exit 1; \
+	  cargo test -q --doc -p $$c --all-features 2>&1 | grep -q '^running 0 tests' \
+	    || { echo "$$c runs doctests; sidecar fences must not execute (#490)"; exit 1; }; \
+	done
 
 test:
 	$(MAKE) goguard

@@ -1,0 +1,1 @@
+How long a granted turn may stay uncommitted before the next `RequestTurn` reclaims it, and the longest a `RequestTurn` will wait for a free turn. Default [`TURN_TIMEOUT`]. The same value is the read timeout on every client connection, so a client that sends no frame for that long is disconnected.

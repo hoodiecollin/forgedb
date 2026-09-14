@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use crate::FsyncPolicy;
 use crate::entry::WalEntry;
 
+#[doc = include_str!("../docs/writer.WalWriter.md")]
 pub struct WalWriter {
     file: File,
     fsync_policy: FsyncPolicy,
@@ -14,6 +15,7 @@ pub struct WalWriter {
 }
 
 impl WalWriter {
+    #[doc = include_str!("../docs/writer.WalWriter.new.md")]
     pub fn new<P: AsRef<Path>>(path: P, fsync_policy: FsyncPolicy) -> io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
@@ -29,6 +31,7 @@ impl WalWriter {
         })
     }
 
+    #[doc = include_str!("../docs/writer.WalWriter.write.md")]
     pub fn write(&mut self, entry: &WalEntry) -> io::Result<()> {
         let bytes = entry.to_bytes();
         self.file.write_all(&bytes)?;
@@ -54,6 +57,7 @@ impl WalWriter {
         Ok(())
     }
 
+    #[doc = include_str!("../docs/writer.WalWriter.write_buffered.md")]
     pub fn write_buffered(&mut self, entry: &WalEntry) -> io::Result<()> {
         let bytes = entry.to_bytes();
         self.file.write_all(&bytes)?;
@@ -61,6 +65,7 @@ impl WalWriter {
         Ok(())
     }
 
+    #[doc = include_str!("../docs/writer.WalWriter.flush.md")]
     pub fn flush(&mut self) -> io::Result<()> {
         self.file.sync_all()?;
         self.last_fsync = Instant::now();
@@ -68,6 +73,7 @@ impl WalWriter {
         Ok(())
     }
 
+    #[doc = include_str!("../docs/writer.WalWriter.truncate.md")]
     pub fn truncate(&mut self) -> io::Result<()> {
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
@@ -77,6 +83,7 @@ impl WalWriter {
         Ok(())
     }
 
+    #[doc = include_str!("../docs/writer.WalWriter.truncate_to.md")]
     pub fn truncate_to(&mut self, offset: u64) -> io::Result<()> {
         let current = self.file.metadata()?.len();
         if offset >= current {
@@ -89,14 +96,17 @@ impl WalWriter {
         Ok(())
     }
 
+    #[doc = include_str!("../docs/writer.WalWriter.fsync_policy.md")]
     pub fn fsync_policy(&self) -> FsyncPolicy {
         self.fsync_policy
     }
 
+    #[doc = include_str!("../docs/writer.WalWriter.bytes_since_fsync.md")]
     pub fn bytes_since_fsync(&self) -> usize {
         self.bytes_since_fsync
     }
 
+    #[doc = include_str!("../docs/writer.WalWriter.time_since_fsync.md")]
     pub fn time_since_fsync(&self) -> Duration {
         self.last_fsync.elapsed()
     }

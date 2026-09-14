@@ -1,23 +1,31 @@
+#![doc = include_str!("../docs/crate.md")]
 use std::collections::{BTreeMap, HashMap};
 
+#[doc = include_str!("../docs/Lsn.md")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Lsn(pub u64);
 
 impl Lsn {
+    #[doc = include_str!("../docs/Lsn.as_u64.md")]
     #[inline]
     pub fn as_u64(&self) -> u64 {
         self.0
     }
 }
 
+#[doc = include_str!("../docs/OpaqueKey.md")]
 pub type OpaqueKey = Box<[u8]>;
 
+#[doc = include_str!("../docs/WriteSet.md")]
 pub struct WriteSet {
+    #[doc = include_str!("../docs/WriteSet.keys.md")]
     pub keys: Vec<OpaqueKey>,
+    #[doc = include_str!("../docs/WriteSet.snapshot_lsn.md")]
     pub snapshot_lsn: Lsn,
 }
 
 impl WriteSet {
+    #[doc = include_str!("../docs/WriteSet.new.md")]
     pub fn new(snapshot_lsn: Lsn) -> Self {
         WriteSet {
             keys: Vec::new(),
@@ -26,13 +34,18 @@ impl WriteSet {
     }
 }
 
+#[doc = include_str!("../docs/CommitOutcome.md")]
 pub enum CommitOutcome {
+    #[doc = include_str!("../docs/CommitOutcome.Committed.md")]
     Committed(Lsn),
+    #[doc = include_str!("../docs/CommitOutcome.Conflict.md")]
     Conflict {
+        #[doc = include_str!("../docs/CommitOutcome.Conflict.key.md")]
         key: OpaqueKey,
     },
 }
 
+#[doc = include_str!("../docs/CommitSequencer.md")]
 pub struct CommitSequencer {
     next_lsn: u64,
     conflicts: HashMap<OpaqueKey, Lsn>,
@@ -40,6 +53,7 @@ pub struct CommitSequencer {
 }
 
 impl CommitSequencer {
+    #[doc = include_str!("../docs/CommitSequencer.new.md")]
     pub fn new(start_lsn: u64) -> Self {
         CommitSequencer {
             next_lsn: start_lsn + 1,
@@ -48,12 +62,14 @@ impl CommitSequencer {
         }
     }
 
+    #[doc = include_str!("../docs/CommitSequencer.register_snapshot.md")]
     pub fn register_snapshot(&mut self) -> Lsn {
         let snap = Lsn(self.next_lsn - 1);
         *self.live_snapshots.entry(snap).or_insert(0) += 1;
         snap
     }
 
+    #[doc = include_str!("../docs/CommitSequencer.release_snapshot.md")]
     pub fn release_snapshot(&mut self, s: Lsn) {
         if let Some(count) = self.live_snapshots.get_mut(&s) {
             if *count <= 1 {
@@ -64,6 +80,7 @@ impl CommitSequencer {
         }
     }
 
+    #[doc = include_str!("../docs/CommitSequencer.oldest_live_snapshot.md")]
     pub fn oldest_live_snapshot(&self) -> Lsn {
         self.live_snapshots
             .keys()
@@ -72,6 +89,7 @@ impl CommitSequencer {
             .unwrap_or(Lsn(0))
     }
 
+    #[doc = include_str!("../docs/CommitSequencer.try_commit.md")]
     pub fn try_commit(&mut self, ws: &WriteSet) -> CommitOutcome {
         for k in &ws.keys {
             if matches!(self.conflicts.get(k), Some(&l) if l > ws.snapshot_lsn) {
@@ -86,6 +104,7 @@ impl CommitSequencer {
         CommitOutcome::Committed(l)
     }
 
+    #[doc = include_str!("../docs/CommitSequencer.gc.md")]
     pub fn gc(&mut self) {
         let oldest = self.oldest_live_snapshot();
         if oldest == Lsn(0) && self.live_snapshots.is_empty() {

@@ -1,0 +1,1 @@
+An exclusive commit turn was granted; the client may perform its data-plane write and then send [`ClientMsg::Committed`]. The turn is reclaimed if no commit arrives within the coordinator's turn timeout.

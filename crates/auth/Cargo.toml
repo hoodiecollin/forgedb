@@ -8,6 +8,9 @@ repository = "https://github.com/hoodiecollin/forgedb"
 keywords = ["jwt", "auth", "multi-tenancy", "axum", "forgedb"]
 categories = ["authentication", "web-programming"]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 default = ["axum"]
 axum = ["dep:axum"]

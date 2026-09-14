@@ -305,6 +305,13 @@ fn the_comment_rule_has_a_place_where_it_can_fail() {
          which prints a count and EXITS ZERO — the report-is-not-a-gate shape (§5.5). \
          Got: {recipe}"
     );
+    assert!(
+        recipe.contains("--self-test"),
+        "`make comment-check` must run the lexer's --self-test first. The fixtures are the \
+         only thing that proves the checker refuses a `#[doc = \"…\"]` literal and keeps a \
+         `#[doc = include_str!(…)]` sidecar (#490); bun is installed after `make test` in \
+         CI, so no cargo test can spawn them. Got: {recipe}"
+    );
 
     let cmd = run_command("test.yml", "No comments in ForgeDB's own source");
     assert!(
@@ -319,6 +326,43 @@ fn the_comment_rule_has_a_place_where_it_can_fail() {
         "the comment check runs under bun, so test.yml must install it. Without the setup \
          step the job fails on a missing interpreter rather than on a real finding, and \
          the usual repair is to delete the step"
+    );
+}
+
+#[test]
+fn the_substrate_docs_have_a_place_where_they_can_fail() {
+    let recipe = make_recipe("docs-check");
+
+    for needle in [
+        "cargo rustdoc",
+        "-D missing_docs",
+        "-D rustdoc::broken_intra_doc_links",
+        "--all-features",
+        "$(SUBSTRATE_DOC_CRATES)",
+        "cargo test",
+        "--doc",
+        "running 0 tests",
+    ] {
+        assert!(
+            recipe.contains(needle),
+            "`make docs-check` no longer carries `{needle}`. The target is the ONE place a \
+             public substrate item without a sidecar, a stale intra-doc link, a feature-gated \
+             item docs.rs would render undocumented, or a sidecar fence rustdoc would execute \
+             can fail (#490). Got: {recipe}"
+        );
+    }
+
+    let cmd = run_command("test.yml", "Substrate docs.rs content");
+    assert!(
+        cmd.contains("make docs-check"),
+        "test.yml must run `make docs-check`, or the sidecar guards are enforced by memory. \
+         Got: {cmd}"
+    );
+    let wf = unwrap_continuations(&workflow("test.yml"));
+    assert!(
+        !wf.contains("cargo rustdoc"),
+        "test.yml has its own copy of the docs check alongside the make target; the two \
+         will drift"
     );
 }
 

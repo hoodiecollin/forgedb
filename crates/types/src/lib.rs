@@ -1,8 +1,10 @@
+#![doc = include_str!("../docs/crate.md")]
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use uuid::Uuid;
 
+#[doc = include_str!("../docs/Timestamp.md")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Timestamp(i64);
 
@@ -13,16 +15,19 @@ const RFC3339_MIN_US: i64 = -62_167_219_200_000_000;
 const RFC3339_MAX_US: i64 = 253_402_300_799_999_999;
 
 impl Timestamp {
+    #[doc = include_str!("../docs/Timestamp.from_micros.md")]
     #[must_use]
     pub fn from_micros(micros: i64) -> Self {
         Timestamp(micros)
     }
 
+    #[doc = include_str!("../docs/Timestamp.as_micros.md")]
     #[must_use]
     pub fn as_micros(&self) -> i64 {
         self.0
     }
 
+    #[doc = include_str!("../docs/Timestamp.now.md")]
     #[must_use]
     pub fn now() -> Self {
         let micros = SystemTime::now()
@@ -32,6 +37,7 @@ impl Timestamp {
         Timestamp(micros)
     }
 
+    #[doc = include_str!("../docs/Timestamp.to_rfc3339.md")]
     #[must_use]
     pub fn to_rfc3339(&self) -> String {
         let days = self.0.div_euclid(US_PER_DAY);
@@ -53,10 +59,12 @@ impl Timestamp {
         format!("{year}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}.{us:06}Z")
     }
 
+    #[doc = include_str!("../docs/Timestamp.from_rfc3339.md")]
     pub fn from_rfc3339(s: &str) -> std::result::Result<Self, TimestampParseError> {
         parse_rfc3339(s).map(Timestamp).ok_or(TimestampParseError)
     }
 
+    #[doc = include_str!("../docs/Timestamp.floor_to_micros.md")]
     #[must_use]
     pub fn floor_to_micros(&self, quantum_us: i64) -> Self {
         if quantum_us <= 1 {
@@ -65,12 +73,14 @@ impl Timestamp {
         Timestamp(self.0.div_euclid(quantum_us) * quantum_us)
     }
 
+    #[doc = include_str!("../docs/Timestamp.is_rfc3339_representable.md")]
     #[must_use]
     pub fn is_rfc3339_representable(&self) -> bool {
         (RFC3339_MIN_US..=RFC3339_MAX_US).contains(&self.0)
     }
 }
 
+#[doc = include_str!("../docs/TimestampParseError.md")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimestampParseError;
 
@@ -278,21 +288,32 @@ impl From<Timestamp> for i64 {
     }
 }
 
+#[doc = include_str!("../docs/Value.md")]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value")]
 pub enum Value {
+    #[doc = include_str!("../docs/Value.U32.md")]
     U32(u32),
+    #[doc = include_str!("../docs/Value.U64.md")]
     U64(u64),
+    #[doc = include_str!("../docs/Value.I32.md")]
     I32(i32),
+    #[doc = include_str!("../docs/Value.I64.md")]
     I64(i64),
+    #[doc = include_str!("../docs/Value.F64.md")]
     F64(f64),
+    #[doc = include_str!("../docs/Value.Bool.md")]
     Bool(bool),
+    #[doc = include_str!("../docs/Value.String.md")]
     String(String),
+    #[doc = include_str!("../docs/Value.Uuid.md")]
     Uuid(Uuid),
+    #[doc = include_str!("../docs/Value.Timestamp.md")]
     Timestamp(Timestamp),
 }
 
 impl Value {
+    #[doc = include_str!("../docs/Value.type_name.md")]
     #[must_use]
     pub fn type_name(&self) -> &'static str {
         match self {
@@ -308,6 +329,7 @@ impl Value {
         }
     }
 
+    #[doc = include_str!("../docs/Value.is_numeric.md")]
     #[must_use]
     pub fn is_numeric(&self) -> bool {
         matches!(
@@ -316,6 +338,7 @@ impl Value {
         )
     }
 
+    #[doc = include_str!("../docs/Value.is_string.md")]
     #[must_use]
     pub fn is_string(&self) -> bool {
         matches!(self, Value::String(_))
@@ -382,15 +405,19 @@ impl From<Timestamp> for Value {
     }
 }
 
+#[doc = include_str!("../docs/InlineStr.md")]
 #[derive(Clone, Copy)]
 pub struct InlineStr<const BYTES: usize> {
     buf: [u8; BYTES],
     len: u16,
 }
 
+#[doc = include_str!("../docs/InlineStrError.md")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InlineStrError {
+    #[doc = include_str!("../docs/InlineStrError.got_bytes.md")]
     pub got_bytes: usize,
+    #[doc = include_str!("../docs/InlineStrError.capacity.md")]
     pub capacity: usize,
 }
 
@@ -407,6 +434,7 @@ impl std::fmt::Display for InlineStrError {
 impl std::error::Error for InlineStrError {}
 
 impl<const BYTES: usize> InlineStr<BYTES> {
+    #[doc = include_str!("../docs/InlineStr.CAPACITY.md")]
     pub const CAPACITY: usize = BYTES;
 
     const _LEN_FITS: () = assert!(
@@ -414,21 +442,25 @@ impl<const BYTES: usize> InlineStr<BYTES> {
         "InlineStr records its length in a u16, so BYTES must be at most 65535",
     );
 
+    #[doc = include_str!("../docs/InlineStr.as_str.md")]
     #[must_use]
     pub fn as_str(&self) -> &str {
         unsafe { std::str::from_utf8_unchecked(&self.buf[..self.len as usize]) }
     }
 
+    #[doc = include_str!("../docs/InlineStr.as_bytes.md")]
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.buf[..self.len as usize]
     }
 
+    #[doc = include_str!("../docs/InlineStr.len.md")]
     #[must_use]
     pub fn len(&self) -> usize {
         self.len as usize
     }
 
+    #[doc = include_str!("../docs/InlineStr.is_empty.md")]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0

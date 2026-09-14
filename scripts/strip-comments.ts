@@ -11,9 +11,14 @@ strip-comments — enforce the "no comments in ForgeDB's own source" rule (#488)
   bun scripts/strip-comments.ts --self-test      run the lexer fixtures
 
 THE RULE
-  ForgeDB's own source carries no comments. Code is read by reading it; prose in a source
+  ForgeDB's own source carries no prose. Code is read by reading it; prose in a source
   file drifts, and it sits in a coding agent's grep path where a stale line is read as
   authoritative and steers a whole session wrong.
+
+  That covers a '#[doc = "..."]' literal exactly as it covers '///'. It does NOT cover
+  '#[doc = include_str!("../docs/<key>.md")]': the attribute names a sidecar file and the
+  sentence is not in the file an agent reads. That is how the substrate crates carry their
+  docs.rs content (#490); 'make docs-check' guards the sidecars.
 
   User-facing documentation belongs on the website, never in a source file.
 
@@ -66,6 +71,39 @@ function lineStartsAt(src: string, i: number): boolean {
   return true;
 }
 
+function docLiteralEnd(src: string, i: number): number {
+  const n = src.length;
+  let p = i + 1;
+  if (src[p] === "!") p++;
+  if (src[p] !== "[") return -1;
+  p++;
+  const head = /^\s*doc\s*=\s*/.exec(src.slice(p, p + 64));
+  if (!head) return -1;
+  p += head[0].length;
+  if (src[p] === '"') {
+    p++;
+    while (p < n) {
+      if (src[p] === "\\") { p += 2; continue; }
+      if (src[p] === '"') { p++; break; }
+      p++;
+    }
+  } else if (src[p] === "r") {
+    let q = p + 1;
+    let hashes = 0;
+    while (src[q] === "#") { hashes++; q++; }
+    if (src[q] !== '"') return -1;
+    const close = '"' + "#".repeat(hashes);
+    const at = src.indexOf(close, q + 1);
+    if (at === -1) return -1;
+    p = at + close.length;
+  } else {
+    return -1;
+  }
+  const tail = /^\s*\]/.exec(src.slice(p, p + 16));
+  if (!tail) return -1;
+  return p + tail[0].length;
+}
+
 function scanRust(src: string): Cut[] {
   const cuts: Cut[] = [];
   const n = src.length;
@@ -75,6 +113,15 @@ function scanRust(src: string): Cut[] {
     const c = src[i]!;
     const d = src[i + 1];
     if (inRegression && !/\s/.test(c) && !(c === "/" && d === "/")) inRegression = false;
+
+    if (c === "#") {
+      const end = docLiteralEnd(src, i);
+      if (end !== -1) {
+        cuts.push({ start: i, end, inline: !lineStartsAt(src, i) });
+        i = end;
+        continue;
+      }
+    }
 
     if (c === '"') {
       i++;
@@ -169,12 +216,13 @@ function embeddedRustCuts(src: string): Cut[] {
         if (/^\s*(pub\s+)?fn\s+\w+\s*[(<]/m.test(body) || /^\s*use\s+[\w:]+\s*(::\{|;)/m.test(body)) {
           let off = p + 1;
           for (const line of body.split("\n")) {
-            if (
+            const comment =
               /^\s*(\/\/\/|\/\/!|\/\/)/.test(line) &&
               !REGRESSION.test(line) &&
               !DIRECTIVE.test(line) &&
-              !GENERATED_MARKER.test(line)
-            ) {
+              !GENERATED_MARKER.test(line);
+            const docLiteral = /^\s*#!?\[\s*doc\s*=\s*(r#*)?"/.test(line);
+            if (comment || docLiteral) {
               cuts.push({ start: off, end: off + line.length, inline: false });
             }
             off += line.length + 1;
@@ -447,6 +495,22 @@ function selfTest(): number {
     ["let x = 5; // trailing\n", "rust", "let x = 5;\n"],
     ["/// doc\nfn f() {}\n", "rust", "fn f() {}\n"],
     ["//! inner\nfn f() {}\n", "rust", "fn f() {}\n"],
+    ['#[doc = "x"]\nfn f() {}\n', "rust", "fn f() {}\n"],
+    ['#![doc = "x"]\nfn f() {}\n', "rust", "fn f() {}\n"],
+    ['#[doc = r#"x"#]\nfn f() {}\n', "rust", "fn f() {}\n"],
+    ['#[doc = " a \\"q\\" ]"]\n#[doc = "b"]\nfn f() {}\n', "rust", "fn f() {}\n"],
+    [
+      '#[doc = include_str!("../docs/f.md")]\nfn f() {}\n',
+      "rust",
+      '#[doc = include_str!("../docs/f.md")]\nfn f() {}\n',
+    ],
+    ['let s = r##"#[doc = "x"]"##;\n', "rust", 'let s = r##"#[doc = "x"]"##;\n'],
+    [
+      'const D: &str = r##"use x;\n#[doc = "gone"]\n#[doc = include_str!("k.md")]\nfn main() {}\n"##;\n',
+      "rust",
+      'const D: &str = r##"use x;\n#[doc = include_str!("k.md")]\nfn main() {}\n"##;\n',
+    ],
+    ["#[derive(Debug)]\n#[doc(hidden)]\nfn f() {}\n", "rust", "#[derive(Debug)]\n#[doc(hidden)]\nfn f() {}\n"],
     ["/* /* nested */ */\nfn f() {}\n", "rust", "fn f() {}\n"],
     ["foo(/* x */ y);\n", "rust", "foo( y);\n"],
     ["let z = a/*x*/b;\n", "rust", "let z = a b;\n"],
@@ -534,7 +598,8 @@ function main(): number {
       console.error(`  ${path}  (${count} comment${count === 1 ? "" : "s"})`);
     }
     if (offenders.length > 40) console.error(`  … and ${offenders.length - 40} more`);
-    console.error(`\nForgeDB's own source carries no comments (#488). Delete them, or — only for`);
+    console.error(`\nForgeDB's own source carries no prose (#488, #490): no comments, and no`);
+    console.error(`#[doc = "..."] literal (a #[doc = include_str!(...)] sidecar is fine). Delete them, or — only for`);
     console.error(`bugfix commentary that prevents a regression, beside its test — write:`);
     console.error(`\n    // REGRESSION(#<issue>): <what the defect was>\n`);
     console.error(`Fix: bun scripts/strip-comments.ts --write`);

@@ -305,6 +305,16 @@ make test
 # warnings do not. CI runs it as a step of the same required check.
 make clippy
 
+# Substrate docs.rs content: rustdoc's missing_docs + broken-intra-doc-link lints over the
+# 10 host-side substrate crates with all features, plus a zero-doctest check. Their prose
+# lives in crates/<c>/docs/<key>.md sidecars, one per public item (#490); a new public item
+# needs its sidecar or this fails. tests/substrate_docs_test.rs reconciles the other direction.
+make docs-check
+
+# No prose in ForgeDB's own source: comments and `#[doc = "…"]` literals are refused;
+# `#[doc = include_str!(…)]` sidecars pass. Runs the lexer's self-test first.
+make comment-check
+
 # TIER 2 — the ~20 tests that each generate and compile a crate. #[ignore]d out of
 # tier 1; CI runs it only on manual dispatch while #449 is open. Minutes, not seconds. Run it when you touch codegen, the
 # build cache, or the generated API.

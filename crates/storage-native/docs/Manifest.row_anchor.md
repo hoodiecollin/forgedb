@@ -1,0 +1,3 @@
+Which file's length authoritatively counts committed rows, and how many bytes it spends per row.
+
+A schema-blind reader derives the committed row count as `len(anchor file) / bytes_per_row`, a live watermark independent of the possibly stale [`Manifest::row_count`]. This works because generated code appends the anchor file last for each row, so every row below the watermark has all of its columns fully written. For a model the anchor is `tombstones.bin` (1 byte per row); for a many-to-many junction it is `fixed/right.bin` (16 bytes per row). `None` on manifests written before the field existed; readers then assume `tombstones.bin` at 1 byte per row.

@@ -4,11 +4,13 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[doc = include_str!("../docs/stats.StatsCollector.md")]
 pub struct StatsCollector {
     data_dir: PathBuf,
 }
 
 impl StatsCollector {
+    #[doc = include_str!("../docs/stats.StatsCollector.new.md")]
     pub fn new<P: AsRef<Path>>(data_dir: P) -> Self {
         Self {
             data_dir: data_dir.as_ref().to_path_buf(),
@@ -28,6 +30,7 @@ impl StatsCollector {
             .map_err(|e| format!("Failed to stat {:?}: {}", tombstone_path, e))
     }
 
+    #[doc = include_str!("../docs/stats.StatsCollector.collect_model_stats.md")]
     pub fn collect_model_stats(&self, model_name: &str) -> Result<ModelStats, String> {
         let model_dir = self.data_dir.join(model_name);
 
@@ -100,6 +103,7 @@ impl StatsCollector {
         Ok(stats)
     }
 
+    #[doc = include_str!("../docs/stats.StatsCollector.collect_database_stats.md")]
     pub fn collect_database_stats(&self) -> Result<DatabaseStats, String> {
         let mut db_stats = DatabaseStats {
             models: Vec::new(),

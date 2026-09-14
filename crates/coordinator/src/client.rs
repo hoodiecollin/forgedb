@@ -7,15 +7,25 @@ use std::time::Duration;
 
 use crate::{ClientMsg, ServerMsg, decode_msg, encode_msg};
 
+#[doc = include_str!("../docs/client.DEFAULT_IO_TIMEOUT.md")]
 pub const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(35);
 
+#[doc = include_str!("../docs/client.POISONED_MSG.md")]
 pub const POISONED_MSG: &str = "coordinator connection unusable after a failed request — reopen required";
 
+#[doc = include_str!("../docs/client.ClientError.md")]
 #[derive(Debug)]
 pub enum ClientError {
+    #[doc = include_str!("../docs/client.ClientError.Io.md")]
     Io(io::Error),
-    Conflict { conflict_key: Vec<u8> },
+    #[doc = include_str!("../docs/client.ClientError.Conflict.md")]
+    Conflict {
+        #[doc = include_str!("../docs/client.ClientError.Conflict.conflict_key.md")]
+        conflict_key: Vec<u8>,
+    },
+    #[doc = include_str!("../docs/client.ClientError.Busy.md")]
     Busy,
+    #[doc = include_str!("../docs/client.ClientError.Protocol.md")]
     Protocol(String),
 }
 
@@ -36,6 +46,7 @@ impl From<io::Error> for ClientError {
     }
 }
 
+#[doc = include_str!("../docs/client.CoordinatorClient.md")]
 pub struct CoordinatorClient {
     stream: Mutex<UnixStream>,
     last_known_lsn: Mutex<u64>,
@@ -45,10 +56,12 @@ pub struct CoordinatorClient {
 }
 
 impl CoordinatorClient {
+    #[doc = include_str!("../docs/client.CoordinatorClient.connect.md")]
     pub fn connect(socket_path: &Path) -> io::Result<Self> {
         Self::connect_with_io_timeout(socket_path, DEFAULT_IO_TIMEOUT)
     }
 
+    #[doc = include_str!("../docs/client.CoordinatorClient.connect_with_io_timeout.md")]
     pub fn connect_with_io_timeout(socket_path: &Path, io_timeout: Duration) -> io::Result<Self> {
         let stream = Self::dial(socket_path, io_timeout)?;
         Ok(CoordinatorClient {
@@ -67,10 +80,12 @@ impl CoordinatorClient {
         Ok(stream)
     }
 
+    #[doc = include_str!("../docs/client.CoordinatorClient.is_poisoned.md")]
     pub fn is_poisoned(&self) -> bool {
         self.poisoned.load(Ordering::Acquire)
     }
 
+    #[doc = include_str!("../docs/client.CoordinatorClient.reconnect.md")]
     pub fn reconnect(&self) -> io::Result<()> {
         let mut stream = self.stream.lock().unwrap();
         let fresh = Self::dial(&self.socket_path, self.io_timeout)?;
@@ -82,10 +97,12 @@ impl CoordinatorClient {
         Ok(())
     }
 
+    #[doc = include_str!("../docs/client.CoordinatorClient.last_known_lsn.md")]
     pub fn last_known_lsn(&self) -> u64 {
         *self.last_known_lsn.lock().unwrap()
     }
 
+    #[doc = include_str!("../docs/client.CoordinatorClient.request_turn.md")]
     pub fn request_turn(
         &self,
         write_set_keys: Vec<Vec<u8>>,
@@ -106,6 +123,7 @@ impl CoordinatorClient {
         }
     }
 
+    #[doc = include_str!("../docs/client.CoordinatorClient.committed.md")]
     pub fn committed(
         &self,
         turn_id: u64,

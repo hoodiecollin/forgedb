@@ -42,6 +42,12 @@ normalized. Treat the crate manifests and crates.io as the authoritative version
 | `forgedb-txn` | MVCC Tier-2 commit sequencer: monotonic LSN + first-committer-wins conflict detection over an in-memory map (rebuilt empty on open; never persisted). |
 | `forgedb-coordinator` | MVCC Tier-3 multi-process write control plane. A `forgedb coordinate <root>` process holds the directory lock and serializes the commit turn. **No `forgedb-storage*` dep** — it never writes columns. |
 
+Every public item of the host-side crates is documented on docs.rs (`https://docs.rs/<crate>`).
+ForgeDB's own source carries no comments, so that prose lives in per-item sidecar files the
+build includes at docs.rs time; a public item without one fails CI. The `forgedb-storage` page
+documents only the facade and links `forgedb-storage-native` for the items. The sidecars carry
+no runnable examples.
+
 ## Dependency shape
 
 The storage facade never links both backends at once. `cfg(not(target_arch = "wasm32"))`

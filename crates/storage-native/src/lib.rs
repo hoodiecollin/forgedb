@@ -1,3 +1,4 @@
+#![doc = include_str!("../docs/crate.md")]
 pub use forgedb_wal::{FsyncPolicy, WalEntry, WalManager, WalOperation};
 
 mod dir_lock;
@@ -44,39 +45,54 @@ fn default_engine_version() -> u32 {
     1
 }
 
+#[doc = include_str!("../docs/Manifest.md")]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Manifest {
+    #[doc = include_str!("../docs/Manifest.schema_version.md")]
     #[serde(rename = "format_version", default = "default_schema_version")]
     pub schema_version: u32,
+    #[doc = include_str!("../docs/Manifest.engine_version.md")]
     #[serde(default = "default_engine_version")]
     pub engine_version: u32,
+    #[doc = include_str!("../docs/Manifest.row_count.md")]
     pub row_count: usize,
+    #[doc = include_str!("../docs/Manifest.columns.md")]
     pub columns: Vec<ColumnMetadata>,
+    #[doc = include_str!("../docs/Manifest.wal_enabled.md")]
     #[serde(default)]
     pub wal_enabled: bool,
+    #[doc = include_str!("../docs/Manifest.last_checkpoint.md")]
     #[serde(default)]
     pub last_checkpoint: u64,
+    #[doc = include_str!("../docs/Manifest.compaction_epoch.md")]
     #[serde(default)]
     pub compaction_epoch: u64,
+    #[doc = include_str!("../docs/Manifest.row_anchor.md")]
     #[serde(default)]
     pub row_anchor: Option<RowAnchor>,
+    #[doc = include_str!("../docs/Manifest.auto_sequences.md")]
     #[serde(default)]
     pub auto_sequences: std::collections::BTreeMap<String, u64>,
 }
 
+#[doc = include_str!("../docs/RowAnchor.md")]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RowAnchor {
+    #[doc = include_str!("../docs/RowAnchor.relative_path.md")]
     pub relative_path: String,
+    #[doc = include_str!("../docs/RowAnchor.bytes_per_row.md")]
     pub bytes_per_row: usize,
 }
 
 impl Manifest {
+    #[doc = include_str!("../docs/Manifest.load_from.md")]
     pub fn load_from(path: &std::path::Path) -> io::Result<Manifest> {
         let content = fs::read_to_string(path)?;
         serde_json::from_str(&content)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
+    #[doc = include_str!("../docs/Manifest.save_to.md")]
     pub fn save_to(&self, path: &std::path::Path) -> io::Result<()> {
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -102,68 +118,97 @@ impl Manifest {
     }
 }
 
+#[doc = include_str!("../docs/ColumnKind.md")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ColumnKind {
+    #[doc = include_str!("../docs/ColumnKind.Fixed.md")]
     #[default]
     Fixed,
+    #[doc = include_str!("../docs/ColumnKind.Variable.md")]
     Variable,
 }
 
+#[doc = include_str!("../docs/ColumnMetadata.md")]
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ColumnMetadata {
+    #[doc = include_str!("../docs/ColumnMetadata.name.md")]
     pub name: String,
+    #[doc = include_str!("../docs/ColumnMetadata.column_type.md")]
     pub column_type: ColumnType,
+    #[doc = include_str!("../docs/ColumnMetadata.column_index.md")]
     pub column_index: usize,
+    #[doc = include_str!("../docs/ColumnMetadata.value_size.md")]
     #[serde(default)]
     pub value_size: usize,
+    #[doc = include_str!("../docs/ColumnMetadata.kind.md")]
     #[serde(default)]
     pub kind: ColumnKind,
+    #[doc = include_str!("../docs/ColumnMetadata.relative_path.md")]
     #[serde(default)]
     pub relative_path: String,
 }
 
+#[doc = include_str!("../docs/ColumnType.md")]
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ColumnType {
+    #[doc = include_str!("../docs/ColumnType.U32.md")]
     #[default]
     U32,
+    #[doc = include_str!("../docs/ColumnType.U64.md")]
     U64,
+    #[doc = include_str!("../docs/ColumnType.I32.md")]
     I32,
+    #[doc = include_str!("../docs/ColumnType.I64.md")]
     I64,
+    #[doc = include_str!("../docs/ColumnType.F64.md")]
     F64,
+    #[doc = include_str!("../docs/ColumnType.Bool.md")]
     Bool,
+    #[doc = include_str!("../docs/ColumnType.Uuid.md")]
     Uuid,
+    #[doc = include_str!("../docs/ColumnType.Timestamp.md")]
     Timestamp,
+    #[doc = include_str!("../docs/ColumnType.String.md")]
     String,
+    #[doc = include_str!("../docs/ColumnType.FixedBytes.md")]
     FixedBytes(usize),
 }
 
+#[doc = include_str!("../docs/Snapshot.md")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Snapshot {
     watermark: usize,
 }
 
 impl Snapshot {
+    #[doc = include_str!("../docs/Snapshot.new.md")]
     pub fn new(row_count: usize) -> Self {
         Self {
             watermark: row_count,
         }
     }
 
+    #[doc = include_str!("../docs/Snapshot.watermark.md")]
     pub fn watermark(&self) -> usize {
         self.watermark
     }
 
+    #[doc = include_str!("../docs/Snapshot.visible.md")]
     pub fn visible(&self, index: usize) -> bool {
         index < self.watermark
     }
 }
 
+#[doc = include_str!("../docs/ColumnExport.md")]
 pub enum ColumnExport {
+    #[doc = include_str!("../docs/ColumnExport.Owned.md")]
     Owned(Vec<u8>),
+    #[doc = include_str!("../docs/ColumnExport.Mapped.md")]
     Mapped(memmap2::Mmap),
 }
 
 impl ColumnExport {
+    #[doc = include_str!("../docs/ColumnExport.as_ptr.md")]
     #[must_use]
     pub fn as_ptr(&self) -> *const u8 {
         match self {
@@ -172,6 +217,7 @@ impl ColumnExport {
         }
     }
 
+    #[doc = include_str!("../docs/ColumnExport.len.md")]
     #[must_use]
     pub fn len(&self) -> usize {
         match self {
@@ -180,11 +226,13 @@ impl ColumnExport {
         }
     }
 
+    #[doc = include_str!("../docs/ColumnExport.is_empty.md")]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    #[doc = include_str!("../docs/ColumnExport.as_slice.md")]
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
         match self {
@@ -194,17 +242,20 @@ impl ColumnExport {
     }
 }
 
+#[doc = include_str!("../docs/BufferedFixedColumn.md")]
 pub struct BufferedFixedColumn {
     buf: ColumnExport,
     value_size: usize,
 }
 
 impl BufferedFixedColumn {
+    #[doc = include_str!("../docs/BufferedFixedColumn.len.md")]
     #[must_use]
     pub fn len(&self) -> usize {
         self.buf.len() / self.value_size
     }
 
+    #[doc = include_str!("../docs/BufferedFixedColumn.is_empty.md")]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -218,54 +269,65 @@ impl BufferedFixedColumn {
         })
     }
 
+    #[doc = include_str!("../docs/BufferedFixedColumn.read_u32.md")]
     pub fn read_u32(&self, slot: usize) -> io::Result<u32> {
         let b = self.slot_bytes(slot)?;
         Ok(u32::from_le_bytes(b[..4].try_into().unwrap()))
     }
 
+    #[doc = include_str!("../docs/BufferedFixedColumn.read_u64.md")]
     pub fn read_u64(&self, slot: usize) -> io::Result<u64> {
         let b = self.slot_bytes(slot)?;
         Ok(u64::from_le_bytes(b[..8].try_into().unwrap()))
     }
 
+    #[doc = include_str!("../docs/BufferedFixedColumn.read_i32.md")]
     pub fn read_i32(&self, slot: usize) -> io::Result<i32> {
         let b = self.slot_bytes(slot)?;
         Ok(i32::from_le_bytes(b[..4].try_into().unwrap()))
     }
 
+    #[doc = include_str!("../docs/BufferedFixedColumn.read_i64.md")]
     pub fn read_i64(&self, slot: usize) -> io::Result<i64> {
         let b = self.slot_bytes(slot)?;
         Ok(i64::from_le_bytes(b[..8].try_into().unwrap()))
     }
 
+    #[doc = include_str!("../docs/BufferedFixedColumn.read_f64.md")]
     pub fn read_f64(&self, slot: usize) -> io::Result<f64> {
         let b = self.slot_bytes(slot)?;
         Ok(f64::from_le_bytes(b[..8].try_into().unwrap()))
     }
 
+    #[doc = include_str!("../docs/BufferedFixedColumn.read_bool.md")]
     pub fn read_bool(&self, slot: usize) -> io::Result<bool> {
         let b = self.slot_bytes(slot)?;
         Ok(b[0] != 0)
     }
 
+    #[doc = include_str!("../docs/BufferedFixedColumn.read_uuid.md")]
     pub fn read_uuid(&self, slot: usize) -> io::Result<[u8; 16]> {
         let b = self.slot_bytes(slot)?;
         Ok(b[..16].try_into().unwrap())
     }
 
+    #[doc = include_str!("../docs/BufferedFixedColumn.read_timestamp.md")]
     pub fn read_timestamp(&self, slot: usize) -> io::Result<i64> {
         let b = self.slot_bytes(slot)?;
         Ok(i64::from_le_bytes(b[..8].try_into().unwrap()))
     }
 
+    #[doc = include_str!("../docs/BufferedFixedColumn.read_bytes.md")]
     pub fn read_bytes(&self, slot: usize) -> io::Result<Vec<u8>> {
         Ok(self.slot_bytes(slot)?.to_vec())
     }
 
+    #[doc = include_str!("../docs/BufferedFixedColumn.read_slice.md")]
     pub fn read_slice(&self, slot: usize) -> io::Result<&[u8]> {
         self.slot_bytes(slot)
     }
 
+    #[doc = include_str!("../docs/BufferedFixedColumn.read_str.md")]
     pub fn read_str(&self, slot: usize) -> io::Result<&str> {
         std::str::from_utf8(self.slot_bytes(slot)?)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
@@ -274,6 +336,7 @@ impl BufferedFixedColumn {
 
 const GATHER_MMAP_MIN_ROWS: usize = 8;
 
+#[doc = include_str!("../docs/FixedColumn.md")]
 pub struct FixedColumn {
     file: File,
     row_count: usize,
@@ -281,6 +344,7 @@ pub struct FixedColumn {
 }
 
 impl FixedColumn {
+    #[doc = include_str!("../docs/FixedColumn.new.md")]
     pub fn new(path: PathBuf, value_size: usize) -> io::Result<Self> {
         if value_size == 0 {
             return Err(io::Error::new(
@@ -309,6 +373,7 @@ impl FixedColumn {
         })
     }
 
+    #[doc = include_str!("../docs/FixedColumn.append_u32.md")]
     pub fn append_u32(&mut self, value: u32) -> io::Result<()> {
         self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(&value.to_le_bytes())?;
@@ -316,6 +381,7 @@ impl FixedColumn {
         Ok(())
     }
 
+    #[doc = include_str!("../docs/FixedColumn.read_u32.md")]
     pub fn read_u32(&self, index: usize) -> io::Result<u32> {
         if index >= self.row_count {
             return Err(io::Error::new(
@@ -330,6 +396,7 @@ impl FixedColumn {
         Ok(u32::from_le_bytes(buf))
     }
 
+    #[doc = include_str!("../docs/FixedColumn.append_u64.md")]
     pub fn append_u64(&mut self, value: u64) -> io::Result<()> {
         self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(&value.to_le_bytes())?;
@@ -337,6 +404,7 @@ impl FixedColumn {
         Ok(())
     }
 
+    #[doc = include_str!("../docs/FixedColumn.read_u64.md")]
     pub fn read_u64(&self, index: usize) -> io::Result<u64> {
         if index >= self.row_count {
             return Err(io::Error::new(
@@ -351,6 +419,7 @@ impl FixedColumn {
         Ok(u64::from_le_bytes(buf))
     }
 
+    #[doc = include_str!("../docs/FixedColumn.append_i32.md")]
     pub fn append_i32(&mut self, value: i32) -> io::Result<()> {
         self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(&value.to_le_bytes())?;
@@ -358,6 +427,7 @@ impl FixedColumn {
         Ok(())
     }
 
+    #[doc = include_str!("../docs/FixedColumn.read_i32.md")]
     pub fn read_i32(&self, index: usize) -> io::Result<i32> {
         if index >= self.row_count {
             return Err(io::Error::new(
@@ -372,6 +442,7 @@ impl FixedColumn {
         Ok(i32::from_le_bytes(buf))
     }
 
+    #[doc = include_str!("../docs/FixedColumn.append_i64.md")]
     pub fn append_i64(&mut self, value: i64) -> io::Result<()> {
         self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(&value.to_le_bytes())?;
@@ -379,6 +450,7 @@ impl FixedColumn {
         Ok(())
     }
 
+    #[doc = include_str!("../docs/FixedColumn.read_i64.md")]
     pub fn read_i64(&self, index: usize) -> io::Result<i64> {
         if index >= self.row_count {
             return Err(io::Error::new(
@@ -393,6 +465,7 @@ impl FixedColumn {
         Ok(i64::from_le_bytes(buf))
     }
 
+    #[doc = include_str!("../docs/FixedColumn.append_f64.md")]
     pub fn append_f64(&mut self, value: f64) -> io::Result<()> {
         self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(&value.to_le_bytes())?;
@@ -400,6 +473,7 @@ impl FixedColumn {
         Ok(())
     }
 
+    #[doc = include_str!("../docs/FixedColumn.read_f64.md")]
     pub fn read_f64(&self, index: usize) -> io::Result<f64> {
         if index >= self.row_count {
             return Err(io::Error::new(
@@ -414,6 +488,7 @@ impl FixedColumn {
         Ok(f64::from_le_bytes(buf))
     }
 
+    #[doc = include_str!("../docs/FixedColumn.append_bool.md")]
     pub fn append_bool(&mut self, value: bool) -> io::Result<()> {
         self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(&[if value { 1u8 } else { 0u8 }])?;
@@ -421,6 +496,7 @@ impl FixedColumn {
         Ok(())
     }
 
+    #[doc = include_str!("../docs/FixedColumn.read_bool.md")]
     pub fn read_bool(&self, index: usize) -> io::Result<bool> {
         if index >= self.row_count {
             return Err(io::Error::new(
@@ -435,6 +511,7 @@ impl FixedColumn {
         Ok(buf[0] != 0)
     }
 
+    #[doc = include_str!("../docs/FixedColumn.append_uuid.md")]
     pub fn append_uuid(&mut self, value: [u8; 16]) -> io::Result<()> {
         self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(&value)?;
@@ -442,6 +519,7 @@ impl FixedColumn {
         Ok(())
     }
 
+    #[doc = include_str!("../docs/FixedColumn.read_uuid.md")]
     pub fn read_uuid(&self, index: usize) -> io::Result<[u8; 16]> {
         if index >= self.row_count {
             return Err(io::Error::new(
@@ -456,6 +534,7 @@ impl FixedColumn {
         Ok(buf)
     }
 
+    #[doc = include_str!("../docs/FixedColumn.append_timestamp.md")]
     pub fn append_timestamp(&mut self, value: i64) -> io::Result<()> {
         self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(&value.to_le_bytes())?;
@@ -463,6 +542,7 @@ impl FixedColumn {
         Ok(())
     }
 
+    #[doc = include_str!("../docs/FixedColumn.read_timestamp.md")]
     pub fn read_timestamp(&self, index: usize) -> io::Result<i64> {
         if index >= self.row_count {
             return Err(io::Error::new(
@@ -477,6 +557,7 @@ impl FixedColumn {
         Ok(i64::from_le_bytes(buf))
     }
 
+    #[doc = include_str!("../docs/FixedColumn.append_bytes.md")]
     pub fn append_bytes(&mut self, value: &[u8]) -> io::Result<()> {
         if value.len() != self.value_size {
             return Err(io::Error::new(
@@ -491,6 +572,7 @@ impl FixedColumn {
         Ok(())
     }
 
+    #[doc = include_str!("../docs/FixedColumn.read_bytes.md")]
     pub fn read_bytes(&self, index: usize) -> io::Result<Vec<u8>> {
         if index >= self.row_count {
             return Err(io::Error::new(
@@ -505,6 +587,7 @@ impl FixedColumn {
         Ok(buf)
     }
 
+    #[doc = include_str!("../docs/FixedColumn.gather.md")]
     pub fn gather(&self, indices: &[usize]) -> io::Result<Vec<u8>> {
         if indices.is_empty() {
             return Ok(Vec::new());
@@ -561,6 +644,7 @@ impl FixedColumn {
         Ok(out)
     }
 
+    #[doc = include_str!("../docs/FixedColumn.export.md")]
     pub fn export(&self, indices: &[usize]) -> io::Result<ColumnExport> {
         let n = indices.len();
         let is_dense_prefix =
@@ -575,6 +659,7 @@ impl FixedColumn {
         Ok(ColumnExport::Owned(self.gather(indices)?))
     }
 
+    #[doc = include_str!("../docs/FixedColumn.gather_buffered.md")]
     pub fn gather_buffered(&self, indices: &[usize]) -> io::Result<BufferedFixedColumn> {
         Ok(BufferedFixedColumn {
             buf: self.export(indices)?,
@@ -582,33 +667,40 @@ impl FixedColumn {
         })
     }
 
+    #[doc = include_str!("../docs/FixedColumn.flush.md")]
     pub fn flush(&mut self) -> io::Result<()> {
         self.file.sync_all()
     }
 
+    #[doc = include_str!("../docs/FixedColumn.sync_to_drive.md")]
     pub fn sync_to_drive(&self) -> io::Result<()> {
         fsync_to_drive(&self.file)
     }
 
+    #[doc = include_str!("../docs/FixedColumn.barrier.md")]
     pub fn barrier(&self) -> io::Result<()> {
         device_barrier(&self.file)
     }
 
+    #[doc = include_str!("../docs/FixedColumn.len.md")]
     #[must_use]
     pub fn len(&self) -> usize {
         self.row_count
     }
 
+    #[doc = include_str!("../docs/FixedColumn.is_empty.md")]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.row_count == 0
     }
 
+    #[doc = include_str!("../docs/FixedColumn.sync_from_disk.md")]
     pub fn sync_from_disk(&mut self) -> io::Result<()> {
         self.row_count = self.file.metadata()?.len() as usize / self.value_size;
         Ok(())
     }
 
+    #[doc = include_str!("../docs/FixedColumn.truncate_to_rows.md")]
     pub fn truncate_to_rows(&mut self, rows: usize) -> io::Result<()> {
         if rows > self.row_count {
             return Err(io::Error::new(
@@ -621,6 +713,7 @@ impl FixedColumn {
         Ok(())
     }
 
+    #[doc = include_str!("../docs/FixedColumn.reader.md")]
     pub fn reader(&self) -> io::Result<FixedColumnReader> {
         Ok(FixedColumnReader {
             file: self.file.try_clone()?,
@@ -629,6 +722,7 @@ impl FixedColumn {
     }
 }
 
+#[doc = include_str!("../docs/BufferedVariableColumn.md")]
 pub struct BufferedVariableColumn {
     data: ColumnExport,
     base: u64,
@@ -636,16 +730,19 @@ pub struct BufferedVariableColumn {
 }
 
 impl BufferedVariableColumn {
+    #[doc = include_str!("../docs/BufferedVariableColumn.len.md")]
     #[must_use]
     pub fn len(&self) -> usize {
         self.slots.len()
     }
 
+    #[doc = include_str!("../docs/BufferedVariableColumn.is_empty.md")]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }
 
+    #[doc = include_str!("../docs/BufferedVariableColumn.read_str.md")]
     pub fn read_str(&self, slot: usize) -> io::Result<&str> {
         let &(offset, length) = self.slots.get(slot).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "Slot out of bounds")
@@ -658,6 +755,7 @@ impl BufferedVariableColumn {
         std::str::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
+    #[doc = include_str!("../docs/BufferedVariableColumn.read_string.md")]
     pub fn read_string(&self, slot: usize) -> io::Result<String> {
         self.read_str(slot).map(str::to_owned)
     }
@@ -667,6 +765,7 @@ const VAR_MMAP_MIN_BYTES: usize = 64 * 1024;
 
 const SPARSE_OFFSETS_SPAN_FACTOR: usize = 128;
 
+#[doc = include_str!("../docs/VariableColumn.md")]
 pub struct VariableColumn {
     data_file: File,
     offsets_file: File,
@@ -675,6 +774,7 @@ pub struct VariableColumn {
 }
 
 impl VariableColumn {
+    #[doc = include_str!("../docs/VariableColumn.new.md")]
     pub fn new(data_path: PathBuf, offsets_path: PathBuf) -> io::Result<Self> {
         if let Some(parent) = data_path.parent() {
             fs::create_dir_all(parent)?;
@@ -705,6 +805,7 @@ impl VariableColumn {
         })
     }
 
+    #[doc = include_str!("../docs/VariableColumn.append_string.md")]
     pub fn append_string(&mut self, value: &str) -> io::Result<()> {
         let bytes = value.as_bytes();
         let length = bytes.len() as u64;
@@ -723,6 +824,7 @@ impl VariableColumn {
         Ok(())
     }
 
+    #[doc = include_str!("../docs/VariableColumn.append_tagged.md")]
     pub fn append_tagged(&mut self, tag: u8, value: &str) -> io::Result<()> {
         let bytes = value.as_bytes();
         let length = bytes.len() as u64 + 1;
@@ -754,6 +856,7 @@ impl VariableColumn {
         Ok(())
     }
 
+    #[doc = include_str!("../docs/VariableColumn.read_string.md")]
     pub fn read_string(&self, index: usize) -> io::Result<String> {
         if index >= self.row_count {
             return Err(io::Error::new(
@@ -778,6 +881,7 @@ impl VariableColumn {
         String::from_utf8(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
+    #[doc = include_str!("../docs/VariableColumn.gather_buffered.md")]
     pub fn gather_buffered(&self, indices: &[usize]) -> io::Result<BufferedVariableColumn> {
         if indices.is_empty() {
             return Ok(BufferedVariableColumn {
@@ -876,36 +980,43 @@ impl VariableColumn {
         })
     }
 
+    #[doc = include_str!("../docs/VariableColumn.flush.md")]
     pub fn flush(&mut self) -> io::Result<()> {
         self.data_file.sync_all()?;
         self.offsets_file.sync_all()
     }
 
+    #[doc = include_str!("../docs/VariableColumn.sync_to_drive.md")]
     pub fn sync_to_drive(&self) -> io::Result<()> {
         fsync_to_drive(&self.data_file)?;
         fsync_to_drive(&self.offsets_file)
     }
 
+    #[doc = include_str!("../docs/VariableColumn.barrier.md")]
     pub fn barrier(&self) -> io::Result<()> {
         device_barrier(&self.data_file)
     }
 
+    #[doc = include_str!("../docs/VariableColumn.len.md")]
     #[must_use]
     pub fn len(&self) -> usize {
         self.row_count
     }
 
+    #[doc = include_str!("../docs/VariableColumn.is_empty.md")]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.row_count == 0
     }
 
+    #[doc = include_str!("../docs/VariableColumn.sync_from_disk.md")]
     pub fn sync_from_disk(&mut self) -> io::Result<()> {
         self.row_count = self.offsets_file.metadata()?.len() as usize / 16;
         self.current_data_offset = self.data_file.metadata()?.len();
         Ok(())
     }
 
+    #[doc = include_str!("../docs/VariableColumn.truncate_to_rows.md")]
     pub fn truncate_to_rows(&mut self, rows: usize) -> io::Result<()> {
         if rows > self.row_count {
             return Err(io::Error::new(
@@ -936,6 +1047,7 @@ impl VariableColumn {
         Ok(())
     }
 
+    #[doc = include_str!("../docs/VariableColumn.reader.md")]
     pub fn reader(&self) -> io::Result<VariableColumnReader> {
         Ok(VariableColumnReader {
             data_file: self.data_file.try_clone()?,
@@ -944,12 +1056,14 @@ impl VariableColumn {
     }
 }
 
+#[doc = include_str!("../docs/Tombstones.md")]
 pub struct Tombstones {
     file: File,
     count: usize,
 }
 
 impl Tombstones {
+    #[doc = include_str!("../docs/Tombstones.new.md")]
     pub fn new(path: PathBuf) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -967,6 +1081,7 @@ impl Tombstones {
         Ok(Tombstones { file, count })
     }
 
+    #[doc = include_str!("../docs/Tombstones.append.md")]
     pub fn append(&mut self, deleted: bool) -> io::Result<()> {
         self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(&[if deleted { 1u8 } else { 0u8 }])?;
@@ -974,6 +1089,7 @@ impl Tombstones {
         Ok(())
     }
 
+    #[doc = include_str!("../docs/Tombstones.is_deleted.md")]
     pub fn is_deleted(&self, index: usize) -> io::Result<bool> {
         if index >= self.count {
             return Err(io::Error::new(
@@ -987,6 +1103,7 @@ impl Tombstones {
         Ok(buf[0] != 0)
     }
 
+    #[doc = include_str!("../docs/Tombstones.live_indices.md")]
     pub fn live_indices(&self, rows: &[usize]) -> io::Result<Vec<usize>> {
         let mut bytes = vec![0u8; self.count];
         if !bytes.is_empty() {
@@ -999,28 +1116,34 @@ impl Tombstones {
             .collect())
     }
 
+    #[doc = include_str!("../docs/Tombstones.flush.md")]
     pub fn flush(&mut self) -> io::Result<()> {
         self.file.sync_all()
     }
 
+    #[doc = include_str!("../docs/Tombstones.sync_to_drive.md")]
     pub fn sync_to_drive(&self) -> io::Result<()> {
         fsync_to_drive(&self.file)
     }
 
+    #[doc = include_str!("../docs/Tombstones.barrier.md")]
     pub fn barrier(&self) -> io::Result<()> {
         device_barrier(&self.file)
     }
 
+    #[doc = include_str!("../docs/Tombstones.len.md")]
     #[must_use]
     pub fn len(&self) -> usize {
         self.count
     }
 
+    #[doc = include_str!("../docs/Tombstones.is_empty.md")]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
 
+    #[doc = include_str!("../docs/Tombstones.truncate_to_rows.md")]
     pub fn truncate_to_rows(&mut self, rows: usize) -> io::Result<()> {
         if rows > self.count {
             return Err(io::Error::new(
@@ -1033,11 +1156,13 @@ impl Tombstones {
         Ok(())
     }
 
+    #[doc = include_str!("../docs/Tombstones.sync_from_disk.md")]
     pub fn sync_from_disk(&mut self) -> io::Result<()> {
         self.count = self.file.metadata()?.len() as usize;
         Ok(())
     }
 
+    #[doc = include_str!("../docs/Tombstones.reader.md")]
     pub fn reader(&self) -> io::Result<TombstonesReader> {
         Ok(TombstonesReader {
             file: self.file.try_clone()?,
@@ -1053,12 +1178,14 @@ fn map_out_of_bounds(e: io::Error) -> io::Error {
     }
 }
 
+#[doc = include_str!("../docs/FixedColumnReader.md")]
 pub struct FixedColumnReader {
     file: File,
     value_size: usize,
 }
 
 impl FixedColumnReader {
+    #[doc = include_str!("../docs/FixedColumnReader.len.md")]
     #[must_use]
     pub fn len(&self) -> usize {
         self.file
@@ -1067,11 +1194,13 @@ impl FixedColumnReader {
             .unwrap_or(0)
     }
 
+    #[doc = include_str!("../docs/FixedColumnReader.is_empty.md")]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    #[doc = include_str!("../docs/FixedColumnReader.read_u32.md")]
     pub fn read_u32(&self, index: usize) -> io::Result<u32> {
         let mut buf = [0u8; 4];
         self.file
@@ -1080,6 +1209,7 @@ impl FixedColumnReader {
         Ok(u32::from_le_bytes(buf))
     }
 
+    #[doc = include_str!("../docs/FixedColumnReader.read_u64.md")]
     pub fn read_u64(&self, index: usize) -> io::Result<u64> {
         let mut buf = [0u8; 8];
         self.file
@@ -1088,6 +1218,7 @@ impl FixedColumnReader {
         Ok(u64::from_le_bytes(buf))
     }
 
+    #[doc = include_str!("../docs/FixedColumnReader.read_i32.md")]
     pub fn read_i32(&self, index: usize) -> io::Result<i32> {
         let mut buf = [0u8; 4];
         self.file
@@ -1096,6 +1227,7 @@ impl FixedColumnReader {
         Ok(i32::from_le_bytes(buf))
     }
 
+    #[doc = include_str!("../docs/FixedColumnReader.read_i64.md")]
     pub fn read_i64(&self, index: usize) -> io::Result<i64> {
         let mut buf = [0u8; 8];
         self.file
@@ -1104,6 +1236,7 @@ impl FixedColumnReader {
         Ok(i64::from_le_bytes(buf))
     }
 
+    #[doc = include_str!("../docs/FixedColumnReader.read_f64.md")]
     pub fn read_f64(&self, index: usize) -> io::Result<f64> {
         let mut buf = [0u8; 8];
         self.file
@@ -1112,6 +1245,7 @@ impl FixedColumnReader {
         Ok(f64::from_le_bytes(buf))
     }
 
+    #[doc = include_str!("../docs/FixedColumnReader.read_bool.md")]
     pub fn read_bool(&self, index: usize) -> io::Result<bool> {
         let mut buf = [0u8; 1];
         self.file
@@ -1120,6 +1254,7 @@ impl FixedColumnReader {
         Ok(buf[0] != 0)
     }
 
+    #[doc = include_str!("../docs/FixedColumnReader.read_uuid.md")]
     pub fn read_uuid(&self, index: usize) -> io::Result<[u8; 16]> {
         let mut buf = [0u8; 16];
         self.file
@@ -1128,6 +1263,7 @@ impl FixedColumnReader {
         Ok(buf)
     }
 
+    #[doc = include_str!("../docs/FixedColumnReader.read_timestamp.md")]
     pub fn read_timestamp(&self, index: usize) -> io::Result<i64> {
         let mut buf = [0u8; 8];
         self.file
@@ -1136,6 +1272,7 @@ impl FixedColumnReader {
         Ok(i64::from_le_bytes(buf))
     }
 
+    #[doc = include_str!("../docs/FixedColumnReader.read_bytes.md")]
     pub fn read_bytes(&self, index: usize) -> io::Result<Vec<u8>> {
         let mut buf = vec![0u8; self.value_size];
         self.file
@@ -1145,12 +1282,14 @@ impl FixedColumnReader {
     }
 }
 
+#[doc = include_str!("../docs/VariableColumnReader.md")]
 pub struct VariableColumnReader {
     data_file: File,
     offsets_file: File,
 }
 
 impl VariableColumnReader {
+    #[doc = include_str!("../docs/VariableColumnReader.len.md")]
     #[must_use]
     pub fn len(&self) -> usize {
         self.offsets_file
@@ -1159,11 +1298,13 @@ impl VariableColumnReader {
             .unwrap_or(0)
     }
 
+    #[doc = include_str!("../docs/VariableColumnReader.is_empty.md")]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    #[doc = include_str!("../docs/VariableColumnReader.read_string.md")]
     pub fn read_string(&self, index: usize) -> io::Result<String> {
         let offsets_pos = (index * 16) as u64;
         let mut offset_buf = [0u8; 8];
@@ -1185,21 +1326,25 @@ impl VariableColumnReader {
     }
 }
 
+#[doc = include_str!("../docs/TombstonesReader.md")]
 pub struct TombstonesReader {
     file: File,
 }
 
 impl TombstonesReader {
+    #[doc = include_str!("../docs/TombstonesReader.len.md")]
     #[must_use]
     pub fn len(&self) -> usize {
         self.file.metadata().map(|m| m.len() as usize).unwrap_or(0)
     }
 
+    #[doc = include_str!("../docs/TombstonesReader.is_empty.md")]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    #[doc = include_str!("../docs/TombstonesReader.is_deleted.md")]
     pub fn is_deleted(&self, index: usize) -> io::Result<bool> {
         let mut buf = [0u8; 1];
         self.file

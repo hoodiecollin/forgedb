@@ -3,8 +3,10 @@ use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::Path;
 
+#[doc = include_str!("../docs/dir_lock.LOCK_FILENAME.md")]
 pub const LOCK_FILENAME: &str = ".forgedb.lock";
 
+#[doc = include_str!("../docs/dir_lock.DirLock.md")]
 pub struct DirLock {
     _file: std::fs::File,
 }
@@ -16,6 +18,7 @@ impl std::fmt::Debug for DirLock {
 }
 
 impl DirLock {
+    #[doc = include_str!("../docs/dir_lock.DirLock.acquire.md")]
     pub fn acquire(root: &Path) -> io::Result<DirLock> {
         fs::create_dir_all(root)?;
         let lock_path = root.join(LOCK_FILENAME);
