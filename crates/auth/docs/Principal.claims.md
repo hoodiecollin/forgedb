@@ -1,1 +1,1 @@
-The full decoded claim set, for handlers that need more.
+The full decoded claim map, for handlers that need more than the fields above.

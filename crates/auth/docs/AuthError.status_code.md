@@ -1,3 +1,2 @@
-HTTP status for this failure: `403` only for a tenant mismatch (a valid,
-authenticated caller reaching the wrong process), `401` for every
-authentication failure.
+The HTTP status this failure maps to: `403` for
+[`AuthError::TenantMismatch`], `401` for every other variant.

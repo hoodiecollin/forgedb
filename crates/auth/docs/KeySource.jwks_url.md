@@ -1,5 +1,11 @@
-Fetch a JWKS document over HTTP and keep it fresh (#81). Fetches once
-**synchronously** (so a bad URL / unreachable IdP fails loud at startup,
-never a silently-unauthenticated server), then spawns a background thread
-that re-fetches every `refresh_interval` — picking up a rotated-in signing
-key within one interval. On a refresh error the previous key set is kept.
+Fetch a JWK Set from `url` and keep it fresh, yielding a
+[`KeySource::JwksHttp`].
+
+The first fetch is synchronous, so an unreachable IdP or a non-success status
+fails here as [`AuthError::Fetch`] and an unparsable body as
+[`AuthError::Key`], rather than producing a server that verifies nothing.
+When `refresh_interval` is non-zero, a thread named `forgedb-jwks-refresh`
+then sleeps that long and re-fetches, for the life of the process, so a
+rotated-in signing key is seen within one interval. A failed refresh keeps the
+current key set and writes one line to stderr; a thread that cannot be spawned
+is ignored. A zero interval fetches once and never refreshes.

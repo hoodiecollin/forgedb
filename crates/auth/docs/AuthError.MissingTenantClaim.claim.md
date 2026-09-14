@@ -1,1 +1,1 @@
-TODO(#490)
+The claim name that was looked up: [`AuthConfig::tenant_claim`].

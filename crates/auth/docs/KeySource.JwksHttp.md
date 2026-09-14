@@ -1,4 +1,3 @@
-A JWKS document fetched over HTTP and refreshed on a schedule (#81). The
-cache holds the current key set behind a lock and a background thread
-re-fetches it, so a key rotated in at the IdP is picked up at the next
-refresh. Feature-gated to keep the default dep surface lean.
+A JWK Set fetched over HTTP and refreshed on a schedule by a
+[`JwksHttpCache`]; build it with [`KeySource::jwks_url`]. Only present with
+the `jwks-http` feature.

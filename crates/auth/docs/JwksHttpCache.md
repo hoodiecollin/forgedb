@@ -1,4 +1,7 @@
-A JWKS document fetched over HTTP, cached behind a lock, and refreshed by a
-background thread (#81). Schema-agnostic — cryptographic material only, the
-same class as [`KeySource`]. Cloneable handle (`Arc`) so the refresh thread
-and the [`Authenticator`] share one cache.
+The state behind [`KeySource::JwksHttp`]: the JWKS URL and the most recently
+fetched JWK Set behind an `RwLock`.
+
+Created only by [`KeySource::jwks_url`], which shares it between the source
+and the refresh thread through an `Arc`; it exposes no public methods. Each
+key selection reads the current set under the lock, and a refresh replaces the
+whole set at once. Only present with the `jwks-http` feature.

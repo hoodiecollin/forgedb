@@ -1,3 +1,5 @@
-Parse a JWKS document (e.g. the body of `.well-known/jwks.json`). Offline
-and pure (no HTTP) so it is fully testable; for the fetch-and-refresh
-variant see [`KeySource::jwks_url`] (#81).
+Parse a JWK Set document into a [`KeySource::Jwks`].
+
+Offline and pure: no HTTP is involved and the set is never refreshed. A
+document that does not deserialize as a JWK Set is [`AuthError::Key`]. For the
+fetch-and-refresh form see [`KeySource::jwks_url`].

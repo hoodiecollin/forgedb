@@ -1,1 +1,2 @@
-The tenant this process serves (the cross-check target).
+The tenant this process serves: the value every token's tenant claim must
+equal.

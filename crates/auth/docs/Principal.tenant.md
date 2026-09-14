@@ -1,1 +1,1 @@
-The verified tenant (== the process's tenant).
+The verified tenant, equal to the process tenant.

@@ -1,1 +1,1 @@
-TODO(#490)
+The tenant this process serves, as given to [`Authenticator::new`].
