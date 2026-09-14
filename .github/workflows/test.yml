@@ -33,6 +33,9 @@ jobs:
       - name: Clippy — deny-level lints over every target
         run: make clippy
 
+      - name: Substrate docs.rs content
+        run: make docs-check
+
       - uses: oven-sh/setup-bun@v2
 
       - name: No comments in ForgeDB's own source
