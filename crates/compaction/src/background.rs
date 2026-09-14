@@ -8,6 +8,7 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
+#[doc = include_str!("../docs/background.BackgroundCompactor.md")]
 pub struct BackgroundCompactor {
     compactor: Arc<Mutex<Compactor>>,
     config: CompactionConfig,
@@ -18,6 +19,7 @@ pub struct BackgroundCompactor {
 }
 
 impl BackgroundCompactor {
+    #[doc = include_str!("../docs/background.BackgroundCompactor.new.md")]
     pub fn new<P: AsRef<Path>>(data_dir: P, config: CompactionConfig) -> Self {
         let compactor = Compactor::new(data_dir, config.clone());
 
@@ -31,6 +33,7 @@ impl BackgroundCompactor {
         }
     }
 
+    #[doc = include_str!("../docs/background.BackgroundCompactor.start.md")]
     pub fn start(&self) {
         if self.running.load(Ordering::SeqCst) {
             return;
@@ -114,24 +117,29 @@ impl BackgroundCompactor {
         *self.handle.lock().unwrap() = Some(handle);
     }
 
+    #[doc = include_str!("../docs/background.BackgroundCompactor.stop.md")]
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
     }
 
+    #[doc = include_str!("../docs/background.BackgroundCompactor.is_running.md")]
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
     }
 
+    #[doc = include_str!("../docs/background.BackgroundCompactor.status.md")]
     pub fn status(&self) -> CompactionStatus {
         let status = self.status.lock().unwrap();
         status.clone()
     }
 
+    #[doc = include_str!("../docs/background.BackgroundCompactor.last_results.md")]
     pub fn last_results(&self) -> Vec<CompactionResult> {
         let results = self.last_results.lock().unwrap();
         results.clone()
     }
 
+    #[doc = include_str!("../docs/background.BackgroundCompactor.trigger_manual.md")]
     pub fn trigger_manual(&self) -> Result<(), String> {
         {
             let mut s = self.status.lock().unwrap();

@@ -1,0 +1,1 @@
+Enable automatic background compaction

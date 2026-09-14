@@ -1,0 +1,1 @@
+Active rows (excluding deleted)

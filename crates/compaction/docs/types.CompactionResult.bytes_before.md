@@ -1,0 +1,1 @@
+Bytes before compaction

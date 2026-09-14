@@ -6,12 +6,14 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+#[doc = include_str!("../docs/compactor.Compactor.md")]
 pub struct Compactor {
     data_dir: PathBuf,
     config: CompactionConfig,
 }
 
 impl Compactor {
+    #[doc = include_str!("../docs/compactor.Compactor.new.md")]
     pub fn new<P: AsRef<Path>>(data_dir: P, config: CompactionConfig) -> Self {
         Self {
             data_dir: data_dir.as_ref().to_path_buf(),
@@ -53,6 +55,7 @@ impl Compactor {
         Ok(())
     }
 
+    #[doc = include_str!("../docs/compactor.Compactor.compact_model.md")]
     pub fn compact_model(&self, model_name: &str) -> Result<CompactionResult, String> {
         let model_dir = self.data_dir.join(model_name);
 
@@ -67,6 +70,7 @@ impl Compactor {
         self.compact_with_drop_mask(model_name, &model_dir, drop_mask)
     }
 
+    #[doc = include_str!("../docs/compactor.Compactor.compact_model_keeping.md")]
     pub fn compact_model_keeping(
         &self,
         model_name: &str,
@@ -175,6 +179,7 @@ impl Compactor {
         })
     }
 
+    #[doc = include_str!("../docs/compactor.Compactor.compact_all.md")]
     pub fn compact_all(&self) -> Result<Vec<CompactionResult>, String> {
         let entries = fs::read_dir(&self.data_dir).map_err(|e| e.to_string())?;
         let mut results = Vec::new();
@@ -209,6 +214,7 @@ impl Compactor {
         Ok(results)
     }
 
+    #[doc = include_str!("../docs/compactor.Compactor.compact_needed.md")]
     pub fn compact_needed(&self) -> Result<Vec<CompactionResult>, String> {
         let collector = StatsCollector::new(&self.data_dir);
         let db_stats = collector.collect_database_stats()?;
@@ -237,6 +243,7 @@ impl Compactor {
         Ok(results)
     }
 
+    #[doc = include_str!("../docs/compactor.Compactor.compact_variable_column.md")]
     pub fn compact_variable_column(
         &self,
         data_path: &Path,
@@ -251,6 +258,7 @@ impl Compactor {
         Ok(())
     }
 
+    #[doc = include_str!("../docs/compactor.Compactor.compact_fixed_column.md")]
     pub fn compact_fixed_column(
         &self,
         column_path: &Path,
