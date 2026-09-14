@@ -48,11 +48,8 @@ impl Foo {
 #[test]
 fn a_wasm32_gated_item_is_not_an_attachment_point_but_the_host_branch_is() {
     let src = r#"
-/// browser
 #[cfg(target_arch = "wasm32")]
-pub struct W { /// f
-    pub f: u8 }
-/// host
+pub struct W { pub f: u8 }
 #[cfg(not(target_arch = "wasm32"))]
 pub struct H { pub f: u8 }
 "#;
@@ -62,11 +59,8 @@ pub struct H { pub f: u8 }
 #[test]
 fn nested_modules_extend_the_key_and_private_fields_are_skipped() {
     let src = r#"
-/// m
 pub mod a {
-    /// b
-    pub struct B { /// c
-        pub c: u8, hidden: u8 }
+    pub struct B { pub c: u8, hidden: u8 }
 }
 mod private { pub struct P; }
 "#;
@@ -77,9 +71,7 @@ mod private { pub struct P; }
 fn variants_and_their_named_fields_are_sites_and_positional_fields_are_not() {
     let src = r#"
 pub enum E {
-    /// v
-    V { /// f
-        f: u8 },
+    V { f: u8 },
     T(u8),
 }
 pub struct Tuple(pub u64);
@@ -106,19 +98,21 @@ fn the_crate_root_is_keyed_crate_and_a_module_file_is_keyed_by_its_prefix() {
 
 #[test]
 fn a_trait_impl_is_not_an_attachment_point_but_a_trait_definition_is() {
-    let src = r#"
-pub struct Foo;
-impl std::fmt::Display for Foo {
-    /// not a site
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { Ok(()) }
-}
-pub trait T {
-    /// m
-    fn m(&self);
-    const C: u8;
-}
-"#;
+    let src = "pub struct Foo;\n\
+        impl std::fmt::Display for Foo {\n\
+            /// not a site\n\
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { Ok(()) }\n\
+        }\n\
+        pub trait T {\n\
+            /// m\n\
+            fn m(&self);\n\
+            const C: u8;\n\
+        }\n";
     assert_eq!(keys(src, &[]), vec!["crate", "Foo", "T", "T.m", "T.C"]);
+    assert_eq!(
+        documented(src, &[]),
+        vec![("T.m".to_string(), DocAttr::Literal("m".to_string()))]
+    );
 }
 
 #[test]
