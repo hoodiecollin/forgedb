@@ -1,6 +1,6 @@
-Stable on-disk / on-wire byte encoding.
+The stable byte encoding: `Inserted` = 0, `Updated` = 1, `Deleted` = 2,
+`Linked` = 3.
 
-These byte values are a **durable format contract** for [`durable`] —
-they are persisted to the broker log and sent across a process boundary,
-so they must never be reordered or reused. Append new variants with new
-byte values only.
+These values are persisted in the [`durable`] broker log and sent over the
+replication transport, so they must never be reordered or reused; a new
+variant takes a new byte. [`Self::from_byte`] is the inverse.

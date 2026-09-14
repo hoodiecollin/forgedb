@@ -1,1 +1,1 @@
-Fsync after every recorded event (maximum durability).
+Fsync the log after every recorded event.

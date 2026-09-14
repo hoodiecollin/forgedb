@@ -1,14 +1,17 @@
-Race-free resume: subscribe to the live tail, then replay everything
-durably retained after `after` up to the current watermark.
+Resume without a gap: subscribe to the live tail, then replay everything
+retained after `after`.
 
-Returns a [`CatchUp`] carrying the replayed events, the `boundary` offset
-they were replayed through, and a live `receiver`. The caller applies
-`replayed` first, then drains `receiver` **skipping any event whose
-`offset <= boundary`** — those were already covered by the replay, and
-skipping them is exactly the "idempotent by absolute offset" rule. No
-event in `(after, ∞)` is dropped: the receiver was subscribed before the
-boundary was read, so any offset `> boundary` is guaranteed to arrive
-live.
+Returns a [`CatchUp`] holding the replayed events, the `boundary` they were
+replayed through (the watermark at the time of the call), and the live
+`receiver`, which was subscribed before that watermark was read. The caller
+applies `replayed` in order, then drains `receiver` skipping every event with
+`offset <= boundary`, which the replay already covered. Any offset above
+`boundary` is guaranteed to arrive on the receiver.
 
-Callers hold the single-writer discipline (this is `&self`; `record` is
-`&mut self`), so no `record` interleaves the subscribe/replay pair.
+`max` caps the replay exactly as in [`DurableBroker::read_from`]. If it stops
+the replay short of `boundary`, the events between the last replayed offset
+and `boundary` reach the caller on neither path, so pass a `max` that reaches
+the watermark (the generated `/replicate` handler passes `usize::MAX`).
+
+This takes `&self` while [`DurableBroker::record`] takes `&mut self`, so no
+record can interleave between the subscribe and the replay.

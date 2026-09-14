@@ -1,1 +1,2 @@
-A pair was appended to an M2M junction table.
+A pair was appended to a many-to-many junction. Removing a pair is reported
+as `Deleted`.

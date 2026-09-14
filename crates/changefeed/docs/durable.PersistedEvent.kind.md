@@ -1,1 +1,1 @@
-The kind of change (insert / update / delete / link).
+Which kind of change this is; see [`ChangeKind`].

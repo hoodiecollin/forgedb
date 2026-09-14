@@ -1,6 +1,6 @@
-Encode to the self-describing binary wire frame — **identical** to the
-durable on-disk framing, so the replication transport and the log share
-one codec. The transport sends exactly one frame per message; a follower
-decodes with [`from_wire`](PersistedEvent::from_wire).
+Encode this event as one self-describing binary frame, byte-identical to its
+representation in the broker log (layout: [`PersistedEvent`]).
 
-Field-blind: `bytes` are copied verbatim, never interpreted.
+The generated replication transport sends exactly one frame per message; a
+follower decodes it with [`PersistedEvent::from_wire`]. `bytes` are copied
+verbatim.

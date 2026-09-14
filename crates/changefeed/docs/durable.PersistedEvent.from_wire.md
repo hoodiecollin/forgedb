@@ -1,4 +1,7 @@
-Decode exactly one wire frame produced by [`to_wire`](PersistedEvent::to_wire).
+Decode exactly one frame produced by [`PersistedEvent::to_wire`].
 
-`Err` on a CRC mismatch, a structurally invalid frame, or a truncated /
-incomplete frame (a whole WS message must be one complete frame).
+Returns an `InvalidData` error on a CRC mismatch, a length prefix too short to
+hold a checksum, an unknown kind byte or a non-UTF-8 model name, and an
+`UnexpectedEof` error when `buf` ends before the frame does or the payload's
+own length fields overrun it. Bytes after the first complete frame are
+ignored.

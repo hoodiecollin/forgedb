@@ -1,1 +1,1 @@
-The append position of the row in that collection's storage.
+The row position in that collection's storage, widened to `u64`.
