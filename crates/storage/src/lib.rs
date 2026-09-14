@@ -1,3 +1,4 @@
+#![doc = include_str!("../docs/crate.md")]
 #[cfg(not(target_arch = "wasm32"))]
 pub use forgedb_storage_native::*;
 
