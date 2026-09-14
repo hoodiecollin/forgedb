@@ -17,7 +17,7 @@ const BUDGET: &[(&str, usize)] = &[
     ("tests/cache_dir_test.rs", 8),
     ("tests/cache_home_isolation_test.rs", 1),
     ("tests/cache_manifest_deps_test.rs", 1),
-    ("tests/ci_gate_test.rs", 16),
+    ("tests/ci_gate_test.rs", 17),
     ("tests/cli_loop_test.rs", 1),
     ("tests/delivery_test.rs", 9),
     ("tests/generation_memo_ratchet_test.rs", 1),

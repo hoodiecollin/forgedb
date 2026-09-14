@@ -35,6 +35,8 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     ("tests/delivery_test.rs", "scenario_9_generated_code_carries_no_version_string_and_no_timestamp", 1, "a lexical word sweep over nine artifacts in five languages; language-agnostic by design"),
     ("tests/prompt_boundary_test.rs", "trace_lines", 1, "the FORGEDB_ASK_TRACE file"),
     ("crates/codegen/tests/codegen_snapshots.rs", "test_wasm_generation_async_client_and_worker", 1, "generated TypeScript; no TS parser in the dependency graph"),
+    ("tests/substrate_docs_test.rs", "fences", 1, "markdown sidecars; no markdown parser in the dependency graph, and a fence opener is by definition a line"),
+    ("tests/substrate_docs_test.rs", "the_makefile_checks_exactly_these_crates", 1, "the Makefile's SUBSTRATE_DOC_CRATES variable; same class as ci_gate_test::make_recipe"),
 ];
 
 fn repo_root() -> PathBuf {
