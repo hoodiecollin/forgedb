@@ -19,7 +19,7 @@ We already avoid gratuitous breakage and document every change, but these are on
 | 1. Schema language | the `.forge` grammar, directives, and the shape of the generated API | the `forgedb` CLI version |
 | 2. Substrate ABI | the published `forgedb-*` runtime crates generated code links | per-crate, independent |
 | 3. The CLI | `forgedb` commands, flags, config | the `forgedb` CLI version |
-| 4. Compiler internals | `forgedb-parser`, `-codegen`, `-migrations`, `-watcher`, `-validation`, `-backup` | per-crate, but **not a stability surface** |
+| 4. Compiler internals | `forgedb-parser`, `-codegen`, `-migrations`, `-watcher`, `-validation`, `-backup`, `-lsp-server` | per-crate, but **not a stability surface** |
 
 ## 1. Schema language
 
@@ -70,9 +70,9 @@ major.
 
 ## 4. Compiler internals are NOT a public API
 
-`forgedb-parser`, `-codegen`, `-migrations`, `-watcher`, `-validation`, and `-backup` are
-published to crates.io **only so that `cargo install forgedb` can build the CLI from the
-registry.** They are the CLI's implementation, not a supported library surface.
+`forgedb-parser`, `-codegen`, `-migrations`, `-watcher`, `-validation`, `-backup`, and
+`-lsp-server` are published to crates.io **only so that `cargo install forgedb` can build the
+CLI from the registry.** They are the CLI's implementation, not a supported library surface.
 
 - Their public APIs may change in any release, including breaking changes in a minor bump,
   without notice.
