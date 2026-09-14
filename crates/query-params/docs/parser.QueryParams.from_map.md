@@ -1,0 +1,1 @@
+Parse from a HashMap

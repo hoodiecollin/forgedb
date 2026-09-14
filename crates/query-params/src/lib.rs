@@ -1,3 +1,4 @@
+#![doc = include_str!("../docs/crate.md")]
 mod filter;
 mod pagination;
 mod parser;

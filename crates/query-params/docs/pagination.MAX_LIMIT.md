@@ -1,0 +1,1 @@
+Maximum pagination limit
