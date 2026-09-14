@@ -17,7 +17,7 @@ line and its own compatibility rules.
 | 1. Schema language | the `.forge` grammar, directives, and the shape of the generated API | the `forgedb` CLI version |
 | 2. Substrate ABI | the published `forgedb-*` runtime crates the generated code links | per-crate, independent |
 | 3. The CLI | `forgedb` commands, flags, config | the `forgedb` CLI version |
-| 4. Compiler internals | `forgedb-parser`, `forgedb-codegen`, `forgedb-migrations`, `forgedb-watcher`, `forgedb-validation`, `forgedb-backup` | per-crate, but **not a stability surface** — see §4 |
+| 4. Compiler internals | `forgedb-parser`, `forgedb-codegen`, `forgedb-migrations`, `forgedb-watcher`, `forgedb-validation`, `forgedb-backup`, `forgedb-lsp-server` | per-crate, but **not a stability surface** — see §4 |
 
 ---
 
@@ -85,8 +85,8 @@ own semver.
 ## 4. Compiler internals are NOT a public API
 
 `forgedb-parser`, `forgedb-codegen`, `forgedb-migrations`, `forgedb-watcher`,
-`forgedb-validation`, and `forgedb-backup` are published to crates.io **only so
-that `cargo install forgedb` can build the CLI from the registry.** They are the
+`forgedb-validation`, `forgedb-backup`, and `forgedb-lsp-server` are published to
+crates.io **only so that `cargo install forgedb` can build the CLI from the registry.** They are the
 CLI's implementation, not a supported library surface.
 
 - Their public APIs may change in any release, including breaking changes in a

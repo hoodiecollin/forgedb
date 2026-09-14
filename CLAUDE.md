@@ -348,27 +348,19 @@ The root `forgedb` crate is now published **with** that `lsp` feature (2026-07-2
   `RustSdkGenerator` / `PythonSdkGenerator` / `GoSdkGenerator` (#206/#118/#205 — the
   Rust/Python/Go siblings of the TS SDK; `generate <rust|python|go> --sdk`) (each
   `::generate(&schema) -> GeneratedCode`)
-- `validation`, `migrations`, `backup`, `changefeed`,
-  `watcher`, `lsp-server`  (`query-params` + `compaction` are now **published** — see the
-  published-crates list above)
+- `validation`, `watcher`, `lsp-server`, and `backup` (#57 — lock-free full-snapshot
+  create/restore over a data dir as opaque bytes, reading per-model `manifest.json` + column files
+  and never the `.forge` schema. It is a compiler internal that the CLI's `forgedb backup` drives,
+  NOT substrate: nothing generated links it and the substrate reclose does not resolve it. This file
+  called it class-1 until 2026-09-13; #490's verify pass corrected that against the generated
+  manifests.) `changefeed`, `query-params` and `compaction` are substrate and are described in the
+  published-crates list above, not here.
   (`fulltext` + `crud-api` were removed in Phase 3b; `query-optimization` + `http-server` were
   removed by the legacy audit (#94) as zero-consumer dead code — the API existence/404 logic lives
   in the generated handlers, and the generated `api.rs` builds its own router. `ffi` — the pre-v1
   C-ABI bindings crate — and the legacy `npm-package/` Bun FFI runtime were removed 2026-07-15 as a
   clean slate for the bindings phase (#50–#53); they predated the generator-identity discipline
   (the npm-package shipped a generic runtime `QueryBuilder` — a red-line violation).)
-  `query-params` (#90) is now **wired**: a schema-agnostic query-string parser (URL → generic
-  `Filter`/`Sort`/`Pagination`) that the generated `api.rs` list endpoint links against — it interprets no
-  schema (all field-aware filter/sort is generated per-model), so it is class-1 substrate the generated code
-  links against, like `changefeed`/`auth`. Generated code requires it, and it is published.
-  `backup` (#57) is a **class-1 substrate** peer to `compaction`: lock-free full-snapshot
-  create/restore over a data dir as opaque bytes (reads per-model `manifest.json` + column
-  files, never the `.forge` schema).
-  `changefeed` (#62 Direction A) is a **class-1 substrate** the *generated code links against*
-  (like `storage`/`wal`, not like the internal-only crates above): a field-blind
-  `tokio::sync::broadcast` of `ChangeEvent { model: &'static str, row_index, kind }`. Published; the
-  scaffold pins it by major (derive both numbers — see the *Workspace layout* note). It never decodes
-  a field; generated code routes by model name and materializes typed events.
 
 Deeper docs live in `docs/` (`ARCHITECTURE.md`, `PUBLIC_CRATES.md`,
 `DEVELOPMENT.md`, `PUBLISHING.md`, `CONTRIBUTING.md`).
@@ -829,9 +821,13 @@ so a component there would be downloaded by every job for a tool no job runs.
 
 ## Conventions
 
-- **ForgeDB's own source carries NO comments (#488).** Not doc comments (`///`, `//!`,
-  `#[doc]`, JSDoc), not inline `//` prose, on any surface — Rust, TS/TSX, `Cargo.toml`,
-  the workflows, the Makefile. A comment drifts the moment the code moves, and it sits in
+- **ForgeDB's own source carries NO prose (#488, restated by #490).** Not doc comments (`///`,
+  `//!`, a `#[doc = "…"]` literal, JSDoc), not inline `//` prose, on any surface — Rust, TS/TSX,
+  `Cargo.toml`, the workflows, the Makefile. The rule bans prose in a source file, not the `doc`
+  attribute: `#[doc = include_str!("…")]` naming a sidecar file is permitted, because the sentence
+  it points at is not in the file an agent reads. That is how the substrate crates get their
+  docs.rs content back (#490), and the checker's refusal of the literal form lands with it.
+  A comment drifts the moment the code moves, and it sits in
   a coding agent's grep path where a stale line reads as authoritative and steers a whole
   session down a path that looks correct the entire way. Code is read by reading it; when
   a piece of code needs explaining, rename or restructure until it doesn't.
