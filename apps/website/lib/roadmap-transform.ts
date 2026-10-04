@@ -57,7 +57,7 @@ function isCoreScoped(labels: string[]): boolean {
 function has(labels: string[], l: string): boolean {
   return labels.includes(l);
 }
-const GATE_LABEL = /^[a-z]+:gate-\d+$/;
+const GATE_LABEL = /^(gate:[a-z]+|[a-z]+:gate-\d+)$/;
 function isGate(labels: string[]): boolean {
   return labels.some((l) => GATE_LABEL.test(l));
 }
