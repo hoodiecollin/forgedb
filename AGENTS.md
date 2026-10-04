@@ -1,56 +1,41 @@
 # Agent instructions
 
 <!-- pm-playbook:begin -->
-## Project management — pm-playbook v3.0.0
+## Project management — pm-playbook v4.0.0
 
-Issue tracking in this repo follows the **pm-playbook** two-axis model. The full doctrine is
-vendored at `.pm-playbook/` and is authoritative; this block is only a summary.
+Work is tracked in GitHub Issues. **Milestone = when**: assigning one means committed, and the
+lowest open one is the cycle in flight. **Label = what kind**: every work item carries exactly one
+of `improvement`, `bugfix`, `experiment`. Epics group work items as native sub-issues. There are
+no priority or size fields.
 
-**Before you create, label, milestone, or close an issue — read `.pm-playbook/AGENT.md`.**
-It is a short router: load only the reference section relevant to what you are doing.
+| Type | Gates (sub-issues, `gate:<verb>`) | Then |
+|---|---|---|
+| `improvement` | intent → proof | build |
+| `bugfix` | none — a `hotfix` takes a warrant | fix, with a regression test |
+| `experiment` | charter → verdict (never milestoned) | — |
 
-**The two axes, and nothing else, organize work:**
-- **Milestone** = *when*. Assigning one means **committed**. *Focus* — the milestone being the
-  cycle in flight — is what means scheduled. There is no label for "committed but unscheduled."
-- **Labels** = *what kind*. Epics decompose via **native sub-issues**, never checkboxes and never
-  a Project field.
-- There are **no Priority / Size / Workstream fields**. Do not propose adding any.
+**A person closes a gate, not an agent.** Gates are created only by `pm-playbook materialize`. A
+proof gate closes on evidence through `pm-playbook prove <n> --yes`; for any other gate that is
+ready, say so and stop. If later work shows an accepted gate was wrong, say so and ask for it to be
+reopened.
 
-**Every work item carries exactly one type, and the type decides its gates:**
+Load the skill for what you are doing (Claude Code: the `pm-playbook` plugin provides the same):
 
-| Type | Gates |
+| When | Read |
 |---|---|
-| `improvement` | design → plan → impl |
-| `bugfix` | diagnose → fix (`hotfix` is a bounded form of this) |
-| `experiment` | research → evaluate (never milestoned) |
-
-Each gate is a sub-issue labelled `{type}:gate-{n}`. A closed gate means approved. The tree is
-exactly three levels: epic → work item → gate.
-
-**The commitment ladder is DERIVED from gate state — there are no maturity labels.** Walk the
-gates in order; the first not closed decides the rung. Ask for it with `pm-playbook ladder`; no
-GitHub filter can compute it.
-
-**Invariants — violating one is a bug, not a style preference:**
-- Exactly **one** type label per work item — never zero, never two (PM010). An `epic`, a gate and
-  a `release-gate` are not work items for this purpose and need no type.
-- `experiment` never carries a milestone. A spike's deliverable is a finding; it feeds the
-  release spine, it never rides it (PM003).
-- **Never create a gate by hand** — `pm-playbook materialize` owns them and creates a complete
-  set at once. A hand-made gate destroys the meaning of an absent one.
-- A gate's milestone equals its parent's (PM011); an `epic` never carries gates (PM012).
-- `release-gate` always has a milestone and never carries `experiment`. An open `release-gate`
-  means its milestone **cannot be tagged** (PM004/PM005).
-- A non-core `surface:*` issue never rides a core `v*` milestone (PM006).
-
-**Read the backlog from the local mirror when it exists.** `.pm-playbook/backlog/` holds every
-issue body and comment as files — grep it instead of spending an API round trip per question. It is
-gitignored and machine-local, so its absence means "not pulled here yet", never "no issues", and it
-goes stale as soon as anyone else moves an issue. Reading is local; **writing is not** — edit and
-`push` (it refuses when both sides moved), or use `gh` directly.
+| the model, and which skill to load | `.pm-playbook/skills/pm-playbook/SKILL.md` |
+| filing a new issue | `.pm-playbook/skills/file/SKILL.md` |
+| writing an improvement's intent gate | `.pm-playbook/skills/intent/SKILL.md` |
+| writing or closing a proof gate | `.pm-playbook/skills/prove/SKILL.md` |
+| implementing an improvement whose gates are closed | `.pm-playbook/skills/build/SKILL.md` |
+| fixing a bug, or a hotfix | `.pm-playbook/skills/fix/SKILL.md` |
+| a spike, benchmark or evaluation | `.pm-playbook/skills/experiment/SKILL.md` |
+| what is left, what to do next, briefing parallel agents | `.pm-playbook/skills/next/SKILL.md` |
+| tagging, the release-gate ledger, which branch to target | `.pm-playbook/skills/release/SKILL.md` |
+| linting the backlog and fixing what it finds | `.pm-playbook/skills/check/SKILL.md` |
 
 ```bash
-npx @hoodiecollin/pm-playbook pull     # refresh the mirror (idempotent)
-npx @hoodiecollin/pm-playbook check    # verify before opening a PR — exit 0 means compliant
+npx @hoodiecollin/pm-playbook pull     # refresh the local mirror at .pm-playbook/backlog/ (read it, edit via push)
+npx @hoodiecollin/pm-playbook check    # before finishing — exit 0 means compliant
 ```
 <!-- pm-playbook:end -->
