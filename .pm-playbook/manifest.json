@@ -1,22 +1,19 @@
 {
   "package": "@hoodiecollin/pm-playbook",
-  "version": "3.0.0",
-  "migratedThrough": "2.0.0",
+  "version": "4.0.0",
+  "migratedThrough": "4.0.0",
   "files": {
-    "AGENT.md": "943188616ec9c64b96cd4008fee5f21407d15351a17fd2897df71ddd89524809",
-    "PLAYBOOK.md": "bdaa330fb0ea03ff181b5b90e5c260a85b143893dbca57da029b37913c1bdc23",
-    "reference/01-two-axis-core.md": "bd2bb4e753be8c7951e676d300fe5b68e1c2310ac9aad29102135fba68aa0b80",
-    "reference/02-commitment-ladder.md": "841209aec92aa9ba8fa6dacc010f985b16bd0e8331641d8e8e5217dc02466cc5",
-    "reference/03-labels.md": "27bdb6bacc65177ec204def2d14c54884fc2c5f40ed244b0baf2ff53baf02306",
-    "reference/04-experiments.md": "0e713adfc694cea0c533f591b0105187edc8eda4cafa76f9c97c1d8071088e9c",
-    "reference/05-release-spine.md": "06691b83e45ba24e465e35b038347b9791762eb8465d415052e439e5ddf2c414",
-    "reference/06-surfaces.md": "cd46918f11b251f92301aa81347d1bcdaa341c3f9629fd0eaf03ada6a5f8decc",
-    "reference/07-epics-and-roadmap.md": "75e1e2335c93a72f18215a843d6bde11596786dae8726b639a2d9aeb9d48fdb0",
-    "reference/08-board-is-a-view.md": "c5746a21beb944575d104567bc7c3394053a8416b530b912d1773c9052eb2969",
-    "reference/09-gates.md": "5feda10a1146242ffda15f0b247de3b5aa8c853ac39284fa08959325b2a0a116",
-    "reference/10-documentation.md": "3bd7ebdf4ff457b8c7dd1a5c53eabafe5e4590e08a5ce5f67aef640201c78f25",
-    "reference/11-operating-disciplines.md": "603a35500868f318b21e39ddff3a7461358b0a7063d21b16b6d3cff0340f8839",
-    "reference/12-adopting.md": "13291076fc075451f1b1deaeffdc6d19f3f506486d0ad3fdf4795bd1c7246a4e",
-    "reference/13-anti-patterns.md": "19fbbb3e563f91538094bbf70234ab5848c48a2bc566e1c59522524ed6ab8c1e"
+    "PLAYBOOK.md": "e97d316f0eaaf36856bebd34843a414be2489a74577233308e07757855f4b591",
+    "skills/build/SKILL.md": "dea0d95cc7f974903f75616ccc250d4d0d20f3e7198aaa0e502a05d6f335a35e",
+    "skills/check/SKILL.md": "e6d08d2a044e81ff05b0a926585187fed47b29c88ec5771737dcfb94f61ba583",
+    "skills/experiment/SKILL.md": "7c1619b9b34ba8678b54636812645335141ef58236350607b6c8c48a036813af",
+    "skills/file/SKILL.md": "5a9d5439b7f61a53108a976ceea532bcfa125cc3f078a4d1a62e94dc704bcb2b",
+    "skills/fix/SKILL.md": "9b12d8d7601f8b1823934a0f3e222eb95d24998574c5d85b3d921286af0a438b",
+    "skills/intent/SKILL.md": "e2de285d557b2fe7c9c362664a1dd4021aa40a74537465fa959db1ffb4dcd14a",
+    "skills/next/SKILL.md": "234efbfb4696c32601ac9143861158c5ca360f6790a3eaab892f2d8fd60e7a00",
+    "skills/pm-playbook/SKILL.md": "a3aaf6fbfb16b9142ce863387d6009d5a9035971523cb635168711824ec59aa7",
+    "skills/prove/SKILL.md": "715d437671192f1c814cdb17a344adeef7a51fed3ad08822b061fbb0d29d0cf2",
+    "skills/release/SKILL.md": "b23e1e657a04613b4720b9fe437ab8a53c0926957e6f53a3277b5c9c96d57ae8",
+    "skills/release/reference/release-engineering.md": "f362c5fafcd7351dd7f3781b9b4dedb1be34b11e7e0da9a0e8036994f668c500"
   }
 }

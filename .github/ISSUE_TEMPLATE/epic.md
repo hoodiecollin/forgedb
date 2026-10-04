@@ -13,7 +13,7 @@ labels: epic
 ### In plain English
 <!-- What this epic delivers, for a reader who has never seen it. Mark **release-blocking**
      here if it gates a release. Same heading every issue uses — an epic is read by the same
-     tooling its children are (PLAYBOOK §9.6). -->
+     tooling its children are (PLAYBOOK §8). -->
 
 ## Current state (ground truth)
 <!-- Where the CODE actually is right now — not intentions. Update this as reality moves.
@@ -31,4 +31,4 @@ labels: epic
 
 ## Surface
 <!-- Only for multi-artifact repos: surface:core / surface:website / surface:ide-extension.
-     Non-core surface work must NOT be milestoned onto a core v* release (PLAYBOOK §6.1). -->
+     Non-core surface work must NOT be milestoned onto a core v* release (PLAYBOOK §6). -->

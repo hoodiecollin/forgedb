@@ -477,10 +477,12 @@ what's next, exact versions — lives in ground truth, not here:
 ### Project management (the ONE tracking model — no parallel systems)
 
 ForgeDB follows the **ai-pm-playbook** (the portable form of the model worked out here; adopted
-2026-07-31, migrated to **v2.0** on 2026-08-12). **The doctrine is vendored at `.pm-playbook/` and
-is authoritative** — read `.pm-playbook/AGENT.md` before you create, label, milestone or close an
-issue, and do not re-transcribe the model here. Section refs below are to that playbook. All work
-is tracked in **GitHub Issues** on `hoodiecollin/forgedb`.
+2026-07-31, migrated to **v2.0** on 2026-08-12 and to **v4.0** on 2026-10-03). **The doctrine
+is vendored at `.pm-playbook/` and is authoritative** — load the matching skill under
+`.pm-playbook/skills/` before you create, label, milestone or close an issue, and do not
+re-transcribe the model here.
+Section refs below are to `.pm-playbook/PLAYBOOK.md`. All work is tracked in **GitHub Issues** on
+`hoodiecollin/forgedb`.
 
 The two axes, in one line each: a **milestone** says *when* and means **committed** (being the
 cycle in flight is what means *scheduled*); **labels** say *what kind*. Every work item carries
@@ -490,7 +492,7 @@ The commitment ladder is **derived** from gate state — ask `pm-playbook ladder
 Verify with `npx @hoodiecollin/pm-playbook check` — exit 0 means compliant. What follows is only
 what is **specific to this repo** and is not in the playbook.
 
-**`release-gate` = blocks the tag (§5.2).** The rung between *closed-into-milestone* and
+**`release-gate` = blocks the tag (§5).** The rung between *closed-into-milestone* and
 *released*. An open `release-gate` issue on a milestone means **that milestone cannot be tagged**,
 even if every feature on it is closed — it is a release obligation (publish the substrate,
 reconcile a version line, rotate a credential), not deferrable work. File one the moment you
@@ -501,7 +503,7 @@ everything still builds locally. The complete "can we tag?" query:
 gh issue list --label release-gate --state open      # any row ⇒ blocked
 ```
 
-**The release-gate issue MUST carry a versioned-asset ledger (§5.2).** Its body holds a table of
+**The release-gate issue MUST carry a versioned-asset ledger (§5).** Its body holds a table of
 **every** independently versioned asset in this repo — all 18 `crates/*` plus the root `forgedb`
 crate plus `apps/vscode-forgedb` — each row defaulting to **"no change"**, created when the
 milestone opens. **When a change touches one of those, set its row in the same pass that lands the
@@ -517,7 +519,7 @@ registry), and the release ships old source behind a correct-looking number. Use
 `git log --oneline main..develop -- crates/<c>` against the version line; never the version alone.
 Template: `.github/ISSUE_TEMPLATE/release-gate.md`.
 
-**Surfaces (§6.1).** A `surface:*` label marks a separately shippable product face. This repo uses
+**Surfaces (§6).** A `surface:*` label marks a separately shippable product face. This repo uses
 `surface:website` and `surface:ide-extension`; **core is the implicit default and carries no label.**
 **Never put a non-core `surface:*` issue on a core `v*` milestone** — it would read as "done,
 awaiting vX" though it already shipped on its own line, and would never reach the core changelog.
@@ -554,7 +556,8 @@ is a meaningful signal.)
 
 **Gate sub-issues are not roadmap entries.** `materialize` creates them under a work item, so they
 are children of an issue rather than of an epic and `claimedChildren` does not filter them. The
-transform excludes them by label pattern (`isGate`); leave that filter in place or a single
+transform excludes them by label pattern (`isGate`, matching `gate:<verb>` and the pre-4.0
+`{type}:gate-{n}`); leave that filter in place or a single
 milestone's gate set floods the roadmap.
 
 **Retired — do NOT reintroduce:** the "workstream" decomposition (`WS1`/`WS2`/`Workstream 2` sub-
@@ -580,7 +583,7 @@ of truth.
    reclose does. Additive substrate changes (no on-disk format break) keep the scaffold pin
    (`= "0.2"`) resolving; a format break bumps the major and needs a migration path.
 
-   **Where the gap is allowed to live — the branch model (playbook §5.2).** ForgeDB batches the
+   **Where the gap is allowed to live — the branch model (playbook §5).** ForgeDB batches the
    substrate publish at the release rather than publishing per-issue, so a publish gap *does* open
    mid-cycle. It is held off the default branch:
 
@@ -659,7 +662,7 @@ of truth.
    other correct response is that the issue was mis-scheduled — move the milestone rather than
    merging past it. **This makes closing the milestone part of the release ritual**: a milestone
    left open after its tag freezes the derived cycle and blocks legitimate next-cycle work.
-   (Portable form: `ai-pm-playbook` PLAYBOOK §5.3, rules PM008/PM009.)
+   (Portable form: `ai-pm-playbook` PLAYBOOK §5 and the `release` skill, rules PM008/PM009.)
 
 3. **Codegen is compile-tested, not just snapshot-tested.** The `insta` snapshots compare
    generated code as *strings* — a snapshot pass does **not** mean the output compiles. When you
@@ -672,43 +675,21 @@ of truth.
    task boundaries; when a claim disagrees with code, fix the claim. Do not pin an exact test count
    in prose (chronic drift source — run the runner).
 
-5. **Design docs are not committed to the repo.** Proposals / design notes live as **gate
-   sub-issues**, not files — run the **`design-gates`** skill to file one (it has the dedup check,
-   the body template, and the epic cross-link). (The historical `docs/proposals/` set was removed;
-   git history holds it. Shipped-feature *architecture* reference belongs in `docs/ARCHITECTURE.md`.)
-
-6. **Gates in series, before any code (§9).** A work item's gates are **native sub-issues** created
-   by `pm-playbook materialize` — never by hand, and always as a complete set. For an `improvement`:
-   **gate 1 design** (problem, desired behavior, solution *shape*, alternatives, explicit non-goals
-   — solution-shaped, not code-shaped; catches *conceptual* gotchas), **gate 2 plan** (files to
-   touch, build order, interfaces, blockers, and the BDD scenarios to write; catches *execution*
-   gotchas), **gate 3 impl** (scenarios RED → implement to GREEN → refactor under green). A
-   `bugfix` takes two: diagnose → fix. **Closing a gate means accepted**, and the rung is derived
-   from which gates are closed — never from a status label, and **effort labels are banned**. When
-   a feature ships, fold its durable design into `docs/ARCHITECTURE.md`.
-
-7. **Reopening an accepted gate? Purge the issue body FIRST (§9.1).** Gates get redone — new
-   information lands, a constraint turns out to be an artifact of an assumption. The moment you
-   decide to redo one, the body is purged *before any new thinking*, down to a placeholder saying
-   the gate is being redone and that the body deliberately holds no design content. Stashing the
-   old body to a scratch file while you work is fine; **delete the stash** once the new gate is
-   accepted and the new body is written.
-
-   A withdrawn design left in the body does not read as withdrawn — it reads as **the** accepted
-   design, because that is what a body *is*. The correction invariably lands in a comment, and
-   top-down readers never reach it, so the next planning pass builds on it silently and the plan
-   looks correct (it is internally consistent with the wrong premise). #187 hit exactly this: a
-   Gate 2 was written against a body describing a design that acceptance had rejected. Repopulate
-   the body **only at acceptance**, from the accepted outcome — never patch it incrementally as
-   thinking evolves, which recreates the half-superseded state the purge exists to prevent.
-
-8. **Run `sync-sources` on BOTH sides of every gate (§9.2) — no triviality exemption.** The global
-   rule scopes it to non-trivial tasks; gates are exempt from that exemption. `verify` before
-   (check every claim source against code, fix what drifted), `propagate` after (push the accepted
-   outcome into the issue body, docs, memory, cross-linked issues). A gate's input is the previous
-   gate's output, so a stale claim there is not caught downstream — it is *built on*. This burns
-   tokens; do it anyway, because the cost is bounded and paid once while planning against a stale
-   claim is unbounded and discovered late.
+5. **Gates follow pm-playbook 4.0 — load the skill, not this file.** `.pm-playbook/skills/`
+   (or the `pm-playbook` Claude Code plugin) holds the workflows: `intent`, `prove`, `build`,
+   `fix`, `experiment`. What is specific to this repo:
+   - **Prove by running.** The accepted designs that failed here rested on unrun claims about a
+     library, compiler or runtime — `syn::File` being `Send` (#388), a copied dylib surviving its
+     `LC_ID_DYLIB` (#335), cargo's nested-workspace rule (#328), no harness owning a pty (#367),
+     Serena forwarding `allFeatures` (#519). Each was one small probe away from disproved. In a
+     proof gate, such a claim is `ran` with the command and output, or it stays `assumed`.
+   - **An agent never closes a gate.** Say it is ready and stop; the maintainer closes it. A proof
+     gate with every claim proven and no one-way doors may close via `pm-playbook prove <n> --yes`.
+   - **When later work disproves an accepted gate, stop and say so**, and correct the body in place
+     once it is reopened — never a correction underneath, which reads as the old design.
+   - **Design docs are not committed.** Intent and proof live in the gate issues; when a feature
+     ships, its durable architecture goes into `docs/ARCHITECTURE.md`.
+   - A plain `bugfix` has no gates: the PR carries a regression test that fails before the fix.
 
 ## Code search
 
@@ -841,56 +822,41 @@ so a component there would be downloaded by every job for a tool no job runs.
 - `rust-core-library` — idiomatic Rust for core library/crate work.
 
 <!-- pm-playbook:begin -->
-## Project management — pm-playbook v3.0.0
+## Project management — pm-playbook v4.0.0
 
-Issue tracking in this repo follows the **pm-playbook** two-axis model. The full doctrine is
-vendored at `.pm-playbook/` and is authoritative; this block is only a summary.
+Work is tracked in GitHub Issues. **Milestone = when**: assigning one means committed, and the
+lowest open one is the cycle in flight. **Label = what kind**: every work item carries exactly one
+of `improvement`, `bugfix`, `experiment`. Epics group work items as native sub-issues. There are
+no priority or size fields.
 
-**Before you create, label, milestone, or close an issue — read `.pm-playbook/AGENT.md`.**
-It is a short router: load only the reference section relevant to what you are doing.
+| Type | Gates (sub-issues, `gate:<verb>`) | Then |
+|---|---|---|
+| `improvement` | intent → proof | build |
+| `bugfix` | none — a `hotfix` takes a warrant | fix, with a regression test |
+| `experiment` | charter → verdict (never milestoned) | — |
 
-**The two axes, and nothing else, organize work:**
-- **Milestone** = *when*. Assigning one means **committed**. *Focus* — the milestone being the
-  cycle in flight — is what means scheduled. There is no label for "committed but unscheduled."
-- **Labels** = *what kind*. Epics decompose via **native sub-issues**, never checkboxes and never
-  a Project field.
-- There are **no Priority / Size / Workstream fields**. Do not propose adding any.
+**A person closes a gate, not an agent.** Gates are created only by `pm-playbook materialize`. A
+proof gate closes on evidence through `pm-playbook prove <n> --yes`; for any other gate that is
+ready, say so and stop. If later work shows an accepted gate was wrong, say so and ask for it to be
+reopened.
 
-**Every work item carries exactly one type, and the type decides its gates:**
+Load the skill for what you are doing (Claude Code: the `pm-playbook` plugin provides the same):
 
-| Type | Gates |
+| When | Read |
 |---|---|
-| `improvement` | design → plan → impl |
-| `bugfix` | diagnose → fix (`hotfix` is a bounded form of this) |
-| `experiment` | research → evaluate (never milestoned) |
-
-Each gate is a sub-issue labelled `{type}:gate-{n}`. A closed gate means approved. The tree is
-exactly three levels: epic → work item → gate.
-
-**The commitment ladder is DERIVED from gate state — there are no maturity labels.** Walk the
-gates in order; the first not closed decides the rung. Ask for it with `pm-playbook ladder`; no
-GitHub filter can compute it.
-
-**Invariants — violating one is a bug, not a style preference:**
-- Exactly **one** type label per work item — never zero, never two (PM010). An `epic`, a gate and
-  a `release-gate` are not work items for this purpose and need no type.
-- `experiment` never carries a milestone. A spike's deliverable is a finding; it feeds the
-  release spine, it never rides it (PM003).
-- **Never create a gate by hand** — `pm-playbook materialize` owns them and creates a complete
-  set at once. A hand-made gate destroys the meaning of an absent one.
-- A gate's milestone equals its parent's (PM011); an `epic` never carries gates (PM012).
-- `release-gate` always has a milestone and never carries `experiment`. An open `release-gate`
-  means its milestone **cannot be tagged** (PM004/PM005).
-- A non-core `surface:*` issue never rides a core `v*` milestone (PM006).
-
-**Read the backlog from the local mirror when it exists.** `.pm-playbook/backlog/` holds every
-issue body and comment as files — grep it instead of spending an API round trip per question. It is
-gitignored and machine-local, so its absence means "not pulled here yet", never "no issues", and it
-goes stale as soon as anyone else moves an issue. Reading is local; **writing is not** — edit and
-`push` (it refuses when both sides moved), or use `gh` directly.
+| the model, and which skill to load | `.pm-playbook/skills/pm-playbook/SKILL.md` |
+| filing a new issue | `.pm-playbook/skills/file/SKILL.md` |
+| writing an improvement's intent gate | `.pm-playbook/skills/intent/SKILL.md` |
+| writing or closing a proof gate | `.pm-playbook/skills/prove/SKILL.md` |
+| implementing an improvement whose gates are closed | `.pm-playbook/skills/build/SKILL.md` |
+| fixing a bug, or a hotfix | `.pm-playbook/skills/fix/SKILL.md` |
+| a spike, benchmark or evaluation | `.pm-playbook/skills/experiment/SKILL.md` |
+| what is left, what to do next, briefing parallel agents | `.pm-playbook/skills/next/SKILL.md` |
+| tagging, the release-gate ledger, which branch to target | `.pm-playbook/skills/release/SKILL.md` |
+| linting the backlog and fixing what it finds | `.pm-playbook/skills/check/SKILL.md` |
 
 ```bash
-npx @hoodiecollin/pm-playbook pull     # refresh the mirror (idempotent)
-npx @hoodiecollin/pm-playbook check    # verify before opening a PR — exit 0 means compliant
+npx @hoodiecollin/pm-playbook pull     # refresh the local mirror at .pm-playbook/backlog/ (read it, edit via push)
+npx @hoodiecollin/pm-playbook check    # before finishing — exit 0 means compliant
 ```
 <!-- pm-playbook:end -->
