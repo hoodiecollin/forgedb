@@ -120,13 +120,12 @@ Before creating bug reports, please check existing issues to avoid duplicates.
 [Links, references, etc.]
 ```
 
-**Design notes & proposals live as issues, not committed files.** A non-trivial design is captured
-as the **design gate** — a sub-issue of the work item it belongs to, labelled
-`improvement:gate-1` — and we do **not** commit proposal/design documents to the repository.
-Durable *architecture* reference for shipped features belongs in
-[`ARCHITECTURE.md`](./ARCHITECTURE.md); the gate issue holds the forward-looking design while it is
-under discussion, and closing it means the design was accepted. This keeps the tree free of
-point-in-time design notes that drift out of sync with the code.
+**Design notes & proposals live as issues, not committed files.** A non-trivial change is
+captured in its **gates** — `gate:intent` (what and why, approved by the maintainer) and
+`gate:proof` (the approach, with evidence for every claim it rests on), sub-issues of the work item
+— and we do **not** commit proposal/design documents to the repository. Durable *architecture*
+reference for shipped features belongs in [`ARCHITECTURE.md`](./ARCHITECTURE.md). This keeps the
+tree free of point-in-time design notes that drift out of sync with the code.
 
 ### Your First Code Contribution
 
