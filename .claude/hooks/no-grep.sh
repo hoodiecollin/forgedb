@@ -26,7 +26,7 @@ symbol reads as dead code. Cross-check with ast-grep, which parses every file re
 of cfg, before concluding a symbol is absent OR that nothing calls it.
 
 Text search is still right for things with no AST node — string literals, error copy,
-config keys, Cargo.toml version lines, .pm-playbook/backlog/. Scope those to a non-code
+config keys, Cargo.toml version lines. Scope those to a non-code
 glob (e.g. glob: "*.toml"). Generated code held inside quote! bodies also has no reachable
 AST node; search it as text.
 EOF
@@ -44,7 +44,7 @@ from a call site, an import, or a same-named symbol in another module.
   Structural pattern .... ast-grep run -p '<pattern>' -l rust|ts|tsx|go
 
 Shell search is still right for files with no AST node — scope it to docs/, .github/,
-.pm-playbook/, examples/, a *.md / *.toml / *.json / *.yml glob, or an \`-t md\` type filter —
+examples/, a *.md / *.toml / *.json / *.yml glob, or an \`-t md\` type filter —
 and for filtering command output through a pipe (\`cargo test | grep 'test result'\`).
 
 Refused command segment: ${seg}
@@ -91,7 +91,7 @@ if [ "$tool" = "Bash" ]; then
 
   code_file='\.(rs|ts|tsx|js|mjs|cjs|go)([^A-Za-z0-9_]|$)'
   scratch='(^|[ =/])(/tmp|/private/tmp|scratchpad|target|node_modules)/'
-  noncode_scope='\.(md|mdx|json|jsonc|ya?ml|toml|sql|css|scss|txt|lock|proto|sh|log|snap|env)([^A-Za-z0-9_]|$)|(^|[ =/])(docs|\.github|\.pm-playbook|examples|migrations|vendor|scratchpad|\.serena|\.claude)/|/tmp/|~/\.|\$HOME/\.|(^| )(-t|--type)[ =]?(md|toml|json|yaml|txt|sh)( |$)'
+  noncode_scope='\.(md|mdx|json|jsonc|ya?ml|toml|sql|css|scss|txt|lock|proto|sh|log|snap|env)([^A-Za-z0-9_]|$)|(^|[ =/])(docs|\.github|examples|migrations|vendor|scratchpad|\.serena|\.claude)/|/tmp/|~/\.|\$HOME/\.|(^| )(-t|--type)[ =]?(md|toml|json|yaml|txt|sh)( |$)'
   redirect_into_code='>>?[[:space:]]*[^[:space:]>]*\.(rs|ts|tsx|js|mjs|cjs|go)([^A-Za-z0-9_]|$)'
 
   segments=$(awk '{
@@ -171,7 +171,7 @@ case "$glob" in
 esac
 
 case "$path" in
-  */docs/*|*/docs|*/.github/*|*/.pm-playbook/*|*/examples/*|*/migrations/*|*/vendor/*) exit 0 ;;
+  */docs/*|*/docs|*/.github/*|*/examples/*|*/migrations/*|*/vendor/*) exit 0 ;;
 esac
 
 [[ "$pattern" =~ ^[A-Za-z_][A-Za-z0-9_.:]*$ ]] || exit 0

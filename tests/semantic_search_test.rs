@@ -121,7 +121,7 @@ fn text_search_for_things_with_no_ast_node_still_works() {
         r#"{"tool_name":"Grep","tool_input":{"pattern":"test result: ok\\. (\\d+) passed"}}"#,
         r#"{"tool_name":"Grep","tool_input":{"pattern":"version","glob":"*.toml"}}"#,
         r#"{"tool_name":"Grep","tool_input":{"pattern":"Serena","glob":"*.md"}}"#,
-        r#"{"tool_name":"Grep","tool_input":{"pattern":"milestone","path":"/x/.pm-playbook/backlog"}}"#,
+        r#"{"tool_name":"Grep","tool_input":{"pattern":"substrate","path":"/x/docs/design"}}"#,
     ];
     for payload in cases {
         assert_eq!(
@@ -364,7 +364,7 @@ fn shell_search_scoped_to_non_code_or_piped_output_still_works() {
         "git log --oneline | rg fix",
         "ls crates | grep storage",
         "grep -n '^version' crates/*/Cargo.toml",
-        "grep -rn 'milestone' .pm-playbook/backlog/",
+        "grep -rn 'read_only' .serena/",
         "grep -rn 'publish-gap' docs/",
         "rg -t md Serena docs/",
         "grep -c hooks .claude/settings.json",
