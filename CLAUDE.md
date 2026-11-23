@@ -53,8 +53,7 @@ rather than a generic runtime that interprets schemas? If either fails → rejec
   than on five substrings a rename walks past. It is built on demand by `make test`. **A missing
   toolchain is a hard test failure, never a skip** — a guard that skips reports green because it
   never evaluated. `crates/source-guard` is the Rust half; it is `publish = false`, is the 19th
-  `crates/*` entry, and is deliberately excluded from the release ledger because it ships
-  nowhere.
+  `crates/*` entry, and is never versioned or published because it ships nowhere.
 
 ## Build, test, run
 
@@ -480,112 +479,18 @@ every deferred limit — is stated in [`docs/WHAT_V1_IS.md`](docs/WHAT_V1_IS.md)
 This file describes the **durable shape** of the project. Point-in-time state — what's landed,
 what's next, exact versions — lives in ground truth, not here:
 
-- **Feature status & backlog:** `gh issue list` (types: `improvement`, `bugfix`, `experiment`;
-  plus `epic`, `hotfix`, `release-gate`) and `pm-playbook ladder` for the derived rung, which no
-  label carries and no filter can compute + git history. The narrative is in
+- **Feature status & backlog:** `gh issue list` + git history. The narrative is in
   [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/V1_ROADMAP.md`](docs/V1_ROADMAP.md).
 - **What a feature is guarded by:** the guard test itself — grep `crates/codegen/tests/` for
   `test_rust_generation_*` / `test_api_generation_*`. The test is the record; a prose list drifts.
 - **Substrate versions / publish status:** derive per the *Workspace layout* note above (grep
   `crates/*/Cargo.toml`, `cargo search forgedb-<crate>`, and the scaffold pins). Never trust a
   version written in prose.
-- **What we're working on right now:** open milestones + `gh issue list`. There is deliberately
+- **What we're working on right now:** open issues (`gh issue list`). There is deliberately
   **no "current focus" section in this file**, and one must not be re-added. A focus statement is
   temporal state: it is stale the moment priorities move, and because it sits in the agent's
   always-loaded context it gets *acted on* — sending a session off to pick up work that was
   finished or abandoned. This file is for the durable shape; what is live is a query, not prose.
-
-### Project management (the ONE tracking model — no parallel systems)
-
-ForgeDB follows the **ai-pm-playbook** (the portable form of the model worked out here; adopted
-2026-07-31, migrated to **v2.0** on 2026-08-12 and to **v4.0** on 2026-10-03). **The doctrine
-is vendored at `.pm-playbook/` and is authoritative** — load the matching skill under
-`.pm-playbook/skills/` before you create, label, milestone or close an issue, and do not
-re-transcribe the model here.
-Section refs below are to `.pm-playbook/PLAYBOOK.md`. All work is tracked in **GitHub Issues** on
-`hoodiecollin/forgedb`.
-
-The two axes, in one line each: a **milestone** says *when* and means **committed** (being the
-cycle in flight is what means *scheduled*); **labels** say *what kind*. Every work item carries
-exactly one of `improvement` / `bugfix` / `experiment`, and that type decides its gate sub-issues.
-The commitment ladder is **derived** from gate state — ask `pm-playbook ladder`, never a filter.
-
-Verify with `npx @hoodiecollin/pm-playbook check` — exit 0 means compliant. What follows is only
-what is **specific to this repo** and is not in the playbook.
-
-**`release-gate` = blocks the tag (§5).** The rung between *closed-into-milestone* and
-*released*. An open `release-gate` issue on a milestone means **that milestone cannot be tagged**,
-even if every feature on it is closed — it is a release obligation (publish the substrate,
-reconcile a version line, rotate a credential), not deferrable work. File one the moment you
-*knowingly* defer such an obligation; the deferral is exactly when it gets forgotten, because
-everything still builds locally. The complete "can we tag?" query:
-
-```bash
-gh issue list --label release-gate --state open      # any row ⇒ blocked
-```
-
-**The release-gate issue MUST carry a versioned-asset ledger (§5).** Its body holds a table of
-**every** independently versioned asset in this repo — all 18 *publishable* `crates/*` plus the root `forgedb`
-crate plus `apps/vscode-forgedb` — each row defaulting to **"no change"**, created when the
-milestone opens. **When a change touches one of those, set its row in the same pass that lands the
-change.** Deciding "does this need a bump?" with the change in front of you is reliable;
-reconstructing it at tag time from a diff is not.
-
-An absent row and a "no change" row look identical at tag time and mean opposite things
-(*verified untouched* vs *never considered*), which is why every asset gets a row rather than only
-the touched ones. This is not the same check as the publish gap: the gap is about a *missing*
-version, the ledger is about a *stale* one. The stale case is the quiet one — the version exists,
-so `cargo publish -p forgedb --dry-run` passes, the workspace builds (path deps shadow the
-registry), and the release ships old source behind a correct-looking number. Use
-`git log --oneline main..develop -- crates/<c>` against the version line; never the version alone.
-Template: `.github/ISSUE_TEMPLATE/release-gate.md`.
-
-**Surfaces (§6).** A `surface:*` label marks a separately shippable product face. This repo uses
-`surface:website` and `surface:ide-extension`; **core is the implicit default and carries no label.**
-**Never put a non-core `surface:*` issue on a core `v*` milestone** — it would read as "done,
-awaiting vX" though it already shipped on its own line, and would never reach the core changelog.
-Non-core surfaces get their own namespace milestones (`vscode-v*`) or deploy continuously. The
-core roadmap excludes them by label prefix — `apps/website/lib/roadmap-transform.ts`
-(`isCoreScoped`) drops any `surface:*` that isn't `surface:core`, so a newly-added surface is
-filtered the moment it exists.
-
-**`experiment` never rides the release spine (§4).** The playbook covers the rule; the ForgeDB
-corollary worth stating is this: **never anchor a milestone's theme on an experiment's hoped-for
-outcome.** You cannot schedule a feature whose existence the experiment has not yet decided. The
-discipline test when typing an issue — if its primary output is a measurement, evaluation or
-feasibility verdict, it is an `experiment` and stays off the spine; if it is shippable code that
-ships regardless of any measurement, it is an `improvement`.
-
-**Epics decompose via GitHub *native sub-issues*** (the `Parent issue` / `Sub-issues progress`
-link — `gh api repos/OWNER/REPO/issues/N/sub_issues`), *not* task-list checkboxes (secondary,
-drift-prone) and *not* a labels/fields convention. An epic is a top-level container that MAY span
-releases; each child carries its own milestone. The website `/roadmap` reads exactly this shape
-(epics collapsible, standalone issues alongside) — see [`apps/website/lib/roadmap-transform.ts`].
-
-**Never parent an unmilestoned work item or an `experiment` to an epic.** Neither can close into a
-release, and making one a sub-issue does two bad things: it pins the epic's `done/total` below 100%
-permanently (the transform counts every child indiscriminately), and it removes the child from the
-standalone list — the *only* path by which an unmilestoned item reaches the roadmap's **Ideas**
-section and an `experiment` reaches **Labs** (`claimedChildren`). Parenting an idea to an epic
-therefore **hides** it. Link them instead with a plain `#number` reference under a *Related,
-deliberately unparented* heading in the epic body: GitHub records a cross-reference event on the
-child, so the link is bidirectional and machine-visible with nothing to hand-maintain, and unlike a
-checkbox it carries no status to drift. When an experiment's measured conclusion commits real work,
-*that* work is a new issue — and it parents normally. (The one coherent exception is an epic that
-is *itself* labeled `experiment`, e.g. #167: it rides no release spine, so its children completing
-is a meaningful signal.)
-
-**Gate sub-issues are not roadmap entries.** `materialize` creates them under a work item, so they
-are children of an issue rather than of an epic and `claimedChildren` does not filter them. The
-transform excludes them by label pattern (`isGate`, matching `gate:<verb>` and the pre-4.0
-`{type}:gate-{n}`); leave that filter in place or a single
-milestone's gate set floods the roadmap.
-
-**Retired — do NOT reintroduce:** the "workstream" decomposition (`WS1`/`WS2`/`Workstream 2` sub-
-tasking of an epic) and the flat 5-bucket roadmap are **dead patterns**. Break an epic into real
-child issues linked as native sub-issues; never invent `WSn` sub-labels or a parallel Project
-field to slice work. The Project board (project #3) is a *view* over issues, never a second source
-of truth.
 
 ### Operating disciplines (guidance, not changelog — follow these)
 
@@ -604,14 +509,14 @@ of truth.
    reclose does. Additive substrate changes (no on-disk format break) keep the scaffold pin
    (`= "0.2"`) resolving; a format break bumps the major and needs a migration path.
 
-   **Where the gap is allowed to live — the branch model (playbook §5).** ForgeDB batches the
+   **Where the gap is allowed to live — the branch model.** ForgeDB batches the
    substrate publish at the release rather than publishing per-issue, so a publish gap *does* open
    mid-cycle. It is held off the default branch:
 
    | Branch | Holds | Invariant |
    |---|---|---|
    | `main` | released state | **Always releasable.** An outside-repo `init → generate → cargo build` resolves entirely from crates.io. |
-   | `develop` | the current core release cycle | May knowingly carry a publish gap. That is its job. |
+   | `develop` | the core release in progress | May knowingly carry a publish gap. That is its job. |
 
    - **Core work branches off `develop` and merges back to `develop`** (keep branch-per-scope +
      auto-merge; only the base changes). Nothing core lands on `main` except a release merge.
@@ -640,9 +545,8 @@ of truth.
      integration branch it would sit red for an entire cycle and stop being read.
      `.github/workflows/substrate-reclose.yml`.
 
-   **Which branch a docs / website / extension change targets is a *coupling* question, not a
-   surface one.** The surface-exclusion rule above governs *milestones and changelogs*; this
-   governs *when the change becomes visible*:
+   **Which branch a docs / website / extension change targets is a *coupling* question** — it
+   governs *when the change becomes visible*, not which directory the change lives in:
 
    - **Independent of unreleased core → straight to `main`.** Typo and link fixes, styling, SEO,
      analytics, dep bumps, corrections to already-shipped docs. These deploy continuously and must
@@ -658,32 +562,10 @@ of truth.
    **There is exactly ONE `develop`, and its name never contains a version.** No `v0.5-develop`
    beside a `v0.4-develop`. crates.io has one version line per crate and the gap is defined against
    what is *currently published*, so two cycle branches carrying unpublished substrate changes
-   cannot both be measured — whichever publishes first silently redefines the other's gap. And the
-   milestone already encodes *when*; a version in the branch name is a second scheduling axis,
-   which is the parallel-decomposition anti-pattern. Version-agnostic also means self-advancing:
-   tagging a release turns `develop` into the next cycle with no rename and no workflow edit.
-
-   So what keeps next-cycle work off `develop` is **the milestone, not the branch**:
-
-   > A PR targeting `develop` may not close an issue milestoned later than the cycle in flight
-   > (**derived**: the lowest open `v*` milestone — never configured, never written down).
-
-   A **deny-list on future milestones**, not an allow-list on the current one — so chores, CI fixes
-   and typo PRs close no issue and pass silently, correctly: work with no issue cannot be
-   next-cycle work. `.github/workflows/cycle-scope.yml` gates PRs into `develop` — which now
-   reaches core work, since it goes through PRs (#390). For anything that still lands directly,
-   run the same check yourself before merging a branch back:
-
-   ```bash
-   make cycle-scope ISSUE=245        # what the branch closes
-   make cycle-scope PR=250           # or a PR, as CI does
-   ```
-
-   Blocked means *early*, not wrong: keep the branch, let the cycle ship, rebase, land it. The only
-   other correct response is that the issue was mis-scheduled — move the milestone rather than
-   merging past it. **This makes closing the milestone part of the release ritual**: a milestone
-   left open after its tag freezes the derived cycle and blocks legitimate next-cycle work.
-   (Portable form: `ai-pm-playbook` PLAYBOOK §5 and the `release` skill, rules PM008/PM009.)
+   cannot both be measured — whichever publishes first silently redefines the other's gap.
+   Version-agnostic also means self-advancing: tagging a release turns `develop` into the next
+   release's branch with no rename and no workflow edit. Work meant for a later release stays on
+   its own branch off `develop`, unmerged, until the current release ships.
 
 3. **Codegen is compile-tested, not just snapshot-tested.** The `insta` snapshots compare
    generated code as *strings* — a snapshot pass does **not** mean the output compiles. Tier 1
@@ -698,21 +580,17 @@ of truth.
    task boundaries; when a claim disagrees with code, fix the claim. Do not pin an exact test count
    in prose (chronic drift source — run the runner).
 
-5. **Gates follow pm-playbook 4.0 — load the skill, not this file.** `.pm-playbook/skills/`
-   (or the `pm-playbook` Claude Code plugin) holds the workflows: `intent`, `prove`, `build`,
-   `fix`, `experiment`. What is specific to this repo:
+5. **Designs and fixes.**
    - **Prove by running.** The accepted designs that failed here rested on unrun claims about a
      library, compiler or runtime — `syn::File` being `Send` (#388), a copied dylib surviving its
      `LC_ID_DYLIB` (#335), cargo's nested-workspace rule (#328), no harness owning a pty (#367),
-     Serena forwarding `allFeatures` (#519). Each was one small probe away from disproved. In a
-     proof gate, such a claim is `ran` with the command and output, or it stays `assumed`.
-   - **An agent never closes a gate.** Say it is ready and stop; the maintainer closes it. A proof
-     gate with every claim proven and no one-way doors may close via `pm-playbook prove <n> --yes`.
-   - **When later work disproves an accepted gate, stop and say so**, and correct the body in place
-     once it is reopened — never a correction underneath, which reads as the old design.
-   - **Design docs are not committed.** Intent and proof live in the gate issues; when a feature
-     ships, its durable architecture goes into `docs/ARCHITECTURE.md`.
-   - A plain `bugfix` has no gates: the PR carries a regression test that fails before the fix.
+     Serena forwarding `allFeatures` (#519). Each was one small probe away from disproved. A
+     design claim is backed by the command and its output, or it is stated as an assumption.
+   - **When later work disproves an accepted design, stop and say so**, and correct the design's
+     issue body in place — never a correction underneath, which reads as the old design.
+   - **Design docs are not committed.** A design lives in its issue; when a feature ships, its
+     durable architecture goes into `docs/ARCHITECTURE.md`.
+   - A bug fix carries a regression test that fails before the fix.
 
 ## Code search
 
@@ -741,12 +619,12 @@ Two `PreToolUse` matchers enforce it, both running `.claude/hooks/no-grep.sh`:
   scoped to a non-code glob or directory. Anything with spaces, quotes or regex metacharacters passes.
 - **`Bash`** refuses `grep` / `rg` / `git grep` run over files (a grep that *filters piped output*
   passes — `cargo test | grep 'test result'`), and `cat` / `head` / `tail` / `sed` / `tee` / `>` naming a
-  `.rs` / `.ts` / `.tsx` / `.js` / `.go` file. A search scoped to `docs/`, `.github/`, `.pm-playbook/`,
+  `.rs` / `.ts` / `.tsx` / `.js` / `.go` file. A search scoped to `docs/`, `.github/`,
   `examples/`, a non-code extension, or a `-t md` type filter passes, as does any path under `/tmp` or
   `scratchpad/`. `ast-grep` is not `grep` and passes.
 
 Text search is still the right tool for string literals, error copy, config keys, `Cargo.toml` version
-lines and `.pm-playbook/backlog/` — scope those to a non-code glob. Both matchers are guarded by
+lines — scope those to a non-code glob. Both matchers are guarded by
 `tests/semantic_search_test.rs`, which runs the hook against a table of payloads.
 
 **The same rule holds for TESTS that assert a property of source (#388, #515).** A guard over
@@ -871,43 +749,3 @@ so a component there would be downloaded by every job for a tool no job runs.
 - `forgedb-product-manager` — product/architecture decisions; guards the generator identity.
 - `forgedb-schema-author` — authors realistic `.forge` example schemas.
 - `rust-core-library` — idiomatic Rust for core library/crate work.
-
-<!-- pm-playbook:begin -->
-## Project management — pm-playbook v4.0.0
-
-Work is tracked in GitHub Issues. **Milestone = when**: assigning one means committed, and the
-lowest open one is the cycle in flight. **Label = what kind**: every work item carries exactly one
-of `improvement`, `bugfix`, `experiment`. Epics group work items as native sub-issues. There are
-no priority or size fields.
-
-| Type | Gates (sub-issues, `gate:<verb>`) | Then |
-|---|---|---|
-| `improvement` | intent → proof | build |
-| `bugfix` | none — a `hotfix` takes a warrant | fix, with a regression test |
-| `experiment` | charter → verdict (never milestoned) | — |
-
-**A person closes a gate, not an agent.** Gates are created only by `pm-playbook materialize`. A
-proof gate closes on evidence through `pm-playbook prove <n> --yes`; for any other gate that is
-ready, say so and stop. If later work shows an accepted gate was wrong, say so and ask for it to be
-reopened.
-
-Load the skill for what you are doing (Claude Code: the `pm-playbook` plugin provides the same):
-
-| When | Read |
-|---|---|
-| the model, and which skill to load | `.pm-playbook/skills/pm-playbook/SKILL.md` |
-| filing a new issue | `.pm-playbook/skills/file/SKILL.md` |
-| writing an improvement's intent gate | `.pm-playbook/skills/intent/SKILL.md` |
-| writing or closing a proof gate | `.pm-playbook/skills/prove/SKILL.md` |
-| implementing an improvement whose gates are closed | `.pm-playbook/skills/build/SKILL.md` |
-| fixing a bug, or a hotfix | `.pm-playbook/skills/fix/SKILL.md` |
-| a spike, benchmark or evaluation | `.pm-playbook/skills/experiment/SKILL.md` |
-| what is left, what to do next, briefing parallel agents | `.pm-playbook/skills/next/SKILL.md` |
-| tagging, the release-gate ledger, which branch to target | `.pm-playbook/skills/release/SKILL.md` |
-| linting the backlog and fixing what it finds | `.pm-playbook/skills/check/SKILL.md` |
-
-```bash
-npx @hoodiecollin/pm-playbook pull     # refresh the local mirror at .pm-playbook/backlog/ (read it, edit via push)
-npx @hoodiecollin/pm-playbook check    # before finishing — exit 0 means compliant
-```
-<!-- pm-playbook:end -->
