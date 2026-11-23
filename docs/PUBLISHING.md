@@ -252,8 +252,8 @@ build`, which resolves `forgedb-storage-web` from the registry and compiles agai
 no longer runs `rustup target add` for you — install `wasm32-unknown-unknown` yourself, and note
 the honest limit if the wasm toolchain can't run in a given environment.
 
-Track the open/closed state of a gap in the project's GitHub issues (a knowingly deferred one is
-a `release-gate`), and update the generated pins when you publish.
+Track the open/closed state of a gap in the project's GitHub issues, and update the generated
+pins when you publish.
 
 ---
 

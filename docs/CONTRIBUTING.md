@@ -120,10 +120,9 @@ Before creating bug reports, please check existing issues to avoid duplicates.
 [Links, references, etc.]
 ```
 
-**Design notes & proposals live as issues, not committed files.** A non-trivial change is
-captured in its **gates** — `gate:intent` (what and why, approved by the maintainer) and
-`gate:proof` (the approach, with evidence for every claim it rests on), sub-issues of the work item
-— and we do **not** commit proposal/design documents to the repository. Durable *architecture*
+**Design notes & proposals live as issues, not committed files.** Describe a non-trivial change —
+what and why, and the approach with evidence for every claim it rests on — in its GitHub issue;
+we do **not** commit proposal/design documents to the repository. Durable *architecture*
 reference for shipped features belongs in [`ARCHITECTURE.md`](./ARCHITECTURE.md). This keeps the
 tree free of point-in-time design notes that drift out of sync with the code.
 
