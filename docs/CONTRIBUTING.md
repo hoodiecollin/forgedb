@@ -451,40 +451,14 @@ version, for two reasons.
 crates.io has **one version line per crate**, and the publish gap is defined
 relative to what is currently published — so two cycle branches carrying
 unpublished substrate changes cannot both be measured against it. Whichever
-publishes first silently redefines the other's gap. Separately, the **milestone
-already says when a change ships**; putting a version in the branch name encodes
-that a second time, somewhere harder to query and harder to correct.
+publishes first silently redefines the other's gap.
 
 Keeping it version-agnostic also makes it self-advancing: `develop` means "the
-cycle in flight," so tagging a release turns it into the next cycle with no
+release in progress," so tagging a release turns it into the next one with no
 rename and no workflow edit.
 
-**So what keeps next-cycle work off `develop` is the milestone, not the branch:**
-
-> A PR targeting `develop` may not close an issue milestoned later than the cycle
-> in flight (the lowest open `v*` milestone).
-
-Note the shape — a deny-list on *future* milestones, not an allow-list on the
-current one. Chores, CI fixes and typo PRs close no issue and pass silently, and
-correctly so: work with no issue cannot be next-cycle work, because next-cycle
-work is *defined* by carrying that milestone.
-
-The `Cycle scope` workflow enforces this on PRs to `develop`, which is how core
-work lands (#390), so CI sees it. Run the same check yourself for anything that
-still lands directly:
-
-```bash
-make cycle-scope ISSUE=245        # the issue(s) your branch closes
-make cycle-scope PR=250           # or a PR, as CI does
-```
-
-If it blocks you, the work is not wrong — it is early. Keep the branch, let
-`develop` ship its cycle, then rebase and land it. The only other correct
-response is that the issue was mis-scheduled, in which case move the milestone
-rather than merging past it.
-
-**Work scheduled for a later version** therefore lives on its own branch off
-`develop`, unmerged, carrying its real milestone. Two long-lived branches *are*
+**Work meant for a later release** lives on its own branch off `develop`,
+unmerged, until the current release ships. Two long-lived branches *are*
 legitimate and neither is a second cycle line: a maintenance line cut off a tag
 (`release/v0.4.x`) when a patch is needed after the cycle moved on, and a track
 that cannot merge into the current cycle at all — named for the work
@@ -630,7 +604,6 @@ Closes #123
 | Check | Runs on | Blocks? |
 |---|---|---|
 | **`test suite`** — tier 1 (`make test`, then `make clippy`) | PRs into `develop`/`main`, and pushes to both | **Yes**, on PRs |
-| Cycle-scope gate | PRs into `develop` | Yes |
 | Substrate outside-repo reclose | `main` | Yes |
 | Reclose under a foreign cargo workspace root | `main` | Yes |
 | `migrate_tests` vs the published substrate | `main` | Yes |
@@ -702,7 +675,6 @@ the GitHub button (merge commit — squash and rebase are disabled), or locally 
 PR's checks are green:
 
 ```bash
-make cycle-scope PR=<n>          # or ISSUE=<n> — the gate CI runs on PRs into develop
 git checkout develop             # or main, per the coupling rule in CLAUDE.md
 git merge --no-ff <branch> -m "Merge <branch>: <what it did> (#<issue>)"
 git push origin develop

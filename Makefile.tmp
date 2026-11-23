@@ -227,17 +227,6 @@ scripts-typecheck:
 	@$(BUN) install --cwd scripts
 	@(cd scripts && $(BUN) x tsc --noEmit)
 
-.PHONY: cycle-scope
-
-cycle-scope:
-ifdef PR
-	@$(BUN) scripts/check-cycle-scope.ts --pr $(PR)
-else ifdef ISSUE
-	@$(BUN) scripts/check-cycle-scope.ts --issue $(ISSUE)
-else
-	@echo "usage: make cycle-scope ISSUE=<n[,n...]>   (or PR=<n>)"; exit 2
-endif
-
 .PHONY: experiment-261
 
 experiment-261:
