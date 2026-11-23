@@ -9,7 +9,6 @@ on:
 
 permissions:
   contents: read
-  issues: read
 
 jobs:
   reclose:
@@ -523,22 +522,6 @@ jobs:
           # find WARM — and the whole check would then be measuring its own
           # leftovers rather than crates.io.
           test ! -e "$HOME/.forgedb"
-
-      - name: Report open release gates
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gates="$(gh issue list --label release-gate --state open \
-                     --json number,title,milestone \
-                     --jq '.[] | "  #\(.number) [\(.milestone.title // "no milestone")] \(.title)"')"
-          if [ -n "$gates" ]; then
-            echo "Open release gates — these block the tag:"
-            echo "$gates"
-          else
-            echo "No open release gates."
-          fi
 
   migrate:
     name: migrate_tests against the published substrate
