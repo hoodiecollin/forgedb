@@ -569,11 +569,10 @@ fn a_failing_nightly_has_the_permission_and_the_condition_to_report() {
     let create = create.split(" fi").next().unwrap_or(create);
 
     assert!(
-        create.contains("--label bugfix"),
-        "the CREATED issue must carry the `bugfix` type label. pm-playbook PM010 requires \
-         exactly one type label per work item, so an unlabelled auto-filed issue turns \
-         `pm-playbook check` red — a new control whose side effect is breaking an existing \
-         one. Got: {create}"
+        create.contains("--label nightly-failure"),
+        "the CREATED issue must carry the `nightly-failure` marker label. The lookup that \
+         finds an existing report searches by that label, so an issue filed without it is \
+         never found again and every failing night opens a duplicate. Got: {create}"
     );
 }
 

@@ -41,7 +41,7 @@ jobs:
           # carrying the marker label so a closed one starts a fresh report rather than
           # being resurrected.
           EXISTING="$(gh issue list \
-            --state open --label nightly-failure --label bugfix \
+            --state open --label nightly-failure \
             --search "\"$TITLE\" in:title" \
             --json number --jq '.[0].number // empty')"
 
@@ -67,7 +67,6 @@ jobs:
           else
             gh issue create \
               --title "$TITLE" \
-              --label bugfix \
               --label nightly-failure \
               --body "$BODY"
           fi
